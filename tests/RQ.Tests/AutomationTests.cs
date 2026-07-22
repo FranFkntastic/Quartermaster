@@ -5,12 +5,60 @@ using Franthropy.Dalamud.Automation.Inventory;
 using Franthropy.Dalamud.Automation.Retainers;
 using RQ.Automation;
 using RQ.Domain;
+using RQ.Inventory;
 using RQ.Operations;
+using RQ.Persistence;
 
 namespace RQ.Tests;
 
 public sealed class AutomationTests
 {
+    [Fact]
+    public void AutomationServices_DoNotRegisterCallbacksDuringConstruction()
+    {
+        using var directory = new TemporaryDirectory();
+        var dependencyCalls = 0;
+        var unused = new Func<MethodInfo, object?[]?, object?>((_, _) =>
+        {
+            dependencyCalls++;
+            return null;
+        });
+        var log = CreateProxy<IPluginLog>((_, _) => null);
+        var scanner = new InventoryScanner(CreateProxy<IDataManager>(unused), log);
+        using var captures = new RetainerCaptureService(
+            CreateProxy<IAddonLifecycle>(unused),
+            log,
+            scanner,
+            new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory.Path, "retainers.json"))),
+            () => TestData.Owner);
+        using var refresh = new AutoRetainerRefreshService(
+            CreateProxy<Dalamud.Plugin.IDalamudPluginInterface>(unused),
+            CreateProxy<IFramework>(unused),
+            log,
+            captures,
+            CreateProxy<IRetainerAutomationSession>(unused));
+
+        Assert.Equal(0, dependencyCalls);
+    }
+
+    [Fact]
+    public void MetadataCatalog_ConcurrentCacheMissesRemainSafe()
+    {
+        var data = CreateProxy<IDataManager>((_, _) => throw new InvalidOperationException("No test sheet."));
+        var log = CreateProxy<IPluginLog>((_, _) => null);
+        var catalog = new ItemMetadataCatalog(data, log);
+        var failures = new System.Collections.Concurrent.ConcurrentQueue<Exception>();
+
+        Parallel.For(0, 512, _ =>
+        {
+            try { Assert.Equal("Item 42", catalog.Resolve(42).Name); }
+            catch (Exception exception) { failures.Enqueue(exception); }
+        });
+
+        Assert.Empty(failures);
+        Assert.Equal("Item 42", catalog.Resolve(42).Name);
+    }
+
     [Fact]
     public async Task RetainerLiveDriver_PropagatesCancellationIntoFrameworkWork()
     {

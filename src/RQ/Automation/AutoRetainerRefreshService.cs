@@ -1,4 +1,6 @@
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface;
+using Dalamud.Interface.Components;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Franthropy.Dalamud.Automation.Retainers;
@@ -32,6 +34,7 @@ public sealed class AutoRetainerRefreshService : IDisposable
     private bool postprocessOwned;
     private int expected;
     private int processed;
+    private bool registered;
     private volatile bool disposed;
 
     public AutoRetainerRefreshService(
@@ -48,9 +51,37 @@ public sealed class AutoRetainerRefreshService : IDisposable
         this.captures = captures;
         this.session = session;
         this.automation = automation ?? new AutomationLease();
-        pluginInterface.GetIpcSubscriber<object>(DrawButtons).Subscribe(DrawButton);
-        pluginInterface.GetIpcSubscriber<string, object>(AdditionalTask).Subscribe(OnAdditionalTask);
-        pluginInterface.GetIpcSubscriber<string, string, object>(ReadyForPostprocess).Subscribe(OnReady);
+    }
+
+    public void Register()
+    {
+        ObjectDisposedException.ThrowIf(disposed, this);
+        if (registered)
+            return;
+
+        var draw = false;
+        var additional = false;
+        var ready = false;
+        try
+        {
+            pluginInterface.GetIpcSubscriber<object>(DrawButtons).Subscribe(DrawButton);
+            draw = true;
+            pluginInterface.GetIpcSubscriber<string, object>(AdditionalTask).Subscribe(OnAdditionalTask);
+            additional = true;
+            pluginInterface.GetIpcSubscriber<string, string, object>(ReadyForPostprocess).Subscribe(OnReady);
+            ready = true;
+            registered = true;
+        }
+        catch
+        {
+            if (ready)
+                pluginInterface.GetIpcSubscriber<string, string, object>(ReadyForPostprocess).Unsubscribe(OnReady);
+            if (additional)
+                pluginInterface.GetIpcSubscriber<string, object>(AdditionalTask).Unsubscribe(OnAdditionalTask);
+            if (draw)
+                pluginInterface.GetIpcSubscriber<object>(DrawButtons).Unsubscribe(DrawButton);
+            throw;
+        }
     }
 
     public bool IsRefreshing => refreshing || postprocessOwned;
@@ -112,13 +143,15 @@ public sealed class AutoRetainerRefreshService : IDisposable
             return;
         try
         {
-            ImGui.SameLine();
             if (IsRefreshing || queued || (automation.IsHeld && automation.Holder is not ("retainer refresh" or "retainer postprocess")))
                 ImGui.BeginDisabled();
-            if (ImGui.SmallButton("Quartermaster refresh"))
+            ImGui.SameLine();
+            if (ImGuiComponents.IconButton("QuartermasterRefresh", FontAwesomeIcon.BookOpen))
                 Start();
             if (IsRefreshing || queued || (automation.IsHeld && automation.Holder is not ("retainer refresh" or "retainer postprocess")))
                 ImGui.EndDisabled();
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Refresh all Quartermaster retainer inventory caches.");
             if (queued)
             {
                 queued = false;
@@ -216,13 +249,7 @@ public sealed class AutoRetainerRefreshService : IDisposable
             var opened = await session.OpenInventoryAsync(cancellationToken).ConfigureAwait(false);
             if (!opened.Success)
                 throw new InvalidOperationException($"{opened.Code}: {opened.Message}");
-            var captureWait = await framework.RunOnTick(() =>
-            {
-                ThrowIfStopped(cancellationToken);
-                return captures.GetWaitSnapshot();
-            }, cancellationToken: cancellationToken).ConfigureAwait(false);
-            if (captureWait.Session is null)
-                throw new InvalidOperationException("Retainer inventory opened without a stable capture session.");
+            var captureWait = await WaitForCaptureSessionAsync(retainerName, cancellationToken).ConfigureAwait(false);
             isCurrent = await framework.RunOnTick(() =>
             {
                 ThrowIfStopped(cancellationToken);
@@ -291,6 +318,21 @@ public sealed class AutoRetainerRefreshService : IDisposable
         throw new InvalidOperationException($"Timed out waiting for persisted capture of {retainerName} ({expectedRetainerId}).");
     }
 
+    private async Task<CaptureWaitSnapshot> WaitForCaptureSessionAsync(string retainerName, CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; attempt < 180; attempt++)
+        {
+            ThrowIfStopped(cancellationToken);
+            var snapshot = await framework.RunOnTick(
+                () => captures.GetWaitSnapshot(),
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (snapshot.Session is not null)
+                return snapshot;
+            await framework.DelayTicks(1, cancellationToken).ConfigureAwait(false);
+        }
+        throw new InvalidOperationException($"Timed out waiting for a stable capture session after opening {retainerName}'s inventory.");
+    }
+
     private async Task FailAsync(string message, Exception exception, CancellationToken cancellationToken)
     {
         if (disposed || cancellationToken.IsCancellationRequested)
@@ -322,6 +364,8 @@ public sealed class AutoRetainerRefreshService : IDisposable
         Status = $"{message} {exception.Message}";
         if (readyRequest is not null)
         {
+            try { session.CancelActive(); }
+            catch (Exception cleanupException) { log.Warning(cleanupException, "Unable to close Quartermaster retainer UI after refresh failure."); }
             try { pluginInterface.GetIpcSubscriber<object>(FinishPostprocess).InvokeAction(); }
             catch { }
         }
@@ -333,9 +377,13 @@ public sealed class AutoRetainerRefreshService : IDisposable
             return;
         disposed = true;
         activeTasks.Stop();
-        pluginInterface.GetIpcSubscriber<object>(DrawButtons).Unsubscribe(DrawButton);
-        pluginInterface.GetIpcSubscriber<string, object>(AdditionalTask).Unsubscribe(OnAdditionalTask);
-        pluginInterface.GetIpcSubscriber<string, string, object>(ReadyForPostprocess).Unsubscribe(OnReady);
+        if (registered)
+        {
+            pluginInterface.GetIpcSubscriber<object>(DrawButtons).Unsubscribe(DrawButton);
+            pluginInterface.GetIpcSubscriber<string, object>(AdditionalTask).Unsubscribe(OnAdditionalTask);
+            pluginInterface.GetIpcSubscriber<string, string, object>(ReadyForPostprocess).Unsubscribe(OnReady);
+            registered = false;
+        }
         lifetime.Cancel();
         if (!activeTasks.Wait(DisposeJoinTimeout))
             log.Warning("Timed out waiting for AutoRetainer refresh tasks to stop during plugin disposal.");

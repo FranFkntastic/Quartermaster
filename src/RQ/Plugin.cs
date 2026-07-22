@@ -116,19 +116,28 @@ public sealed class Plugin : IDalamudPlugin
             new QuartermasterBridgeProvider(CreateAgentBridgeTruth, window.OpenReviewSurface, () => window.IsOpen = false));
         windows.AddWindow(window);
 
-        state.Changed += OnStateChanged;
-        cache.Changed += OnCacheChanged;
-        journal.OperationChanged += OnOperationChanged;
-        submissions.OperationChanged += OnSubmittedOperationChanged;
-        var commandHelp = "Open Quartermaster.";
+        try
+        {
+            captures.Register();
+            autoRetainer.Register();
+            state.Changed += OnStateChanged;
+            cache.Changed += OnCacheChanged;
+            journal.OperationChanged += OnOperationChanged;
+            submissions.OperationChanged += OnSubmittedOperationChanged;
+            var commandHelp = "Open Quartermaster.";
 #if DEBUG
-        commandHelp += " Use '/rq bridge on|off' to control the local development bridge.";
+            commandHelp += " Use '/rq bridge on|off' to control the local development bridge.";
 #endif
-        commands.AddHandler(Command, new CommandInfo((_, arguments) => HandleCommand(arguments)) { HelpMessage = commandHelp });
-        pluginInterface.UiBuilder.Draw += windows.Draw;
-        pluginInterface.UiBuilder.OpenMainUi += OpenMainUi;
-        RefreshSnapshot();
-        framework.Update += OnFrameworkUpdate;
+            commands.AddHandler(Command, new CommandInfo((_, arguments) => HandleCommand(arguments)) { HelpMessage = commandHelp });
+            pluginInterface.UiBuilder.Draw += windows.Draw;
+            pluginInterface.UiBuilder.OpenMainUi += OpenMainUi;
+            framework.Update += OnFrameworkUpdate;
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
     }
 
     private void RecoverPendingCacheInvalidations()

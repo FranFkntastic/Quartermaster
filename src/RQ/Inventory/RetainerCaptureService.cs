@@ -24,6 +24,7 @@ public sealed class RetainerCaptureService : IDisposable
     private CaptureSession? session;
     private long receiptRevision;
     private readonly List<CaptureReceipt> receipts = [];
+    private bool registered;
 
     public RetainerCaptureService(IAddonLifecycle lifecycle, IPluginLog log, InventoryScanner scanner, RetainerCacheRepository cache, Func<OwnerScope> currentOwner)
     {
@@ -32,10 +33,25 @@ public sealed class RetainerCaptureService : IDisposable
         this.scanner = scanner;
         this.cache = cache;
         this.currentOwner = currentOwner;
-        lifecycle.RegisterListener(AddonEvent.PostSetup, LargeAddon, Opened);
-        lifecycle.RegisterListener(AddonEvent.PreFinalize, LargeAddon, Closing);
-        lifecycle.RegisterListener(AddonEvent.PostSetup, SmallAddon, Opened);
-        lifecycle.RegisterListener(AddonEvent.PreFinalize, SmallAddon, Closing);
+    }
+
+    public void Register()
+    {
+        if (registered)
+            return;
+        registered = true;
+        try
+        {
+            lifecycle.RegisterListener(AddonEvent.PostSetup, LargeAddon, Opened);
+            lifecycle.RegisterListener(AddonEvent.PreFinalize, LargeAddon, Closing);
+            lifecycle.RegisterListener(AddonEvent.PostSetup, SmallAddon, Opened);
+            lifecycle.RegisterListener(AddonEvent.PreFinalize, SmallAddon, Closing);
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
     }
 
     public event Action<CaptureReceipt>? CaptureCompleted;
@@ -185,9 +201,12 @@ public sealed class RetainerCaptureService : IDisposable
 
     public void Dispose()
     {
+        if (!registered)
+            return;
         lifecycle.UnregisterListener(AddonEvent.PostSetup, LargeAddon, Opened);
         lifecycle.UnregisterListener(AddonEvent.PreFinalize, LargeAddon, Closing);
         lifecycle.UnregisterListener(AddonEvent.PostSetup, SmallAddon, Opened);
         lifecycle.UnregisterListener(AddonEvent.PreFinalize, SmallAddon, Closing);
+        registered = false;
     }
 }

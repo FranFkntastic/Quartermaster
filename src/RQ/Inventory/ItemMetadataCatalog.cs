@@ -38,39 +38,42 @@ public sealed class ItemMetadataCatalog
 
     public ItemMetadata Resolve(uint itemId)
     {
-        if (cache.TryGetValue(itemId, out var cached))
-            return cached;
-        try
+        lock (cache)
         {
-            var item = dataManager.GetExcelSheet<Item>().GetRowOrDefault(itemId);
-            if (item is null)
+            if (cache.TryGetValue(itemId, out var cached))
+                return cached;
+            try
+            {
+                var item = dataManager.GetExcelSheet<Item>().GetRowOrDefault(itemId);
+                if (item is null)
+                    return cache[itemId] = Unknown(itemId);
+                var value = item.Value;
+                var name = value.Name.ToString();
+                var itemType = ResolveItemType(value);
+                var equipment = value.EquipSlotCategory.RowId != 0;
+                return cache[itemId] = new(
+                    itemId,
+                    string.IsNullOrWhiteSpace(name) ? $"Item {itemId}" : name,
+                    itemType,
+                    value.StackSize == 1 && equipment,
+                    value.LevelItem.RowId,
+                    equipment ? value.LevelEquip : null,
+                    equipment ? ResolveEligibleJobs(value) : null,
+                    equipment ? ResolveSlots(value.EquipSlotCategory.RowId) : null,
+                    ResolveRarity(value.Rarity),
+                    value.ItemUICategory.RowId > 0 ? new FfxivUiCategoryKey(value.ItemUICategory.RowId) : null,
+                    itemType,
+                    value.IsUnique,
+                    !value.IsUntradable,
+                    value.Desynth > 0,
+                    value.CanBeHq,
+                    value.StackSize > 0 ? value.StackSize : null);
+            }
+            catch (Exception exception)
+            {
+                log.Verbose(exception, $"Unable to resolve metadata for item {itemId}.");
                 return cache[itemId] = Unknown(itemId);
-            var value = item.Value;
-            var name = value.Name.ToString();
-            var itemType = ResolveItemType(value);
-            var equipment = value.EquipSlotCategory.RowId != 0;
-            return cache[itemId] = new(
-                itemId,
-                string.IsNullOrWhiteSpace(name) ? $"Item {itemId}" : name,
-                itemType,
-                value.StackSize == 1 && equipment,
-                value.LevelItem.RowId,
-                equipment ? value.LevelEquip : null,
-                equipment ? ResolveEligibleJobs(value) : null,
-                equipment ? ResolveSlots(value.EquipSlotCategory.RowId) : null,
-                ResolveRarity(value.Rarity),
-                value.ItemUICategory.RowId > 0 ? new FfxivUiCategoryKey(value.ItemUICategory.RowId) : null,
-                itemType,
-                value.IsUnique,
-                !value.IsUntradable,
-                value.Desynth > 0,
-                value.CanBeHq,
-                value.StackSize > 0 ? value.StackSize : null);
-        }
-        catch (Exception exception)
-        {
-            log.Verbose(exception, $"Unable to resolve metadata for item {itemId}.");
-            return cache[itemId] = Unknown(itemId);
+            }
         }
     }
 
