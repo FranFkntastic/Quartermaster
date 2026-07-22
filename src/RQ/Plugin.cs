@@ -115,7 +115,7 @@ public sealed class Plugin : IDalamudPlugin
             configDirectory,
             SaveConfiguration,
             DispatchOnFramework,
-            new QuartermasterBridgeProvider(CreateAgentBridgeTruth, window.OpenReviewSurface, () => window.IsOpen = false, agentReviewRegistry));
+            new QuartermasterBridgeProvider(CreateAgentBridgeTruth, window.OpenReviewSurface, window.CloseReviewSurface, agentReviewRegistry));
         windows.AddWindow(window);
 
         try

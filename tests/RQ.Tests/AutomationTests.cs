@@ -95,6 +95,7 @@ public sealed class AutomationTests
             session,
             automation: null,
             autoRetainerAvailable: () => true,
+            autoRetainerBusy: () => false,
             countAvailableRetainers: () => 2);
 
         Assert.True(refresh.Start());
@@ -103,6 +104,82 @@ public sealed class AutomationTests
             TimeSpan.FromSeconds(2)));
         Assert.Equal(1, ensureCalls);
         Assert.True(refresh.IsQueued);
+    }
+
+    [Fact]
+    public void RefreshStart_RecoversIdleExistingRetainerInteraction()
+    {
+        using var directory = new TemporaryDirectory();
+        var unused = new Func<MethodInfo, object?[]?, object?>((method, _) =>
+            throw new InvalidOperationException($"Unexpected dependency call: {method.Name}."));
+        var framework = CreateProxy<IFramework>((method, arguments) =>
+        {
+            Assert.Equal(nameof(IFramework.RunOnTick), method.Name);
+            var callback = Assert.IsAssignableFrom<Delegate>(arguments![0]);
+            return CreateCompletedTask(method.ReturnType, callback.DynamicInvoke());
+        });
+        var ensureCalls = 0;
+        var closeCalls = 0;
+        var session = CreateProxy<IRetainerAutomationSession>((method, _) => method.Name switch
+        {
+            "get_IsRetainerListReady" => false,
+            nameof(IRetainerAutomationSession.EnsureRetainerListAsync) => Task.FromResult(
+                ++ensureCalls == 1
+                    ? RetainerAutomationResult.Failed("RetainerInteractionAlreadyOpen", "A retainer is open.")
+                    : RetainerAutomationResult.Succeeded("RetainerListReady", "Retainer list opened.")),
+            nameof(IRetainerAutomationSession.CloseRetainerAsync) => Task.FromResult(
+                (++closeCalls, RetainerAutomationResult.Succeeded("RetainerClosed", "Retainer closed.")).Item2),
+            _ => throw new InvalidOperationException($"Unexpected session call: {method.Name}."),
+        });
+        var log = CreateProxy<IPluginLog>((_, _) => null);
+        var scanner = new InventoryScanner(CreateProxy<IDataManager>(unused), log);
+        using var captures = new RetainerCaptureService(
+            CreateProxy<IAddonLifecycle>(unused),
+            log,
+            scanner,
+            new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory.Path, "retainers.json"))),
+            () => TestData.Owner);
+        using var refresh = new AutoRetainerRefreshService(
+            CreateProxy<Dalamud.Plugin.IDalamudPluginInterface>(unused),
+            framework,
+            log,
+            captures,
+            session,
+            automation: null,
+            autoRetainerAvailable: () => true,
+            autoRetainerBusy: () => false,
+            countAvailableRetainers: () => 2);
+
+        Assert.True(refresh.Start());
+        Assert.True(SpinWait.SpinUntil(
+            () => refresh.Status == "Retainer refresh queued.",
+            TimeSpan.FromSeconds(2)));
+        Assert.Equal(2, ensureCalls);
+        Assert.Equal(1, closeCalls);
+        Assert.True(refresh.IsQueued);
+    }
+
+    [Fact]
+    public void StaleIpcRepair_RemovesOnlyPriorQuartermasterTargets()
+    {
+        var subscriber = new FakeSubscriber<string>();
+        var current = new FakeSubscriptionTarget();
+        var stale = new FakeSubscriptionTarget();
+        subscriber.Subscribe(current.Handle);
+        subscriber.Subscribe(stale.Handle);
+        Action<string> unrelated = _ => { };
+        subscriber.Subscribe(unrelated);
+
+        var removed = StaleIpcSubscriptionRepair.Remove<Action<string>>(
+            subscriber,
+            current,
+            nameof(FakeSubscriptionTarget.Handle),
+            subscriber.Unsubscribe);
+
+        Assert.Equal(1, removed);
+        Assert.Contains(subscriber.Current, candidate => ReferenceEquals(candidate.Target, current));
+        Assert.Contains(unrelated, subscriber.Current);
+        Assert.DoesNotContain(subscriber.Current, candidate => ReferenceEquals(candidate.Target, stale));
     }
 
     [Fact]
@@ -334,6 +411,31 @@ public sealed class AutomationTests
 
         public void CancelActive() => CancelCalls++;
         public void Complete() => completion.TrySetResult(new(true, "Automatic retrieval completed."));
+    }
+
+    private sealed class FakeSubscriptionTarget
+    {
+        public void Handle(string _) { }
+    }
+
+    private abstract class FakeSubscriberBase<T>
+    {
+        protected FakeChannel<T> Channel { get; } = new();
+    }
+
+    private sealed class FakeSubscriber<T> : FakeSubscriberBase<T>
+    {
+        public IReadOnlyList<Action<T>> Current => Channel.Subscriptions.Cast<Action<T>>().ToArray();
+        public void Subscribe(Action<T> action) => Channel.Subscribe(action);
+        public void Unsubscribe(Action<T> action) => Channel.Unsubscribe(action);
+    }
+
+    private sealed class FakeChannel<T>
+    {
+        private readonly HashSet<Delegate> subscriptions = [];
+        public IReadOnlyList<Delegate> Subscriptions => subscriptions.ToArray();
+        public void Subscribe(Action<T> action) => subscriptions.Add(action);
+        public void Unsubscribe(Action<T> action) => subscriptions.Remove(action);
     }
 }
 

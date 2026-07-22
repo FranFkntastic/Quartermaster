@@ -37,6 +37,7 @@ public sealed class QuartermasterWindow : Window
     private string transferStatus = "No transfer has run.";
     private WorkbenchView? requestedView;
     private Task? activeTransferTask;
+    private bool clearAgentReviewWindowOverride;
 
     public QuartermasterWindow(
         StateRepository state,
@@ -147,6 +148,30 @@ public sealed class QuartermasterWindow : Window
             _ => WorkbenchView.StockAndPlan,
         };
         IsOpen = true;
+        Collapsed = false;
+        CollapsedCondition = ImGuiCond.Always;
+        clearAgentReviewWindowOverride = true;
+    }
+
+    public void CloseReviewSurface()
+    {
+        ClearAgentReviewWindowOverride();
+        IsOpen = false;
+    }
+
+    public override void OnClose()
+    {
+        ClearAgentReviewWindowOverride();
+        IsOpen = false;
+    }
+
+    private void ClearAgentReviewWindowOverride()
+    {
+        if (!clearAgentReviewWindowOverride)
+            return;
+        Collapsed = null;
+        CollapsedCondition = ImGuiCond.None;
+        clearAgentReviewWindowOverride = false;
     }
 
     private void DrawWorkbench(BrowserProjection projection, RetrievalPlan plan, QuartermasterState snapshot, OwnerScope owner, IReadOnlyDictionary<ulong, CachedRetainer> cacheSnapshot)
