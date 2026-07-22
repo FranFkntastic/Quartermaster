@@ -1,0 +1,17 @@
+author: FranFkntastic
+name: Quartermaster
+repo_url: https://github.com/FranFkntastic/Quartermaster
+punchline: Owner-scoped retainer stock, target plans, and reviewed transfers.
+description: |
+  Retainer Quartermaster (RQ) lets you browse player and retainer stock, track
+  target quantities, inspect listings, refresh retainer evidence, and run
+  explicitly reviewed retrieval or elemental deposit operations. Use /rq to
+  open Quartermaster.
+tags:
+  - Inventory
+  - Retainer
+  - Utility
+  - Franthropy
+category_tags:
+  - Utility
+  - Other

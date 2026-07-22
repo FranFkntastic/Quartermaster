@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="../Franthropy/src/Franthropy.Filtering/Franthropy.Filtering.csproj" />
+  <Project Path="../Franthropy/src/Franthropy.FFXIV/Franthropy.FFXIV.csproj" />
+  <Project Path="../Franthropy/src/Franthropy.Dalamud/Franthropy.Dalamud.csproj" />
+  <Project Path="src/RQ/RQ.csproj" />
+  <Project Path="tests/RQ.Tests/RQ.Tests.csproj" />
+</Solution>

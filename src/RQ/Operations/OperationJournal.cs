@@ -1,0 +1,334 @@
+using RQ.Domain;
+using RQ.Persistence;
+using RQ.Planning;
+
+namespace RQ.Operations;
+
+public sealed class OperationJournal
+{
+    private readonly StateRepository repository;
+    private readonly Func<DateTime> utcNow;
+
+    public OperationJournal(StateRepository repository, Func<DateTime>? utcNow = null)
+    {
+        this.repository = repository;
+        this.utcNow = utcNow ?? (() => DateTime.UtcNow);
+    }
+
+    public event Action<OperationRecord>? OperationChanged;
+
+    public OperationRecord? Get(string operationId) => repository.Read(state =>
+        state.Operations.FirstOrDefault(operation => operation.OperationId == operationId) is { } operation
+            ? Copy(operation)
+            : null);
+
+    public OperationRecord? Current(OwnerScope owner) => repository.Read(state => state.Operations
+        .Where(operation => operation.Owner.Matches(owner))
+        .OrderByDescending(operation => operation.UpdatedAtUtc)
+        .Select(Copy)
+        .FirstOrDefault());
+
+    public OperationRecord? NextAutomaticRetrieval(OwnerScope owner)
+    {
+        if (!owner.HasStableIdentity)
+            return null;
+        return repository.Read(state => state.Operations
+            .Where(operation => operation.Kind == OperationKinds.Retrieval &&
+                                operation.ExecuteImmediately &&
+                                operation.Status == OperationStatuses.Accepted &&
+                                operation.Owner.HasStableIdentity &&
+                                operation.Owner.Matches(owner))
+            .OrderBy(operation => operation.CreatedAtUtc)
+            .ThenBy(operation => operation.OperationId, StringComparer.Ordinal)
+            .Select(Copy)
+            .FirstOrDefault());
+    }
+
+    public IReadOnlyList<OperationRecord> ReconcileInterruptedOperations()
+    {
+        if (!repository.Read(state => state.Operations.Any(operation => operation.Status == OperationStatuses.Running)))
+            return [];
+        var reconciled = new List<OperationRecord>();
+        repository.Mutate(state =>
+        {
+            foreach (var operation in state.Operations.Where(operation => operation.Status == OperationStatuses.Running))
+            {
+                operation.Status = OperationStatuses.Indeterminate;
+                operation.Revision = checked(operation.Revision + 1);
+                operation.UpdatedAtUtc = utcNow();
+                operation.Message = "Quartermaster reloaded before live transfer completion could be verified; involved cache evidence was invalidated.";
+                AddReceipt(state, operation, "InterruptedByReload", operation.Message);
+                reconciled.Add(Copy(operation));
+            }
+        });
+        foreach (var operation in reconciled)
+            OperationChanged?.Invoke(operation);
+        return reconciled;
+    }
+
+    public OperationRecord CreateManual(OwnerScope owner, IReadOnlyList<TargetPlanItem> plan, string kind = OperationKinds.Retrieval)
+    {
+        if (kind is not (OperationKinds.Retrieval or OperationKinds.Deposit))
+            throw new ArgumentOutOfRangeException(nameof(kind));
+        var id = $"rq-{Guid.NewGuid():N}";
+        var now = utcNow();
+        var enabledPlan = plan.Where(item => item.Enabled).ToArray();
+        var operation = new OperationRecord
+        {
+            OperationId = id,
+            RequestId = id,
+            Kind = kind,
+            Owner = owner,
+            Status = OperationStatuses.Accepted,
+            Revision = 1,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+            Message = "Plan is ready for explicit execution.",
+            SourcePlanItems = enabledPlan.Select(Copy).ToList(),
+            Lines = enabledPlan
+                .GroupBy(item => item.ItemId)
+                .Select(group => new OperationLine
+                {
+                    ItemId = group.Key,
+                    ItemName = group.Select(item => item.ItemName).First(name => !string.IsNullOrWhiteSpace(name)),
+                    TargetQuantity = group.Sum(item => item.TargetQuantity),
+                })
+                .ToList(),
+        };
+        repository.Mutate(state =>
+        {
+            state.Operations.Add(operation);
+            AddReceipt(state, operation, "PlanAccepted", operation.Message);
+        });
+        var copy = Copy(operation);
+        OperationChanged?.Invoke(copy);
+        return copy;
+    }
+
+    public OperationRecord CreateDeposit(OwnerScope owner, ElementalDepositPlan plan)
+    {
+        if (!owner.HasStableIdentity)
+            throw new InvalidOperationException("Deposit operations require stable owner identity.");
+        var now = utcNow();
+        var operation = new OperationRecord
+        {
+            OperationId = $"rq-{Guid.NewGuid():N}",
+            RequestId = string.Empty,
+            Kind = OperationKinds.Deposit,
+            Owner = owner,
+            Status = OperationStatuses.Accepted,
+            Revision = 1,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+            Message = "Exact crystal deposit authorization is ready for explicit execution.",
+            Lines = plan.Lines.Where(line => line.PlannedQuantity > 0).Select(line => new OperationLine
+            {
+                ItemId = line.ItemId,
+                ItemName = line.ItemName,
+                TargetQuantity = line.PlannedQuantity,
+                ShortageQuantity = line.PlannedQuantity,
+            }).ToList(),
+            DepositCandidates = plan.Candidates.Select(candidate => new DepositCandidateAuthorization
+            {
+                RetainerId = candidate.RetainerId,
+                RetainerName = candidate.RetainerName,
+                ObservedAtUtc = candidate.ObservedAtUtc,
+                CapacityByItem = candidate.CapacityByItem.ToDictionary(entry => entry.Key, entry => entry.Value),
+            }).ToList(),
+        };
+        operation.RequestId = operation.OperationId;
+        if (operation.Lines.Count == 0 || operation.DepositCandidates.Count == 0)
+            throw new InvalidOperationException("Deposit plan has no executable reviewed authorization.");
+        repository.Mutate(state =>
+        {
+            state.Operations.Add(operation);
+            AddReceipt(state, operation, "DepositAuthorizationPersisted", operation.Message);
+        });
+        var copy = Copy(operation);
+        OperationChanged?.Invoke(copy);
+        return copy;
+    }
+
+    public void ArmCacheInvalidation(string operationId, ulong retainerId, OwnerScope owner) => repository.Mutate(state =>
+    {
+        if (!state.PendingCacheInvalidations.Any(entry => entry.OperationId == operationId && entry.RetainerId == retainerId))
+            state.PendingCacheInvalidations.Add(new PendingCacheInvalidation { OperationId = operationId, RetainerId = retainerId, Owner = owner with { } });
+    });
+
+    public void ResolveCacheInvalidation(string operationId, ulong retainerId) => repository.Mutate(state =>
+        state.PendingCacheInvalidations.RemoveAll(entry => entry.OperationId == operationId && entry.RetainerId == retainerId));
+
+    public IReadOnlyList<PendingCacheInvalidation> PendingCacheInvalidations() => repository.Read(state =>
+        state.PendingCacheInvalidations.Select(entry => new PendingCacheInvalidation
+        {
+            OperationId = entry.OperationId,
+            RetainerId = entry.RetainerId,
+            Owner = entry.Owner with { },
+        }).ToArray());
+
+    public OperationRecord Transition(string operationId, string status, string code, string message)
+    {
+        OperationRecord changed = null!;
+        repository.Mutate(state =>
+        {
+            var operation = state.Operations.SingleOrDefault(candidate => candidate.OperationId == operationId)
+                ?? throw new KeyNotFoundException($"Operation '{operationId}' was not found.");
+            ValidateTransition(operation.Status, status);
+            operation.Status = status;
+            operation.Revision = checked(operation.Revision + 1);
+            operation.UpdatedAtUtc = utcNow();
+            operation.Message = message;
+            AddReceipt(state, operation, code, message);
+            changed = Copy(operation);
+        });
+        OperationChanged?.Invoke(changed);
+        return changed;
+    }
+
+    public void RecordTransfer(string operationId, uint itemId, ulong retainerId, int quantity, string code, string message, bool clearRetrievalPlanItem = false)
+    {
+        if (quantity <= 0)
+            throw new ArgumentOutOfRangeException(nameof(quantity));
+        OperationRecord changed = null!;
+        repository.Mutate(state =>
+        {
+            var operation = state.Operations.Single(candidate => candidate.OperationId == operationId);
+            if (operation.Status != OperationStatuses.Running)
+                throw new InvalidOperationException("Transfers can only be recorded for a running operation.");
+            var line = operation.Lines.Single(candidate => candidate.ItemId == itemId);
+            if (line.TransferredQuantity > line.TargetQuantity - quantity)
+                throw new InvalidOperationException("Verified transfer exceeds persisted operation authorization.");
+            line.TransferredQuantity = checked(line.TransferredQuantity + quantity);
+            operation.Revision = checked(operation.Revision + 1);
+            operation.UpdatedAtUtc = utcNow();
+            state.Receipts.Add(new OperationReceipt
+            {
+                OperationId = operationId,
+                Revision = operation.Revision,
+                OccurredAtUtc = operation.UpdatedAtUtc,
+                Status = operation.Status,
+                Code = code,
+                Message = message,
+                ItemId = itemId,
+                RetainerId = retainerId,
+                Quantity = quantity,
+            });
+            if (clearRetrievalPlanItem)
+                ClearMatchingPlanItems(state, operation, new HashSet<uint> { itemId });
+            changed = Copy(operation);
+        });
+        OperationChanged?.Invoke(changed);
+    }
+
+    public void ClearSatisfiedRetrievalPlanItems(string operationId, IReadOnlySet<uint> itemIds)
+    {
+        if (itemIds.Count == 0)
+            return;
+        repository.Mutate(state =>
+        {
+            var operation = state.Operations.Single(candidate => candidate.OperationId == operationId);
+            if (operation.Kind != OperationKinds.Retrieval || operation.Status != OperationStatuses.Running)
+                throw new InvalidOperationException("Satisfied retrieval plan items can only be cleared during a running retrieval operation.");
+            ClearMatchingPlanItems(state, operation, itemIds);
+        });
+    }
+
+    public void RecordWarning(string operationId, string code, string message)
+    {
+        OperationRecord changed = null!;
+        repository.Mutate(state =>
+        {
+            var operation = state.Operations.Single(candidate => candidate.OperationId == operationId);
+            if (OperationStatuses.IsTerminal(operation.Status))
+                throw new InvalidOperationException("Warnings cannot be appended to a terminal operation.");
+            operation.Revision = checked(operation.Revision + 1);
+            operation.UpdatedAtUtc = utcNow();
+            state.Receipts.Add(new OperationReceipt
+            {
+                OperationId = operationId,
+                Revision = operation.Revision,
+                OccurredAtUtc = operation.UpdatedAtUtc,
+                Status = operation.Status,
+                Code = code,
+                Message = message,
+            });
+            changed = Copy(operation);
+        });
+        OperationChanged?.Invoke(changed);
+    }
+
+    private static void ValidateTransition(string current, string next)
+    {
+        if (current == next)
+            throw new InvalidOperationException($"Operation is already '{next}'.");
+        if (OperationStatuses.IsTerminal(current))
+            throw new InvalidOperationException($"Terminal operation '{current}' cannot transition to '{next}'.");
+        if (current == OperationStatuses.Accepted && next != OperationStatuses.Running && next != OperationStatuses.Cancelled && next != OperationStatuses.Failed)
+            throw new InvalidOperationException($"Invalid operation transition '{current}' -> '{next}'.");
+        if (current == OperationStatuses.Running && next is not (OperationStatuses.Succeeded or OperationStatuses.PartiallySucceeded or OperationStatuses.Indeterminate or OperationStatuses.Failed or OperationStatuses.Cancelled))
+            throw new InvalidOperationException($"Invalid operation transition '{current}' -> '{next}'.");
+    }
+
+    private static void AddReceipt(QuartermasterState state, OperationRecord operation, string code, string message) => state.Receipts.Add(new OperationReceipt
+    {
+        OperationId = operation.OperationId,
+        Revision = operation.Revision,
+        OccurredAtUtc = operation.UpdatedAtUtc,
+        Status = operation.Status,
+        Code = code,
+        Message = message,
+    });
+
+    private static OperationRecord Copy(OperationRecord operation) => new()
+    {
+        OperationId = operation.OperationId,
+        RequestId = operation.RequestId,
+        Kind = operation.Kind,
+        ExecuteImmediately = operation.ExecuteImmediately,
+        Owner = operation.Owner with { },
+        Status = operation.Status,
+        Revision = operation.Revision,
+        CreatedAtUtc = operation.CreatedAtUtc,
+        UpdatedAtUtc = operation.UpdatedAtUtc,
+        Message = operation.Message,
+        SourcePlanItems = operation.SourcePlanItems.Select(Copy).ToList(),
+        DepositCandidates = operation.DepositCandidates.Select(candidate => new DepositCandidateAuthorization
+        {
+            RetainerId = candidate.RetainerId,
+            RetainerName = candidate.RetainerName,
+            ObservedAtUtc = candidate.ObservedAtUtc,
+            CapacityByItem = candidate.CapacityByItem.ToDictionary(entry => entry.Key, entry => entry.Value),
+        }).ToList(),
+        Lines = operation.Lines.Select(line => new OperationLine
+        {
+            ItemId = line.ItemId,
+            ItemName = line.ItemName,
+            TargetQuantity = line.TargetQuantity,
+            ShortageQuantity = line.ShortageQuantity,
+            TransferredQuantity = line.TransferredQuantity,
+        }).ToList(),
+    };
+
+    private static void ClearMatchingPlanItems(QuartermasterState state, OperationRecord operation, IReadOnlySet<uint> itemIds)
+    {
+        var authorized = operation.SourcePlanItems.Where(item => itemIds.Contains(item.ItemId)).ToDictionary(item => item.Id);
+        state.PlanItems.RemoveAll(item => authorized.TryGetValue(item.Id, out var source) && Matches(item, source));
+    }
+
+    private static bool Matches(TargetPlanItem current, TargetPlanItem source) =>
+        current.ItemId == source.ItemId &&
+        current.ItemName == source.ItemName &&
+        current.TargetQuantity == source.TargetQuantity &&
+        current.Notes == source.Notes &&
+        current.Enabled == source.Enabled;
+
+    private static TargetPlanItem Copy(TargetPlanItem item) => new()
+    {
+        Id = item.Id,
+        ItemId = item.ItemId,
+        ItemName = item.ItemName,
+        TargetQuantity = item.TargetQuantity,
+        Notes = item.Notes,
+        Enabled = item.Enabled,
+    };
+}

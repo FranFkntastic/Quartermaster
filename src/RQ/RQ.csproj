@@ -1,0 +1,42 @@
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+  <PropertyGroup>
+    <Title>Quartermaster</Title>
+    <Description>Retainer Quartermaster (RQ) provides owner-scoped retainer stock, target plans, and reviewed transfers.</Description>
+    <AssemblyName>RQ</AssemblyName>
+    <RootNamespace>RQ</RootNamespace>
+    <Version>0.1.0.0</Version>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <FranthropyDalamudProject Condition="'$(FranthropyDalamudProject)' == ''">..\..\..\Franthropy\src\Franthropy.Dalamud\Franthropy.Dalamud.csproj</FranthropyDalamudProject>
+    <FranthropyFfxivProject Condition="'$(FranthropyFfxivProject)' == ''">..\..\..\Franthropy\src\Franthropy.FFXIV\Franthropy.FFXIV.csproj</FranthropyFfxivProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="$(FranthropyDalamudProject)" SetConfiguration="Configuration=$(Configuration)" />
+    <ProjectReference Include="$(FranthropyFfxivProject)" SetConfiguration="Configuration=$(Configuration)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="RQ.Tests" />
+  </ItemGroup>
+
+  <Target Name="ValidateFranthropyProjects" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(FranthropyDalamudProject)')" Text="Franthropy.Dalamud was not found at '$(FranthropyDalamudProject)'. Clone Franthropy beside Quartermaster or set FranthropyDalamudProject." />
+    <Error Condition="!Exists('$(FranthropyFfxivProject)')" Text="Franthropy.FFXIV was not found at '$(FranthropyFfxivProject)'. Clone Franthropy beside Quartermaster or set FranthropyFfxivProject." />
+  </Target>
+
+  <Target Name="RejectDebugProjectReferencesInRelease" AfterTargets="ResolveProjectReferences" Condition="'$(Configuration)' == 'Release'">
+    <ItemGroup>
+      <_DebugProjectReference Include="@(_ResolvedProjectReferencePaths)" Condition="$([System.String]::Copy('%(FullPath)').Contains('\bin\Debug\'))" />
+    </ItemGroup>
+    <Error Condition="'@(_DebugProjectReference)' != ''" Text="Release build resolved Debug project output: @(_DebugProjectReference)." />
+  </Target>
+</Project>
