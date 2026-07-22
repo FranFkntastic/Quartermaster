@@ -62,7 +62,6 @@ public sealed class BrowserProjection
     public required IReadOnlyList<StockGroup> Items { get; init; }
     public required IReadOnlyList<ListingRow> Listings { get; init; }
     public required OwnerScope Owner { get; init; }
-    public required string Identity { get; init; }
 
     public IReadOnlyList<StockGroup> GetItems(string? scopeKey) => string.IsNullOrWhiteSpace(scopeKey) || scopeKey == BrowserScope.AllKey
         ? Items
@@ -132,23 +131,10 @@ public static class BrowserProjectionBuilder
             Items = items,
             Listings = sortedListings,
             Owner = owner,
-            Identity = CreateIdentity(items, sortedListings, scopes),
         };
     }
 
     private static string DisplayName(uint id, string? name) => string.IsNullOrWhiteSpace(name) ? $"Item {id}" : name;
-
-    private static string CreateIdentity(IEnumerable<StockGroup> items, IEnumerable<ListingRow> listings, IEnumerable<BrowserScope> scopes)
-    {
-        var hash = new HashCode();
-        foreach (var stack in items.SelectMany(item => item.Stacks).OrderBy(stack => stack.ScopeKey).ThenBy(stack => stack.ItemId).ThenBy(stack => stack.SlotIndex))
-            hash.Add((stack.ScopeKey, stack.ItemId, stack.Quantity, stack.Quality, stack.ObservedAtUtc));
-        foreach (var listing in listings.OrderBy(listing => listing.RetainerId).ThenBy(listing => listing.ItemId))
-            hash.Add((listing.RetainerId, listing.ItemId, listing.Quantity, listing.ObservedAtUtc));
-        foreach (var scope in scopes)
-            hash.Add((scope.Key, scope.Label));
-        return hash.ToHashCode().ToString("X8", CultureInfo.InvariantCulture);
-    }
 }
 
 public sealed record BrowserFilterStatus(bool IsValid, bool ShowingLastValid, IReadOnlyList<FilterDiagnostic> Diagnostics);
@@ -160,19 +146,38 @@ public sealed class BrowserQueryController
     private readonly QueryState<StockGroup> items = new();
     private readonly QueryState<ListingRow> listings = new();
 
-    public ItemQueryResult QueryItems(BrowserProjection projection, string? expression, string? scopeKey = null)
+    public int ItemCompilationCount => items.CompilationCount;
+    public int ItemEvaluationCount => items.EvaluationCount;
+    public int ListingCompilationCount => listings.CompilationCount;
+    public int ListingEvaluationCount => listings.EvaluationCount;
+
+    public ItemQueryResult QueryItems(BrowserProjection projection, string? expression, string? scopeKey = null, bool isEditing = false)
     {
         var source = projection.GetItems(scopeKey);
-        var context = CreateItemContext(source, projection.Owner);
-        var result = items.Query(source, $"{projection.Identity}|{scopeKey}", expression, context);
+        var context = items.EnsureContext(
+            BrowserProjectionIdentity.CreateContext(source, [], projection.Scopes, scopeKey, projection.Owner),
+            () => CreateItemContext(source, projection.Owner));
+        var result = items.Query(
+            source,
+            BrowserProjectionIdentity.CreateData(source, []),
+            expression,
+            context,
+            isEditing);
         return new(result.Rows, result.Status);
     }
 
-    public ListingQueryResult QueryListings(BrowserProjection projection, string? expression, string? scopeKey = null)
+    public ListingQueryResult QueryListings(BrowserProjection projection, string? expression, string? scopeKey = null, bool isEditing = false)
     {
         var source = projection.GetListings(scopeKey);
-        var context = CreateListingContext(source, projection.Owner);
-        var result = listings.Query(source, $"{projection.Identity}|{scopeKey}", expression, context);
+        var context = listings.EnsureContext(
+            BrowserProjectionIdentity.CreateContext([], source, projection.Scopes, scopeKey, projection.Owner),
+            () => CreateListingContext(source, projection.Owner));
+        var result = listings.Query(
+            source,
+            BrowserProjectionIdentity.CreateData([], source),
+            expression,
+            context,
+            isEditing);
         return new(result.Rows, result.Status);
     }
 
@@ -265,36 +270,241 @@ public sealed class BrowserQueryController
 
     private sealed class QueryState<T>
     {
-        private string identity = string.Empty;
-        private string expression = string.Empty;
-        private FilterCompilation<T>? compilation;
-        private FilterCompilation<T>? lastValid;
+        private FilterContext<T>? context;
+        private string? contextIdentity;
+        private FilterCompilation<T>? currentCompilation;
+        private string currentExpression = string.Empty;
+        private FilterCompilation<T>? evaluatedCompilation;
+        private IReadOnlyList<T> evaluatedRows = [];
+        private string? evaluatedDataIdentity;
+        private FilterCompilation<T>? lastValidCompilation;
         private IReadOnlyList<T> lastValidRows = [];
+        private string? lastValidDataIdentity;
+        private bool hasLastValidResults;
 
-        public (IReadOnlyList<T> Rows, BrowserFilterStatus Status) Query(IReadOnlyList<T> source, string newIdentity, string? value, FilterContext<T> context)
+        public int CompilationCount { get; private set; }
+        public int EvaluationCount { get; private set; }
+
+        public FilterContext<T> EnsureContext(string identity, Func<FilterContext<T>> create)
         {
-            if (identity != newIdentity)
+            if (context is null || !string.Equals(identity, contextIdentity, StringComparison.Ordinal))
             {
-                identity = newIdentity;
-                compilation = null;
-                lastValid = null;
+                context = create();
+                contextIdentity = identity;
+                currentCompilation = null;
+                evaluatedCompilation = null;
+                evaluatedRows = [];
+                evaluatedDataIdentity = null;
+                lastValidCompilation = null;
                 lastValidRows = [];
+                lastValidDataIdentity = null;
+                hasLastValidResults = false;
             }
+
+            return context;
+        }
+
+        public (IReadOnlyList<T> Rows, BrowserFilterStatus Status) Query(
+            IReadOnlyList<T> source,
+            string dataIdentity,
+            string? value,
+            FilterContext<T> currentContext,
+            bool isEditing)
+        {
             var input = value ?? string.Empty;
-            if (compilation is null || expression != input)
+            if (currentCompilation is null || !string.Equals(currentExpression, input, StringComparison.Ordinal))
             {
-                expression = input;
-                compilation = FilterCompiler.Compile(input, context);
+                currentExpression = input;
+                currentCompilation = FilterCompiler.Compile(input, currentContext);
+                CompilationCount++;
             }
-            if (compilation.IsValid)
+
+            if (currentCompilation.IsValid)
             {
-                lastValid = compilation;
-                lastValidRows = source.Where(compilation.Matches).ToArray();
-                return (lastValidRows, new(true, false, compilation.Diagnostics));
+                var applyCurrentCompilation = evaluatedCompilation is null || !isEditing;
+                var compilationToEvaluate = applyCurrentCompilation
+                    ? currentCompilation
+                    : evaluatedCompilation!;
+                var rows = Evaluate(source, dataIdentity, compilationToEvaluate);
+
+                if (applyCurrentCompilation || ReferenceEquals(compilationToEvaluate, lastValidCompilation))
+                {
+                    lastValidCompilation = compilationToEvaluate;
+                    lastValidRows = rows;
+                    lastValidDataIdentity = dataIdentity;
+                    hasLastValidResults = true;
+                }
+
+                return (rows, new(true, false, currentCompilation.Diagnostics));
             }
-            if (lastValid is not null)
-                lastValidRows = source.Where(lastValid.Matches).ToArray();
-            return (lastValidRows, new(false, lastValid is not null, compilation.Diagnostics));
+
+            if (lastValidCompilation is not null &&
+                (!ReferenceEquals(lastValidCompilation, evaluatedCompilation) ||
+                 !string.Equals(dataIdentity, lastValidDataIdentity, StringComparison.Ordinal)))
+            {
+                lastValidRows = Evaluate(source, dataIdentity, lastValidCompilation);
+                lastValidDataIdentity = dataIdentity;
+            }
+
+            return (lastValidRows, new(false, hasLastValidResults, currentCompilation.Diagnostics));
+        }
+
+        private IReadOnlyList<T> Evaluate(
+            IReadOnlyList<T> source,
+            string dataIdentity,
+            FilterCompilation<T> compilation)
+        {
+            if (!ReferenceEquals(compilation, evaluatedCompilation) ||
+                !string.Equals(dataIdentity, evaluatedDataIdentity, StringComparison.Ordinal))
+            {
+                evaluatedRows = source.Where(compilation.Matches).ToArray();
+                evaluatedCompilation = compilation;
+                evaluatedDataIdentity = dataIdentity;
+                EvaluationCount++;
+            }
+
+            return evaluatedRows;
+        }
+    }
+}
+
+internal static class BrowserProjectionIdentity
+{
+    public static string CreateData(
+        IEnumerable<StockGroup> items,
+        IEnumerable<ListingRow> listings)
+    {
+        var hash = new HashCode();
+        foreach (var item in items.OrderBy(item => item.ItemId))
+        {
+            AddDefinition(ref hash, item.Definition);
+            foreach (var stack in item.Stacks
+                         .OrderBy(stack => stack.ScopeKey)
+                         .ThenBy(stack => stack.Storage)
+                         .ThenBy(stack => stack.SlotIndex))
+            {
+                hash.Add(stack.ScopeKey, StringComparer.Ordinal);
+                hash.Add(stack.Storage, StringComparer.Ordinal);
+                hash.Add(stack.SlotIndex);
+                hash.Add(stack.ItemId);
+                hash.Add(stack.ItemName, StringComparer.Ordinal);
+                hash.Add(stack.ItemType, StringComparer.Ordinal);
+                hash.Add(stack.Quantity);
+                hash.Add(stack.Quality);
+                hash.Add(stack.ConditionPercent);
+                hash.Add(stack.Equipped);
+                hash.Add(stack.ObservedAtUtc);
+            }
+        }
+
+        foreach (var listing in listings
+                     .OrderBy(listing => listing.RetainerId)
+                     .ThenBy(listing => listing.ItemId))
+        {
+            hash.Add(listing.ScopeKey, StringComparer.Ordinal);
+            hash.Add(listing.RetainerId);
+            hash.Add(listing.RetainerName, StringComparer.Ordinal);
+            hash.Add(listing.ItemId);
+            hash.Add(listing.ItemName, StringComparer.Ordinal);
+            hash.Add(listing.Quantity);
+            hash.Add(listing.Quality);
+            hash.Add(EvidenceKey(listing.Condition), StringComparer.Ordinal);
+            hash.Add(EvidenceKey(listing.UnitPrice), StringComparer.Ordinal);
+            hash.Add(EvidenceKey(listing.TotalPrice), StringComparer.Ordinal);
+            hash.Add(listing.ObservedAtUtc);
+            AddDefinition(ref hash, listing.Definition);
+        }
+
+        return hash.ToHashCode().ToString("X8", CultureInfo.InvariantCulture);
+    }
+
+    public static string CreateContext(
+        IEnumerable<StockGroup> items,
+        IEnumerable<ListingRow> listings,
+        IEnumerable<BrowserScope> scopes,
+        string? selectedScope,
+        OwnerScope owner)
+    {
+        var hash = new HashCode();
+        hash.Add(selectedScope ?? BrowserScope.AllKey, StringComparer.Ordinal);
+        hash.Add(owner.LocalContentId);
+        hash.Add(owner.HomeWorldId);
+        hash.Add(owner.CharacterName, StringComparer.Ordinal);
+        hash.Add(owner.HomeWorldName, StringComparer.Ordinal);
+
+        foreach (var item in items.OrderBy(item => item.ItemId))
+        {
+            hash.Add(item.ItemId);
+            hash.Add(item.ItemName, StringComparer.Ordinal);
+            AddDefinitionContext(ref hash, item.Definition);
+            foreach (var retainer in item.Stacks
+                         .Where(stack => stack.RetainerId is not null)
+                         .OrderBy(stack => stack.RetainerId)
+                         .ThenBy(stack => stack.OwnerName))
+            {
+                hash.Add(retainer.RetainerId);
+                hash.Add(retainer.OwnerName, StringComparer.Ordinal);
+            }
+        }
+
+        foreach (var listing in listings
+                     .OrderBy(listing => listing.ItemId)
+                     .ThenBy(listing => listing.RetainerId))
+        {
+            hash.Add(listing.ItemId);
+            hash.Add(listing.ItemName, StringComparer.Ordinal);
+            hash.Add(listing.RetainerId);
+            hash.Add(listing.RetainerName, StringComparer.Ordinal);
+            AddDefinitionContext(ref hash, listing.Definition);
+        }
+
+        foreach (var scope in scopes.OrderBy(scope => scope.Key))
+        {
+            hash.Add(scope.Key, StringComparer.Ordinal);
+            hash.Add(scope.Label, StringComparer.Ordinal);
+        }
+
+        return hash.ToHashCode().ToString("X8", CultureInfo.InvariantCulture);
+    }
+
+    private static string EvidenceKey(FieldEvidence<decimal> evidence) => evidence.IsKnown
+        ? $"K:{evidence.Value.ToString(CultureInfo.InvariantCulture)}"
+        : $"U:{evidence.UnknownReason}";
+
+    private static void AddDefinition(ref HashCode hash, ItemMetadata? definition)
+    {
+        if (definition is null)
+        {
+            hash.Add(false);
+            return;
+        }
+
+        hash.Add(true);
+        hash.Add(definition.ItemLevel);
+        hash.Add(definition.EquipLevel);
+        hash.Add(definition.Rarity);
+        hash.Add(definition.UiCategory);
+        hash.Add(definition.IsUnique);
+        hash.Add(definition.IsTradable);
+        hash.Add(definition.IsDesynthesizable);
+        foreach (var job in definition.EligibleJobs ?? [])
+            hash.Add(job.Key);
+        foreach (var slot in definition.Slots ?? [])
+            hash.Add(slot);
+    }
+
+    private static void AddDefinitionContext(ref HashCode hash, ItemMetadata? definition)
+    {
+        if (definition is null)
+            return;
+
+        hash.Add(definition.UiCategory);
+        hash.Add(definition.UiCategoryName, StringComparer.Ordinal);
+        foreach (var job in definition.EligibleJobs ?? [])
+        {
+            hash.Add(job.Key);
+            hash.Add(job.Name, StringComparer.Ordinal);
+            hash.Add(job.Abbreviation, StringComparer.Ordinal);
         }
     }
 }

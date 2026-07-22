@@ -84,11 +84,126 @@ public sealed class BrowserTests
         var controller = new BrowserQueryController();
         Assert.Equal([100U], controller.QueryItems(projection, "darksteel").Items.Select(item => item.ItemId));
 
-        var invalid = controller.QueryItems(projection, "ownership.quantity:");
+        var invalid = controller.QueryItems(projection, "ownership.quantity:", isEditing: true);
 
         Assert.False(invalid.Filter.IsValid);
         Assert.True(invalid.Filter.ShowingLastValid);
         Assert.Equal([100U], invalid.Items.Select(item => item.ItemId));
+    }
+
+    [Fact]
+    public void ValidIntermediateEdit_KeepsEvaluatedRowsUntilEditingEnds()
+    {
+        var projection = BrowserProjectionBuilder.Build([], new Dictionary<ulong, CachedRetainer>
+        {
+            [10] = TestData.Retainer(10, "Eris", (100, "Darksteel Ore", 3), (200, "Spruce Log", 3)),
+        }, TestData.Owner);
+        var controller = new BrowserQueryController();
+
+        Assert.Equal([100U], controller.QueryItems(projection, "darksteel").Items.Select(item => item.ItemId));
+
+        var editing = controller.QueryItems(projection, "spruce", isEditing: true);
+
+        Assert.True(editing.Filter.IsValid);
+        Assert.Equal([100U], editing.Items.Select(item => item.ItemId));
+        Assert.Equal(2, controller.ItemCompilationCount);
+        Assert.Equal(1, controller.ItemEvaluationCount);
+
+        var committed = controller.QueryItems(projection, "spruce");
+
+        Assert.Equal([200U], committed.Items.Select(item => item.ItemId));
+        Assert.Equal(2, controller.ItemCompilationCount);
+        Assert.Equal(2, controller.ItemEvaluationCount);
+    }
+
+    [Fact]
+    public void DataChange_ReevaluatesDisplayedCompilationDuringEdit()
+    {
+        var retainer = TestData.Retainer(10, "Eris", (100, "Darksteel Ore", 3), (200, "Spruce Log", 3));
+        var controller = new BrowserQueryController();
+        var initial = BrowserProjectionBuilder.Build(
+            [Bag((100, "Darksteel Ore", 2))],
+            new Dictionary<ulong, CachedRetainer> { [10] = retainer },
+            TestData.Owner);
+
+        Assert.Equal([100U], controller.QueryItems(initial, "ownership.quantity>=5").Items.Select(item => item.ItemId));
+
+        retainer.Bags.Single().Items.Single(item => item.ItemId == 100).Quantity = 1;
+        var changed = BrowserProjectionBuilder.Build(
+            [Bag((100, "Darksteel Ore", 2))],
+            new Dictionary<ulong, CachedRetainer> { [10] = retainer },
+            TestData.Owner);
+        var editing = controller.QueryItems(changed, "spruce", isEditing: true);
+
+        Assert.Empty(editing.Items);
+        Assert.Equal(2, controller.ItemCompilationCount);
+        Assert.Equal(2, controller.ItemEvaluationCount);
+    }
+
+    [Fact]
+    public void FirstValidQueryWhileEditing_ProducesResults()
+    {
+        var projection = BrowserProjectionBuilder.Build([], new Dictionary<ulong, CachedRetainer>
+        {
+            [10] = TestData.Retainer(10, "Eris", (100, "Darksteel Ore", 3)),
+        }, TestData.Owner);
+        var controller = new BrowserQueryController();
+
+        var editing = controller.QueryItems(projection, "darksteel", isEditing: true);
+
+        Assert.Equal([100U], editing.Items.Select(item => item.ItemId));
+        Assert.Equal(1, controller.ItemCompilationCount);
+        Assert.Equal(1, controller.ItemEvaluationCount);
+    }
+
+    [Fact]
+    public void ListingsKeepEvaluatedRowsUntilEditingEnds()
+    {
+        var retainer = TestData.Retainer(10, "Eris");
+        retainer.Listings.Add(new CachedMarketListing { ItemId = 100, ItemName = "Darksteel Ore", Quantity = 2, UnitPrice = 40 });
+        retainer.Listings.Add(new CachedMarketListing { ItemId = 200, ItemName = "Spruce Log", Quantity = 1, UnitPrice = 20 });
+        var projection = BrowserProjectionBuilder.Build(
+            [],
+            new Dictionary<ulong, CachedRetainer> { [10] = retainer },
+            TestData.Owner);
+        var controller = new BrowserQueryController();
+
+        Assert.Equal([100U], controller.QueryListings(projection, "darksteel").Listings.Select(item => item.ItemId));
+
+        var editing = controller.QueryListings(projection, "spruce", isEditing: true);
+
+        Assert.Equal([100U], editing.Listings.Select(item => item.ItemId));
+        Assert.Equal(2, controller.ListingCompilationCount);
+        Assert.Equal(1, controller.ListingEvaluationCount);
+
+        Assert.Equal([200U], controller.QueryListings(projection, "spruce").Listings.Select(item => item.ItemId));
+        Assert.Equal(2, controller.ListingCompilationCount);
+        Assert.Equal(2, controller.ListingEvaluationCount);
+    }
+
+    [Fact]
+    public void ContextChange_DoesNotReuseLastValidResults()
+    {
+        var projection = BrowserProjectionBuilder.Build([], new Dictionary<ulong, CachedRetainer>
+        {
+            [10] = TestData.Retainer(10, "Eris", (100, "Darksteel Ore", 3)),
+            [11] = TestData.Retainer(11, "Nyx", (200, "Spruce Log", 3)),
+        }, TestData.Owner);
+        var controller = new BrowserQueryController();
+
+        Assert.Equal(
+            [100U],
+            controller.QueryItems(projection, "darksteel", BrowserScope.RetainerKey(10)).Items.Select(item => item.ItemId));
+
+        var invalid = controller.QueryItems(
+            projection,
+            "ownership.quantity:",
+            BrowserScope.RetainerKey(11),
+            isEditing: true);
+
+        Assert.False(invalid.Filter.IsValid);
+        Assert.False(invalid.Filter.ShowingLastValid);
+        Assert.Empty(invalid.Items);
     }
 
     [Fact]

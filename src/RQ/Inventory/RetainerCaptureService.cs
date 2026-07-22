@@ -137,7 +137,38 @@ public sealed class RetainerCaptureService : IDisposable
         receipts.Add(receipt);
         if (receipts.Count > 64)
             receipts.RemoveAt(0);
-        CaptureCompleted?.Invoke(receipt);
+        PublishSubscribersSafely(
+            CaptureCompleted,
+            receipt,
+            exception => log.Error(exception, "Quartermaster retainer capture subscriber failed."));
+    }
+
+    internal static void PublishSubscribersSafely<T>(
+        Action<T>? subscribers,
+        T value,
+        Action<Exception> logException)
+    {
+        if (subscribers is null)
+            return;
+
+        foreach (var subscriber in subscribers.GetInvocationList().Cast<Action<T>>())
+        {
+            try
+            {
+                subscriber(value);
+            }
+            catch (Exception exception)
+            {
+                try
+                {
+                    logException(exception);
+                }
+                catch
+                {
+                    // Addon lifecycle callbacks must contain both subscriber and diagnostic failures.
+                }
+            }
+        }
     }
 
     private static unsafe (ulong Id, string Name)? ReadActiveRetainer()

@@ -142,7 +142,11 @@ public sealed class QuartermasterWindow : Window
     private void DrawStock(BrowserProjection projection)
     {
         DrawBrowserToolbar(projection, listings: false);
-        var result = queries.QueryItems(projection, workbench.ItemFilter, workbench.ScopeKey);
+        var result = queries.QueryItems(
+            projection,
+            workbench.ItemFilter,
+            workbench.ScopeKey,
+            workbench.ItemFilterState.IsInputActive);
         if (!result.Filter.IsValid)
             ImGui.TextColored(new Vector4(1f, .65f, .25f, 1f), result.Filter.Diagnostics.FirstOrDefault()?.Message ?? "Invalid filter");
 
@@ -318,7 +322,11 @@ public sealed class QuartermasterWindow : Window
     private void DrawListings(BrowserProjection projection)
     {
         DrawBrowserToolbar(projection, listings: true);
-        var result = queries.QueryListings(projection, workbench.ListingFilter, workbench.ScopeKey);
+        var result = queries.QueryListings(
+            projection,
+            workbench.ListingFilter,
+            workbench.ScopeKey,
+            workbench.ListingFilterState.IsInputActive);
         if (!result.Filter.IsValid)
             ImGui.TextColored(new Vector4(1f, .65f, .25f, 1f), result.Filter.Diagnostics.FirstOrDefault()?.Message ?? "Invalid filter");
         if (!ImGui.BeginTable("RQListings", 7, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable, new Vector2(0, ImGui.GetContentRegionAvail().Y)))
