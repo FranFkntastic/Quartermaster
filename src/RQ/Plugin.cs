@@ -2,6 +2,7 @@ using Dalamud.Game.Command;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
+using Franthropy.Dalamud.Automation.Retainers;
 using RQ.AgentBridge;
 using RQ.Automation;
 using RQ.Domain;
@@ -85,13 +86,14 @@ public sealed class Plugin : IDalamudPlugin
         state = new(new QuartermasterStateStore(statePath));
         captures = new(addonLifecycle, log, scanner, cache, CurrentOwner);
         var automation = new AutomationLease();
-        autoRetainer = new(pluginInterface, framework, gameGui, dataManager, log, captures, automation);
+        var retainerSession = new DalamudRetainerAutomationSession(framework, gameGui, dataManager, log, objects, targets, sigScanner);
+        autoRetainer = new(pluginInterface, framework, log, captures, retainerSession, automation);
         journal = new OperationJournal(state);
         RecoverPendingCacheInvalidations();
         foreach (var operation in state.Snapshot().Operations.Where(operation => operation.Status == OperationStatuses.Running))
             InvalidateOwnerEvidence(operation);
         journal.ReconcileInterruptedOperations();
-        var driver = new RetainerLiveDriver(framework, gameGui, dataManager, log, objects, targets, sigScanner);
+        var driver = new RetainerLiveDriver(retainerSession);
         transfers = new TransferCoordinator(
             journal,
             driver,

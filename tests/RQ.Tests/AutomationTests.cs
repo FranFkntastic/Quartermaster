@@ -42,6 +42,23 @@ public sealed class AutomationTests
     }
 
     [Fact]
+    public async Task RetainerLiveDriver_PreservesSharedFailureCodeForProductDiagnostics()
+    {
+        var session = CreateProxy<IRetainerAutomationSession>((method, _) => method.Name switch
+        {
+            nameof(IRetainerAutomationSession.OpenInventoryAsync) => Task.FromResult(
+                RetainerAutomationResult.Failed("RetainerMenuUnavailable", "Retainer command menu is unavailable.")),
+            _ => throw new InvalidOperationException($"Unexpected session call: {method.Name}."),
+        });
+        var driver = new RetainerLiveDriver(session);
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            driver.OpenInventoryAsync(CancellationToken.None));
+
+        Assert.Contains("RetainerMenuUnavailable", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task CrystalDeposit_PropagatesCancellationIntoFrameworkWork()
     {
         using var cancellation = new CancellationTokenSource();

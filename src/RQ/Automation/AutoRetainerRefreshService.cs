@@ -1,11 +1,7 @@
 using Dalamud.Bindings.ImGui;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
-using Dalamud.Utility;
-using FFXIVClientStructs.FFXIV.Client.Game;
-using FFXIVClientStructs.FFXIV.Client.UI;
-using FFXIVClientStructs.FFXIV.Component.GUI;
-using Lumina.Excel.Sheets;
+using Franthropy.Dalamud.Automation.Retainers;
 using RQ.Inventory;
 
 namespace RQ.Automation;
@@ -23,10 +19,9 @@ public sealed class AutoRetainerRefreshService : IDisposable
     private const string FinishPostprocess = "AutoRetainer.FinishPostprocessRequest";
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly IFramework framework;
-    private readonly IGameGui gameGui;
-    private readonly IDataManager dataManager;
     private readonly IPluginLog log;
     private readonly RetainerCaptureService captures;
+    private readonly IRetainerAutomationSession session;
     private readonly AutomationLease automation;
     private readonly CancellationTokenSource lifetime = new();
     private readonly ActiveTaskTracker activeTasks = new();
@@ -42,18 +37,16 @@ public sealed class AutoRetainerRefreshService : IDisposable
     public AutoRetainerRefreshService(
         IDalamudPluginInterface pluginInterface,
         IFramework framework,
-        IGameGui gameGui,
-        IDataManager dataManager,
         IPluginLog log,
         RetainerCaptureService captures,
+        IRetainerAutomationSession session,
         AutomationLease? automation = null)
     {
         this.pluginInterface = pluginInterface;
         this.framework = framework;
-        this.gameGui = gameGui;
-        this.dataManager = dataManager;
         this.log = log;
         this.captures = captures;
+        this.session = session;
         this.automation = automation ?? new AutomationLease();
         pluginInterface.GetIpcSubscriber<object>(DrawButtons).Subscribe(DrawButton);
         pluginInterface.GetIpcSubscriber<string, object>(AdditionalTask).Subscribe(OnAdditionalTask);
@@ -91,12 +84,12 @@ public sealed class AutoRetainerRefreshService : IDisposable
             Status = "AutoRetainer is unavailable.";
             return false;
         }
-        if (!IsReady("RetainerList"))
+        if (!session.IsRetainerListReady)
         {
             Status = "Open retainer list before starting refresh.";
             return false;
         }
-        expected = GetAvailableRetainerCount();
+        expected = DalamudRetainerInventory.CountAvailableRetainers();
         if (expected == 0)
         {
             Status = "No available retainers were found.";
@@ -210,15 +203,19 @@ public sealed class AutoRetainerRefreshService : IDisposable
             }, cancellationToken: cancellationToken).ConfigureAwait(false);
             if (request is null)
                 return;
-            await WaitUntilAsync(IsCommandMenuReady, $"command menu for {retainerName}", cancellationToken).ConfigureAwait(false);
-            var selected = await framework.RunOnTick(() =>
+            var menu = await session.WaitForCurrentRetainerMenuAsync(cancellationToken).ConfigureAwait(false);
+            if (!menu.Success)
+                throw new InvalidOperationException($"{menu.Code}: {menu.Message}");
+            var isCurrent = await framework.RunOnTick(() =>
             {
                 ThrowIfStopped(cancellationToken);
-                return postprocess.IsCurrent(request) && SelectInventoryCommand();
+                return postprocess.IsCurrent(request);
             }, cancellationToken: cancellationToken).ConfigureAwait(false);
-            if (!selected)
-                throw new InvalidOperationException("Retainer inventory command was not available.");
-            await WaitUntilAsync(() => IsReady("InventoryRetainerLarge") || IsReady("InventoryRetainer"), $"inventory for {retainerName}", cancellationToken).ConfigureAwait(false);
+            if (!isCurrent)
+                return;
+            var opened = await session.OpenInventoryAsync(cancellationToken).ConfigureAwait(false);
+            if (!opened.Success)
+                throw new InvalidOperationException($"{opened.Code}: {opened.Message}");
             var captureWait = await framework.RunOnTick(() =>
             {
                 ThrowIfStopped(cancellationToken);
@@ -226,12 +223,16 @@ public sealed class AutoRetainerRefreshService : IDisposable
             }, cancellationToken: cancellationToken).ConfigureAwait(false);
             if (captureWait.Session is null)
                 throw new InvalidOperationException("Retainer inventory opened without a stable capture session.");
-            await framework.RunOnTick(() =>
+            isCurrent = await framework.RunOnTick(() =>
             {
                 ThrowIfStopped(cancellationToken);
-                if (postprocess.IsCurrent(request))
-                    CloseInventory();
+                return postprocess.IsCurrent(request);
             }, cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (!isCurrent)
+                return;
+            var closed = await session.CloseInventoryAsync(cancellationToken).ConfigureAwait(false);
+            if (!closed.Success)
+                throw new InvalidOperationException($"{closed.Code}: {closed.Message}");
             await WaitForPersistedCaptureAsync(captureWait, retainerName, cancellationToken).ConfigureAwait(false);
             await framework.RunOnTick(() =>
             {
@@ -267,18 +268,6 @@ public sealed class AutoRetainerRefreshService : IDisposable
         {
             await FailAsync($"Refresh failed for {retainerName}.", exception, cancellationToken).ConfigureAwait(false);
         }
-    }
-
-    private async Task WaitUntilAsync(Func<bool> predicate, string state, CancellationToken cancellationToken)
-    {
-        for (var attempt = 0; attempt < 180; attempt++)
-        {
-            ThrowIfStopped(cancellationToken);
-            if (await framework.RunOnTick(predicate, cancellationToken: cancellationToken).ConfigureAwait(false))
-                return;
-            await framework.DelayTicks(1, cancellationToken).ConfigureAwait(false);
-        }
-        throw new InvalidOperationException($"Timed out waiting for {state}.");
     }
 
     private async Task WaitForPersistedCaptureAsync(CaptureWaitSnapshot captureWait, string retainerName, CancellationToken cancellationToken)
@@ -338,62 +327,6 @@ public sealed class AutoRetainerRefreshService : IDisposable
         }
     }
 
-    private unsafe bool IsCommandMenuReady()
-    {
-        var addon = gameGui.GetAddonByName<AddonSelectString>("SelectString", 1);
-        return addon is not null && addon->AtkUnitBase.IsReady && addon->AtkUnitBase.IsVisible && FindEntry(addon, AddonText(2378)) >= 0;
-    }
-
-    private unsafe bool SelectInventoryCommand()
-    {
-        var addon = gameGui.GetAddonByName<AddonSelectString>("SelectString", 1);
-        if (addon is null || !addon->AtkUnitBase.IsReady || !addon->AtkUnitBase.IsVisible)
-            return false;
-        var index = FindEntry(addon, AddonText(2378));
-        if (index < 0)
-            return false;
-        addon->AtkUnitBase.FireCallbackInt(index);
-        return true;
-    }
-
-    private static unsafe int FindEntry(AddonSelectString* addon, string target)
-    {
-        var popup = addon->PopupMenu.PopupMenu;
-        for (var index = 0; index < popup.EntryCount; index++)
-            if (RetainerUiAutomationText.IsSelectStringEntryMatch(popup.EntryNames[index].ToString(), target))
-                return index;
-        return -1;
-    }
-
-    private unsafe bool IsReady(string addonName)
-    {
-        var addon = gameGui.GetAddonByName<AtkUnitBase>(addonName, 1);
-        return addon is not null && addon->IsReady && addon->IsVisible;
-    }
-
-    private unsafe void CloseInventory()
-    {
-        var addon = gameGui.GetAddonByName<AtkUnitBase>("InventoryRetainerLarge", 1);
-        if (addon == null)
-            addon = gameGui.GetAddonByName<AtkUnitBase>("InventoryRetainer", 1);
-        if (addon != null)
-            addon->Close(true);
-    }
-
-    private static unsafe int GetAvailableRetainerCount()
-    {
-        var manager = RetainerManager.Instance();
-        if (manager is null)
-            return 0;
-        var count = 0;
-        for (var index = 0; index < manager->GetRetainerCount(); index++)
-            if (manager->Retainers[index].Available)
-                count++;
-        return count;
-    }
-
-    private string AddonText(uint id) => dataManager.GetExcelSheet<Addon>().GetRow(id).Text.ExtractText();
-
     public void Dispose()
     {
         if (disposed)
@@ -412,7 +345,7 @@ public sealed class AutoRetainerRefreshService : IDisposable
         postprocessOwned = false;
         if (readyRequest is not null)
         {
-            try { CloseInventory(); }
+            try { session.CancelActive(); }
             catch { }
             try { pluginInterface.GetIpcSubscriber<object>(FinishPostprocess).InvokeAction(); }
             catch { }
