@@ -32,11 +32,11 @@ public sealed class AutomationTests
             new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory.Path, "retainers.json"))),
             () => TestData.Owner);
         using var refresh = new AutoRetainerRefreshService(
-            CreateProxy<Dalamud.Plugin.IDalamudPluginInterface>(unused),
             CreateProxy<IFramework>(unused),
             log,
             captures,
-            CreateProxy<IRetainerAutomationSession>(unused));
+            CreateProxy<IRetainerAutomationSession>(unused),
+            new FakeAutoRetainerIpc());
 
         Assert.Equal(0, dependencyCalls);
     }
@@ -88,14 +88,12 @@ public sealed class AutomationTests
             new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory.Path, "retainers.json"))),
             () => TestData.Owner);
         using var refresh = new AutoRetainerRefreshService(
-            CreateProxy<Dalamud.Plugin.IDalamudPluginInterface>(unused),
             framework,
             log,
             captures,
             session,
+            new FakeAutoRetainerIpc(),
             automation: null,
-            autoRetainerAvailable: () => true,
-            autoRetainerBusy: () => false,
             countAvailableRetainers: () => 2);
 
         Assert.True(refresh.Start());
@@ -140,14 +138,12 @@ public sealed class AutomationTests
             new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory.Path, "retainers.json"))),
             () => TestData.Owner);
         using var refresh = new AutoRetainerRefreshService(
-            CreateProxy<Dalamud.Plugin.IDalamudPluginInterface>(unused),
             framework,
             log,
             captures,
             session,
+            new FakeAutoRetainerIpc(),
             automation: null,
-            autoRetainerAvailable: () => true,
-            autoRetainerBusy: () => false,
             countAvailableRetainers: () => 2);
 
         Assert.True(refresh.Start());
@@ -160,26 +156,29 @@ public sealed class AutomationTests
     }
 
     [Fact]
-    public void StaleIpcRepair_RemovesOnlyPriorQuartermasterTargets()
+    public void RefreshStart_QueuesBehindBusyAutoRetainerWithoutTouchingRetainerUi()
     {
-        var subscriber = new FakeSubscriber<string>();
-        var current = new FakeSubscriptionTarget();
-        var stale = new FakeSubscriptionTarget();
-        subscriber.Subscribe(current.Handle);
-        subscriber.Subscribe(stale.Handle);
-        Action<string> unrelated = _ => { };
-        subscriber.Subscribe(unrelated);
+        using var directory = new TemporaryDirectory();
+        var unused = new Func<MethodInfo, object?[]?, object?>((method, _) =>
+            throw new InvalidOperationException($"Unexpected dependency call: {method.Name}."));
+        var log = CreateProxy<IPluginLog>((_, _) => null);
+        var scanner = new InventoryScanner(CreateProxy<IDataManager>(unused), log);
+        using var captures = new RetainerCaptureService(
+            CreateProxy<IAddonLifecycle>(unused),
+            log,
+            scanner,
+            new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory.Path, "retainers.json"))),
+            () => TestData.Owner);
+        using var refresh = new AutoRetainerRefreshService(
+            CreateProxy<IFramework>(unused),
+            log,
+            captures,
+            CreateProxy<IRetainerAutomationSession>(unused),
+            new FakeAutoRetainerIpc { IsBusy = true });
 
-        var removed = StaleIpcSubscriptionRepair.Remove<Action<string>>(
-            subscriber,
-            current,
-            nameof(FakeSubscriptionTarget.Handle),
-            subscriber.Unsubscribe);
-
-        Assert.Equal(1, removed);
-        Assert.Contains(subscriber.Current, candidate => ReferenceEquals(candidate.Target, current));
-        Assert.Contains(unrelated, subscriber.Current);
-        Assert.DoesNotContain(subscriber.Current, candidate => ReferenceEquals(candidate.Target, stale));
+        Assert.True(refresh.Start());
+        Assert.True(refresh.IsQueued);
+        Assert.Equal("Retainer refresh queued behind AutoRetainer.", refresh.Status);
     }
 
     [Fact]
@@ -413,29 +412,16 @@ public sealed class AutomationTests
         public void Complete() => completion.TrySetResult(new(true, "Automatic retrieval completed."));
     }
 
-    private sealed class FakeSubscriptionTarget
+    private sealed class FakeAutoRetainerIpc : IAutoRetainerIpc
     {
-        public void Handle(string _) { }
-    }
-
-    private abstract class FakeSubscriberBase<T>
-    {
-        protected FakeChannel<T> Channel { get; } = new();
-    }
-
-    private sealed class FakeSubscriber<T> : FakeSubscriberBase<T>
-    {
-        public IReadOnlyList<Action<T>> Current => Channel.Subscriptions.Cast<Action<T>>().ToArray();
-        public void Subscribe(Action<T> action) => Channel.Subscribe(action);
-        public void Unsubscribe(Action<T> action) => Channel.Unsubscribe(action);
-    }
-
-    private sealed class FakeChannel<T>
-    {
-        private readonly HashSet<Delegate> subscriptions = [];
-        public IReadOnlyList<Delegate> Subscriptions => subscriptions.ToArray();
-        public void Subscribe(Action<T> action) => subscriptions.Add(action);
-        public void Unsubscribe(Action<T> action) => subscriptions.Remove(action);
+        public bool IsAvailable { get; set; } = true;
+        public bool IsBusy { get; set; }
+        public AutoRetainerIpcCallbacks? Callbacks { get; private set; }
+        public void Register(AutoRetainerIpcCallbacks callbacks) => Callbacks = callbacks;
+        public void QueueRetainerListTask(string consumer) { }
+        public void RequestPostprocess(string consumer) { }
+        public void FinishPostprocess() { }
+        public void Dispose() => Callbacks = null;
     }
 }
 

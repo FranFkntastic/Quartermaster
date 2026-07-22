@@ -11,6 +11,7 @@ using RQ.Interop;
 using RQ.Inventory;
 using RQ.Operations;
 using RQ.Persistence;
+using RQ.Runtime;
 using RQ.UI;
 
 namespace RQ;
@@ -33,6 +34,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly OperationJournal journal;
     private readonly TransferCoordinator transfers;
     private readonly AutomaticRetrievalQueue automaticRetrievals;
+    private readonly QuartermasterRuntimeSnapshotSource runtimeSnapshots;
     private readonly SnapshotPublisher snapshots;
     private readonly ShortageSubmissionService submissions;
     private readonly QuartermasterIpcProvider ipc;
@@ -89,7 +91,7 @@ public sealed class Plugin : IDalamudPlugin
         captures = new(addonLifecycle, log, scanner, cache, CurrentOwner);
         var automation = new AutomationLease();
         var retainerSession = new DalamudRetainerAutomationSession(framework, gameGui, dataManager, log, objects, targets, sigScanner);
-        autoRetainer = new(pluginInterface, framework, log, captures, retainerSession, automation);
+        autoRetainer = new(framework, log, captures, retainerSession, new DalamudAutoRetainerIpc(pluginInterface), automation);
         journal = new OperationJournal(state);
         RecoverPendingCacheInvalidations();
         foreach (var operation in state.Snapshot().Operations.Where(operation => operation.Status == OperationStatuses.Running))
@@ -106,10 +108,14 @@ public sealed class Plugin : IDalamudPlugin
             clearRetrievalPlansAsActioned: () => configuration.ClearRetrievalPlansAsActioned);
         automaticRetrievals = new(journal, transfers, CurrentOwner);
         workQueue = new();
+        runtimeSnapshots = new(scanner, cache, state, CurrentOwner);
+        var initialSnapshot = runtimeSnapshots.Refresh();
         snapshots = new(providerInstanceId, state, cache.Snapshot);
+        snapshots.Refresh(initialSnapshot);
+        nextSnapshotAt = DateTime.UtcNow.AddSeconds(1);
         submissions = new ShortageSubmissionService(providerInstanceId, state, workQueue, CurrentOwner);
         ipc = new(new DalamudIpcRegistrar(pluginInterface), snapshots, submissions);
-        window = new(state, cache, scanner, journal, transfers, autoRetainer, dataManager, CurrentOwner, configuration, SaveConfiguration, agentReviewRegistry);
+        window = new(state, runtimeSnapshots, journal, transfers, autoRetainer, dataManager, configuration, SaveConfiguration, agentReviewRegistry);
         agentBridge = new(
             configuration,
             configDirectory,
@@ -207,7 +213,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private void RefreshSnapshot()
     {
-        snapshots.Refresh(CurrentOwner(), scanner.CapturePlayerStorage());
+        snapshots.Refresh(runtimeSnapshots.Refresh());
         nextSnapshotAt = DateTime.UtcNow.AddSeconds(1);
     }
 
@@ -278,11 +284,10 @@ public sealed class Plugin : IDalamudPlugin
 
     private QuartermasterBridgeTruth CreateAgentBridgeTruth()
     {
-        var owner = CurrentOwner();
-        var retainers = cache.Snapshot().Values.Where(retainer => owner.Matches(retainer.Owner)).ToArray();
-        var stateSnapshot = state.Snapshot();
-        var operation = stateSnapshot.Operations
-            .Where(candidate => candidate.Owner.Matches(owner))
+        var runtime = runtimeSnapshots.Current;
+        var retainers = runtime.Retainers.Values.Where(retainer => runtime.Owner.Matches(retainer.Owner)).ToArray();
+        var operation = runtime.State.Operations
+            .Where(candidate => candidate.Owner.Matches(runtime.Owner))
             .OrderByDescending(candidate => candidate.UpdatedAtUtc)
             .FirstOrDefault();
         return new QuartermasterBridgeTruth(
@@ -291,12 +296,12 @@ public sealed class Plugin : IDalamudPlugin
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
             window.IsOpen,
-            owner.HasStableIdentity ? $"{owner.CharacterName} @ {owner.HomeWorldName}" : "Unavailable",
-            owner.HasStableIdentity,
+            runtime.Owner.HasStableIdentity ? $"{runtime.Owner.CharacterName} @ {runtime.Owner.HomeWorldName}" : "Unavailable",
+            runtime.Owner.HasStableIdentity,
             retainers.Length,
             retainers.Length == 0 ? null : retainers.Min(retainer => new DateTimeOffset(DateTime.SpecifyKind(retainer.ObservedAtUtc, DateTimeKind.Utc))),
-            stateSnapshot.PlanItems.Count,
-            stateSnapshot.PlanItems.Count(item => item.Enabled),
+            runtime.State.PlanItems.Count,
+            runtime.State.PlanItems.Count(item => item.Enabled),
             operation?.OperationId,
             operation?.Status,
             autoRetainer.IsAvailable,

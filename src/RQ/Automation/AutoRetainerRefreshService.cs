@@ -1,7 +1,6 @@
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Components;
-using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Franthropy.Dalamud.Automation.Retainers;
 using RQ.Inventory;
@@ -12,138 +11,68 @@ public sealed class AutoRetainerRefreshService : IDisposable
 {
     private static readonly TimeSpan DisposeJoinTimeout = TimeSpan.FromSeconds(2);
     private const string Consumer = "Quartermaster";
-    private const string Init = "AutoRetainer.Init";
-    private const string IsBusy = "AutoRetainer.PluginState.IsBusy";
-    private const string DrawButtons = "AutoRetainer.OnRetainerListTaskButtonsDraw";
-    private const string CustomTask = "AutoRetainer.OnRetainerListCustomTask";
-    private const string AdditionalTask = "AutoRetainer.OnRetainerAdditionalTask";
-    private const string RequestPostprocess = "AutoRetainer.RequestPostprocess";
-    private const string ReadyForPostprocess = "AutoRetainer.OnRetainerReadyForPostprocess";
-    private const string FinishPostprocess = "AutoRetainer.FinishPostprocessRequest";
-    private readonly IDalamudPluginInterface pluginInterface;
     private readonly IFramework framework;
     private readonly IPluginLog log;
     private readonly RetainerCaptureService captures;
     private readonly IRetainerAutomationSession session;
+    private readonly IAutoRetainerIpc autoRetainer;
     private readonly AutomationLease automation;
-    private readonly Func<bool> autoRetainerAvailable;
-    private readonly Func<bool> autoRetainerBusy;
     private readonly Func<int> countAvailableRetainers;
     private readonly CancellationTokenSource lifetime = new();
     private readonly ActiveTaskTracker activeTasks = new();
     private readonly AutoRetainerPostprocessState postprocess = new();
     private IDisposable? automationLease;
-    private bool preparing;
-    private bool queued;
-    private bool refreshing;
-    private bool postprocessOwned;
+    private AutoRetainerRefreshPhase phase;
     private int expected;
     private int processed;
-    private bool registered;
     private volatile bool disposed;
 
     public AutoRetainerRefreshService(
-        IDalamudPluginInterface pluginInterface,
         IFramework framework,
         IPluginLog log,
         RetainerCaptureService captures,
         IRetainerAutomationSession session,
+        IAutoRetainerIpc autoRetainer,
         AutomationLease? automation = null)
-        : this(pluginInterface, framework, log, captures, session, automation, null, null, null)
+        : this(framework, log, captures, session, autoRetainer, automation, null)
     {
     }
 
     internal AutoRetainerRefreshService(
-        IDalamudPluginInterface pluginInterface,
         IFramework framework,
         IPluginLog log,
         RetainerCaptureService captures,
         IRetainerAutomationSession session,
+        IAutoRetainerIpc autoRetainer,
         AutomationLease? automation,
-        Func<bool>? autoRetainerAvailable,
-        Func<bool>? autoRetainerBusy,
         Func<int>? countAvailableRetainers)
     {
-        this.pluginInterface = pluginInterface;
         this.framework = framework;
         this.log = log;
         this.captures = captures;
         this.session = session;
+        this.autoRetainer = autoRetainer;
         this.automation = automation ?? new AutomationLease();
-        this.autoRetainerAvailable = autoRetainerAvailable ?? CheckAutoRetainerAvailable;
-        this.autoRetainerBusy = autoRetainerBusy ?? CheckAutoRetainerBusy;
         this.countAvailableRetainers = countAvailableRetainers ?? DalamudRetainerInventory.CountAvailableRetainers;
     }
 
     public void Register()
     {
         ObjectDisposedException.ThrowIf(disposed, this);
-        if (registered)
-            return;
-
-        var drawSubscriber = pluginInterface.GetIpcSubscriber<object>(DrawButtons);
-        var additionalSubscriber = pluginInterface.GetIpcSubscriber<string, object>(AdditionalTask);
-        var readySubscriber = pluginInterface.GetIpcSubscriber<string, string, object>(ReadyForPostprocess);
-#if DEBUG
-        var repaired =
-            StaleIpcSubscriptionRepair.Remove<Action>(drawSubscriber, this, nameof(DrawButton), drawSubscriber.Unsubscribe) +
-            StaleIpcSubscriptionRepair.Remove<Action<string>>(additionalSubscriber, this, nameof(OnAdditionalTask), additionalSubscriber.Unsubscribe) +
-            StaleIpcSubscriptionRepair.Remove<Action<string, string>>(readySubscriber, this, nameof(OnReady), readySubscriber.Unsubscribe);
-        if (repaired > 0)
-            log.Warning("Removed {Count} stale Quartermaster AutoRetainer IPC subscriptions left by a failed plugin construction.", repaired);
-#endif
-        var draw = false;
-        var additional = false;
-        var ready = false;
-        try
-        {
-            drawSubscriber.Subscribe(DrawButton);
-            draw = true;
-            additionalSubscriber.Subscribe(OnAdditionalTask);
-            additional = true;
-            readySubscriber.Subscribe(OnReady);
-            ready = true;
-            registered = true;
-        }
-        catch
-        {
-            if (ready)
-                readySubscriber.Unsubscribe(OnReady);
-            if (additional)
-                additionalSubscriber.Unsubscribe(OnAdditionalTask);
-            if (draw)
-                drawSubscriber.Unsubscribe(DrawButton);
-            throw;
-        }
+        autoRetainer.Register(new(DrawButton, OnAdditionalTask, OnReady));
     }
 
-    public bool IsRefreshing => refreshing || postprocessOwned;
-    public bool IsQueued => preparing || queued;
+    public bool IsRefreshing => phase is AutoRetainerRefreshPhase.Refreshing or AutoRetainerRefreshPhase.PassivePostprocess;
+    public bool IsQueued => phase is AutoRetainerRefreshPhase.Preparing or AutoRetainerRefreshPhase.Queued;
     public string Status { get; private set; } = "Retainer refresh has not run.";
 
-    public bool IsAvailable => autoRetainerAvailable();
-
-    private bool CheckAutoRetainerAvailable()
-    {
-        try
-        {
-            pluginInterface.GetIpcSubscriber<object>(Init).InvokeAction();
-            return true;
-        }
-        catch { return false; }
-    }
-
-    private bool CheckAutoRetainerBusy()
-    {
-        try { return pluginInterface.GetIpcSubscriber<bool>(IsBusy).InvokeFunc(); }
-        catch { return false; }
-    }
+    public bool IsAvailable => autoRetainer.IsAvailable;
 
     public bool Start()
     {
         if (disposed)
             return false;
-        if (preparing || queued || refreshing || postprocessOwned)
+        if (phase != AutoRetainerRefreshPhase.Idle)
         {
             Status = "Retainer refresh is already queued or running.";
             return false;
@@ -153,17 +82,18 @@ public sealed class AutoRetainerRefreshService : IDisposable
             Status = "AutoRetainer is unavailable.";
             return false;
         }
-        if (autoRetainerBusy())
-        {
-            Status = "AutoRetainer is busy; refresh was not started.";
-            return false;
-        }
         if (!automation.TryAcquire("retainer refresh", out automationLease))
         {
             Status = $"Automation is busy with {automation.Holder}.";
             return false;
         }
-        preparing = true;
+        if (autoRetainer.IsBusy)
+        {
+            phase = AutoRetainerRefreshPhase.Queued;
+            Status = "Retainer refresh queued behind AutoRetainer.";
+            return true;
+        }
+        phase = AutoRetainerRefreshPhase.Preparing;
         Status = session.IsRetainerListReady ? "Preparing retainer refresh." : "Opening retainer list.";
         Track(() => PrepareRefreshAsync(lifetime.Token));
         return true;
@@ -176,36 +106,22 @@ public sealed class AutoRetainerRefreshService : IDisposable
             var list = await session.EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);
             if (!list.Success && string.Equals(list.Code, "RetainerInteractionAlreadyOpen", StringComparison.Ordinal))
             {
-                if (autoRetainerBusy())
-                    throw new InvalidOperationException("AutoRetainerBusy: AutoRetainer is processing the current retainer interaction.");
-                var closed = await session.CloseRetainerAsync(cancellationToken).ConfigureAwait(false);
-                if (!closed.Success)
-                    throw new InvalidOperationException($"{closed.Code}: {closed.Message}");
-                list = await session.EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);
+                if (autoRetainer.IsBusy)
+                {
+                    await framework.RunOnTick(() => QueuePreparedRefresh(cancellationToken), cancellationToken: cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+                else
+                {
+                    var closed = await session.CloseRetainerAsync(cancellationToken).ConfigureAwait(false);
+                    if (!closed.Success)
+                        throw new InvalidOperationException($"{closed.Code}: {closed.Message}");
+                    list = await session.EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);
+                }
             }
             if (!list.Success)
                 throw new InvalidOperationException($"{list.Code}: {list.Message}");
-
-            var available = await framework.RunOnTick(
-                countAvailableRetainers,
-                cancellationToken: cancellationToken).ConfigureAwait(false);
-            await framework.RunOnTick(() =>
-            {
-                ThrowIfStopped(cancellationToken);
-                if (available == 0)
-                {
-                    preparing = false;
-                    ReleaseAutomationLease();
-                    Status = "No available retainers were found.";
-                    return;
-                }
-
-                expected = available;
-                processed = 0;
-                preparing = false;
-                queued = true;
-                Status = "Retainer refresh queued.";
-            }, cancellationToken: cancellationToken).ConfigureAwait(false);
+            await framework.RunOnTick(() => QueuePreparedRefresh(cancellationToken), cancellationToken: cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
         catch (Exception exception)
@@ -214,27 +130,45 @@ public sealed class AutoRetainerRefreshService : IDisposable
         }
     }
 
+    private void QueuePreparedRefresh(CancellationToken cancellationToken)
+    {
+        ThrowIfStopped(cancellationToken);
+        if (phase == AutoRetainerRefreshPhase.Preparing)
+            phase = AutoRetainerRefreshPhase.Queued;
+        Status = "Retainer refresh queued.";
+    }
+
     private void DrawButton()
     {
         if (disposed)
             return;
         try
         {
-            if (IsRefreshing || queued || (automation.IsHeld && automation.Holder is not ("retainer refresh" or "retainer postprocess")))
+            var disabled = phase != AutoRetainerRefreshPhase.Idle ||
+                           (automation.IsHeld && automation.Holder is not ("retainer refresh" or "retainer postprocess"));
+            if (disabled)
                 ImGui.BeginDisabled();
             ImGui.SameLine();
             if (ImGuiComponents.IconButton("QuartermasterRefresh", FontAwesomeIcon.BookOpen))
                 Start();
-            if (IsRefreshing || queued || (automation.IsHeld && automation.Holder is not ("retainer refresh" or "retainer postprocess")))
+            if (disabled)
                 ImGui.EndDisabled();
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip("Refresh all Quartermaster retainer inventory caches.");
-            if (queued)
+            if (phase == AutoRetainerRefreshPhase.Queued)
             {
-                queued = false;
-                refreshing = true;
+                expected = countAvailableRetainers();
+                processed = 0;
+                if (expected == 0)
+                {
+                    phase = AutoRetainerRefreshPhase.Idle;
+                    ReleaseAutomationLease();
+                    Status = "No available retainers were found.";
+                    return;
+                }
+                phase = AutoRetainerRefreshPhase.Refreshing;
                 Status = $"Refreshing retainers: 0/{expected}.";
-                pluginInterface.GetIpcSubscriber<string, object>(CustomTask).InvokeAction(Consumer);
+                autoRetainer.QueueRetainerListTask(Consumer);
             }
         }
         catch (Exception exception)
@@ -264,32 +198,32 @@ public sealed class AutoRetainerRefreshService : IDisposable
                 ThrowIfStopped(cancellationToken);
                 if (postprocess.HasOutstanding)
                     return;
-                var partOfFullRefresh = refreshing;
+                var partOfFullRefresh = phase == AutoRetainerRefreshPhase.Refreshing;
                 if (!partOfFullRefresh)
                 {
-                    if (preparing || queued)
+                    if (phase is AutoRetainerRefreshPhase.Preparing or AutoRetainerRefreshPhase.Queued)
                         return;
-                    if (postprocessOwned)
+                    if (phase != AutoRetainerRefreshPhase.Idle)
                         return;
                     if (!automation.TryAcquire("retainer postprocess", out automationLease))
                     {
                         Status = $"Skipped AutoRetainer postprocess because automation is busy with {automation.Holder}.";
                         return;
                     }
-                    postprocessOwned = true;
+                    phase = AutoRetainerRefreshPhase.PassivePostprocess;
                 }
                 if (!postprocess.TryBegin(retainerName, partOfFullRefresh, out var request))
                     return;
                 try
                 {
-                    pluginInterface.GetIpcSubscriber<string, object>(RequestPostprocess).InvokeAction(Consumer);
+                    autoRetainer.RequestPostprocess(Consumer);
                 }
                 catch
                 {
                     postprocess.TryComplete(request);
                     if (!partOfFullRefresh)
                     {
-                        postprocessOwned = false;
+                        phase = AutoRetainerRefreshPhase.Idle;
                         ReleaseAutomationLease();
                     }
                     throw;
@@ -354,17 +288,17 @@ public sealed class AutoRetainerRefreshService : IDisposable
                 {
                     Status = $"Refreshed {retainerName} during AutoRetainer postprocess.";
                 }
-                pluginInterface.GetIpcSubscriber<object>(FinishPostprocess).InvokeAction();
+                autoRetainer.FinishPostprocess();
                 postprocess.TryComplete(request);
                 if (request.PartOfFullRefresh && processed >= expected)
                 {
-                    refreshing = false;
+                    phase = AutoRetainerRefreshPhase.Idle;
                     ReleaseAutomationLease();
                     Status = $"Retainer refresh complete: {processed}/{expected}.";
                 }
                 else if (!request.PartOfFullRefresh)
                 {
-                    postprocessOwned = false;
+                    phase = AutoRetainerRefreshPhase.Idle;
                     ReleaseAutomationLease();
                 }
             }, cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -436,17 +370,14 @@ public sealed class AutoRetainerRefreshService : IDisposable
             return;
         log.Error(exception, message);
         var readyRequest = postprocess.Cancel();
-        preparing = false;
-        queued = false;
-        refreshing = false;
-        postprocessOwned = false;
+        phase = AutoRetainerRefreshPhase.Idle;
         ReleaseAutomationLease();
         Status = $"{message} {exception.Message}";
         if (readyRequest is not null)
         {
             try { session.CancelActive(); }
             catch (Exception cleanupException) { log.Warning(cleanupException, "Unable to close Quartermaster retainer UI after refresh failure."); }
-            try { pluginInterface.GetIpcSubscriber<object>(FinishPostprocess).InvokeAction(); }
+            try { autoRetainer.FinishPostprocess(); }
             catch { }
         }
     }
@@ -457,28 +388,19 @@ public sealed class AutoRetainerRefreshService : IDisposable
             return;
         disposed = true;
         activeTasks.Stop();
-        if (registered)
-        {
-            pluginInterface.GetIpcSubscriber<object>(DrawButtons).Unsubscribe(DrawButton);
-            pluginInterface.GetIpcSubscriber<string, object>(AdditionalTask).Unsubscribe(OnAdditionalTask);
-            pluginInterface.GetIpcSubscriber<string, string, object>(ReadyForPostprocess).Unsubscribe(OnReady);
-            registered = false;
-        }
         lifetime.Cancel();
         if (!activeTasks.Wait(DisposeJoinTimeout))
             log.Warning("Timed out waiting for AutoRetainer refresh tasks to stop during plugin disposal.");
         var readyRequest = postprocess.Cancel();
-        preparing = false;
-        queued = false;
-        refreshing = false;
-        postprocessOwned = false;
+        phase = AutoRetainerRefreshPhase.Disposed;
         if (readyRequest is not null)
         {
             try { session.CancelActive(); }
             catch { }
-            try { pluginInterface.GetIpcSubscriber<object>(FinishPostprocess).InvokeAction(); }
+            try { autoRetainer.FinishPostprocess(); }
             catch { }
         }
+        autoRetainer.Dispose();
         ReleaseAutomationLease();
         lifetime.Dispose();
     }
@@ -504,6 +426,16 @@ public sealed class AutoRetainerRefreshService : IDisposable
         if (disposed)
             throw new OperationCanceledException(cancellationToken);
     }
+}
+
+internal enum AutoRetainerRefreshPhase
+{
+    Idle,
+    Preparing,
+    Queued,
+    Refreshing,
+    PassivePostprocess,
+    Disposed,
 }
 
 internal sealed record AutoRetainerPostprocessRequest(long Sequence, string RetainerName, bool PartOfFullRefresh, bool Ready);

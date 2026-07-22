@@ -9,23 +9,21 @@ using Franthropy.Dalamud.UI.Filtering;
 using Lumina.Excel.Sheets;
 using RQ.Automation;
 using RQ.Domain;
-using RQ.Inventory;
 using RQ.Operations;
 using RQ.Persistence;
 using RQ.Planning;
+using RQ.Runtime;
 
 namespace RQ.UI;
 
 public sealed class QuartermasterWindow : Window
 {
     private readonly StateRepository state;
-    private readonly RetainerCacheRepository cache;
-    private readonly InventoryScanner scanner;
+    private readonly QuartermasterRuntimeSnapshotSource runtimeSnapshots;
     private readonly OperationJournal journal;
     private readonly TransferCoordinator transfers;
     private readonly AutoRetainerRefreshService autoRetainer;
     private readonly IDataManager dataManager;
-    private readonly Func<OwnerScope> currentOwner;
     private readonly PluginConfiguration configuration;
     private readonly System.Action saveConfiguration;
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
@@ -41,26 +39,22 @@ public sealed class QuartermasterWindow : Window
 
     public QuartermasterWindow(
         StateRepository state,
-        RetainerCacheRepository cache,
-        InventoryScanner scanner,
+        QuartermasterRuntimeSnapshotSource runtimeSnapshots,
         OperationJournal journal,
         TransferCoordinator transfers,
         AutoRetainerRefreshService autoRetainer,
         IDataManager dataManager,
-        Func<OwnerScope> currentOwner,
         PluginConfiguration configuration,
         System.Action saveConfiguration,
         AgentBridgeUiReviewRegistry reviewRegistry)
         : base("Quartermaster###RQMain", ImGuiWindowFlags.NoScrollbar)
     {
         this.state = state;
-        this.cache = cache;
-        this.scanner = scanner;
+        this.runtimeSnapshots = runtimeSnapshots;
         this.journal = journal;
         this.transfers = transfers;
         this.autoRetainer = autoRetainer;
         this.dataManager = dataManager;
-        this.currentOwner = currentOwner;
         this.configuration = configuration;
         this.saveConfiguration = saveConfiguration;
         this.reviewRegistry = reviewRegistry;
@@ -84,17 +78,11 @@ public sealed class QuartermasterWindow : Window
 
     private void DrawContent()
     {
-        var owner = currentOwner();
-        var playerBags = scanner.ScanPlayerBags();
-        var cacheSnapshot = cache.Snapshot();
-        var projection = BrowserProjectionBuilder.Build(playerBags, cacheSnapshot, owner, scanner.ResolveItemMetadata);
-        var stateSnapshot = state.Snapshot();
-        var counts = playerBags.SelectMany(bag => bag.Items).GroupBy(item => item.ItemId).ToDictionary(group => group.Key, group => group.Sum(item => checked((int)item.Quantity)));
-        var plan = RestockPlanner.Build(stateSnapshot.PlanItems, counts, cacheSnapshot, owner, DateTime.UtcNow);
-        workbench.EnsureScope(projection);
-        var scopedRetainerCount = cacheSnapshot.Values.Count(retainer => owner.Matches(retainer.Owner));
+        var runtime = runtimeSnapshots.Current;
+        workbench.EnsureScope(runtime.Browser);
+        var scopedRetainerCount = runtime.Retainers.Values.Count(retainer => runtime.Owner.Matches(retainer.Owner));
 
-        ImGui.TextUnformatted(owner.HasStableIdentity ? $"{owner.CharacterName} @ {owner.HomeWorldName}" : "Owner scope unavailable");
+        ImGui.TextUnformatted(runtime.Owner.HasStableIdentity ? $"{runtime.Owner.CharacterName} @ {runtime.Owner.HomeWorldName}" : "Owner scope unavailable");
         ImGui.SameLine();
         ImGui.TextDisabled($"{scopedRetainerCount:N0} cached retainers");
         ImGui.SameLine();
@@ -119,19 +107,19 @@ public sealed class QuartermasterWindow : Window
             if (ImGui.BeginTabItem("Stock & plan", requestedView == WorkbenchView.StockAndPlan ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
             {
                 workbench.View = WorkbenchView.StockAndPlan;
-                DrawWorkbench(projection, plan, stateSnapshot, owner, cacheSnapshot);
+                DrawWorkbench(runtime);
                 ImGui.EndTabItem();
             }
-            if (ImGui.BeginTabItem($"Listings ({projection.Listings.Count:N0})", requestedView == WorkbenchView.Listings ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
+            if (ImGui.BeginTabItem($"Listings ({runtime.Browser.Listings.Count:N0})", requestedView == WorkbenchView.Listings ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
             {
                 workbench.View = WorkbenchView.Listings;
-                DrawListings(projection);
+                DrawListings(runtime.Browser, runtime.Revision);
                 ImGui.EndTabItem();
             }
             if (ImGui.BeginTabItem("Operation", requestedView == WorkbenchView.Operation ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
             {
                 workbench.View = WorkbenchView.Operation;
-                DrawOperation(owner);
+                DrawOperation(runtime.Owner);
                 ImGui.EndTabItem();
             }
             ImGui.EndTabBar();
@@ -174,27 +162,28 @@ public sealed class QuartermasterWindow : Window
         clearAgentReviewWindowOverride = false;
     }
 
-    private void DrawWorkbench(BrowserProjection projection, RetrievalPlan plan, QuartermasterState snapshot, OwnerScope owner, IReadOnlyDictionary<ulong, CachedRetainer> cacheSnapshot)
+    private void DrawWorkbench(QuartermasterRuntimeSnapshot runtime)
     {
         var available = ImGui.GetContentRegionAvail();
         var leftWidth = Math.Clamp(available.X * 0.45f, 340f, available.X - 360f);
         if (ImGui.BeginChild("RQStock", new Vector2(leftWidth, 0), true))
-            DrawStock(projection);
+            DrawStock(runtime.Browser, runtime.Revision);
         ImGui.EndChild();
         ImGui.SameLine();
         if (ImGui.BeginChild("RQPlan", Vector2.Zero, true))
-            DrawPlan(plan, snapshot, owner, cacheSnapshot);
+            DrawPlan(runtime.Retrieval, runtime.State, runtime.Owner, runtime.Deposit);
         ImGui.EndChild();
     }
 
-    private void DrawStock(BrowserProjection projection)
+    private void DrawStock(BrowserProjection projection, long revision)
     {
         DrawBrowserToolbar(projection, listings: false);
         var result = queries.QueryItems(
             projection,
             workbench.ItemFilter,
             workbench.ScopeKey,
-            workbench.ItemFilterState.IsInputActive);
+            workbench.ItemFilterState.IsInputActive,
+            revision);
         if (!result.Filter.IsValid)
             ImGui.TextColored(new Vector4(1f, .65f, .25f, 1f), result.Filter.Diagnostics.FirstOrDefault()?.Message ?? "Invalid filter");
 
@@ -297,7 +286,7 @@ public sealed class QuartermasterWindow : Window
         }
     }
 
-    private void DrawPlan(RetrievalPlan plan, QuartermasterState snapshot, OwnerScope owner, IReadOnlyDictionary<ulong, CachedRetainer> cacheSnapshot)
+    private void DrawPlan(RetrievalPlan plan, QuartermasterState snapshot, OwnerScope owner, ElementalDepositPlan deposit)
     {
         ImGui.TextUnformatted("Retrieval plan");
         ImGui.SameLine();
@@ -319,7 +308,6 @@ public sealed class QuartermasterWindow : Window
         if (!canExecute)
             ImGui.EndDisabled();
         ImGui.TextDisabled(transferStatus);
-        var deposit = ElementalDepositPlanner.Build(scanner.CountPlayerCrystals(), cacheSnapshot, owner, scanner.ResolveItemName, DateTime.UtcNow);
         DrawDepositReview(deposit, owner);
 
         var lines = plan.Lines.ToDictionary(line => line.PlanItemId);
@@ -367,14 +355,15 @@ public sealed class QuartermasterWindow : Window
         }
     }
 
-    private void DrawListings(BrowserProjection projection)
+    private void DrawListings(BrowserProjection projection, long revision)
     {
         DrawBrowserToolbar(projection, listings: true);
         var result = queries.QueryListings(
             projection,
             workbench.ListingFilter,
             workbench.ScopeKey,
-            workbench.ListingFilterState.IsInputActive);
+            workbench.ListingFilterState.IsInputActive,
+            revision);
         if (!result.Filter.IsValid)
             ImGui.TextColored(new Vector4(1f, .65f, .25f, 1f), result.Filter.Diagnostics.FirstOrDefault()?.Message ?? "Invalid filter");
         if (!ImGui.BeginTable("RQListings", 7, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable, new Vector2(0, ImGui.GetContentRegionAvail().Y)))

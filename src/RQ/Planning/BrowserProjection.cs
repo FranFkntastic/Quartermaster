@@ -99,8 +99,8 @@ public static class BrowserProjectionBuilder
         var stacks = new List<StockStack>();
         var listings = new List<ListingRow>();
         foreach (var bag in playerBags)
-        foreach (var item in bag.Items.Where(item => item.ItemId > 0 && item.Quantity > 0))
-            stacks.Add(new(BrowserScope.PlayerKey, BrowserScopeKind.Player, null, "Player", item.ContainerKey ?? bag.Location ?? bag.BagName, item.SlotIndex, item.ItemId, DisplayName(item.ItemId, item.ItemName), checked((int)item.Quantity), item.IsHq ? FfxivItemQuality.HQ : FfxivItemQuality.NQ, null, item.ItemType, item.ConditionPercent is { } condition ? (decimal)condition : null, item.Equipped));
+            foreach (var item in bag.Items.Where(item => item.ItemId > 0 && item.Quantity > 0))
+                stacks.Add(new(BrowserScope.PlayerKey, BrowserScopeKind.Player, null, "Player", item.ContainerKey ?? bag.Location ?? bag.BagName, item.SlotIndex, item.ItemId, DisplayName(item.ItemId, item.ItemName), checked((int)item.Quantity), item.IsHq ? FfxivItemQuality.HQ : FfxivItemQuality.NQ, null, item.ItemType, item.ConditionPercent is { } condition ? (decimal)condition : null, item.Equipped));
 
         foreach (var retainer in cache.Values.Where(retainer => retainer.Owner.Matches(owner)).OrderBy(retainer => retainer.RetainerName).ThenBy(retainer => retainer.RetainerId))
         {
@@ -108,8 +108,8 @@ public static class BrowserProjectionBuilder
             var name = string.IsNullOrWhiteSpace(retainer.RetainerName) ? $"Retainer {retainer.RetainerId}" : retainer.RetainerName;
             scopes.Add(new(key, name, BrowserScopeKind.Retainer, retainer.RetainerId));
             foreach (var bag in retainer.Bags.Where(bag => bag.BagName is not "RetainerGil" and not "RetainerMarket"))
-            foreach (var item in bag.Items.Where(item => item.ItemId > 0 && item.Quantity > 0))
-                stacks.Add(new(key, BrowserScopeKind.Retainer, retainer.RetainerId, name, item.ContainerKey ?? bag.Location ?? bag.BagName, item.SlotIndex, item.ItemId, DisplayName(item.ItemId, item.ItemName), checked((int)item.Quantity), item.IsHq ? FfxivItemQuality.HQ : FfxivItemQuality.NQ, bag.ObservedAtUtc, item.ItemType, item.ConditionPercent is { } condition ? (decimal)condition : null, item.Equipped));
+                foreach (var item in bag.Items.Where(item => item.ItemId > 0 && item.Quantity > 0))
+                    stacks.Add(new(key, BrowserScopeKind.Retainer, retainer.RetainerId, name, item.ContainerKey ?? bag.Location ?? bag.BagName, item.SlotIndex, item.ItemId, DisplayName(item.ItemId, item.ItemName), checked((int)item.Quantity), item.IsHq ? FfxivItemQuality.HQ : FfxivItemQuality.NQ, bag.ObservedAtUtc, item.ItemType, item.ConditionPercent is { } condition ? (decimal)condition : null, item.Equipped));
             foreach (var listing in retainer.Listings.Where(listing => listing.ItemId > 0 && listing.Quantity > 0))
             {
                 var price = listing.UnitPrice is { } known ? Evidence.Known((decimal)known) : Evidence.Unknown<decimal>("Unit price was not observed.");
@@ -151,35 +151,46 @@ public sealed class BrowserQueryController
     public int ListingCompilationCount => listings.CompilationCount;
     public int ListingEvaluationCount => listings.EvaluationCount;
 
-    public ItemQueryResult QueryItems(BrowserProjection projection, string? expression, string? scopeKey = null, bool isEditing = false)
+    public ItemQueryResult QueryItems(BrowserProjection projection, string? expression, string? scopeKey = null, bool isEditing = false, long revision = 0)
     {
         var source = projection.GetItems(scopeKey);
+        var scopeIdentity = ScopeIdentity(projection, scopeKey);
+        var identity = $"{revision.ToString(CultureInfo.InvariantCulture)}:{scopeIdentity}";
         var context = items.EnsureContext(
-            BrowserProjectionIdentity.CreateContext(source, [], projection.Scopes, scopeKey, projection.Owner),
+            identity,
+            scopeIdentity,
+            isEditing,
             () => CreateItemContext(source, projection.Owner));
         var result = items.Query(
             source,
-            BrowserProjectionIdentity.CreateData(source, []),
+            identity,
             expression,
             context,
             isEditing);
         return new(result.Rows, result.Status);
     }
 
-    public ListingQueryResult QueryListings(BrowserProjection projection, string? expression, string? scopeKey = null, bool isEditing = false)
+    public ListingQueryResult QueryListings(BrowserProjection projection, string? expression, string? scopeKey = null, bool isEditing = false, long revision = 0)
     {
         var source = projection.GetListings(scopeKey);
+        var scopeIdentity = ScopeIdentity(projection, scopeKey);
+        var identity = $"{revision.ToString(CultureInfo.InvariantCulture)}:{scopeIdentity}";
         var context = listings.EnsureContext(
-            BrowserProjectionIdentity.CreateContext([], source, projection.Scopes, scopeKey, projection.Owner),
+            identity,
+            scopeIdentity,
+            isEditing,
             () => CreateListingContext(source, projection.Owner));
         var result = listings.Query(
             source,
-            BrowserProjectionIdentity.CreateData([], source),
+            identity,
             expression,
             context,
             isEditing);
         return new(result.Rows, result.Status);
     }
+
+    private static string ScopeIdentity(BrowserProjection projection, string? scopeKey) =>
+        $"{projection.Owner.LocalContentId}:{projection.Owner.HomeWorldId}:{scopeKey ?? BrowserScope.AllKey}";
 
     public static FilterContext<StockGroup> CreateItemContext(IReadOnlyList<StockGroup> source, OwnerScope owner)
     {
@@ -272,6 +283,7 @@ public sealed class BrowserQueryController
     {
         private FilterContext<T>? context;
         private string? contextIdentity;
+        private string? contextScopeIdentity;
         private FilterCompilation<T>? currentCompilation;
         private string currentExpression = string.Empty;
         private FilterCompilation<T>? evaluatedCompilation;
@@ -285,12 +297,15 @@ public sealed class BrowserQueryController
         public int CompilationCount { get; private set; }
         public int EvaluationCount { get; private set; }
 
-        public FilterContext<T> EnsureContext(string identity, Func<FilterContext<T>> create)
+        public FilterContext<T> EnsureContext(string identity, string scopeIdentity, bool isEditing, Func<FilterContext<T>> create)
         {
-            if (context is null || !string.Equals(identity, contextIdentity, StringComparison.Ordinal))
+            var scopeChanged = !string.Equals(scopeIdentity, contextScopeIdentity, StringComparison.Ordinal);
+            var revisionChanged = !string.Equals(identity, contextIdentity, StringComparison.Ordinal);
+            if (context is null || scopeChanged || (revisionChanged && !isEditing))
             {
                 context = create();
                 contextIdentity = identity;
+                contextScopeIdentity = scopeIdentity;
                 currentCompilation = null;
                 evaluatedCompilation = null;
                 evaluatedRows = [];
@@ -364,147 +379,6 @@ public sealed class BrowserQueryController
             }
 
             return evaluatedRows;
-        }
-    }
-}
-
-internal static class BrowserProjectionIdentity
-{
-    public static string CreateData(
-        IEnumerable<StockGroup> items,
-        IEnumerable<ListingRow> listings)
-    {
-        var hash = new HashCode();
-        foreach (var item in items.OrderBy(item => item.ItemId))
-        {
-            AddDefinition(ref hash, item.Definition);
-            foreach (var stack in item.Stacks
-                         .OrderBy(stack => stack.ScopeKey)
-                         .ThenBy(stack => stack.Storage)
-                         .ThenBy(stack => stack.SlotIndex))
-            {
-                hash.Add(stack.ScopeKey, StringComparer.Ordinal);
-                hash.Add(stack.Storage, StringComparer.Ordinal);
-                hash.Add(stack.SlotIndex);
-                hash.Add(stack.ItemId);
-                hash.Add(stack.ItemName, StringComparer.Ordinal);
-                hash.Add(stack.ItemType, StringComparer.Ordinal);
-                hash.Add(stack.Quantity);
-                hash.Add(stack.Quality);
-                hash.Add(stack.ConditionPercent);
-                hash.Add(stack.Equipped);
-                hash.Add(stack.ObservedAtUtc);
-            }
-        }
-
-        foreach (var listing in listings
-                     .OrderBy(listing => listing.RetainerId)
-                     .ThenBy(listing => listing.ItemId))
-        {
-            hash.Add(listing.ScopeKey, StringComparer.Ordinal);
-            hash.Add(listing.RetainerId);
-            hash.Add(listing.RetainerName, StringComparer.Ordinal);
-            hash.Add(listing.ItemId);
-            hash.Add(listing.ItemName, StringComparer.Ordinal);
-            hash.Add(listing.Quantity);
-            hash.Add(listing.Quality);
-            hash.Add(EvidenceKey(listing.Condition), StringComparer.Ordinal);
-            hash.Add(EvidenceKey(listing.UnitPrice), StringComparer.Ordinal);
-            hash.Add(EvidenceKey(listing.TotalPrice), StringComparer.Ordinal);
-            hash.Add(listing.ObservedAtUtc);
-            AddDefinition(ref hash, listing.Definition);
-        }
-
-        return hash.ToHashCode().ToString("X8", CultureInfo.InvariantCulture);
-    }
-
-    public static string CreateContext(
-        IEnumerable<StockGroup> items,
-        IEnumerable<ListingRow> listings,
-        IEnumerable<BrowserScope> scopes,
-        string? selectedScope,
-        OwnerScope owner)
-    {
-        var hash = new HashCode();
-        hash.Add(selectedScope ?? BrowserScope.AllKey, StringComparer.Ordinal);
-        hash.Add(owner.LocalContentId);
-        hash.Add(owner.HomeWorldId);
-        hash.Add(owner.CharacterName, StringComparer.Ordinal);
-        hash.Add(owner.HomeWorldName, StringComparer.Ordinal);
-
-        foreach (var item in items.OrderBy(item => item.ItemId))
-        {
-            hash.Add(item.ItemId);
-            hash.Add(item.ItemName, StringComparer.Ordinal);
-            AddDefinitionContext(ref hash, item.Definition);
-            foreach (var retainer in item.Stacks
-                         .Where(stack => stack.RetainerId is not null)
-                         .OrderBy(stack => stack.RetainerId)
-                         .ThenBy(stack => stack.OwnerName))
-            {
-                hash.Add(retainer.RetainerId);
-                hash.Add(retainer.OwnerName, StringComparer.Ordinal);
-            }
-        }
-
-        foreach (var listing in listings
-                     .OrderBy(listing => listing.ItemId)
-                     .ThenBy(listing => listing.RetainerId))
-        {
-            hash.Add(listing.ItemId);
-            hash.Add(listing.ItemName, StringComparer.Ordinal);
-            hash.Add(listing.RetainerId);
-            hash.Add(listing.RetainerName, StringComparer.Ordinal);
-            AddDefinitionContext(ref hash, listing.Definition);
-        }
-
-        foreach (var scope in scopes.OrderBy(scope => scope.Key))
-        {
-            hash.Add(scope.Key, StringComparer.Ordinal);
-            hash.Add(scope.Label, StringComparer.Ordinal);
-        }
-
-        return hash.ToHashCode().ToString("X8", CultureInfo.InvariantCulture);
-    }
-
-    private static string EvidenceKey(FieldEvidence<decimal> evidence) => evidence.IsKnown
-        ? $"K:{evidence.Value.ToString(CultureInfo.InvariantCulture)}"
-        : $"U:{evidence.UnknownReason}";
-
-    private static void AddDefinition(ref HashCode hash, ItemMetadata? definition)
-    {
-        if (definition is null)
-        {
-            hash.Add(false);
-            return;
-        }
-
-        hash.Add(true);
-        hash.Add(definition.ItemLevel);
-        hash.Add(definition.EquipLevel);
-        hash.Add(definition.Rarity);
-        hash.Add(definition.UiCategory);
-        hash.Add(definition.IsUnique);
-        hash.Add(definition.IsTradable);
-        hash.Add(definition.IsDesynthesizable);
-        foreach (var job in definition.EligibleJobs ?? [])
-            hash.Add(job.Key);
-        foreach (var slot in definition.Slots ?? [])
-            hash.Add(slot);
-    }
-
-    private static void AddDefinitionContext(ref HashCode hash, ItemMetadata? definition)
-    {
-        if (definition is null)
-            return;
-
-        hash.Add(definition.UiCategory);
-        hash.Add(definition.UiCategoryName, StringComparer.Ordinal);
-        foreach (var job in definition.EligibleJobs ?? [])
-        {
-            hash.Add(job.Key);
-            hash.Add(job.Name, StringComparer.Ordinal);
-            hash.Add(job.Abbreviation, StringComparer.Ordinal);
         }
     }
 }

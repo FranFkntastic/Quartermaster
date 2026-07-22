@@ -133,7 +133,7 @@ public sealed class BrowserTests
             [Bag((100, "Darksteel Ore", 2))],
             new Dictionary<ulong, CachedRetainer> { [10] = retainer },
             TestData.Owner);
-        var editing = controller.QueryItems(changed, "spruce", isEditing: true);
+        var editing = controller.QueryItems(changed, "spruce", isEditing: true, revision: 2);
 
         Assert.Empty(editing.Items);
         Assert.Equal(2, controller.ItemCompilationCount);

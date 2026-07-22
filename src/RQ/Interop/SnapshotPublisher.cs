@@ -2,6 +2,7 @@ using System.Text.Json;
 using RQ.Domain;
 using RQ.Inventory;
 using RQ.Persistence;
+using RQ.Runtime;
 
 namespace RQ.Interop;
 
@@ -40,10 +41,21 @@ public sealed class SnapshotPublisher
 
     public void Refresh(OwnerScope owner, PlayerStorageCapture playerStorage)
     {
+        Refresh(owner, playerStorage, state.Snapshot(), cache());
+    }
+
+    public void Refresh(QuartermasterRuntimeSnapshot runtime) =>
+        Refresh(runtime.Owner, runtime.PlayerStorage, runtime.State, runtime.Retainers);
+
+    private void Refresh(
+        OwnerScope owner,
+        PlayerStorageCapture playerStorage,
+        QuartermasterState stateSnapshot,
+        IReadOnlyDictionary<ulong, CachedRetainer> retainersById)
+    {
         Volatile.Write(ref currentOwner, owner);
-        var stateSnapshot = state.Snapshot();
         var nextRevision = Interlocked.Increment(ref revision);
-        var retainers = cache().Values
+        var retainers = retainersById.Values
             .Where(retainer => owner.Matches(retainer.Owner))
             .OrderBy(retainer => retainer.RetainerName)
             .Select(RetainerContract)
