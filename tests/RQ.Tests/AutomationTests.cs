@@ -60,6 +60,52 @@ public sealed class AutomationTests
     }
 
     [Fact]
+    public void RefreshStart_OpensRetainerListBeforeQueueingAutoRetainerWork()
+    {
+        using var directory = new TemporaryDirectory();
+        var unused = new Func<MethodInfo, object?[]?, object?>((method, _) =>
+            throw new InvalidOperationException($"Unexpected dependency call: {method.Name}."));
+        var framework = CreateProxy<IFramework>((method, arguments) =>
+        {
+            Assert.Equal(nameof(IFramework.RunOnTick), method.Name);
+            var callback = Assert.IsAssignableFrom<Delegate>(arguments![0]);
+            return CreateCompletedTask(method.ReturnType, callback.DynamicInvoke());
+        });
+        var ensureCalls = 0;
+        var session = CreateProxy<IRetainerAutomationSession>((method, _) => method.Name switch
+        {
+            "get_IsRetainerListReady" => false,
+            nameof(IRetainerAutomationSession.EnsureRetainerListAsync) => Task.FromResult(
+                (++ensureCalls, RetainerAutomationResult.Succeeded("RetainerListReady", "Retainer list opened.")).Item2),
+            _ => throw new InvalidOperationException($"Unexpected session call: {method.Name}."),
+        });
+        var log = CreateProxy<IPluginLog>((_, _) => null);
+        var scanner = new InventoryScanner(CreateProxy<IDataManager>(unused), log);
+        using var captures = new RetainerCaptureService(
+            CreateProxy<IAddonLifecycle>(unused),
+            log,
+            scanner,
+            new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory.Path, "retainers.json"))),
+            () => TestData.Owner);
+        using var refresh = new AutoRetainerRefreshService(
+            CreateProxy<Dalamud.Plugin.IDalamudPluginInterface>(unused),
+            framework,
+            log,
+            captures,
+            session,
+            automation: null,
+            autoRetainerAvailable: () => true,
+            countAvailableRetainers: () => 2);
+
+        Assert.True(refresh.Start());
+        Assert.True(SpinWait.SpinUntil(
+            () => refresh.Status == "Retainer refresh queued.",
+            TimeSpan.FromSeconds(2)));
+        Assert.Equal(1, ensureCalls);
+        Assert.True(refresh.IsQueued);
+    }
+
+    [Fact]
     public async Task RetainerLiveDriver_PropagatesCancellationIntoFrameworkWork()
     {
         using var cancellation = new CancellationTokenSource();
@@ -251,6 +297,18 @@ public sealed class AutomationTests
             .GetMethod(nameof(CreateCancellableTaskCore), BindingFlags.NonPublic | BindingFlags.Static)!
             .MakeGenericMethod(resultType)
             .Invoke(null, [cancellationToken])!;
+    }
+
+    private static object CreateCompletedTask(Type taskType, object? result)
+    {
+        if (taskType == typeof(Task))
+            return Task.CompletedTask;
+        var resultType = taskType.GetGenericArguments().Single();
+        return typeof(Task)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(method => method.Name == nameof(Task.FromResult))
+            .MakeGenericMethod(resultType)
+            .Invoke(null, [result])!;
     }
 
     private static async Task<T> CreateCancellableTaskCore<T>(CancellationToken cancellationToken)

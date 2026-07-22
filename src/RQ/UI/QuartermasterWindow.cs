@@ -4,6 +4,7 @@ using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin.Services;
 using Dalamud.Utility;
+using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.UI.Filtering;
 using Lumina.Excel.Sheets;
 using RQ.Automation;
@@ -27,6 +28,7 @@ public sealed class QuartermasterWindow : Window
     private readonly Func<OwnerScope> currentOwner;
     private readonly PluginConfiguration configuration;
     private readonly System.Action saveConfiguration;
+    private readonly AgentBridgeUiReviewRegistry reviewRegistry;
     private readonly WorkbenchState workbench = new();
     private readonly BrowserQueryController queries = new();
     private string itemSearch = string.Empty;
@@ -46,7 +48,8 @@ public sealed class QuartermasterWindow : Window
         IDataManager dataManager,
         Func<OwnerScope> currentOwner,
         PluginConfiguration configuration,
-        System.Action saveConfiguration)
+        System.Action saveConfiguration,
+        AgentBridgeUiReviewRegistry reviewRegistry)
         : base("Quartermaster###RQMain", ImGuiWindowFlags.NoScrollbar)
     {
         this.state = state;
@@ -59,12 +62,26 @@ public sealed class QuartermasterWindow : Window
         this.currentOwner = currentOwner;
         this.configuration = configuration;
         this.saveConfiguration = saveConfiguration;
+        this.reviewRegistry = reviewRegistry;
         Size = new Vector2(1280, 760);
         SizeCondition = ImGuiCond.FirstUseEver;
         SizeConstraints = new WindowSizeConstraints { MinimumSize = new Vector2(760, 520), MaximumSize = new Vector2(float.MaxValue, float.MaxValue) };
     }
 
     public override void Draw()
+    {
+        reviewRegistry.BeginFrame();
+        try
+        {
+            DrawContent();
+        }
+        finally
+        {
+            reviewRegistry.EndFrame();
+        }
+    }
+
+    private void DrawContent()
     {
         var owner = currentOwner();
         var playerBags = scanner.ScanPlayerBags();
@@ -87,6 +104,12 @@ public sealed class QuartermasterWindow : Window
             autoRetainer.Start();
         if (automationBusy)
             ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.refresh-retainers",
+            "Refresh retainers",
+            !automationBusy,
+            () => autoRetainer.Start(),
+            autoRetainer.Status);
         ImGui.SameLine();
         ImGui.TextDisabled(autoRetainer.Status);
 

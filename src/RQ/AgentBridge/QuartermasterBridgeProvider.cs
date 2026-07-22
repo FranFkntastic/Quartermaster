@@ -33,19 +33,25 @@ public sealed class QuartermasterBridgeProvider
     private readonly Func<QuartermasterBridgeTruth> createTruth;
     private readonly Action<string> openMainWindow;
     private readonly Action closeMainWindow;
+    private readonly AgentBridgeUiReviewRegistry reviewRegistry;
 
     public QuartermasterBridgeProvider(
         Func<QuartermasterBridgeTruth> createTruth,
         Action<string> openMainWindow,
-        Action closeMainWindow)
+        Action closeMainWindow,
+        AgentBridgeUiReviewRegistry reviewRegistry)
     {
         this.createTruth = createTruth;
         this.openMainWindow = openMainWindow;
         this.closeMainWindow = closeMainWindow;
+        this.reviewRegistry = reviewRegistry;
     }
 
     public QuartermasterBridgeTruth CreateTruth() => createTruth();
     public IReadOnlyList<AgentBridgeReviewSurfaceDescriptor> GetReviewSurfaces() => ReviewSurfaces;
+    public AgentBridgeUiReviewFrame GetControlSurface() => reviewRegistry.Snapshot();
+    public AgentBridgeUiControlReview ReviewControl(string id) => reviewRegistry.Review(id);
+    public AgentBridgeUiControlInvocation InvokeControl(string id, long frameId) => reviewRegistry.Invoke(id, frameId);
     public bool TryOpenMainWindow(string target)
     {
         if (target.Trim().ToLowerInvariant() is not ("stock" or "stock-and-plan" or "listings" or "operation"))

@@ -127,8 +127,30 @@ public sealed class AgentBridgeHost : IDisposable
                 QuartermasterBridgeTruth? truth = null;
                 await dispatchOnFramework(() => truth = provider.CreateTruth(), cancellationToken).ConfigureAwait(false);
                 return AgentBridgeResponse.Ok("Quartermaster truth captured.", truth);
+            case "get-control-surface":
+                return AgentBridgeResponse.Ok("Control surface captured.", provider.GetControlSurface());
+            case "get-control":
+                if (string.IsNullOrWhiteSpace(request.Target))
+                    return AgentBridgeResponse.Fail("A control ID is required.");
+                var controlReview = provider.ReviewControl(request.Target);
+                return controlReview.Control is null
+                    ? new AgentBridgeResponse { Success = false, Message = "The requested control is not rendered.", Receipt = controlReview }
+                    : AgentBridgeResponse.Ok("Reviewed control captured.", controlReview);
             case "get-review-surfaces":
                 return AgentBridgeResponse.Ok("Review surfaces captured.", provider.GetReviewSurfaces());
+            case "invoke-control":
+                if (string.IsNullOrWhiteSpace(request.Target) || request.FrameId is null)
+                    return AgentBridgeResponse.Fail("Control ID and reviewed frame ID are required.");
+                AgentBridgeUiControlInvocation? invocation = null;
+                await dispatchOnFramework(
+                    () => invocation = provider.InvokeControl(request.Target, request.FrameId.Value),
+                    cancellationToken).ConfigureAwait(false);
+                if (invocation is null)
+                    return AgentBridgeResponse.Fail("Control invocation did not complete on the framework thread.");
+                AppendAudit("invoke-control", invocation.Success ? request.Target : "rejected");
+                return invocation.Success
+                    ? AgentBridgeResponse.Ok(invocation.Message, invocation.Frame)
+                    : AgentBridgeResponse.Fail(invocation.Message);
             case "open-main-window":
                 var opened = false;
                 await dispatchOnFramework(() => opened = provider.TryOpenMainWindow(request.Target ?? "stock"), cancellationToken).ConfigureAwait(false);

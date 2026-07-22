@@ -2,6 +2,7 @@ using Dalamud.Game.Command;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
+using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.Automation.Retainers;
 using RQ.AgentBridge;
 using RQ.Automation;
@@ -36,6 +37,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly ShortageSubmissionService submissions;
     private readonly QuartermasterIpcProvider ipc;
     private readonly AgentBridgeHost agentBridge;
+    private readonly AgentBridgeUiReviewRegistry agentReviewRegistry = new();
     private readonly WindowSystem windows = new("RQ");
     private readonly QuartermasterWindow window;
     private readonly System.Collections.Concurrent.ConcurrentQueue<(string Kind, string? OperationId)> pendingChanges = new();
@@ -107,13 +109,13 @@ public sealed class Plugin : IDalamudPlugin
         snapshots = new(providerInstanceId, state, cache.Snapshot);
         submissions = new ShortageSubmissionService(providerInstanceId, state, workQueue, CurrentOwner);
         ipc = new(new DalamudIpcRegistrar(pluginInterface), snapshots, submissions);
-        window = new(state, cache, scanner, journal, transfers, autoRetainer, dataManager, CurrentOwner, configuration, SaveConfiguration);
+        window = new(state, cache, scanner, journal, transfers, autoRetainer, dataManager, CurrentOwner, configuration, SaveConfiguration, agentReviewRegistry);
         agentBridge = new(
             configuration,
             configDirectory,
             SaveConfiguration,
             DispatchOnFramework,
-            new QuartermasterBridgeProvider(CreateAgentBridgeTruth, window.OpenReviewSurface, () => window.IsOpen = false));
+            new QuartermasterBridgeProvider(CreateAgentBridgeTruth, window.OpenReviewSurface, () => window.IsOpen = false, agentReviewRegistry));
         windows.AddWindow(window);
 
         try
