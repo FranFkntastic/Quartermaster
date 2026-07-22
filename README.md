@@ -14,6 +14,20 @@ Quartermaster is a standalone Dalamud plugin for browsing owner-scoped player an
 
 Use `/rq` to open the workbench. Manual retrieval plans, deposits, and shortage requests without automatic-execution intent require an explicit action in Quartermaster.
 
+## Installation
+
+Add the Gooseworks custom plugin repository in Dalamud, then install **Quartermaster** from the plugin installer:
+
+```text
+https://raw.githubusercontent.com/FranFkntastic/DalamudPlugins/main/pluginmaster.json
+```
+
+Quartermaster also publishes a standalone repository manifest with each GitHub release:
+
+```text
+https://github.com/FranFkntastic/Quartermaster/releases/latest/download/repo.json
+```
+
 ## Build
 
 Quartermaster expects the public `Franthropy` checkout beside this repository.
@@ -30,3 +44,11 @@ dotnet test Quartermaster.slnx -c Release --no-build
 ```
 
 Pass `-SkipBuild` to deploy an existing Release build.
+
+## Release packaging
+
+```powershell
+.\tools\Build-DalamudRelease.ps1
+```
+
+The script creates `dist/latest.zip` and `dist/repo.json` for the version declared in `src/RQ/RQ.csproj`.
