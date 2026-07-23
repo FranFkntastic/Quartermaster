@@ -14,7 +14,8 @@ public sealed record QuartermasterRuntimeSnapshot(
     QuartermasterState State,
     BrowserProjection Browser,
     RetrievalPlan Retrieval,
-    ElementalDepositPlan Deposit);
+    ElementalDepositPlan Deposit,
+    IReadOnlyList<StowageEvaluation> Stowage);
 
 public sealed class QuartermasterRuntimeSnapshotSource
 {
@@ -52,8 +53,10 @@ public sealed class QuartermasterRuntimeSnapshotSource
             .GroupBy(item => item.ItemId)
             .ToDictionary(group => group.Key, group => group.Sum(item => checked((int)item.Quantity)));
         var browser = BrowserProjectionBuilder.Build(playerStorage.Bags, retainers, owner, scanner.ResolveItemMetadata);
-        var retrieval = RestockPlanner.Build(stateSnapshot.PlanItems, playerCounts, retainers, owner, capturedAtUtc);
+        var ownerRules = StowagePlanMigration.OwnerRules(stateSnapshot, owner);
+        var retrieval = RestockPlanner.Build(ownerRules, playerCounts, retainers, owner, capturedAtUtc, browser);
         var deposit = ElementalDepositPlanner.Build(scanner.CountPlayerCrystals(), retainers, owner, scanner.ResolveItemName, capturedAtUtc);
+        var stowage = StowageEvaluator.Build(stateSnapshot, browser, owner);
         var snapshot = new QuartermasterRuntimeSnapshot(
             Interlocked.Increment(ref revision),
             capturedAtUtc,
@@ -63,7 +66,8 @@ public sealed class QuartermasterRuntimeSnapshotSource
             stateSnapshot,
             browser,
             retrieval,
-            deposit);
+            deposit,
+            stowage);
         Volatile.Write(ref current, snapshot);
         return snapshot;
     }

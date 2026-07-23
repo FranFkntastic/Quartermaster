@@ -86,11 +86,16 @@ public sealed class OperationJournal
             Message = "Plan is ready for explicit execution.",
             SourcePlanItems = enabledPlan.Select(Copy).ToList(),
             Lines = enabledPlan
-                .GroupBy(item => item.ItemId)
+                .GroupBy(item => (item.ItemId, item.Quality))
                 .Select(group => new OperationLine
                 {
-                    ItemId = group.Key,
+                    SourcePlanId = group.Select(item => item.StowagePlanId).Distinct().Count() == 1
+                        ? group.First().StowagePlanId
+                        : null,
+                    SourceRuleId = group.Count() == 1 ? group.First().Id : null,
+                    ItemId = group.Key.ItemId,
                     ItemName = group.Select(item => item.ItemName).First(name => !string.IsNullOrWhiteSpace(name)),
+                    Quality = group.Key.Quality,
                     TargetQuantity = group.Sum(item => item.TargetQuantity),
                 })
                 .ToList(),
@@ -149,6 +154,80 @@ public sealed class OperationJournal
         return copy;
     }
 
+    public OperationRecord CreateDeposit(
+        OwnerScope owner,
+        StowageDepositBatch batch,
+        string kind = OperationKinds.QuickDeposit)
+    {
+        if (!owner.HasStableIdentity)
+            throw new InvalidOperationException("Deposit operations require stable owner identity.");
+        if (kind is not (OperationKinds.QuickDeposit or OperationKinds.StowageSurplus))
+            throw new ArgumentOutOfRangeException(nameof(kind));
+
+        var now = utcNow();
+        var routes = batch.Routes.Where(route => route.RoutedQuantity > 0).ToArray();
+        var operation = new OperationRecord
+        {
+            OperationId = $"rq-{Guid.NewGuid():N}",
+            Kind = kind,
+            Owner = owner with { },
+            Status = OperationStatuses.Accepted,
+            Revision = 1,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+            Message = "Reviewed stowage authorization is ready for explicit execution.",
+            Lines = routes
+                .GroupBy(route => (route.Request.ItemId, route.Request.IsHighQuality))
+                .Select(group => new OperationLine
+                {
+                    SourcePlanId = group.Select(route => route.Request.SourcePlanId).Distinct().Count() == 1
+                        ? group.First().Request.SourcePlanId
+                        : null,
+                    SourceRuleId = group.Select(route => route.Request.SourceRuleId).Distinct().Count() == 1
+                        ? group.First().Request.SourceRuleId
+                        : null,
+                    ItemId = group.Key.ItemId,
+                    ItemName = group.Select(route => route.Request.ItemName).First(name => !string.IsNullOrWhiteSpace(name)),
+                    IsHighQuality = group.Key.IsHighQuality,
+                    Quality = group.Key.IsHighQuality ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly,
+                    TargetQuantity = group.Sum(route => route.RoutedQuantity),
+                    ShortageQuantity = group.Sum(route => route.RoutedQuantity),
+                })
+                .ToList(),
+            DepositCandidates = routes
+                .SelectMany(route => route.Allocations.Select(allocation => new
+                {
+                    Route = route,
+                    Allocation = allocation,
+                }))
+                .GroupBy(entry => entry.Allocation.RetainerId)
+                .Select(group => new DepositCandidateAuthorization
+                {
+                    RetainerId = group.Key,
+                    RetainerName = group.First().Allocation.RetainerName,
+                    ObservedAtUtc = group.First().Allocation.ObservedAtUtc,
+                    CapacityByVariant = group
+                        .GroupBy(entry => VariantKey(entry.Route.Request.ItemId, entry.Route.Request.IsHighQuality))
+                        .ToDictionary(
+                            entries => entries.Key,
+                            entries => entries.Sum(entry => entry.Allocation.Quantity)),
+                })
+                .ToList(),
+        };
+        operation.RequestId = operation.OperationId;
+        if (operation.Lines.Count == 0 || operation.DepositCandidates.Count == 0)
+            throw new InvalidOperationException("Stowage batch has no executable reviewed authorization.");
+
+        repository.Mutate(state =>
+        {
+            state.Operations.Add(operation);
+            AddReceipt(state, operation, "StowageAuthorizationPersisted", operation.Message);
+        });
+        var copy = Copy(operation);
+        OperationChanged?.Invoke(copy);
+        return copy;
+    }
+
     public void ArmCacheInvalidation(string operationId, ulong retainerId, OwnerScope owner) => repository.Mutate(state =>
     {
         if (!state.PendingCacheInvalidations.Any(entry => entry.OperationId == operationId && entry.RetainerId == retainerId))
@@ -196,6 +275,94 @@ public sealed class OperationJournal
             if (operation.Status != OperationStatuses.Running)
                 throw new InvalidOperationException("Transfers can only be recorded for a running operation.");
             var line = operation.Lines.Single(candidate => candidate.ItemId == itemId);
+            if (line.TransferredQuantity > line.TargetQuantity - quantity)
+                throw new InvalidOperationException("Verified transfer exceeds persisted operation authorization.");
+            line.TransferredQuantity = checked(line.TransferredQuantity + quantity);
+            operation.Revision = checked(operation.Revision + 1);
+            operation.UpdatedAtUtc = utcNow();
+            state.Receipts.Add(new OperationReceipt
+            {
+                OperationId = operationId,
+                Revision = operation.Revision,
+                OccurredAtUtc = operation.UpdatedAtUtc,
+                Status = operation.Status,
+                Code = code,
+                Message = message,
+                ItemId = itemId,
+                RetainerId = retainerId,
+                Quantity = quantity,
+            });
+            if (clearRetrievalPlanItem)
+                ClearMatchingPlanItems(state, operation, new HashSet<uint> { itemId });
+            changed = Copy(operation);
+        });
+        OperationChanged?.Invoke(changed);
+    }
+
+    public void RecordDepositTransfer(
+        string operationId,
+        uint itemId,
+        bool isHighQuality,
+        ulong retainerId,
+        int quantity,
+        string code,
+        string message)
+    {
+        if (quantity <= 0)
+            throw new ArgumentOutOfRangeException(nameof(quantity));
+        OperationRecord changed = null!;
+        repository.Mutate(state =>
+        {
+            var operation = state.Operations.Single(candidate => candidate.OperationId == operationId);
+            if (operation.Status != OperationStatuses.Running)
+                throw new InvalidOperationException("Transfers can only be recorded for a running operation.");
+            var line = operation.Lines.Single(candidate =>
+                candidate.ItemId == itemId && candidate.IsHighQuality == isHighQuality);
+            if (line.TransferredQuantity > line.TargetQuantity - quantity)
+                throw new InvalidOperationException("Verified transfer exceeds persisted operation authorization.");
+            line.TransferredQuantity = checked(line.TransferredQuantity + quantity);
+            operation.Revision = checked(operation.Revision + 1);
+            operation.UpdatedAtUtc = utcNow();
+            state.Receipts.Add(new OperationReceipt
+            {
+                OperationId = operationId,
+                Revision = operation.Revision,
+                OccurredAtUtc = operation.UpdatedAtUtc,
+                Status = operation.Status,
+                Code = code,
+                Message = message,
+                ItemId = itemId,
+                RetainerId = retainerId,
+                Quantity = quantity,
+            });
+            changed = Copy(operation);
+        });
+        OperationChanged?.Invoke(changed);
+    }
+
+    public void RecordRetrievalTransfer(
+        string operationId,
+        uint itemId,
+        bool isHighQuality,
+        ulong retainerId,
+        int quantity,
+        string code,
+        string message,
+        bool clearRetrievalPlanItem = false)
+    {
+        if (quantity <= 0)
+            throw new ArgumentOutOfRangeException(nameof(quantity));
+        OperationRecord changed = null!;
+        repository.Mutate(state =>
+        {
+            var operation = state.Operations.Single(candidate => candidate.OperationId == operationId);
+            if (operation.Status != OperationStatuses.Running)
+                throw new InvalidOperationException("Transfers can only be recorded for a running operation.");
+            var line = operation.Lines
+                .Where(candidate => candidate.ItemId == itemId && QualityMatches(candidate.Quality, isHighQuality))
+                .OrderBy(candidate => candidate.Quality == ItemQualityPolicy.Any ? 1 : 0)
+                .FirstOrDefault(candidate => candidate.TransferredQuantity < candidate.TargetQuantity)
+                ?? throw new InvalidOperationException("No persisted operation line authorizes this item quality.");
             if (line.TransferredQuantity > line.TargetQuantity - quantity)
                 throw new InvalidOperationException("Verified transfer exceeds persisted operation authorization.");
             line.TransferredQuantity = checked(line.TransferredQuantity + quantity);
@@ -298,11 +465,16 @@ public sealed class OperationJournal
             RetainerName = candidate.RetainerName,
             ObservedAtUtc = candidate.ObservedAtUtc,
             CapacityByItem = candidate.CapacityByItem.ToDictionary(entry => entry.Key, entry => entry.Value),
+            CapacityByVariant = candidate.CapacityByVariant.ToDictionary(entry => entry.Key, entry => entry.Value),
         }).ToList(),
         Lines = operation.Lines.Select(line => new OperationLine
         {
+            SourcePlanId = line.SourcePlanId,
+            SourceRuleId = line.SourceRuleId,
             ItemId = line.ItemId,
             ItemName = line.ItemName,
+            IsHighQuality = line.IsHighQuality,
+            Quality = line.Quality,
             TargetQuantity = line.TargetQuantity,
             ShortageQuantity = line.ShortageQuantity,
             TransferredQuantity = line.TransferredQuantity,
@@ -316,19 +488,39 @@ public sealed class OperationJournal
     }
 
     private static bool Matches(TargetPlanItem current, TargetPlanItem source) =>
+        current.StowagePlanId == source.StowagePlanId &&
         current.ItemId == source.ItemId &&
         current.ItemName == source.ItemName &&
         current.TargetQuantity == source.TargetQuantity &&
+        current.Quality == source.Quality &&
         current.Notes == source.Notes &&
         current.Enabled == source.Enabled;
 
     private static TargetPlanItem Copy(TargetPlanItem item) => new()
     {
         Id = item.Id,
+        StowagePlanId = item.StowagePlanId,
         ItemId = item.ItemId,
         ItemName = item.ItemName,
         TargetQuantity = item.TargetQuantity,
+        Quality = item.Quality,
+        Routing = new StowageRoutingPolicy
+        {
+            Mode = item.Routing?.Mode ?? StowageRoutingMode.ConsolidateFirst,
+            Overflow = item.Routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
+            PreferredRetainerIds = item.Routing?.PreferredRetainerIds.ToList() ?? [],
+        },
         Notes = item.Notes,
         Enabled = item.Enabled,
+    };
+
+    public static string VariantKey(uint itemId, bool isHighQuality) =>
+        $"{itemId}:{(isHighQuality ? "hq" : "nq")}";
+
+    private static bool QualityMatches(ItemQualityPolicy quality, bool isHighQuality) => quality switch
+    {
+        ItemQualityPolicy.NqOnly => !isHighQuality,
+        ItemQualityPolicy.HqOnly => isHighQuality,
+        _ => true,
     };
 }

@@ -100,11 +100,59 @@ public sealed class InventoryItem
 public sealed class TargetPlanItem
 {
     public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid StowagePlanId { get; set; }
     public uint ItemId { get; set; }
     public string ItemName { get; set; } = string.Empty;
     public int TargetQuantity { get; set; }
+    public ItemQualityPolicy Quality { get; set; } = ItemQualityPolicy.Any;
+    public StowageRoutingPolicy Routing { get; set; } = new();
     public string Notes { get; set; } = string.Empty;
     public bool Enabled { get; set; } = true;
+}
+
+public enum ItemQualityPolicy
+{
+    Any,
+    NqOnly,
+    HqOnly,
+}
+
+public enum StowageRoutingMode
+{
+    ConsolidateFirst,
+    HomeFirst,
+}
+
+public enum StowageOverflowPolicy
+{
+    AnyOwnerRetainer,
+    HoldOnPlayer,
+}
+
+public sealed class StowageRoutingPolicy
+{
+    public StowageRoutingMode Mode { get; set; } = StowageRoutingMode.ConsolidateFirst;
+    public List<ulong> PreferredRetainerIds { get; set; } = [];
+    public StowageOverflowPolicy Overflow { get; set; } = StowageOverflowPolicy.AnyOwnerRetainer;
+}
+
+public sealed class StowagePlan
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public long Revision { get; set; } = 1;
+    public OwnerScope Owner { get; set; } = new();
+    public string Name { get; set; } = "General";
+    public bool Enabled { get; set; } = true;
+    public int Priority { get; set; }
+}
+
+public sealed class StowageMigrationRecord
+{
+    public string MigrationId { get; set; } = "target-plan-to-stowage-v1";
+    public Guid PlanId { get; set; }
+    public OwnerScope Owner { get; set; } = new();
+    public int RuleCount { get; set; }
+    public DateTime CompletedAtUtc { get; set; }
 }
 
 public static class OperationStatuses
@@ -126,6 +174,8 @@ public static class OperationKinds
 {
     public const string Retrieval = "retrieval";
     public const string Deposit = "deposit";
+    public const string QuickDeposit = "quick_deposit";
+    public const string StowageSurplus = "stowage_surplus";
 }
 
 public sealed class SubmittedRequestRecord
@@ -159,6 +209,7 @@ public sealed class DepositCandidateAuthorization
     public string RetainerName { get; set; } = string.Empty;
     public DateTime ObservedAtUtc { get; set; }
     public Dictionary<uint, int> CapacityByItem { get; set; } = [];
+    public Dictionary<string, int> CapacityByVariant { get; set; } = [];
 }
 
 public sealed class PendingCacheInvalidation
@@ -170,8 +221,12 @@ public sealed class PendingCacheInvalidation
 
 public sealed class OperationLine
 {
+    public Guid? SourcePlanId { get; set; }
+    public Guid? SourceRuleId { get; set; }
     public uint ItemId { get; set; }
     public string ItemName { get; set; } = string.Empty;
+    public bool IsHighQuality { get; set; }
+    public ItemQualityPolicy Quality { get; set; } = ItemQualityPolicy.Any;
     public int TargetQuantity { get; set; }
     public int ShortageQuantity { get; set; }
     public int TransferredQuantity { get; set; }
@@ -192,8 +247,10 @@ public sealed class OperationReceipt
 
 public sealed class QuartermasterState
 {
-    public string Schema { get; set; } = "gooseworks-quartermaster-state/v1";
+    public string Schema { get; set; } = "gooseworks-quartermaster-state/v2";
     public long Revision { get; set; }
+    public List<StowagePlan> StowagePlans { get; set; } = [];
+    public List<StowageMigrationRecord> StowageMigrations { get; set; } = [];
     public List<TargetPlanItem> PlanItems { get; set; } = [];
     public List<SubmittedRequestRecord> Requests { get; set; } = [];
     public List<OperationRecord> Operations { get; set; } = [];

@@ -11,6 +11,7 @@ using RQ.Interop;
 using RQ.Inventory;
 using RQ.Operations;
 using RQ.Persistence;
+using RQ.Planning;
 using RQ.Runtime;
 using RQ.UI;
 
@@ -88,6 +89,7 @@ public sealed class Plugin : IDalamudPlugin
             configuration.IncludeSaddlebag));
         cache = new(new RetainerCacheStore(cachePath));
         state = new(new QuartermasterStateStore(statePath));
+        StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
         captures = new(addonLifecycle, log, scanner, cache, CurrentOwner);
         var automation = new AutomationLease();
         var retainerSession = new DalamudRetainerAutomationSession(framework, gameGui, dataManager, log, objects, targets, sigScanner);
@@ -203,6 +205,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnFrameworkUpdate(IFramework _)
     {
+        StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
         workQueue.Drain();
         automaticRetrievals.Tick();
         agentBridge.Tick();
@@ -301,8 +304,8 @@ public sealed class Plugin : IDalamudPlugin
             runtime.Owner.HasStableIdentity,
             retainers.Length,
             retainers.Length == 0 ? null : retainers.Min(retainer => new DateTimeOffset(DateTime.SpecifyKind(retainer.ObservedAtUtc, DateTimeKind.Utc))),
-            runtime.State.PlanItems.Count,
-            runtime.State.PlanItems.Count(item => item.Enabled),
+            StowagePlanMigration.OwnerRules(runtime.State, runtime.Owner, enabledPlansOnly: false).Count,
+            StowagePlanMigration.OwnerRules(runtime.State, runtime.Owner).Count(item => item.Enabled),
             operation?.OperationId,
             operation?.Status,
             autoRetainer.IsAvailable,

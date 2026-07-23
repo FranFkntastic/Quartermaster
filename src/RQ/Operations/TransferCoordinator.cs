@@ -18,6 +18,10 @@ public interface IRetainerTransferDriver
     Task OpenInventoryAsync(CancellationToken cancellationToken);
     Task<IReadOnlyList<DalamudInventoryStack>> ScanRetainerAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken);
     Task<RetrievalResult> RetrieveAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken);
+    Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerInventoryAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken) =>
+        Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([]);
+    Task<RetainerDepositResult> DepositAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken) =>
+        Task.FromResult(new RetainerDepositResult(false, 0, "Unsupported", "Ordinary item deposits are not supported by this driver."));
     Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerCrystalsAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken);
     Task<RetainerCrystalTransferResult> DepositCrystalAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken);
     Task CloseRetainerAsync(CancellationToken cancellationToken);
@@ -92,17 +96,25 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                 ItemId = line.ItemId,
                 ItemName = line.ItemName,
                 TargetQuantity = line.TargetQuantity,
+                Quality = line.Quality,
                 Enabled = true,
             }).ToArray();
             var plan = RestockPlanner.Build(rows, playerInventory(), cache.Snapshot(), owner, utcNow());
-            var remaining = plan.Lines.GroupBy(line => line.ItemId).ToDictionary(group => group.Key, group => group.Sum(line => line.NeededQuantity));
+            var remaining = plan.Lines
+                .GroupBy(line => RetrievalKey(line.ItemId, line.Quality))
+                .ToDictionary(group => group.Key, group => group.Sum(line => line.NeededQuantity));
             journal.Transition(
                 operationId,
                 OperationStatuses.Running,
                 "ExecutionStarted",
                 operation.ExecuteImmediately ? "Automatic live retrieval verification started." : "Reviewed live retrieval verification started.");
             if (clearRetrievalPlansAsActioned())
-                journal.ClearSatisfiedRetrievalPlanItems(operationId, remaining.Where(entry => entry.Value <= 0).Select(entry => entry.Key).ToHashSet());
+                journal.ClearSatisfiedRetrievalPlanItems(
+                    operationId,
+                    operation.Lines
+                        .Where(line => remaining.GetValueOrDefault(RetrievalKey(line.ItemId, line.Quality)) <= 0)
+                        .Select(line => line.ItemId)
+                        .ToHashSet());
             if (plan.NeededQuantity == 0)
             {
                 journal.Transition(
@@ -114,7 +126,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         : "Reviewed execution confirmed player inventory already satisfies every target.");
                 return new(true, "Player inventory already satisfies every target.");
             }
-            var candidates = plan.Lines.SelectMany(line => line.Candidates.Select(candidate => (line.ItemId, Candidate: candidate)))
+            var candidates = plan.Lines.SelectMany(line => line.Candidates.Select(candidate => (line.ItemId, line.Quality, Candidate: candidate)))
                 .GroupBy(entry => entry.Candidate.RetainerId)
                 .Select(group => new
                 {
@@ -140,11 +152,18 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                 token.ThrowIfCancellationRequested();
                 retainerOpen = true;
                 await driver.OpenInventoryAsync(token).ConfigureAwait(false);
-                var wanted = candidate.ItemIds.Where(itemId => remaining.GetValueOrDefault(itemId) > 0).ToHashSet();
+                var wanted = candidate.ItemIds.Where(itemId =>
+                    operation.Lines.Any(line =>
+                        line.ItemId == itemId &&
+                        remaining.GetValueOrDefault(RetrievalKey(line.ItemId, line.Quality)) > 0)).ToHashSet();
                 foreach (var stack in await driver.ScanRetainerAsync(wanted, token).ConfigureAwait(false))
                 {
                     token.ThrowIfCancellationRequested();
-                    var quantity = Math.Min(stack.Quantity, remaining.GetValueOrDefault(stack.ItemId));
+                    var exactQuality = stack.IsHighQuality ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly;
+                    var key = RetrievalKey(stack.ItemId, exactQuality);
+                    if (remaining.GetValueOrDefault(key) <= 0)
+                        key = RetrievalKey(stack.ItemId, ItemQualityPolicy.Any);
+                    var quantity = Math.Min(stack.Quantity, remaining.GetValueOrDefault(key));
                     if (quantity <= 0)
                         continue;
                     journal.ArmCacheInvalidation(operationId, candidate.Route.RetainerId, operation.Owner);
@@ -153,17 +172,21 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     token.ThrowIfCancellationRequested();
                     if (!result.Success)
                         throw new InvalidOperationException(result.Message);
-                    remaining[stack.ItemId] -= result.Transferred;
+                    remaining[key] -= result.Transferred;
                     transferred += result.Transferred;
                     RecordInvalidation(operationId, candidate.Route.RetainerId);
-                    journal.RecordTransfer(
+                    journal.RecordRetrievalTransfer(
                         operationId,
                         stack.ItemId,
+                        stack.IsHighQuality,
                         candidate.Route.RetainerId,
                         result.Transferred,
                         result.Code,
                         result.Message,
-                        clearRetrievalPlansAsActioned() && remaining[stack.ItemId] <= 0);
+                        clearRetrievalPlansAsActioned() &&
+                        operation.Lines
+                            .Where(line => line.ItemId == stack.ItemId)
+                            .All(line => remaining.GetValueOrDefault(RetrievalKey(line.ItemId, line.Quality)) <= 0));
                     journal.ResolveCacheInvalidation(operationId, candidate.Route.RetainerId);
                 }
                 await driver.CloseRetainerAsync(token).ConfigureAwait(false);
@@ -231,7 +254,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         {
             token.ThrowIfCancellationRequested();
             var operation = journal.Get(operationId) ?? throw new KeyNotFoundException($"Operation '{operationId}' was not found.");
-            if (operation.Kind != OperationKinds.Deposit)
+            if (operation.Kind is not (OperationKinds.Deposit or OperationKinds.QuickDeposit or OperationKinds.StowageSurplus))
                 throw new InvalidOperationException($"Operation '{operationId}' is '{operation.Kind}', not deposit.");
             if (operation.Status != OperationStatuses.Accepted)
                 throw new InvalidOperationException($"Operation '{operationId}' is '{operation.Status}', not accepted.");
@@ -240,39 +263,78 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                 throw new InvalidOperationException("Operation owner no longer matches current character.");
             if (operation.DepositCandidates.Count == 0 || operation.Lines.Count == 0)
                 throw new InvalidOperationException("Deposit operation has no persisted reviewed authorization.");
-            journal.Transition(operationId, OperationStatuses.Running, "DepositStarted", "Live crystal deposit verification started.");
-            var remaining = operation.Lines.ToDictionary(line => line.ItemId, line => line.TargetQuantity);
+            var legacyCrystalDeposit = operation.Kind == OperationKinds.Deposit;
+            journal.Transition(operationId, OperationStatuses.Running, "DepositStarted", "Live stowage verification started.");
+            var remaining = operation.Lines.ToDictionary(
+                line => OperationJournal.VariantKey(line.ItemId, line.IsHighQuality),
+                line => line.TargetQuantity);
             var transferred = 0;
             await driver.RequireRetainerListAsync(token).ConfigureAwait(false);
             token.ThrowIfCancellationRequested();
             foreach (var source in operation.DepositCandidates)
             {
-                var candidateCapacity = source.CapacityByItem.ToDictionary(entry => entry.Key, entry => entry.Value);
+                var candidateCapacity = legacyCrystalDeposit
+                    ? source.CapacityByItem.ToDictionary(
+                        entry => OperationJournal.VariantKey(entry.Key, false),
+                        entry => entry.Value)
+                    : source.CapacityByVariant.ToDictionary(entry => entry.Key, entry => entry.Value);
                 var candidate = new RetainerRouteCandidate(source.RetainerId, source.RetainerName, source.ObservedAtUtc);
                 await driver.OpenRetainerAsync(candidate, token).ConfigureAwait(false);
                 token.ThrowIfCancellationRequested();
                 retainerOpen = true;
                 await driver.OpenInventoryAsync(token).ConfigureAwait(false);
-                var wanted = remaining.Where(entry => entry.Value > 0 && candidateCapacity.GetValueOrDefault(entry.Key) > 0).Select(entry => entry.Key).ToHashSet();
-                foreach (var stack in await driver.ScanPlayerCrystalsAsync(wanted, token).ConfigureAwait(false))
+                var authorizedKeys = remaining
+                    .Where(entry => entry.Value > 0 && candidateCapacity.GetValueOrDefault(entry.Key) > 0)
+                    .Select(entry => entry.Key)
+                    .ToHashSet(StringComparer.Ordinal);
+                var wanted = operation.Lines
+                    .Where(line => authorizedKeys.Contains(OperationJournal.VariantKey(line.ItemId, line.IsHighQuality)))
+                    .Select(line => line.ItemId)
+                    .ToHashSet();
+                var stacks = legacyCrystalDeposit
+                    ? await driver.ScanPlayerCrystalsAsync(wanted, token).ConfigureAwait(false)
+                    : (await driver.ScanPlayerInventoryAsync(wanted, token).ConfigureAwait(false))
+                        .Concat(await driver.ScanPlayerCrystalsAsync(wanted, token).ConfigureAwait(false))
+                        .ToArray();
+                foreach (var stack in stacks)
                 {
                     token.ThrowIfCancellationRequested();
-                    var authorized = Math.Min(remaining.GetValueOrDefault(stack.ItemId), candidateCapacity.GetValueOrDefault(stack.ItemId));
+                    var key = OperationJournal.VariantKey(stack.ItemId, stack.IsHighQuality);
+                    var authorized = Math.Min(remaining.GetValueOrDefault(key), candidateCapacity.GetValueOrDefault(key));
                     if (authorized <= 0)
                         continue;
                     journal.ArmCacheInvalidation(operationId, candidate.RetainerId, operation.Owner);
                     movementAttempted = true;
-                    var result = await driver.DepositCrystalAsync(stack, Math.Min(stack.Quantity, authorized), token).ConfigureAwait(false);
+                    var quantity = Math.Min(stack.Quantity, authorized);
+                    (bool Success, int Transferred, string Code, string Message) result;
+                    if (stack.Container == FFXIVClientStructs.FFXIV.Client.Game.InventoryType.Crystals)
+                    {
+                        var crystal = await driver.DepositCrystalAsync(stack, quantity, token).ConfigureAwait(false);
+                        result = (crystal.Success, crystal.Transferred, crystal.Code, crystal.Message);
+                    }
+                    else
+                    {
+                        var item = await driver.DepositAsync(stack, quantity, token).ConfigureAwait(false);
+                        result = (item.Success, item.Transferred, item.Code, item.Message);
+                    }
                     token.ThrowIfCancellationRequested();
+                    if (!result.Success && result.Code == "NoCapacity")
+                    {
+                        journal.ResolveCacheInvalidation(operationId, candidate.RetainerId);
+                        continue;
+                    }
                     if (!result.Success)
                         throw new InvalidOperationException(result.Message);
                     if (result.Transferred == 0)
                         continue;
-                    remaining[stack.ItemId] -= result.Transferred;
-                    candidateCapacity[stack.ItemId] -= result.Transferred;
+                    remaining[key] -= result.Transferred;
+                    candidateCapacity[key] -= result.Transferred;
                     transferred += result.Transferred;
                     RecordInvalidation(operationId, candidate.RetainerId);
-                    journal.RecordTransfer(operationId, stack.ItemId, candidate.RetainerId, result.Transferred, result.Code, result.Message);
+                    if (legacyCrystalDeposit)
+                        journal.RecordTransfer(operationId, stack.ItemId, candidate.RetainerId, result.Transferred, result.Code, result.Message);
+                    else
+                        journal.RecordDepositTransfer(operationId, stack.ItemId, stack.IsHighQuality, candidate.RetainerId, result.Transferred, result.Code, result.Message);
                     journal.ResolveCacheInvalidation(operationId, candidate.RetainerId);
                 }
                 await driver.CloseRetainerAsync(token).ConfigureAwait(false);
@@ -284,7 +346,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             journal.Transition(operationId,
                 missing == 0 ? OperationStatuses.Succeeded : transferred > 0 ? OperationStatuses.PartiallySucceeded : OperationStatuses.Failed,
                 missing == 0 ? "DepositComplete" : "DepositPartial",
-                $"Deposited {transferred:N0} elemental units; {missing:N0} remain on character.");
+                $"Stowed {transferred:N0} units; {missing:N0} remain on character.");
             return new(true, missing == 0 ? "Deposit completed." : "Deposit completed with remaining units.");
         }
         catch (OperationCanceledException)
@@ -383,6 +445,9 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         }
         cancellation.Dispose();
     }
+
+    private static string RetrievalKey(uint itemId, ItemQualityPolicy quality) =>
+        $"{itemId}:{quality}";
 
     private void InvalidateOwnerEvidence(string operationId, OwnerScope owner)
     {

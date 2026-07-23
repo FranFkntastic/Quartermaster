@@ -9,6 +9,7 @@ using Franthropy.Dalamud.UI.Filtering;
 using Lumina.Excel.Sheets;
 using RQ.Automation;
 using RQ.Domain;
+using RQ.Inventory;
 using RQ.Operations;
 using RQ.Persistence;
 using RQ.Planning;
@@ -29,6 +30,7 @@ public sealed class QuartermasterWindow : Window
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
     private readonly WorkbenchState workbench = new();
     private readonly BrowserQueryController queries = new();
+    private readonly Dictionary<(uint ItemId, bool IsHighQuality), QuickDepositSelection> quickDeposits = [];
     private string itemSearch = string.Empty;
     private int newTarget = 1;
     private ItemChoice? selectedChoice;
@@ -167,27 +169,28 @@ public sealed class QuartermasterWindow : Window
         var available = ImGui.GetContentRegionAvail();
         var leftWidth = Math.Clamp(available.X * 0.45f, 340f, available.X - 360f);
         if (ImGui.BeginChild("RQStock", new Vector2(leftWidth, 0), true))
-            DrawStock(runtime.Browser, runtime.Revision);
+            DrawStock(runtime);
         ImGui.EndChild();
         ImGui.SameLine();
         if (ImGui.BeginChild("RQPlan", Vector2.Zero, true))
-            DrawPlan(runtime.Retrieval, runtime.State, runtime.Owner, runtime.Deposit);
+            DrawPlan(runtime);
         ImGui.EndChild();
     }
 
-    private void DrawStock(BrowserProjection projection, long revision)
+    private void DrawStock(QuartermasterRuntimeSnapshot runtime)
     {
+        var projection = runtime.Browser;
         DrawBrowserToolbar(projection, listings: false);
         var result = queries.QueryItems(
             projection,
             workbench.ItemFilter,
             workbench.ScopeKey,
             workbench.ItemFilterState.IsInputActive,
-            revision);
+            runtime.Revision);
         if (!result.Filter.IsValid)
             ImGui.TextColored(new Vector4(1f, .65f, .25f, 1f), result.Filter.Diagnostics.FirstOrDefault()?.Message ?? "Invalid filter");
 
-        DrawNameFirstAdd();
+        DrawNameFirstAdd(runtime.Owner);
         if (workbench.SelectedStock is { } selected)
         {
             ImGui.TextUnformatted(selected.ItemName);
@@ -199,7 +202,30 @@ public sealed class QuartermasterWindow : Window
             ImGui.SameLine();
             if (ImGui.Button("Add / update") && workbench.StagedTarget is { } target && target > 0)
             {
-                state.Mutate(document => WithdrawalPlanStager.TryUpsert(document.PlanItems, selected, target));
+                state.Mutate(document =>
+                {
+                    var plan = StowagePlanMigration.OwnerPlan(document, runtime.Owner)
+                        ?? throw new InvalidOperationException("Owner Stowage Plan is unavailable.");
+                    var existing = document.PlanItems.FirstOrDefault(rule =>
+                        rule.StowagePlanId == plan.Id && rule.ItemId == selected.ItemId);
+                    if (existing is null)
+                    {
+                        document.PlanItems.Add(new TargetPlanItem
+                        {
+                            StowagePlanId = plan.Id,
+                            ItemId = selected.ItemId,
+                            ItemName = selected.ItemName,
+                            TargetQuantity = target,
+                        });
+                    }
+                    else
+                    {
+                        existing.ItemName = selected.ItemName;
+                        existing.TargetQuantity = target;
+                        existing.Enabled = true;
+                    }
+                    plan.Revision = checked(plan.Revision + 1);
+                });
                 workbench.ClearSelection();
             }
         }
@@ -212,7 +238,7 @@ public sealed class QuartermasterWindow : Window
         ImGui.TableSetupColumn("Player", ImGuiTableColumnFlags.WidthFixed, 58);
         ImGui.TableSetupColumn("Retainers", ImGuiTableColumnFlags.WidthFixed, 70);
         ImGui.TableSetupColumn("Sources", ImGuiTableColumnFlags.WidthStretch, 1.2f);
-        ImGui.TableSetupColumn("Observed", ImGuiTableColumnFlags.WidthFixed, 72);
+        ImGui.TableSetupColumn("Quick deposit", ImGuiTableColumnFlags.WidthFixed, 88);
         ImGui.TableHeadersRow();
         foreach (var item in SortItems(result.Items))
         {
@@ -227,7 +253,10 @@ public sealed class QuartermasterWindow : Window
             ImGui.TableNextColumn(); ImGui.TextUnformatted(item.PlayerQuantity.ToString("N0"));
             ImGui.TableNextColumn(); ImGui.TextUnformatted(item.RetainerQuantity.ToString("N0"));
             ImGui.TableNextColumn(); ImGui.TextUnformatted(string.Join(", ", item.Stacks.Select(stack => stack.OwnerName).Distinct().Take(2)));
-            ImGui.TableNextColumn(); DrawAge(item.Stacks.Where(stack => stack.ObservedAtUtc is not null).Select(stack => stack.ObservedAtUtc!.Value).DefaultIfEmpty().Min());
+            ImGui.TableNextColumn();
+            var playerStacks = item.Stacks.Where(stack => stack.ScopeKind == BrowserScopeKind.Player).ToArray();
+            if (playerStacks.Length > 0 && ImGui.SmallButton($"Stage##quick{item.ItemId}"))
+                StageQuickDeposit(item);
             if (workbench.IsExpanded(item.ItemId))
             {
                 foreach (var stack in item.Stacks)
@@ -238,14 +267,16 @@ public sealed class QuartermasterWindow : Window
                     ImGui.TableNextColumn(); ImGui.TextDisabled(stack.ScopeKind == BrowserScopeKind.Player ? stack.Quantity.ToString("N0") : "-");
                     ImGui.TableNextColumn(); ImGui.TextDisabled(stack.ScopeKind == BrowserScopeKind.Retainer ? stack.Quantity.ToString("N0") : "-");
                     ImGui.TableNextColumn(); ImGui.TextDisabled($"{stack.OwnerName} · {stack.Quality}");
-                    ImGui.TableNextColumn(); DrawAge(stack.ObservedAtUtc ?? default);
+                    ImGui.TableNextColumn();
+                    if (stack.ScopeKind == BrowserScopeKind.Player && ImGui.SmallButton($"Stage##quick{item.ItemId}:{stack.Storage}:{stack.SlotIndex}"))
+                        StageQuickDeposit(item, stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ);
                 }
             }
         }
         ImGui.EndTable();
     }
 
-    private void DrawNameFirstAdd()
+    private void DrawNameFirstAdd(OwnerScope owner)
     {
         ImGui.SetNextItemWidth(-1);
         if (ImGui.InputTextWithHint("##RQItemName", "Add item by name", ref itemSearch, 96))
@@ -269,15 +300,25 @@ public sealed class QuartermasterWindow : Window
                 var choice = selectedChoice;
                 state.Mutate(document =>
                 {
-                    var existing = document.PlanItems.FirstOrDefault(item => item.ItemId == choice.ItemId);
+                    var plan = StowagePlanMigration.OwnerPlan(document, owner)
+                        ?? throw new InvalidOperationException("Owner Stowage Plan is unavailable.");
+                    var existing = document.PlanItems.FirstOrDefault(item =>
+                        item.StowagePlanId == plan.Id && item.ItemId == choice.ItemId);
                     if (existing is null)
-                        document.PlanItems.Add(new TargetPlanItem { ItemId = choice.ItemId, ItemName = choice.Name, TargetQuantity = newTarget });
+                        document.PlanItems.Add(new TargetPlanItem
+                        {
+                            StowagePlanId = plan.Id,
+                            ItemId = choice.ItemId,
+                            ItemName = choice.Name,
+                            TargetQuantity = newTarget,
+                        });
                     else
                     {
                         existing.ItemName = choice.Name;
                         existing.TargetQuantity = newTarget;
                         existing.Enabled = true;
                     }
+                    plan.Revision = checked(plan.Revision + 1);
                 });
                 selectedChoice = null;
                 itemSearch = string.Empty;
@@ -286,11 +327,18 @@ public sealed class QuartermasterWindow : Window
         }
     }
 
-    private void DrawPlan(RetrievalPlan plan, QuartermasterState snapshot, OwnerScope owner, ElementalDepositPlan deposit)
+    private void DrawPlan(QuartermasterRuntimeSnapshot runtime)
     {
-        ImGui.TextUnformatted("Retrieval plan");
+        var snapshot = runtime.State;
+        var owner = runtime.Owner;
+        var plan = runtime.Retrieval;
+        var stowage = runtime.Stowage.FirstOrDefault();
+        var ownerRules = StowagePlanMigration.OwnerRules(snapshot, owner, enabledPlansOnly: false);
+        DrawQuickDeposit(runtime, ownerRules);
+        ImGui.Separator();
+        ImGui.TextUnformatted($"Stowage plan · {stowage?.PlanName ?? "General"}");
         ImGui.SameLine();
-        ImGui.TextDisabled($"need {plan.NeededQuantity:N0} | covered {plan.CoveredQuantity:N0} | missing {plan.MissingQuantity:N0}");
+        ImGui.TextDisabled($"retrieve {stowage?.RetrieveQuantity ?? 0:N0} | stow {stowage?.DepositQuantity ?? 0:N0}");
         var clearAsActioned = configuration.ClearRetrievalPlansAsActioned;
         if (ImGui.Checkbox("Clear satisfied lines as actioned", ref clearAsActioned))
         {
@@ -302,29 +350,42 @@ public sealed class QuartermasterWindow : Window
             ImGui.BeginDisabled();
         if (ImGui.Button($"Execute reviewed plan ({plan.NeededQuantity:N0})"))
         {
-            var operation = journal.CreateManual(owner, snapshot.PlanItems, OperationKinds.Retrieval);
+            var operation = journal.CreateManual(owner, ownerRules, OperationKinds.Retrieval);
             StartTransfer(transfers.ExecuteRetrievalAsync(operation.OperationId));
         }
         if (!canExecute)
             ImGui.EndDisabled();
+        ImGui.SameLine();
+        var surplusBatch = BuildSurplusBatch(runtime, stowage);
+        var canStow = surplusBatch.PlannedQuantity > 0 && owner.HasStableIdentity && transfers.CanStart && !autoRetainer.IsRefreshing && !autoRetainer.IsQueued;
+        if (!canStow)
+            ImGui.BeginDisabled();
+        if (ImGui.Button($"Stow surplus ({surplusBatch.PlannedQuantity:N0})"))
+        {
+            var operation = journal.CreateDeposit(owner, surplusBatch, OperationKinds.StowageSurplus);
+            StartTransfer(transfers.ExecuteDepositAsync(operation.OperationId));
+        }
+        if (!canStow)
+            ImGui.EndDisabled();
         ImGui.TextDisabled(transferStatus);
-        DrawDepositReview(deposit, owner);
 
         var lines = plan.Lines.ToDictionary(line => line.PlanItemId);
+        var stowageLines = stowage?.Lines.ToDictionary(line => line.RuleId) ?? [];
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
         if (ImGui.BeginTable("RQPlanTable", 7, flags, new Vector2(0, Math.Max(220, ImGui.GetContentRegionAvail().Y))))
         {
             ImGui.TableSetupColumn("On", ImGuiTableColumnFlags.WidthFixed, 30);
             ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.7f);
-            ImGui.TableSetupColumn("Notes", ImGuiTableColumnFlags.WidthStretch, 1.2f);
             ImGui.TableSetupColumn("Have / target", ImGuiTableColumnFlags.WidthFixed, 112);
-            ImGui.TableSetupColumn("Retrieval", ImGuiTableColumnFlags.WidthFixed, 104);
-            ImGui.TableSetupColumn("Sources", ImGuiTableColumnFlags.WidthStretch, 1.2f);
+            ImGui.TableSetupColumn("Action", ImGuiTableColumnFlags.WidthFixed, 104);
+            ImGui.TableSetupColumn("Destination", ImGuiTableColumnFlags.WidthStretch, 1.2f);
+            ImGui.TableSetupColumn("Notes", ImGuiTableColumnFlags.WidthStretch, 1.2f);
             ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 55);
             ImGui.TableHeadersRow();
-            foreach (var item in snapshot.PlanItems)
+            foreach (var item in ownerRules)
             {
                 lines.TryGetValue(item.Id, out var line);
+                stowageLines.TryGetValue(item.Id, out var stowageLine);
                 ImGui.TableNextRow();
                 ImGui.TableNextColumn();
                 var enabled = item.Enabled;
@@ -332,24 +393,37 @@ public sealed class QuartermasterWindow : Window
                     UpdatePlan(item.Id, target => target.Enabled = enabled);
                 ImGui.TableNextColumn();
                 ImGui.TextUnformatted(item.ItemName);
+                ImGui.SameLine();
+                DrawRuleQuality(item);
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted($"{stowageLine?.PlayerQuantity ?? 0:N0} /"); ImGui.SameLine();
+                var targetQuantity = item.TargetQuantity;
+                ImGui.SetNextItemWidth(-1);
+                if (ImGui.InputInt($"##target{item.Id}", ref targetQuantity))
+                    UpdatePlan(item.Id, target => target.TargetQuantity = Math.Max(1, targetQuantity));
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted(stowageLine?.Action switch
+                {
+                    StowageAction.Retrieve => $"Retrieve {stowageLine.RetrieveQuantity:N0}",
+                    StowageAction.Deposit => $"Stow {stowageLine.DepositQuantity:N0}",
+                    _ => "Hold",
+                });
+                ImGui.TableNextColumn();
+                DrawRuleDestination(item, runtime.Retainers, owner);
                 ImGui.TableNextColumn();
                 var notes = item.Notes;
                 ImGui.SetNextItemWidth(-1);
                 if (ImGui.InputTextWithHint($"##notes{item.Id}", "Notes", ref notes, 240))
                     UpdatePlan(item.Id, target => target.Notes = notes);
                 ImGui.TableNextColumn();
-                ImGui.TextUnformatted($"{line?.PlayerQuantity ?? 0:N0} /"); ImGui.SameLine();
-                var targetQuantity = item.TargetQuantity;
-                ImGui.SetNextItemWidth(-1);
-                if (ImGui.InputInt($"##target{item.Id}", ref targetQuantity))
-                    UpdatePlan(item.Id, target => target.TargetQuantity = Math.Max(1, targetQuantity));
-                ImGui.TableNextColumn();
-                ImGui.TextUnformatted(line is null ? "Disabled" : $"{line.NeededQuantity:N0} need / {line.MissingQuantity:N0} missing");
-                ImGui.TableNextColumn();
-                ImGui.TextUnformatted(line is null ? "-" : string.Join(", ", line.Candidates.Select(candidate => candidate.RetainerName).Take(2)));
-                ImGui.TableNextColumn();
                 if (ImGui.SmallButton($"Remove##{item.Id}"))
-                    state.Mutate(document => document.PlanItems.RemoveAll(target => target.Id == item.Id));
+                    state.Mutate(document =>
+                    {
+                        document.PlanItems.RemoveAll(target => target.Id == item.Id);
+                        var changedPlan = document.StowagePlans.FirstOrDefault(candidate => candidate.Id == item.StowagePlanId);
+                        if (changedPlan is not null)
+                            changedPlan.Revision = checked(changedPlan.Revision + 1);
+                    });
             }
             ImGui.EndTable();
         }
@@ -366,9 +440,9 @@ public sealed class QuartermasterWindow : Window
             revision);
         if (!result.Filter.IsValid)
             ImGui.TextColored(new Vector4(1f, .65f, .25f, 1f), result.Filter.Diagnostics.FirstOrDefault()?.Message ?? "Invalid filter");
-        if (!ImGui.BeginTable("RQListings", 7, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable, new Vector2(0, ImGui.GetContentRegionAvail().Y)))
+        if (!ImGui.BeginTable("RQListings", 6, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable, new Vector2(0, ImGui.GetContentRegionAvail().Y)))
             return;
-        ImGui.TableSetupColumn("Item"); ImGui.TableSetupColumn("Retainer"); ImGui.TableSetupColumn("Qty"); ImGui.TableSetupColumn("Quality"); ImGui.TableSetupColumn("Unit price"); ImGui.TableSetupColumn("Total"); ImGui.TableSetupColumn("Observed");
+        ImGui.TableSetupColumn("Item"); ImGui.TableSetupColumn("Retainer"); ImGui.TableSetupColumn("Qty"); ImGui.TableSetupColumn("Quality"); ImGui.TableSetupColumn("Unit price"); ImGui.TableSetupColumn("Total");
         ImGui.TableHeadersRow();
         foreach (var listing in SortListings(result.Listings))
         {
@@ -379,7 +453,6 @@ public sealed class QuartermasterWindow : Window
             ImGui.TableNextColumn(); ImGui.TextUnformatted(listing.Quality.ToString());
             ImGui.TableNextColumn(); ImGui.TextUnformatted(listing.UnitPrice.IsKnown ? $"{listing.UnitPrice.Value:N0}" : "Unknown");
             ImGui.TableNextColumn(); ImGui.TextUnformatted(listing.TotalPrice.IsKnown ? $"{listing.TotalPrice.Value:N0}" : "Unknown");
-            ImGui.TableNextColumn(); DrawAge(listing.ObservedAtUtc ?? default);
         }
         ImGui.EndTable();
     }
@@ -456,7 +529,7 @@ public sealed class QuartermasterWindow : Window
 
     private void DrawSortControl(bool listings)
     {
-        var options = listings ? new[] { "Item", "Retainer", "Quantity", "Price", "Observed" } : new[] { "Name", "Total", "Player", "Retainers", "Observed" };
+        var options = listings ? new[] { "Item", "Retainer", "Quantity", "Price" } : new[] { "Name", "Total", "Player", "Retainers" };
         var selected = listings ? workbench.ListingSort : workbench.ItemSort;
         ImGui.SetNextItemWidth(125);
         if (ImGui.BeginCombo($"Sort##{listings}", selected))
@@ -491,7 +564,6 @@ public sealed class QuartermasterWindow : Window
             "Total" => rows.OrderBy(row => row.TotalQuantity),
             "Player" => rows.OrderBy(row => row.PlayerQuantity),
             "Retainers" => rows.OrderBy(row => row.RetainerQuantity),
-            "Observed" => rows.OrderBy(row => row.Stacks.Where(stack => stack.ObservedAtUtc is not null).Select(stack => stack.ObservedAtUtc).DefaultIfEmpty().Min()),
             _ => rows.OrderBy(row => row.ItemName, StringComparer.OrdinalIgnoreCase),
         };
         return (workbench.ItemSortDescending ? sorted.Reverse() : sorted).ToArray();
@@ -504,46 +576,280 @@ public sealed class QuartermasterWindow : Window
             "Retainer" => rows.OrderBy(row => row.RetainerName, StringComparer.OrdinalIgnoreCase),
             "Quantity" => rows.OrderBy(row => row.Quantity),
             "Price" => rows.OrderBy(row => row.UnitPrice.IsKnown ? row.UnitPrice.Value : decimal.MaxValue),
-            "Observed" => rows.OrderBy(row => row.ObservedAtUtc),
             _ => rows.OrderBy(row => row.ItemName, StringComparer.OrdinalIgnoreCase),
         };
         return (workbench.ListingSortDescending ? sorted.Reverse() : sorted).ToArray();
     }
 
-    private void DrawDepositReview(ElementalDepositPlan deposit, OwnerScope owner)
+    private void StageQuickDeposit(StockGroup item, bool? highQuality = null)
     {
-        if (!ImGui.CollapsingHeader(
-                $"Crystal deposit review | {deposit.PlayerQuantity:N0} carried | {deposit.PlannedQuantity:N0} planned | {deposit.Lines.Sum(line => line.RemainingQuantity):N0} remain",
-                ImGuiTreeNodeFlags.DefaultOpen))
-            return;
-        if (deposit.UnknownCrystalCacheCount > 0)
-            ImGui.TextColored(new Vector4(1f, .65f, .25f, 1f), $"{deposit.UnknownCrystalCacheCount:N0} retainers have unknown crystal capacity and are excluded until refreshed.");
-        if (ImGui.BeginTable("RQDepositReview", 5, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.SizingStretchProp))
+        foreach (var variant in item.Stacks
+                     .Where(stack => stack.ScopeKind == BrowserScopeKind.Player)
+                     .Where(stack => highQuality is null ||
+                                     (stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ) == highQuality)
+                     .GroupBy(stack => stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ))
         {
-            ImGui.TableSetupColumn("Item"); ImGui.TableSetupColumn("Carried"); ImGui.TableSetupColumn("Capacity"); ImGui.TableSetupColumn("Planned"); ImGui.TableSetupColumn("Remain"); ImGui.TableHeadersRow();
-            foreach (var line in deposit.Lines)
+            var quantity = variant.Sum(stack => stack.Quantity);
+            if (quantity <= 0)
+                continue;
+            var key = (item.ItemId, variant.Key);
+            quickDeposits[key] = new QuickDepositSelection(
+                item.ItemId,
+                item.ItemName,
+                variant.Key,
+                quantity,
+                quantity,
+                null);
+        }
+    }
+
+    private void DrawQuickDeposit(
+        QuartermasterRuntimeSnapshot runtime,
+        IReadOnlyList<TargetPlanItem> ownerRules)
+    {
+        var batch = BuildQuickDepositBatch(runtime, ownerRules);
+        ImGui.TextUnformatted("Quick Deposit");
+        ImGui.SameLine();
+        ImGui.TextDisabled(quickDeposits.Count == 0
+            ? "Stage carried items from the stock table."
+            : $"{batch.PlannedQuantity:N0} ready · {batch.RemainingQuantity:N0} stay with you");
+        if (quickDeposits.Count == 0)
+            return;
+
+        if (ImGui.BeginTable("RQQuickDeposit", 5, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.SizingStretchProp))
+        {
+            ImGui.TableSetupColumn("Item");
+            ImGui.TableSetupColumn("Quantity", ImGuiTableColumnFlags.WidthFixed, 92);
+            ImGui.TableSetupColumn("After", ImGuiTableColumnFlags.WidthFixed, 58);
+            ImGui.TableSetupColumn("Destination");
+            ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 55);
+            ImGui.TableHeadersRow();
+            foreach (var entry in quickDeposits.ToArray())
             {
+                var selection = entry.Value;
                 ImGui.TableNextRow();
-                ImGui.TableNextColumn(); ImGui.TextUnformatted(line.ItemName);
-                ImGui.TableNextColumn(); ImGui.TextUnformatted(line.PlayerQuantity.ToString("N0"));
-                ImGui.TableNextColumn(); ImGui.TextUnformatted(line.Capacity.ToString("N0"));
-                ImGui.TableNextColumn(); ImGui.TextUnformatted(line.PlannedQuantity.ToString("N0"));
-                ImGui.TableNextColumn(); ImGui.TextUnformatted(line.RemainingQuantity.ToString("N0"));
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted($"{selection.ItemName}{(selection.IsHighQuality ? " HQ" : string.Empty)}");
+                ImGui.TableNextColumn();
+                var quantity = selection.Quantity;
+                ImGui.SetNextItemWidth(-1);
+                if (ImGui.InputInt($"##quickqty{selection.ItemId}:{selection.IsHighQuality}", ref quantity))
+                    quickDeposits[entry.Key] = selection with { Quantity = Math.Clamp(quantity, 1, selection.AvailableQuantity) };
+                ImGui.TableNextColumn();
+                var after = Math.Max(0, selection.AvailableQuantity - selection.Quantity);
+                ImGui.TextUnformatted(after.ToString("N0"));
+                var matchingRule = ownerRules.FirstOrDefault(rule =>
+                    rule.ItemId == selection.ItemId &&
+                    rule.Enabled &&
+                    (rule.Quality == ItemQualityPolicy.Any ||
+                     rule.Quality == (selection.IsHighQuality ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly)));
+                if (matchingRule is not null && after < matchingRule.TargetQuantity)
+                {
+                    ImGui.SameLine();
+                    ImGui.TextColored(new Vector4(1f, .65f, .25f, 1f), "below target");
+                }
+                ImGui.TableNextColumn();
+                DrawQuickDestination(entry.Key, selection, runtime.Retainers, runtime.Owner);
+                ImGui.TableNextColumn();
+                if (ImGui.SmallButton($"Remove##quick{selection.ItemId}:{selection.IsHighQuality}"))
+                    quickDeposits.Remove(entry.Key);
             }
             ImGui.EndTable();
         }
-        var canDeposit = owner.HasStableIdentity && deposit.CanRun && transfers.CanStart && !autoRetainer.IsRefreshing && !autoRetainer.IsQueued;
+
+        batch = BuildQuickDepositBatch(runtime, ownerRules);
+        var canDeposit = runtime.Owner.HasStableIdentity &&
+                         batch.PlannedQuantity > 0 &&
+                         transfers.CanStart &&
+                         !autoRetainer.IsRefreshing &&
+                         !autoRetainer.IsQueued;
         if (!canDeposit)
             ImGui.BeginDisabled();
-        if (ImGui.Button($"Deposit reviewed crystals ({deposit.PlannedQuantity:N0})"))
+        if (ImGui.Button($"Deposit selected ({batch.PlannedQuantity:N0})"))
         {
-            var operation = journal.CreateDeposit(owner, deposit);
+            var operation = journal.CreateDeposit(runtime.Owner, batch, OperationKinds.QuickDeposit);
+            quickDeposits.Clear();
             StartTransfer(transfers.ExecuteDepositAsync(operation.OperationId));
         }
         if (!canDeposit)
             ImGui.EndDisabled();
-        ImGui.SameLine(); ImGui.TextDisabled($"{deposit.Candidates.Count:N0} candidate retainers");
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Clear"))
+            quickDeposits.Clear();
     }
+
+    private void DrawQuickDestination(
+        (uint ItemId, bool IsHighQuality) key,
+        QuickDepositSelection selection,
+        IReadOnlyDictionary<ulong, CachedRetainer> retainers,
+        OwnerScope owner)
+    {
+        var choices = retainers.Values
+            .Where(retainer => retainer.Owner.Matches(owner))
+            .OrderBy(retainer => retainer.RetainerName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(retainer => retainer.RetainerId)
+            .ToArray();
+        var label = selection.DestinationOverride is { } id
+            ? choices.FirstOrDefault(retainer => retainer.RetainerId == id)?.RetainerName ?? "Unavailable"
+            : "Use plan routing";
+        ImGui.SetNextItemWidth(-1);
+        if (!ImGui.BeginCombo($"##quickdestination{selection.ItemId}:{selection.IsHighQuality}", label))
+            return;
+        if (ImGui.Selectable("Use plan routing", selection.DestinationOverride is null))
+            quickDeposits[key] = selection with { DestinationOverride = null };
+        foreach (var retainer in choices)
+            if (ImGui.Selectable(retainer.RetainerName, selection.DestinationOverride == retainer.RetainerId))
+                quickDeposits[key] = selection with { DestinationOverride = retainer.RetainerId };
+        ImGui.EndCombo();
+    }
+
+    private void DrawRuleDestination(
+        TargetPlanItem rule,
+        IReadOnlyDictionary<ulong, CachedRetainer> retainers,
+        OwnerScope owner)
+    {
+        var choices = retainers.Values
+            .Where(retainer => retainer.Owner.Matches(owner))
+            .OrderBy(retainer => retainer.RetainerName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(retainer => retainer.RetainerId)
+            .ToArray();
+        var preferred = rule.Routing?.PreferredRetainerIds.FirstOrDefault() ?? 0;
+        var label = preferred == 0
+            ? "Consolidate anywhere"
+            : $"{choices.FirstOrDefault(retainer => retainer.RetainerId == preferred)?.RetainerName ?? "Preferred unavailable"}{(rule.Routing?.Overflow == StowageOverflowPolicy.HoldOnPlayer ? " only" : " + overflow")}";
+        ImGui.SetNextItemWidth(-1);
+        if (!ImGui.BeginCombo($"##ruledestination{rule.Id}", label))
+            return;
+        if (ImGui.Selectable("Consolidate anywhere", preferred == 0))
+            UpdatePlan(rule.Id, target =>
+            {
+                target.Routing = new StowageRoutingPolicy();
+            });
+        foreach (var retainer in choices)
+        {
+            if (ImGui.Selectable($"{retainer.RetainerName} + overflow", preferred == retainer.RetainerId && rule.Routing?.Overflow == StowageOverflowPolicy.AnyOwnerRetainer))
+                UpdatePlan(rule.Id, target =>
+                {
+                    target.Routing ??= new StowageRoutingPolicy();
+                    target.Routing.Mode = StowageRoutingMode.HomeFirst;
+                    target.Routing.Overflow = StowageOverflowPolicy.AnyOwnerRetainer;
+                    target.Routing.PreferredRetainerIds = [retainer.RetainerId];
+                });
+            if (ImGui.Selectable($"{retainer.RetainerName} only", preferred == retainer.RetainerId && rule.Routing?.Overflow == StowageOverflowPolicy.HoldOnPlayer))
+                UpdatePlan(rule.Id, target =>
+                {
+                    target.Routing ??= new StowageRoutingPolicy();
+                    target.Routing.Mode = StowageRoutingMode.HomeFirst;
+                    target.Routing.Overflow = StowageOverflowPolicy.HoldOnPlayer;
+                    target.Routing.PreferredRetainerIds = [retainer.RetainerId];
+                });
+        }
+        ImGui.EndCombo();
+    }
+
+    private void DrawRuleQuality(TargetPlanItem rule)
+    {
+        ImGui.SetNextItemWidth(62);
+        if (!ImGui.BeginCombo($"##rulequality{rule.Id}", rule.Quality switch
+            {
+                ItemQualityPolicy.NqOnly => "NQ",
+                ItemQualityPolicy.HqOnly => "HQ",
+                _ => "Any",
+            }))
+            return;
+        foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
+        {
+            var label = quality switch
+            {
+                ItemQualityPolicy.NqOnly => "NQ only",
+                ItemQualityPolicy.HqOnly => "HQ only",
+                _ => "Any quality",
+            };
+            if (ImGui.Selectable(label, rule.Quality == quality))
+                UpdatePlan(rule.Id, target => target.Quality = quality);
+        }
+        ImGui.EndCombo();
+    }
+
+    private StowageDepositBatch BuildQuickDepositBatch(
+        QuartermasterRuntimeSnapshot runtime,
+        IReadOnlyList<TargetPlanItem> ownerRules)
+    {
+        var requests = quickDeposits.Values.Select(selection =>
+        {
+            var matchingRule = ownerRules.FirstOrDefault(rule =>
+                rule.ItemId == selection.ItemId &&
+                rule.Enabled &&
+                (rule.Quality == ItemQualityPolicy.Any ||
+                 rule.Quality == (selection.IsHighQuality ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly)));
+            return new StowageDepositRequest(
+                null,
+                matchingRule?.Id,
+                selection.ItemId,
+                selection.ItemName,
+                selection.IsHighQuality,
+                Math.Min(selection.Quantity, selection.AvailableQuantity),
+                CopyRouting(matchingRule?.Routing),
+                selection.DestinationOverride);
+        });
+        return StowageRouter.BuildBatch(
+            requests,
+            runtime.Retainers,
+            runtime.Owner,
+            itemId => ResolveMaxStack(runtime.Browser, itemId),
+            DateTime.UtcNow);
+    }
+
+    private StowageDepositBatch BuildSurplusBatch(
+        QuartermasterRuntimeSnapshot runtime,
+        StowageEvaluation? evaluation)
+    {
+        if (evaluation is null)
+            return new(DateTime.UtcNow, []);
+        var requests = new List<StowageDepositRequest>();
+        foreach (var line in evaluation.Lines.Where(line => line.DepositQuantity > 0))
+        {
+            var stock = runtime.Browser.Items.FirstOrDefault(item => item.ItemId == line.ItemId);
+            var nq = stock?.Stacks.Where(stack =>
+                    stack.ScopeKind == BrowserScopeKind.Player &&
+                    stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.NQ)
+                .Sum(stack => stack.Quantity) ?? 0;
+            var hq = stock?.Stacks.Where(stack =>
+                    stack.ScopeKind == BrowserScopeKind.Player &&
+                    stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ)
+                .Sum(stack => stack.Quantity) ?? 0;
+            var remaining = line.DepositQuantity;
+            if (line.Quality != ItemQualityPolicy.HqOnly)
+            {
+                var quantity = Math.Min(remaining, nq);
+                if (quantity > 0)
+                    requests.Add(new(line.PlanId, line.RuleId, line.ItemId, line.ItemName, false, quantity, CopyRouting(line.Routing)));
+                remaining -= quantity;
+            }
+            if (line.Quality != ItemQualityPolicy.NqOnly)
+            {
+                var quantity = Math.Min(remaining, hq);
+                if (quantity > 0)
+                    requests.Add(new(line.PlanId, line.RuleId, line.ItemId, line.ItemName, true, quantity, CopyRouting(line.Routing)));
+            }
+        }
+        return StowageRouter.BuildBatch(
+            requests,
+            runtime.Retainers,
+            runtime.Owner,
+            itemId => ResolveMaxStack(runtime.Browser, itemId),
+            DateTime.UtcNow);
+    }
+
+    private static int ResolveMaxStack(BrowserProjection browser, uint itemId) =>
+        checked((int)Math.Clamp(browser.Items.FirstOrDefault(item => item.ItemId == itemId)?.Definition?.MaxStackSize ?? 999, 1, int.MaxValue));
+
+    private static StowageRoutingPolicy CopyRouting(StowageRoutingPolicy? routing) => new()
+    {
+        Mode = routing?.Mode ?? StowageRoutingMode.ConsolidateFirst,
+        Overflow = routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
+        PreferredRetainerIds = routing?.PreferredRetainerIds.ToList() ?? [],
+    };
 
     private void DrawOperation(OwnerScope owner)
     {
@@ -554,15 +860,16 @@ public sealed class QuartermasterWindow : Window
             return;
         }
         ImGui.TextUnformatted($"{operation.Kind} | {operation.Status}");
-        ImGui.SameLine(); ImGui.TextDisabled($"revision {operation.Revision}");
         ImGui.TextWrapped(operation.Message);
-        if (operation.Kind == OperationKinds.Retrieval && operation.Status == OperationStatuses.Accepted)
+        if (operation.Status == OperationStatuses.Accepted)
         {
             var canExecute = transfers.CanStart && !autoRetainer.IsRefreshing && !autoRetainer.IsQueued;
             if (!canExecute)
                 ImGui.BeginDisabled();
             if (ImGui.Button($"Execute this operation##{operation.OperationId}"))
-                StartTransfer(transfers.ExecuteRetrievalAsync(operation.OperationId));
+                StartTransfer(operation.Kind == OperationKinds.Retrieval
+                    ? transfers.ExecuteRetrievalAsync(operation.OperationId)
+                    : transfers.ExecuteDepositAsync(operation.OperationId));
             if (!canExecute)
                 ImGui.EndDisabled();
         }
@@ -603,7 +910,14 @@ public sealed class QuartermasterWindow : Window
             .ToArray();
     }
 
-    private void UpdatePlan(Guid id, Action<TargetPlanItem> update) => state.Mutate(document => update(document.PlanItems.Single(item => item.Id == id)));
+    private void UpdatePlan(Guid id, Action<TargetPlanItem> update) => state.Mutate(document =>
+    {
+        var rule = document.PlanItems.Single(item => item.Id == id);
+        update(rule);
+        var plan = document.StowagePlans.FirstOrDefault(candidate => candidate.Id == rule.StowagePlanId);
+        if (plan is not null)
+            plan.Revision = checked(plan.Revision + 1);
+    });
 
     private void StartTransfer(Task<TransferExecutionResult> transfer) => _ = ObserveTransferAsync(transfer);
 
@@ -660,4 +974,11 @@ public sealed class QuartermasterWindow : Window
     }
 
     private sealed record ItemChoice(uint ItemId, string Name, string Label);
+    private sealed record QuickDepositSelection(
+        uint ItemId,
+        string ItemName,
+        bool IsHighQuality,
+        int AvailableQuantity,
+        int Quantity,
+        ulong? DestinationOverride);
 }

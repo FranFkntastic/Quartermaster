@@ -15,7 +15,7 @@ namespace RQ.Tests;
 public sealed class IpcTests
 {
     [Fact]
-    public void Capabilities_AdvertiseAutomaticRetrievalSupport()
+    public void Capabilities_AdvertiseAutomaticRetrievalAndStowageSupport()
     {
         using var directory = new TemporaryDirectory();
         var snapshots = new SnapshotPublisher("provider", TestData.Repository(directory.Path), () => new Dictionary<ulong, CachedRetainer>());
@@ -25,6 +25,51 @@ public sealed class IpcTests
         Assert.Contains(
             SnapshotPublisher.AutomaticRetrievalCapability,
             document.RootElement.GetProperty("capabilities").EnumerateArray().Select(value => value.GetString()));
+        Assert.Contains(
+            SnapshotPublisher.StowagePlansCapability,
+            document.RootElement.GetProperty("capabilities").EnumerateArray().Select(value => value.GetString()));
+    }
+
+    [Fact]
+    public void Snapshot_PublishesOwnerScopedStowageRulesWithoutInternalConfidenceFields()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var planId = Guid.NewGuid();
+        var ruleId = Guid.NewGuid();
+        repository.Mutate(state =>
+        {
+            state.StowagePlans.Add(new StowagePlan
+            {
+                Id = planId,
+                Owner = TestData.Owner,
+                Name = "General",
+                Revision = 3,
+            });
+            state.PlanItems.Add(new TargetPlanItem
+            {
+                Id = ruleId,
+                StowagePlanId = planId,
+                ItemId = 100,
+                ItemName = "Darksteel Ore",
+                TargetQuantity = 50,
+                Notes = "private operator note",
+            });
+        });
+        var snapshots = new SnapshotPublisher("provider", repository, () => new Dictionary<ulong, CachedRetainer>());
+
+        snapshots.Refresh(TestData.Owner, []);
+        using var document = JsonDocument.Parse(snapshots.GetSnapshot());
+
+        var stowage = document.RootElement.GetProperty("stowagePlans");
+        Assert.Equal("gooseworks-quartermaster-stowage-plans/v1", stowage.GetProperty("schema").GetString());
+        var plan = Assert.Single(stowage.GetProperty("plans").EnumerateArray());
+        Assert.Equal(planId, plan.GetProperty("id").GetGuid());
+        Assert.Equal(3, plan.GetProperty("revision").GetInt32());
+        var rule = Assert.Single(plan.GetProperty("rules").EnumerateArray());
+        Assert.Equal(ruleId, rule.GetProperty("id").GetGuid());
+        Assert.False(rule.TryGetProperty("notes", out _));
+        Assert.False(rule.TryGetProperty("freshness", out _));
     }
 
     [Fact]

@@ -20,6 +20,7 @@ public sealed record PlanLine(
     Guid PlanItemId,
     uint ItemId,
     string ItemName,
+    ItemQualityPolicy Quality,
     int TargetQuantity,
     int PlayerQuantity,
     int NeededQuantity,
@@ -43,7 +44,8 @@ public static class RestockPlanner
         IReadOnlyDictionary<uint, int> playerInventory,
         IReadOnlyDictionary<ulong, CachedRetainer> cache,
         OwnerScope owner,
-        DateTime nowUtc)
+        DateTime nowUtc,
+        BrowserProjection? stock = null)
     {
         ArgumentNullException.ThrowIfNull(rows);
         ArgumentNullException.ThrowIfNull(playerInventory);
@@ -52,7 +54,7 @@ public static class RestockPlanner
 
         var lines = rows
             .Where(row => row.Enabled && row.ItemId > 0 && row.TargetQuantity > 0)
-            .Select(row => BuildLine(row, playerInventory, cache, owner, nowUtc))
+            .Select(row => BuildLine(row, playerInventory, cache, owner, nowUtc, stock))
             .OrderByDescending(line => line.NeededQuantity > 0)
             .ThenByDescending(line => line.MissingQuantity > 0)
             .ThenBy(line => line.ItemName, StringComparer.OrdinalIgnoreCase)
@@ -66,9 +68,12 @@ public static class RestockPlanner
         IReadOnlyDictionary<uint, int> playerInventory,
         IReadOnlyDictionary<ulong, CachedRetainer> cache,
         OwnerScope owner,
-        DateTime nowUtc)
+        DateTime nowUtc,
+        BrowserProjection? stock)
     {
-        var player = playerInventory.GetValueOrDefault(row.ItemId);
+        var player = stock?.Items.FirstOrDefault(item => item.ItemId == row.ItemId)?.Stacks
+            .Where(stack => stack.ScopeKind == BrowserScopeKind.Player && QualityMatches(row.Quality, stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ))
+            .Sum(stack => stack.Quantity) ?? playerInventory.GetValueOrDefault(row.ItemId);
         var needed = Math.Max(0, row.TargetQuantity - player);
         var candidates = needed == 0
             ? []
@@ -80,7 +85,9 @@ public static class RestockPlanner
                         .Select(bag => new
                         {
                             bag.ObservedAtUtc,
-                            Quantity = bag.Items.Where(item => item.ItemId == row.ItemId).Sum(item => checked((int)item.Quantity)),
+                            Quantity = bag.Items
+                                .Where(item => item.ItemId == row.ItemId && QualityMatches(row.Quality, item.IsHq))
+                                .Sum(item => checked((int)item.Quantity)),
                         })
                         .Where(bag => bag.Quantity > 0)
                         .ToArray();
@@ -103,6 +110,13 @@ public static class RestockPlanner
                 ? PlanLineStatus.NoCachedStock
                 : missing > 0 ? PlanLineStatus.Partial : PlanLineStatus.Ready;
         TimeSpan? oldestAge = candidates.Length == 0 ? null : nowUtc - candidates.Min(candidate => candidate.ObservedAtUtc);
-        return new(row.Id, row.ItemId, row.ItemName, row.TargetQuantity, player, needed, cached, missing, candidates, status, oldestAge);
+        return new(row.Id, row.ItemId, row.ItemName, row.Quality, row.TargetQuantity, player, needed, cached, missing, candidates, status, oldestAge);
     }
+
+    private static bool QualityMatches(ItemQualityPolicy policy, bool isHighQuality) => policy switch
+    {
+        ItemQualityPolicy.NqOnly => !isHighQuality,
+        ItemQualityPolicy.HqOnly => isHighQuality,
+        _ => true,
+    };
 }

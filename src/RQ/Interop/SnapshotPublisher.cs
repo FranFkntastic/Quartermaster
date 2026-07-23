@@ -2,6 +2,7 @@ using System.Text.Json;
 using RQ.Domain;
 using RQ.Inventory;
 using RQ.Persistence;
+using RQ.Planning;
 using RQ.Runtime;
 
 namespace RQ.Interop;
@@ -9,6 +10,7 @@ namespace RQ.Interop;
 public sealed class SnapshotPublisher
 {
     public const string AutomaticRetrievalCapability = "automaticRetrieval";
+    public const string StowagePlansCapability = "stowagePlans.v1";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string providerInstanceId;
     private readonly StateRepository state;
@@ -45,13 +47,14 @@ public sealed class SnapshotPublisher
     }
 
     public void Refresh(QuartermasterRuntimeSnapshot runtime) =>
-        Refresh(runtime.Owner, runtime.PlayerStorage, runtime.State, runtime.Retainers);
+        Refresh(runtime.Owner, runtime.PlayerStorage, runtime.State, runtime.Retainers, runtime.Stowage);
 
     private void Refresh(
         OwnerScope owner,
         PlayerStorageCapture playerStorage,
         QuartermasterState stateSnapshot,
-        IReadOnlyDictionary<ulong, CachedRetainer> retainersById)
+        IReadOnlyDictionary<ulong, CachedRetainer> retainersById,
+        IReadOnlyList<StowageEvaluation>? stowage = null)
     {
         Volatile.Write(ref currentOwner, owner);
         var nextRevision = Interlocked.Increment(ref revision);
@@ -73,6 +76,7 @@ public sealed class SnapshotPublisher
             playerStorage = new { requestedSources = playerStorage.RequestedSources, observedSources = playerStorage.ObservedSources },
             retainers,
             planItems = stateSnapshot.PlanItems,
+            stowagePlans = StowageContract(stateSnapshot, owner, stowage ?? []),
             currentOperation = current is null ? null : OperationContract(current),
         };
         var operations = scopedOperations.ToDictionary(
@@ -98,7 +102,7 @@ public sealed class SnapshotPublisher
         providerInstanceId,
         revision = Revision,
         channels = new[] { IpcChannels.GetCapabilities, IpcChannels.GetSnapshot, IpcChannels.SubmitShortages, IpcChannels.GetOperation, IpcChannels.Changed },
-        capabilities = new[] { AutomaticRetrievalCapability },
+        capabilities = new[] { AutomaticRetrievalCapability, StowagePlansCapability },
         requestSchemas = new[] { ShortageSubmissionService.RequestSchema },
         statusVocabulary = new[] { OperationStatuses.Queued, OperationStatuses.Accepted, OperationStatuses.Running, OperationStatuses.Succeeded, OperationStatuses.PartiallySucceeded, OperationStatuses.Indeterminate, OperationStatuses.Failed, OperationStatuses.Cancelled, OperationStatuses.Rejected },
         executionPolicy = "request_selected",
@@ -133,6 +137,58 @@ public sealed class SnapshotPublisher
         operation.Lines,
         operation.DepositCandidates,
     };
+
+    private static object StowageContract(
+        QuartermasterState state,
+        OwnerScope owner,
+        IReadOnlyList<StowageEvaluation> evaluations)
+    {
+        var evaluated = evaluations
+            .SelectMany(plan => plan.Lines)
+            .ToDictionary(line => line.RuleId);
+        return new
+        {
+            schema = "gooseworks-quartermaster-stowage-plans/v1",
+            plans = state.StowagePlans
+                .Where(plan => plan.Owner.Matches(owner))
+                .OrderBy(plan => plan.Priority)
+                .ThenBy(plan => plan.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(plan => new
+                {
+                    plan.Id,
+                    plan.Revision,
+                    plan.Owner,
+                    plan.Name,
+                    plan.Enabled,
+                    plan.Priority,
+                    rules = state.PlanItems
+                        .Where(rule => rule.StowagePlanId == plan.Id)
+                        .Select(rule =>
+                        {
+                            evaluated.TryGetValue(rule.Id, out var line);
+                            return new
+                            {
+                                rule.Id,
+                                rule.ItemId,
+                                rule.ItemName,
+                                desiredPlayerQuantity = rule.TargetQuantity,
+                                quality = rule.Quality.ToString(),
+                                routing = rule.Routing,
+                                rule.Enabled,
+                                evaluated = line is null ? null : new
+                                {
+                                    action = line.Action.ToString().ToLowerInvariant(),
+                                    quantity = line.Action == StowageAction.Retrieve
+                                        ? line.RetrieveQuantity
+                                        : line.DepositQuantity,
+                                    line.PlayerQuantity,
+                                    line.DesiredPlayerQuantity,
+                                },
+                            };
+                        }),
+                }),
+        };
+    }
 
     private object OperationEnvelope(OperationRecord operation, IEnumerable<OperationReceipt> receipts) => new
     {

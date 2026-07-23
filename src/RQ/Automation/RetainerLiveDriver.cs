@@ -57,6 +57,17 @@ public sealed class RetainerLiveDriver : IRetainerTransferDriver
         CancellationToken cancellationToken) =>
         session.ScanPlayerCrystalsAsync(itemIds, cancellationToken);
 
+    public Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerInventoryAsync(
+        IReadOnlySet<uint> itemIds,
+        CancellationToken cancellationToken) =>
+        session.ScanPlayerInventoryAsync(itemIds, cancellationToken);
+
+    public Task<RetainerDepositResult> DepositAsync(
+        DalamudInventoryStack stack,
+        int quantity,
+        CancellationToken cancellationToken) =>
+        session.DepositAsync(stack, quantity, cancellationToken);
+
     public Task<RetainerCrystalTransferResult> DepositCrystalAsync(
         DalamudInventoryStack stack,
         int quantity,
