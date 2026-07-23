@@ -41,6 +41,43 @@ public sealed class PlanWorkspaceTests
     }
 
     [Fact]
+    public void NewDraft_DoesNotPersistUntilApplyAndCannotSaveEmptyResidue()
+    {
+        var state = new QuartermasterState();
+        var draft = StowagePlanCatalog.NewDraft(state, TestData.Owner);
+
+        Assert.Empty(state.StowagePlans);
+        Assert.False(StowagePlanCatalog.CanApply(state, TestData.Owner, draft));
+
+        draft.Rules.Add(Rule(draft.PlanId, 100, "Ore", 10));
+        Assert.True(StowagePlanCatalog.CanApply(state, TestData.Owner, draft));
+
+        var applied = StowagePlanCatalog.Apply(state, TestData.Owner, draft);
+
+        Assert.Equal(draft.PlanId, applied.Id);
+        Assert.Single(state.StowagePlans);
+        Assert.Equal(applied.Id, Assert.Single(state.PlanItems).StowagePlanId);
+    }
+
+    [Fact]
+    public void ExistingDraft_ApplyIsDisabledUntilIntentChanges()
+    {
+        var plan = new StowagePlan { Owner = TestData.Owner };
+        var state = new QuartermasterState
+        {
+            StowagePlans = [plan],
+            PlanItems = [Rule(plan.Id, 100, "Ore", 10)],
+        };
+        var draft = StowagePlanCatalog.Draft(state, TestData.Owner, plan.Id);
+
+        Assert.False(StowagePlanCatalog.CanApply(state, TestData.Owner, draft));
+
+        draft.Rules[0].TargetQuantity = 11;
+
+        Assert.True(StowagePlanCatalog.CanApply(state, TestData.Owner, draft));
+    }
+
+    [Fact]
     public void Apply_PersistsOrderedRoutingOnceAndDisablesOtherPlan()
     {
         var first = new StowagePlan { Owner = TestData.Owner, Name = "First", Enabled = true };
@@ -144,6 +181,24 @@ public sealed class PlanWorkspaceTests
         var selected = ItemGroupCatalog.MatchingRuleIds(group, draft);
 
         Assert.Equal([matching.Id], selected);
+    }
+
+    [Fact]
+    public void ItemGroup_AddAndSelectAlsoWorksForRestockDrafts()
+    {
+        var state = new QuartermasterState();
+        var source = Rule(Guid.NewGuid(), 100, "Ore", 10);
+        var group = ItemGroupCatalog.Create(state, "Metals", [source]);
+        var draft = RestockPlanCatalog.NewDraft(state, TestData.Owner);
+
+        var added = ItemGroupCatalog.AddMissing(group, draft);
+        var selected = ItemGroupCatalog.MatchingItemIds(group, draft);
+
+        Assert.Equal(1, added);
+        var item = Assert.Single(draft.Items);
+        Assert.Equal((uint)100, item.ItemId);
+        Assert.False(item.Enabled);
+        Assert.Equal([item.Id], selected);
     }
 
     [Fact]

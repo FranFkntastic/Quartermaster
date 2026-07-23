@@ -12,7 +12,7 @@ public sealed class AgentBridgeTests
         var truth = new QuartermasterBridgeTruth(
             3, "provider", 42, "1.0", false, "stock", "Wei Ning @ Maduin", true,
             2, DateTimeOffset.UtcNow, 3, 2, 1, null, "General", false,
-            1, null, "Workshop", 12,
+            1, null, "Workshop", 12, false,
             "operation", "accepted", true, false, "Ready", false);
         var openedTarget = string.Empty;
         var invoked = false;

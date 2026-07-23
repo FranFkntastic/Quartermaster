@@ -24,6 +24,7 @@ public sealed record QuartermasterBridgeTruth(
     Guid? SelectedRestockPlanId,
     string? SelectedRestockPlanName,
     int SelectedRestockNeededQuantity,
+    bool RestockEditorOpen,
     string? CurrentOperationId,
     string? CurrentOperationStatus,
     bool RefreshAvailable,

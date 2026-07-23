@@ -64,6 +64,61 @@ public sealed class RestockPlanTests
     }
 
     [Fact]
+    public void NewDraft_DoesNotPersistUntilApplyAndCannotSaveEmptyResidue()
+    {
+        var state = new QuartermasterState();
+        var draft = RestockPlanCatalog.NewDraft(state, TestData.Owner);
+
+        Assert.Empty(state.RestockPlans);
+        Assert.False(RestockPlanCatalog.CanApply(state, TestData.Owner, draft));
+
+        draft.Items.Add(new RestockPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 20 });
+        Assert.True(RestockPlanCatalog.CanApply(state, TestData.Owner, draft));
+
+        var applied = RestockPlanCatalog.Apply(state, TestData.Owner, draft);
+
+        Assert.Equal(draft.PlanId, applied.Id);
+        Assert.Single(state.RestockPlans);
+        Assert.Equal((uint)100, Assert.Single(applied.Items).ItemId);
+    }
+
+    [Fact]
+    public void ExistingDraft_ApplyIsDisabledUntilIntentChanges()
+    {
+        var state = new QuartermasterState();
+        var plan = RestockPlanCatalog.Create(
+            state,
+            TestData.Owner,
+            "Workshop",
+            [new RestockPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 20 }]);
+        var draft = RestockPlanCatalog.Draft(state, TestData.Owner, plan.Id);
+
+        Assert.False(RestockPlanCatalog.CanApply(state, TestData.Owner, draft));
+
+        draft.Items[0].TargetQuantity = 30;
+
+        Assert.True(RestockPlanCatalog.CanApply(state, TestData.Owner, draft));
+    }
+
+    [Fact]
+    public void DuplicateDraft_DoesNotCreateAPlanBeforeApply()
+    {
+        var state = new QuartermasterState();
+        var source = RestockPlanCatalog.Create(
+            state,
+            TestData.Owner,
+            "Workshop",
+            [new RestockPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 20 }]);
+
+        var draft = RestockPlanCatalog.DuplicateDraft(state, TestData.Owner, source.Id);
+
+        Assert.Single(state.RestockPlans);
+        Assert.True(draft.IsNew);
+        Assert.NotEqual(source.Id, draft.PlanId);
+        Assert.NotEqual(source.Items[0].Id, draft.Items[0].Id);
+    }
+
+    [Fact]
     public void Repository_RoundTripsPlansAndLines()
     {
         using var directory = new TemporaryDirectory();

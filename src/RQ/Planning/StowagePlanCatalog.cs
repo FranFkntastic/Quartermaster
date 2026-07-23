@@ -6,6 +6,7 @@ public sealed class StowagePlanDraft
 {
     public Guid PlanId { get; init; }
     public long SourceRevision { get; init; }
+    public bool IsNew { get; init; }
     public string Name { get; set; } = "General";
     public bool Enabled { get; set; } = true;
     public List<TargetPlanItem> Rules { get; set; } = [];
@@ -76,15 +77,107 @@ public static class StowagePlanCatalog
         };
     }
 
+    public static StowagePlanDraft NewDraft(
+        QuartermasterState state,
+        OwnerScope owner,
+        string requestedName = "Stowage plan")
+    {
+        if (!owner.HasStableIdentity)
+            throw new InvalidOperationException("Stowage plans require stable owner identity.");
+        return new StowagePlanDraft
+        {
+            PlanId = Guid.NewGuid(),
+            IsNew = true,
+            Name = UniqueName(state, owner, requestedName),
+            Enabled = !state.StowagePlans.Any(plan => plan.Owner.Matches(owner) && plan.Enabled),
+        };
+    }
+
+    public static StowagePlanDraft DuplicateDraft(
+        QuartermasterState state,
+        OwnerScope owner,
+        Guid sourcePlanId)
+    {
+        var source = state.StowagePlans.Single(plan =>
+            plan.Id == sourcePlanId && plan.Owner.Matches(owner));
+        return new StowagePlanDraft
+        {
+            PlanId = Guid.NewGuid(),
+            IsNew = true,
+            Name = UniqueName(state, owner, $"{source.Name} copy"),
+            Enabled = false,
+            Rules = state.PlanItems
+                .Where(rule => rule.StowagePlanId == source.Id)
+                .Select(rule => CopyRule(rule, Guid.Empty, newIdentity: true))
+                .Select(rule =>
+                {
+                    rule.StowagePlanId = Guid.Empty;
+                    return rule;
+                })
+                .ToList(),
+        };
+    }
+
+    public static bool CanApply(
+        QuartermasterState state,
+        OwnerScope owner,
+        StowagePlanDraft draft) =>
+        !string.IsNullOrWhiteSpace(draft.Name) &&
+        (!draft.IsNew || draft.Rules.Any(rule => rule.ItemId > 0)) &&
+        HasChanges(state, owner, draft);
+
+    public static bool HasChanges(
+        QuartermasterState state,
+        OwnerScope owner,
+        StowagePlanDraft draft)
+    {
+        if (draft.IsNew)
+            return true;
+        var plan = state.StowagePlans.FirstOrDefault(candidate =>
+            candidate.Id == draft.PlanId && candidate.Owner.Matches(owner));
+        if (plan is null ||
+            plan.Revision != draft.SourceRevision ||
+            !string.Equals(plan.Name, draft.Name, StringComparison.Ordinal) ||
+            plan.Enabled != draft.Enabled)
+            return true;
+        var rules = state.PlanItems.Where(rule => rule.StowagePlanId == plan.Id).ToArray();
+        return !RulesEqual(rules, draft.Rules);
+    }
+
     public static StowagePlan Apply(
         QuartermasterState state,
         OwnerScope owner,
         StowagePlanDraft draft)
     {
-        var plan = state.StowagePlans.Single(candidate =>
-            candidate.Id == draft.PlanId && candidate.Owner.Matches(owner));
-        if (plan.Revision != draft.SourceRevision)
-            throw new InvalidOperationException("This Stowage Plan changed after the editor opened. Reopen it to continue.");
+        if (!owner.HasStableIdentity)
+            throw new InvalidOperationException("Stowage plans require stable owner identity.");
+        if (string.IsNullOrWhiteSpace(draft.Name))
+            throw new InvalidOperationException("A Stowage Plan needs a name.");
+        if (draft.IsNew && draft.Rules.All(rule => rule.ItemId == 0))
+            throw new InvalidOperationException("Add at least one item before saving a new Stowage Plan.");
+
+        StowagePlan plan;
+        if (draft.IsNew)
+        {
+            if (state.StowagePlans.Any(candidate => candidate.Id == draft.PlanId))
+                throw new InvalidOperationException("This new Stowage Plan was already saved.");
+            plan = new StowagePlan
+            {
+                Id = draft.PlanId,
+                Owner = owner with { },
+                Revision = 1,
+                Priority = OwnerPlans(state, owner).Count,
+            };
+            state.StowagePlans.Add(plan);
+        }
+        else
+        {
+            plan = state.StowagePlans.Single(candidate =>
+                candidate.Id == draft.PlanId && candidate.Owner.Matches(owner));
+            if (plan.Revision != draft.SourceRevision)
+                throw new InvalidOperationException("This Stowage Plan changed after the editor opened. Reopen it to continue.");
+            plan.Revision = checked(plan.Revision + 1);
+        }
 
         plan.Name = UniqueName(state, owner, draft.Name, plan.Id);
         plan.Enabled = draft.Enabled;
@@ -103,7 +196,6 @@ public static class StowagePlanCatalog
             .Where(rule => rule.ItemId > 0)
             .GroupBy(rule => (rule.ItemId, rule.Quality))
             .Select(group => CopyRule(group.First(), plan.Id, newIdentity: false)));
-        plan.Revision = checked(plan.Revision + 1);
         state.Schema = "gooseworks-quartermaster-state/v4";
         return plan;
     }
@@ -149,6 +241,25 @@ public static class StowagePlanCatalog
         Notes = source.Notes,
         Enabled = source.Enabled,
     };
+
+    private static bool RulesEqual(
+        IReadOnlyList<TargetPlanItem> left,
+        IReadOnlyList<TargetPlanItem> right)
+    {
+        if (left.Count != right.Count)
+            return false;
+        return left.Zip(right).All(pair =>
+            pair.First.Id == pair.Second.Id &&
+            pair.First.ItemId == pair.Second.ItemId &&
+            pair.First.ItemName == pair.Second.ItemName &&
+            pair.First.TargetQuantity == pair.Second.TargetQuantity &&
+            pair.First.Quality == pair.Second.Quality &&
+            pair.First.Notes == pair.Second.Notes &&
+            pair.First.Enabled == pair.Second.Enabled &&
+            pair.First.Routing.Mode == pair.Second.Routing.Mode &&
+            pair.First.Routing.Overflow == pair.Second.Routing.Overflow &&
+            pair.First.Routing.PreferredRetainerIds.SequenceEqual(pair.Second.Routing.PreferredRetainerIds));
+    }
 }
 
 public static class ItemGroupCatalog
@@ -230,6 +341,48 @@ public static class ItemGroupCatalog
             .ToHashSet();
     }
 
+    public static int AddMissing(ItemGroup group, RestockPlanDraft draft)
+    {
+        var existing = draft.Items
+            .Select(item => (item.ItemId, item.Quality))
+            .ToHashSet();
+        var added = 0;
+        foreach (var item in group.Items.Where(item => existing.Add((item.ItemId, item.Quality))))
+        {
+            draft.Items.Add(new RestockPlanItem
+            {
+                ItemId = item.ItemId,
+                ItemName = item.ItemName,
+                Quality = item.Quality,
+                TargetQuantity = 1,
+                Enabled = false,
+            });
+            added++;
+        }
+        return added;
+    }
+
+    public static IReadOnlySet<Guid> MatchingItemIds(ItemGroup group, RestockPlanDraft draft)
+    {
+        var members = group.Items.Select(item => (item.ItemId, item.Quality)).ToHashSet();
+        return draft.Items
+            .Where(item => members.Contains((item.ItemId, item.Quality)))
+            .Select(item => item.Id)
+            .ToHashSet();
+    }
+
+    public static ItemGroup Create(
+        QuartermasterState state,
+        string requestedName,
+        IEnumerable<RestockPlanItem> items) =>
+        Create(state, requestedName, items.Select(ItemAsRule));
+
+    public static void ReplaceItems(
+        QuartermasterState state,
+        Guid groupId,
+        IEnumerable<RestockPlanItem> items) =>
+        ReplaceItems(state, groupId, items.Select(ItemAsRule));
+
     public static string UniqueName(
         QuartermasterState state,
         string requestedName,
@@ -263,4 +416,15 @@ public static class ItemGroupCatalog
             .OrderBy(item => item.ItemName, StringComparer.OrdinalIgnoreCase)
             .ThenBy(item => item.ItemId)
             .ToList();
+
+    private static TargetPlanItem ItemAsRule(RestockPlanItem item) => new()
+    {
+        Id = item.Id,
+        ItemId = item.ItemId,
+        ItemName = item.ItemName,
+        TargetQuantity = item.TargetQuantity,
+        Quality = item.Quality,
+        Notes = item.Notes,
+        Enabled = item.Enabled,
+    };
 }

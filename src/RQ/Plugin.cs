@@ -294,7 +294,7 @@ public sealed class Plugin : IDalamudPlugin
             .OrderByDescending(candidate => candidate.UpdatedAtUtc)
             .FirstOrDefault();
         return new QuartermasterBridgeTruth(
-            3,
+            4,
             configuration.PluginInstanceId,
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
@@ -314,6 +314,7 @@ public sealed class Plugin : IDalamudPlugin
             window.SelectedRestockPlanId,
             window.SelectedRestockPlanName,
             window.SelectedRestockNeededQuantity,
+            window.RestockEditorOpen,
             operation?.OperationId,
             operation?.Status,
             autoRetainer.IsAvailable,
