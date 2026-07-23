@@ -8,7 +8,12 @@ using RQ.Planning;
 namespace RQ.Operations;
 
 public sealed record RetainerRouteCandidate(ulong RetainerId, string RetainerName, DateTime ObservedAtUtc);
-public sealed record RetrievalResult(bool Success, int Transferred, string Code, string Message);
+public sealed record RetrievalResult(
+    bool Success,
+    int Transferred,
+    string Code,
+    string Message,
+    bool MovementMayHaveOccurred = false);
 public sealed record TransferExecutionResult(bool Started, string Message);
 
 public interface IRetainerTransferDriver
@@ -167,11 +172,16 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     if (quantity <= 0)
                         continue;
                     journal.ArmCacheInvalidation(operationId, candidate.Route.RetainerId, operation.Owner);
-                    movementAttempted = true;
                     var result = await driver.RetrieveAsync(stack, quantity, token).ConfigureAwait(false);
                     token.ThrowIfCancellationRequested();
                     if (!result.Success)
+                    {
+                        movementAttempted |= result.MovementMayHaveOccurred;
+                        if (!result.MovementMayHaveOccurred)
+                            journal.ResolveCacheInvalidation(operationId, candidate.Route.RetainerId);
                         throw new InvalidOperationException(result.Message);
+                    }
+                    movementAttempted = true;
                     remaining[key] -= result.Transferred;
                     transferred += result.Transferred;
                     RecordInvalidation(operationId, candidate.Route.RetainerId);

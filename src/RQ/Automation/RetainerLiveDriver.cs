@@ -5,6 +5,23 @@ using RQ.Operations;
 
 namespace RQ.Automation;
 
+internal static class RetainerRetrievalResultPolicy
+{
+    private static readonly IReadOnlySet<string> PreMovementFailures = new HashSet<string>(StringComparer.Ordinal)
+    {
+        "InvalidRequest",
+        "InventoryUnavailable",
+        "RetainerInventoryUnavailable",
+        "SourceSlotChanged",
+        "RetainerAgentUnavailable",
+        "CommandUnavailable",
+        "RetainerIdentityMismatch",
+    };
+
+    public static bool MovementMayHaveOccurred(bool success, string code) =>
+        success || !PreMovementFailures.Contains(code);
+}
+
 /// <summary>
 /// Maps Quartermaster operation semantics onto the product-neutral Franthropy retainer session.
 /// Planning, authorization, persistence, and receipts remain in Quartermaster.
@@ -49,7 +66,12 @@ public sealed class RetainerLiveDriver : IRetainerTransferDriver
         CancellationToken cancellationToken)
     {
         var result = await session.RetrieveAsync(stack, quantity, cancellationToken).ConfigureAwait(false);
-        return new(result.Success, result.Transferred, result.Code, result.Message);
+        return new(
+            result.Success,
+            result.Transferred,
+            result.Code,
+            result.Message,
+            RetainerRetrievalResultPolicy.MovementMayHaveOccurred(result.Success, result.Code));
     }
 
     public Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerCrystalsAsync(

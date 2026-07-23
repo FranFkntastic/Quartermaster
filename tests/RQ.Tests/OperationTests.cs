@@ -1,6 +1,7 @@
 using FFXIVClientStructs.FFXIV.Client.Game;
 using Franthropy.Dalamud.Automation.Inventory;
 using Franthropy.Dalamud.Automation.Retainers;
+using RQ.Automation;
 using RQ.Domain;
 using RQ.Inventory;
 using RQ.Interop;
@@ -357,6 +358,68 @@ public sealed class OperationTests
     }
 
     [Fact]
+    public async Task RetrievalFailure_BeforeCommandLeavesCacheTrustedAndMarksOperationFailed()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateManual(
+            TestData.Owner,
+            [new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }]);
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
+        var cache = new RetainerCacheRepository(store);
+        var coordinator = new TransferCoordinator(
+            journal,
+            new FailedRetrievalDriver(movementMayHaveOccurred: false),
+            cache,
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>());
+
+        await coordinator.ExecuteRetrievalAsync(operation.OperationId);
+
+        Assert.Equal(OperationStatuses.Failed, journal.Get(operation.OperationId)!.Status);
+        Assert.Single(cache.Snapshot());
+        Assert.Empty(journal.PendingCacheInvalidations());
+    }
+
+    [Fact]
+    public async Task RetrievalFailure_AfterCommandInvalidatesEvidenceAndMarksOperationIndeterminate()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateManual(
+            TestData.Owner,
+            [new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }]);
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
+        var cache = new RetainerCacheRepository(store);
+        var coordinator = new TransferCoordinator(
+            journal,
+            new FailedRetrievalDriver(movementMayHaveOccurred: true),
+            cache,
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>());
+
+        await coordinator.ExecuteRetrievalAsync(operation.OperationId);
+
+        Assert.Equal(OperationStatuses.Indeterminate, journal.Get(operation.OperationId)!.Status);
+        Assert.Empty(cache.Snapshot());
+    }
+
+    [Theory]
+    [InlineData(false, "CommandUnavailable", false)]
+    [InlineData(false, "SourceSlotChanged", false)]
+    [InlineData(false, "TransferPending", true)]
+    [InlineData(true, "TransferVerified", true)]
+    public void RetrievalResultPolicy_DistinguishesPreCommandFailures(
+        bool success,
+        string code,
+        bool expected) =>
+        Assert.Equal(expected, RetainerRetrievalResultPolicy.MovementMayHaveOccurred(success, code));
+
+    [Fact]
     public async Task DepositExecution_UsesOnlyPersistedReviewedAuthorization()
     {
         using var directory = new TemporaryDirectory();
@@ -456,6 +519,38 @@ public sealed class OperationTests
             Task.FromResult(new RetrievalResult(true, quantity, "TransferVerified", "Verified."));
         public Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerCrystalsAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken) => Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([]);
         public Task<RetainerCrystalTransferResult> DepositCrystalAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task CloseRetainerAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public void CancelActive() { }
+    }
+
+    private sealed class FailedRetrievalDriver(bool movementMayHaveOccurred) : IRetainerTransferDriver
+    {
+        public Task RequireRetainerListAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task OpenInventoryAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<IReadOnlyList<DalamudInventoryStack>> ScanRetainerAsync(
+            IReadOnlySet<uint> itemIds,
+            CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([new(InventoryType.RetainerPage1, 0, 100, 10)]);
+        public Task<RetrievalResult> RetrieveAsync(
+            DalamudInventoryStack stack,
+            int quantity,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(new RetrievalResult(
+                false,
+                0,
+                movementMayHaveOccurred ? "TransferPending" : "CommandUnavailable",
+                "Retrieval failed.",
+                movementMayHaveOccurred));
+        public Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerCrystalsAsync(
+            IReadOnlySet<uint> itemIds,
+            CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([]);
+        public Task<RetainerCrystalTransferResult> DepositCrystalAsync(
+            DalamudInventoryStack stack,
+            int quantity,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
         public Task CloseRetainerAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public void CancelActive() { }
     }
