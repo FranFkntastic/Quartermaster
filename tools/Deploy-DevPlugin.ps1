@@ -34,8 +34,10 @@ if (-not (Test-Path -LiteralPath $targetPath)) {
     New-Item -ItemType Directory -Path $targetPath | Out-Null
 }
 
-Get-ChildItem -LiteralPath $source -File | ForEach-Object {
+$files = Get-ChildItem -LiteralPath $source -File
+$files | Where-Object Name -NE 'RQ.dll' | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $targetPath $_.Name) -Force
 }
+Copy-Item -LiteralPath $assembly -Destination (Join-Path $targetPath 'RQ.dll') -Force
 
 "Deployed Quartermaster to '$targetPath'."

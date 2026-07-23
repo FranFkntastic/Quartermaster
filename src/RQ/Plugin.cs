@@ -38,7 +38,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly SnapshotPublisher snapshots;
     private readonly ShortageSubmissionService submissions;
     private readonly QuartermasterIpcProvider ipc;
-    private readonly AgentBridgeHost agentBridge;
+    private readonly RQ.AgentBridge.AgentBridgeHost agentBridge;
     private readonly AgentBridgeUiReviewRegistry agentReviewRegistry = new();
     private readonly WindowSystem windows = new("RQ");
     private readonly QuartermasterWindow window;
@@ -119,6 +119,7 @@ public sealed class Plugin : IDalamudPlugin
         agentBridge = new(
             configuration,
             configDirectory,
+            pluginInterface.AssemblyLocation.FullName,
             SaveConfiguration,
             DispatchOnFramework,
             new QuartermasterBridgeProvider(CreateAgentBridgeTruth, window.OpenReviewSurface, window.CloseReviewSurface, agentReviewRegistry));
@@ -306,6 +307,7 @@ public sealed class Plugin : IDalamudPlugin
             operation?.Status,
             autoRetainer.IsAvailable,
             autoRetainer.IsRefreshing || autoRetainer.IsQueued,
+            autoRetainer.Status,
             transfers.IsRunning);
     }
 

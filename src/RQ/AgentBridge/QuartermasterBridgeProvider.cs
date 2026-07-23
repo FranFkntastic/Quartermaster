@@ -19,6 +19,7 @@ public sealed record QuartermasterBridgeTruth(
     string? CurrentOperationStatus,
     bool RefreshAvailable,
     bool RefreshActive,
+    string RefreshStatus,
     bool TransferActive);
 
 public sealed class QuartermasterBridgeProvider
@@ -51,7 +52,8 @@ public sealed class QuartermasterBridgeProvider
     public IReadOnlyList<AgentBridgeReviewSurfaceDescriptor> GetReviewSurfaces() => ReviewSurfaces;
     public AgentBridgeUiReviewFrame GetControlSurface() => reviewRegistry.Snapshot();
     public AgentBridgeUiControlReview ReviewControl(string id) => reviewRegistry.Review(id);
-    public AgentBridgeUiControlInvocation InvokeControl(string id, long frameId) => reviewRegistry.Invoke(id, frameId);
+    public AgentBridgeUiControlInvocation InvokeControl(string id, long frameId, System.Text.Json.JsonElement? arguments = null) =>
+        reviewRegistry.Invoke(id, frameId, arguments);
     public bool TryOpenMainWindow(string target)
     {
         if (target.Trim().ToLowerInvariant() is not ("stock" or "stock-and-plan" or "listings" or "operation"))

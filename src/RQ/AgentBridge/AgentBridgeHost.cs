@@ -1,35 +1,63 @@
-using System.IO.Pipes;
-using System.Text.Json;
+using System.Reflection;
 using Franthropy.Dalamud.AgentBridge;
+using SharedAgentBridgeHost = Franthropy.Dalamud.AgentBridge.AgentBridgeHost;
 
 namespace RQ.AgentBridge;
 
+/// <summary>Quartermaster policy layered on the shared authenticated bridge host.</summary>
 public sealed class AgentBridgeHost : IDisposable
 {
-    private const int MaxRequestCharacters = 16_384;
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
-
     private readonly PluginConfiguration configuration;
-    private readonly string configDirectory;
-    private readonly Action saveConfiguration;
     private readonly Func<Action, CancellationToken, Task> dispatchOnFramework;
     private readonly QuartermasterBridgeProvider provider;
-    private CancellationTokenSource? cancellation;
-    private Task? listenTask;
-    private string? accessToken;
+    private readonly AgentBridgeCommandRouter router = new();
+    private readonly AgentBridgeOperationRegistry operations = new();
+    private readonly SharedAgentBridgeHost host;
+    private readonly AgentBridgeManifest manifest;
+    private string? activeRefreshOperationId;
+    private bool activeRefreshObserved;
 
     public AgentBridgeHost(
         PluginConfiguration configuration,
         string configDirectory,
+        string mainDllPath,
         Action saveConfiguration,
         Func<Action, CancellationToken, Task> dispatchOnFramework,
         QuartermasterBridgeProvider provider)
     {
         this.configuration = configuration;
-        this.configDirectory = configDirectory;
-        this.saveConfiguration = saveConfiguration;
         this.dispatchOnFramework = dispatchOnFramework;
         this.provider = provider;
+        var profile = AgentBridgeProfileIdentity.FromPluginConfigDirectory(configDirectory);
+        manifest = new AgentBridgeManifest(
+            2,
+            AgentBridgeRuntimeIdentity.FromAssembly("RQ", Assembly.GetExecutingAssembly(), mainDllPath),
+            profile.Id,
+            profile.Alias,
+            "Quartermaster.truth.v2",
+            [new("snapshot"), new("reviewed-actions"), new("operations")],
+            provider.GetReviewSurfaces(),
+            [],
+            [new(
+                "quartermaster.refresh-retainers",
+                "Refresh retainers",
+                "stock-and-plan",
+                AgentBridgeUiControlKind.Button,
+                true,
+                CompletionOperationKind: "retainer-refresh")]);
+        RegisterCommands();
+        host = new SharedAgentBridgeHost(new AgentBridgeHostOptions
+        {
+            ConfigDirectory = configDirectory,
+            PluginInstanceId = configuration.PluginInstanceId,
+            PipeName = $"RQ.AgentBridge.{Environment.ProcessId}",
+            GetProtectedAccessToken = () => configuration.AgentBridgeProtectedAccessToken,
+            SetProtectedAccessToken = value => configuration.AgentBridgeProtectedAccessToken = value,
+            SaveConfiguration = saveConfiguration,
+            CreateManifest = () => manifest,
+            HandleRequestAsync = router.HandleAsync,
+            EnableAudit = configuration.EnableAgentBridgeAudit,
+        });
     }
 
     public string PipeName => $"RQ.AgentBridge.{Environment.ProcessId}";
@@ -38,212 +66,109 @@ public sealed class AgentBridgeHost : IDisposable
     {
 #if DEBUG
         if (configuration.EnableAgentBridge)
-        {
-            EnsureStarted();
-            return;
-        }
+            host.Start();
+        else
+            host.Stop();
+#else
+        host.Stop();
 #endif
-        Stop();
+        UpdateRefreshOperation();
     }
 
-    public void Dispose() => Stop();
+    public void Dispose() => host.Dispose();
 
-    private void EnsureStarted()
+    private void RegisterCommands()
     {
-        if (listenTask is not null)
+        router.Register("get-snapshot", async (_, cancellationToken) =>
+            AgentBridgeResponse.Ok("Quartermaster truth captured.", await OnFrameworkAsync(provider.CreateTruth, cancellationToken).ConfigureAwait(false)));
+        router.Register("get-control-surface", _ => AgentBridgeResponse.Ok("Control surface captured.", provider.GetControlSurface()));
+        router.Register("get-review-surfaces", _ => AgentBridgeResponse.Ok("Review surfaces captured.", manifest.ReviewSurfaces));
+        router.Register("get-control", request =>
+        {
+            if (string.IsNullOrWhiteSpace(request.Target)) return AgentBridgeResponse.Fail("A control ID is required.");
+            var review = provider.ReviewControl(request.Target);
+            return review.Control is null
+                ? new AgentBridgeResponse { Success = false, Message = "The requested control is not rendered.", Receipt = review }
+                : AgentBridgeResponse.Ok("Reviewed control captured.", review);
+        });
+        router.Register("invoke-control", InvokeControlAsync);
+        router.Register("get-operation", request =>
+        {
+            if (string.IsNullOrWhiteSpace(request.OperationId)) return AgentBridgeResponse.Fail("An operation ID is required.");
+            var operation = operations.Get(request.OperationId);
+            return operation is null ? AgentBridgeResponse.Fail("Operation was not found.") : AgentBridgeResponse.Ok("Operation captured.", operation);
+        });
+        router.Register("open-main-window", async (request, cancellationToken) =>
+        {
+            var opened = false;
+            await dispatchOnFramework(() => opened = provider.TryOpenMainWindow(request.Target ?? "stock"), cancellationToken).ConfigureAwait(false);
+            return opened ? AgentBridgeResponse.Ok("Quartermaster opened.") : AgentBridgeResponse.Fail("Requested Quartermaster view is not registered.");
+        });
+        router.Register("close-main-window", async (_, cancellationToken) =>
+        {
+            await dispatchOnFramework(provider.CloseMainWindow, cancellationToken).ConfigureAwait(false);
+            return AgentBridgeResponse.Ok("Quartermaster closed.");
+        });
+    }
+
+    private async ValueTask<AgentBridgeResponse> InvokeControlAsync(AgentBridgeRequest request, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.Target) || request.FrameId is null)
+            return AgentBridgeResponse.Fail("Control ID and reviewed frame ID are required.");
+        AgentBridgeUiControlInvocation? invocation = null;
+        await dispatchOnFramework(
+            () => invocation = provider.InvokeControl(request.Target, request.FrameId.Value, request.Arguments),
+            cancellationToken).ConfigureAwait(false);
+        if (invocation is null)
+            return AgentBridgeResponse.Fail("Control invocation did not complete on the framework thread.");
+        if (!invocation.Success)
+            return new AgentBridgeResponse { Success = false, Message = invocation.Message, Receipt = invocation };
+        var operationId = invocation.Action?.OperationId;
+        if (request.Target == "quartermaster.refresh-retainers" && string.IsNullOrWhiteSpace(operationId))
+        {
+            var operation = operations.Begin("retainer-refresh", "Quartermaster accepted the refresh request.");
+            activeRefreshOperationId = operation.Id;
+            activeRefreshObserved = false;
+            operationId = operation.Id;
+        }
+        return AgentBridgeResponse.Ok(invocation.Message, invocation, operationId);
+    }
+
+    private void UpdateRefreshOperation()
+    {
+        if (activeRefreshOperationId is not { } operationId || operations.Get(operationId) is not { } operation)
             return;
-
-        accessToken = GetOrCreateAccessToken();
-        Directory.CreateDirectory(BridgeDirectory);
-        if (!configuration.EnableAgentBridgeAudit && File.Exists(AuditPath))
-            File.Delete(AuditPath);
-        File.WriteAllText(DiscoveryPath, JsonSerializer.Serialize(new AgentBridgeDiscovery
+        var truth = provider.CreateTruth();
+        if (truth.RefreshActive)
         {
-            SchemaVersion = 1,
-            PipeName = PipeName,
-            ProcessId = Environment.ProcessId,
-            PluginInstanceId = configuration.PluginInstanceId,
-        }, JsonOptions));
-        cancellation = new CancellationTokenSource();
-        listenTask = Task.Run(() => ListenLoopAsync(cancellation.Token));
-    }
-
-    private async Task ListenLoopAsync(CancellationToken cancellationToken)
-    {
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            try
-            {
-                await using var pipe = new NamedPipeServerStream(
-                    PipeName,
-                    PipeDirection.InOut,
-                    1,
-                    PipeTransmissionMode.Byte,
-                    PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
-                await pipe.WaitForConnectionAsync(cancellationToken).ConfigureAwait(false);
-                using var reader = new StreamReader(pipe, leaveOpen: true);
-                await using var writer = new StreamWriter(pipe) { AutoFlush = true };
-                using var connectionTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                connectionTimeout.CancelAfter(TimeSpan.FromSeconds(5));
-                var requestJson = await ReadBoundedLineAsync(reader, connectionTimeout.Token).ConfigureAwait(false);
-                var response = await HandleRequestAsync(requestJson, connectionTimeout.Token).ConfigureAwait(false);
-                await writer.WriteLineAsync(JsonSerializer.Serialize(response, JsonOptions)).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception exception)
-            {
-                AppendAudit("host-error", exception.GetType().Name);
-                await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken).ConfigureAwait(false);
-            }
-        }
-    }
-
-    private async Task<AgentBridgeResponse> HandleRequestAsync(string? requestJson, CancellationToken cancellationToken)
-    {
-        if (string.IsNullOrWhiteSpace(requestJson) || requestJson.Length > MaxRequestCharacters)
-            return AgentBridgeResponse.Fail("Invalid bridge request.");
-
-        AgentBridgeRequest? request;
-        try
-        {
-            request = JsonSerializer.Deserialize<AgentBridgeRequest>(requestJson, JsonOptions);
-        }
-        catch (JsonException)
-        {
-            return AgentBridgeResponse.Fail("Bridge request JSON is invalid.");
-        }
-
-        if (request is null || !string.Equals(request.Token, accessToken, StringComparison.Ordinal))
-            return AgentBridgeResponse.Fail("Bridge authentication failed.");
-
-        switch (request.Command?.Trim().ToLowerInvariant())
-        {
-            case "hello":
-                return AgentBridgeResponse.Ok("Bridge is ready.");
-            case "get-snapshot":
-                QuartermasterBridgeTruth? truth = null;
-                await dispatchOnFramework(() => truth = provider.CreateTruth(), cancellationToken).ConfigureAwait(false);
-                return AgentBridgeResponse.Ok("Quartermaster truth captured.", truth);
-            case "get-control-surface":
-                return AgentBridgeResponse.Ok("Control surface captured.", provider.GetControlSurface());
-            case "get-control":
-                if (string.IsNullOrWhiteSpace(request.Target))
-                    return AgentBridgeResponse.Fail("A control ID is required.");
-                var controlReview = provider.ReviewControl(request.Target);
-                return controlReview.Control is null
-                    ? new AgentBridgeResponse { Success = false, Message = "The requested control is not rendered.", Receipt = controlReview }
-                    : AgentBridgeResponse.Ok("Reviewed control captured.", controlReview);
-            case "get-review-surfaces":
-                return AgentBridgeResponse.Ok("Review surfaces captured.", provider.GetReviewSurfaces());
-            case "invoke-control":
-                if (string.IsNullOrWhiteSpace(request.Target) || request.FrameId is null)
-                    return AgentBridgeResponse.Fail("Control ID and reviewed frame ID are required.");
-                AgentBridgeUiControlInvocation? invocation = null;
-                await dispatchOnFramework(
-                    () => invocation = provider.InvokeControl(request.Target, request.FrameId.Value),
-                    cancellationToken).ConfigureAwait(false);
-                if (invocation is null)
-                    return AgentBridgeResponse.Fail("Control invocation did not complete on the framework thread.");
-                AppendAudit("invoke-control", invocation.Success ? request.Target : "rejected");
-                return invocation.Success
-                    ? AgentBridgeResponse.Ok(invocation.Message, invocation.Frame)
-                    : AgentBridgeResponse.Fail(invocation.Message);
-            case "open-main-window":
-                var opened = false;
-                await dispatchOnFramework(() => opened = provider.TryOpenMainWindow(request.Target ?? "stock"), cancellationToken).ConfigureAwait(false);
-                AppendAudit("open-main-window", opened ? request.Target ?? "stock" : "rejected");
-                return opened ? AgentBridgeResponse.Ok("Quartermaster opened.") : AgentBridgeResponse.Fail("Requested Quartermaster view is not registered.");
-            case "close-main-window":
-                await dispatchOnFramework(provider.CloseMainWindow, cancellationToken).ConfigureAwait(false);
-                AppendAudit("close-main-window", "accepted");
-                return AgentBridgeResponse.Ok("Quartermaster closed.");
-            default:
-                return AgentBridgeResponse.Fail("Bridge command is not allowed.");
-        }
-    }
-
-    private void Stop()
-    {
-        var activeCancellation = Interlocked.Exchange(ref cancellation, null);
-        var activeListener = Interlocked.Exchange(ref listenTask, null);
-        if (activeCancellation is not null)
-        {
-            activeCancellation.Cancel();
-            if (activeListener is not null)
-            {
-                try { activeListener.Wait(TimeSpan.FromSeconds(1)); }
-                catch (Exception exception) when (exception is AggregateException or OperationCanceledException) { }
-            }
-            activeCancellation.Dispose();
-        }
-
-        accessToken = null;
-        if (File.Exists(DiscoveryPath))
-            File.Delete(DiscoveryPath);
-    }
-
-    private string GetOrCreateAccessToken()
-    {
-        if (!string.IsNullOrWhiteSpace(configuration.AgentBridgeProtectedAccessToken))
-        {
-            try
-            {
-                return AgentBridgeDataProtection.UnprotectToken(
-                    configuration.AgentBridgeProtectedAccessToken,
-                    configuration.PluginInstanceId);
-            }
-            catch (Exception exception) when (exception is FormatException or System.Security.Cryptography.CryptographicException)
-            {
-                configuration.AgentBridgeProtectedAccessToken = string.Empty;
-            }
-        }
-
-        var token = Guid.NewGuid().ToString("N");
-        configuration.AgentBridgeProtectedAccessToken = AgentBridgeDataProtection.ProtectToken(
-            token,
-            configuration.PluginInstanceId);
-        saveConfiguration();
-        return token;
-    }
-
-    private void AppendAudit(string action, string result)
-    {
-        if (!configuration.EnableAgentBridgeAudit)
+            activeRefreshObserved = true;
+            if (operation.State is AgentBridgeOperationState.Queued)
+                operations.Update(operationId, AgentBridgeOperationState.Running, truth.RefreshStatus);
             return;
-        Directory.CreateDirectory(BridgeDirectory);
-        File.AppendAllText(AuditPath, JsonSerializer.Serialize(new
-        {
-            atUtc = DateTimeOffset.UtcNow,
-            action,
-            result,
-        }, JsonOptions) + Environment.NewLine);
+        }
+        var failed = IsRefreshFailure(truth.RefreshStatus);
+        if (!activeRefreshObserved && !failed)
+            return;
+        operations.Update(
+            operationId,
+            failed ? AgentBridgeOperationState.Failed : AgentBridgeOperationState.Succeeded,
+            truth.RefreshStatus,
+            postconditions: new Dictionary<string, string> { ["refreshActive"] = "false" });
+        activeRefreshOperationId = null;
+        activeRefreshObserved = false;
     }
 
-    private string BridgeDirectory => Path.Combine(configDirectory, "agent-bridge");
-    private string DiscoveryPath => Path.Combine(BridgeDirectory, $"discovery-{Environment.ProcessId}.json");
-    private string AuditPath => Path.Combine(BridgeDirectory, "audit.jsonl");
+    private static bool IsRefreshFailure(string status) =>
+        status.Contains("fail", StringComparison.OrdinalIgnoreCase)
+        || status.Contains("unavailable", StringComparison.OrdinalIgnoreCase)
+        || status.Contains("could not", StringComparison.OrdinalIgnoreCase)
+        || status.Contains("requires", StringComparison.OrdinalIgnoreCase)
+        || status.Contains("disabled", StringComparison.OrdinalIgnoreCase);
 
-    private static async Task<string?> ReadBoundedLineAsync(StreamReader reader, CancellationToken cancellationToken)
+    private async Task<T> OnFrameworkAsync<T>(Func<T> action, CancellationToken cancellationToken)
     {
-        var builder = new System.Text.StringBuilder();
-        var buffer = new char[1024];
-        while (true)
-        {
-            var read = await reader.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
-            if (read == 0)
-                return builder.Length == 0 ? null : builder.ToString();
-            var newline = Array.IndexOf(buffer, '\n', 0, read);
-            var length = newline >= 0 ? newline : read;
-            if (newline >= 0 && length > 0 && buffer[length - 1] == '\r')
-                length--;
-            builder.Append(buffer, 0, length);
-            if (builder.Length > MaxRequestCharacters)
-                throw new InvalidDataException("Bridge request exceeds the maximum length.");
-            if (newline >= 0)
-                return builder.ToString();
-        }
+        T? result = default;
+        await dispatchOnFramework(() => result = action(), cancellationToken).ConfigureAwait(false);
+        return result!;
     }
 }
