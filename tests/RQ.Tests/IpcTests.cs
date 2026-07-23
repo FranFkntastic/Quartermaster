@@ -32,6 +32,10 @@ public sealed class IpcTests
         Assert.Contains(
             SnapshotPublisher.RestockPlansCapability,
             document.RootElement.GetProperty("capabilities").EnumerateArray().Select(value => value.GetString()));
+        Assert.Equal(
+            ["stock", "restock", "stowage", "listings", "activity"],
+            document.RootElement.GetProperty("reviewSurfaces").EnumerateArray()
+                .Select(surface => surface.GetProperty("id").GetString()));
     }
 
     [Fact]

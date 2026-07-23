@@ -111,9 +111,11 @@ public sealed class SnapshotPublisher
         automaticExecutionField = "executeImmediately",
         reviewSurfaces = new[]
         {
-            new { id = "stock-and-plan", label = "Stock and retrieval plan", command = "/rq", target = "stock" },
+            new { id = "stock", label = "Stock and plans", command = "/rq", target = "stock" },
+            new { id = "restock", label = "Reusable Restock Plans", command = "/rq", target = "restock" },
+            new { id = "stowage", label = "Stowage Plans and Quick Deposit", command = "/rq", target = "stowage" },
             new { id = "listings", label = "Retainer listings", command = "/rq", target = "listings" },
-            new { id = "operation", label = "Current operation", command = "/rq", target = "operation" },
+            new { id = "activity", label = "Operations and receipts", command = "/rq", target = "activity" },
         },
     }, JsonOptions);
 

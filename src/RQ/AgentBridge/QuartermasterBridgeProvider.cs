@@ -9,12 +9,17 @@ public sealed record QuartermasterBridgeTruth(
     int ProcessId,
     string PluginVersion,
     bool MainWindowOpen,
+    string CurrentWorkspace,
     string Owner,
     bool OwnerScopeAvailable,
     int ObservedRetainerCount,
     DateTimeOffset? OldestRetainerObservedAtUtc,
     int PlanLineCount,
     int EnabledPlanLineCount,
+    int StowagePlanCount,
+    Guid? SelectedStowagePlanId,
+    string? SelectedStowagePlanName,
+    bool StowageEditorOpen,
     int RestockPlanCount,
     Guid? SelectedRestockPlanId,
     string? SelectedRestockPlanName,
@@ -30,9 +35,11 @@ public sealed class QuartermasterBridgeProvider
 {
     private static readonly IReadOnlyList<AgentBridgeReviewSurfaceDescriptor> ReviewSurfaces =
     [
-        new("stock-and-plan", "Stock and retrieval plan", "open-main-window", "stock", 10),
-        new("listings", "Retainer listings", "open-main-window", "listings", 20),
-        new("operation", "Current operation", "open-main-window", "operation", 30),
+        new("stock", "Stock and plans", "open-main-window", "stock", 10),
+        new("restock", "Reusable Restock Plans", "open-main-window", "restock", 20),
+        new("stowage", "Stowage Plans and Quick Deposit", "open-main-window", "stowage", 30),
+        new("listings", "Retainer listings", "open-main-window", "listings", 40),
+        new("activity", "Operations and receipts", "open-main-window", "activity", 50),
     ];
 
     private readonly Func<QuartermasterBridgeTruth> createTruth;
@@ -60,7 +67,7 @@ public sealed class QuartermasterBridgeProvider
         reviewRegistry.Invoke(id, frameId, arguments);
     public bool TryOpenMainWindow(string target)
     {
-        if (target.Trim().ToLowerInvariant() is not ("stock" or "stock-and-plan" or "listings" or "operation"))
+        if (target.Trim().ToLowerInvariant() is not ("stock" or "stock-and-plan" or "restock" or "stowage" or "listings" or "operation" or "activity"))
             return false;
         openMainWindow(target);
         return true;

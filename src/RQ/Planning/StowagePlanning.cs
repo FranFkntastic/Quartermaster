@@ -83,7 +83,7 @@ public static class StowagePlanMigration
                 });
             }
 
-            state.Schema = "gooseworks-quartermaster-state/v3";
+            state.Schema = "gooseworks-quartermaster-state/v4";
         });
         return true;
     }
@@ -140,6 +140,26 @@ public static class StowageEvaluator
                 return new StowageEvaluation(plan.Id, plan.Name, plan.Revision, lines);
             })
             .ToArray();
+    }
+
+    public static StowageEvaluation? BuildPlan(
+        QuartermasterState state,
+        BrowserProjection stock,
+        OwnerScope owner,
+        Guid planId)
+    {
+        var plan = state.StowagePlans.FirstOrDefault(candidate =>
+            candidate.Id == planId && candidate.Owner.Matches(owner));
+        if (plan is null)
+            return null;
+        var groups = stock.Items.ToDictionary(group => group.ItemId);
+        var lines = state.PlanItems
+            .Where(rule => rule.StowagePlanId == plan.Id && rule.Enabled && rule.ItemId > 0)
+            .Select(rule => BuildLine(plan, rule, groups.GetValueOrDefault(rule.ItemId)))
+            .OrderBy(line => line.ItemName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(line => line.ItemId)
+            .ToArray();
+        return new StowageEvaluation(plan.Id, plan.Name, plan.Revision, lines);
     }
 
     private static StowageEvaluationLine BuildLine(

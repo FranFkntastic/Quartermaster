@@ -294,17 +294,22 @@ public sealed class Plugin : IDalamudPlugin
             .OrderByDescending(candidate => candidate.UpdatedAtUtc)
             .FirstOrDefault();
         return new QuartermasterBridgeTruth(
-            2,
+            3,
             configuration.PluginInstanceId,
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
             window.IsOpen,
+            window.CurrentWorkspace,
             runtime.Owner.HasStableIdentity ? $"{runtime.Owner.CharacterName} @ {runtime.Owner.HomeWorldName}" : "Unavailable",
             runtime.Owner.HasStableIdentity,
             retainers.Length,
             retainers.Length == 0 ? null : retainers.Min(retainer => new DateTimeOffset(DateTime.SpecifyKind(retainer.ObservedAtUtc, DateTimeKind.Utc))),
             StowagePlanMigration.OwnerRules(runtime.State, runtime.Owner, enabledPlansOnly: false).Count,
             StowagePlanMigration.OwnerRules(runtime.State, runtime.Owner).Count(item => item.Enabled),
+            StowagePlanCatalog.OwnerPlans(runtime.State, runtime.Owner).Count,
+            window.SelectedStowagePlanId,
+            window.SelectedStowagePlanName,
+            window.StowageEditorOpen,
             RestockPlanCatalog.OwnerPlans(runtime.State, runtime.Owner).Count,
             window.SelectedRestockPlanId,
             window.SelectedRestockPlanName,

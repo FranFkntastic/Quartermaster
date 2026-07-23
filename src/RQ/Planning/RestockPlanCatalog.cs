@@ -27,7 +27,7 @@ public static class RestockPlanCatalog
             Items = items?.Select(CopyWithNewIdentity).ToList() ?? [],
         };
         state.RestockPlans.Add(plan);
-        state.Schema = "gooseworks-quartermaster-state/v3";
+        state.Schema = "gooseworks-quartermaster-state/v4";
         return plan;
     }
 

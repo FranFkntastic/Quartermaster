@@ -176,6 +176,21 @@ public sealed class RestockPlanItem
     public bool Enabled { get; set; } = true;
 }
 
+public sealed class ItemGroup
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public long Revision { get; set; } = 1;
+    public string Name { get; set; } = "Item group";
+    public List<ItemGroupItem> Items { get; set; } = [];
+}
+
+public sealed class ItemGroupItem
+{
+    public uint ItemId { get; set; }
+    public string ItemName { get; set; } = string.Empty;
+    public ItemQualityPolicy Quality { get; set; } = ItemQualityPolicy.Any;
+}
+
 public static class OperationStatuses
 {
     public const string Queued = "queued";
@@ -271,12 +286,13 @@ public sealed class OperationReceipt
 
 public sealed class QuartermasterState
 {
-    public string Schema { get; set; } = "gooseworks-quartermaster-state/v3";
+    public string Schema { get; set; } = "gooseworks-quartermaster-state/v4";
     public long Revision { get; set; }
     public List<StowagePlan> StowagePlans { get; set; } = [];
     public List<StowageMigrationRecord> StowageMigrations { get; set; } = [];
     public List<TargetPlanItem> PlanItems { get; set; } = [];
     public List<RestockPlan> RestockPlans { get; set; } = [];
+    public List<ItemGroup> ItemGroups { get; set; } = [];
     public List<SubmittedRequestRecord> Requests { get; set; } = [];
     public List<OperationRecord> Operations { get; set; } = [];
     public List<OperationReceipt> Receipts { get; set; } = [];
