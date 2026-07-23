@@ -255,8 +255,17 @@ public sealed class QuartermasterWindow : Window
             ImGui.TableNextColumn(); ImGui.TextUnformatted(string.Join(", ", item.Stacks.Select(stack => stack.OwnerName).Distinct().Take(2)));
             ImGui.TableNextColumn();
             var playerStacks = item.Stacks.Where(stack => stack.ScopeKind == BrowserScopeKind.Player).ToArray();
-            if (playerStacks.Length > 0 && ImGui.SmallButton($"Stage##quick{item.ItemId}"))
-                StageQuickDeposit(item);
+            if (playerStacks.Length > 0)
+            {
+                if (ImGui.SmallButton($"Stage##quick{item.ItemId}"))
+                    StageQuickDeposit(item);
+                reviewRegistry.RegisterLastButton(
+                    $"quartermaster.quick-deposit.stage.{item.ItemId}",
+                    $"Stage {item.ItemName} for Quick Deposit",
+                    true,
+                    () => StageQuickDeposit(item),
+                    $"{playerStacks.Sum(stack => stack.Quantity):N0} carried");
+            }
             if (workbench.IsExpanded(item.ItemId))
             {
                 foreach (var stack in item.Stacks)
@@ -268,8 +277,18 @@ public sealed class QuartermasterWindow : Window
                     ImGui.TableNextColumn(); ImGui.TextDisabled(stack.ScopeKind == BrowserScopeKind.Retainer ? stack.Quantity.ToString("N0") : "-");
                     ImGui.TableNextColumn(); ImGui.TextDisabled($"{stack.OwnerName} · {stack.Quality}");
                     ImGui.TableNextColumn();
-                    if (stack.ScopeKind == BrowserScopeKind.Player && ImGui.SmallButton($"Stage##quick{item.ItemId}:{stack.Storage}:{stack.SlotIndex}"))
-                        StageQuickDeposit(item, stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ);
+                    if (stack.ScopeKind == BrowserScopeKind.Player)
+                    {
+                        var highQuality = stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ;
+                        if (ImGui.SmallButton($"Stage##quick{item.ItemId}:{stack.Storage}:{stack.SlotIndex}"))
+                            StageQuickDeposit(item, highQuality);
+                        reviewRegistry.RegisterLastButton(
+                            $"quartermaster.quick-deposit.stage.{item.ItemId}.{(highQuality ? "hq" : "nq")}.{stack.Storage}.{stack.SlotIndex}",
+                            $"Stage {item.ItemName}{(highQuality ? " HQ" : string.Empty)} stack for Quick Deposit",
+                            true,
+                            () => StageQuickDeposit(item, highQuality),
+                            $"{stack.Quantity:N0} carried");
+                    }
                 }
             }
         }
