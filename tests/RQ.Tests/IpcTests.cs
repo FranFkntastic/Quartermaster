@@ -9,6 +9,7 @@ using RQ.Interop;
 using RQ.Inventory;
 using RQ.Operations;
 using RQ.Persistence;
+using RQ.Planning;
 
 namespace RQ.Tests;
 
@@ -27,6 +28,9 @@ public sealed class IpcTests
             document.RootElement.GetProperty("capabilities").EnumerateArray().Select(value => value.GetString()));
         Assert.Contains(
             SnapshotPublisher.StowagePlansCapability,
+            document.RootElement.GetProperty("capabilities").EnumerateArray().Select(value => value.GetString()));
+        Assert.Contains(
+            SnapshotPublisher.RestockPlansCapability,
             document.RootElement.GetProperty("capabilities").EnumerateArray().Select(value => value.GetString()));
     }
 
@@ -70,6 +74,37 @@ public sealed class IpcTests
         Assert.Equal(ruleId, rule.GetProperty("id").GetGuid());
         Assert.False(rule.TryGetProperty("notes", out _));
         Assert.False(rule.TryGetProperty("freshness", out _));
+    }
+
+    [Fact]
+    public void Snapshot_PublishesOwnerScopedRestockIntentWithoutPrivateNotes()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        repository.Mutate(state => RestockPlanCatalog.Create(
+            state,
+            TestData.Owner,
+            "Workshop",
+            [new RestockPlanItem
+            {
+                ItemId = 100,
+                ItemName = "Darksteel Ore",
+                TargetQuantity = 50,
+                Notes = "private operator note",
+            }]));
+        var snapshots = new SnapshotPublisher("provider", repository, () => new Dictionary<ulong, CachedRetainer>());
+
+        snapshots.Refresh(TestData.Owner, []);
+        using var document = JsonDocument.Parse(snapshots.GetSnapshot());
+
+        var restock = document.RootElement.GetProperty("restockPlans");
+        Assert.Equal("gooseworks-quartermaster-restock-plans/v1", restock.GetProperty("schema").GetString());
+        var plan = Assert.Single(restock.GetProperty("plans").EnumerateArray());
+        Assert.Equal("Workshop", plan.GetProperty("name").GetString());
+        var line = Assert.Single(plan.GetProperty("lines").EnumerateArray());
+        Assert.Equal(50, line.GetProperty("desiredPlayerQuantity").GetInt32());
+        Assert.False(line.TryGetProperty("notes", out _));
+        Assert.False(line.TryGetProperty("freshness", out _));
     }
 
     [Fact]

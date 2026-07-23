@@ -42,7 +42,6 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
     private readonly Func<IReadOnlyDictionary<uint, int>> playerInventory;
     private readonly AutomationLease automation;
     private readonly Func<DateTime> utcNow;
-    private readonly Func<bool> clearRetrievalPlansAsActioned;
     private readonly object activeGate = new();
     private CancellationTokenSource? activeCancellation;
     private string? activeOperationId;
@@ -55,8 +54,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         Func<OwnerScope> currentOwner,
         Func<IReadOnlyDictionary<uint, int>> playerInventory,
         AutomationLease? automation = null,
-        Func<DateTime>? utcNow = null,
-        Func<bool>? clearRetrievalPlansAsActioned = null)
+        Func<DateTime>? utcNow = null)
     {
         this.journal = journal;
         this.driver = driver;
@@ -65,7 +63,6 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         this.playerInventory = playerInventory;
         this.automation = automation ?? new AutomationLease();
         this.utcNow = utcNow ?? (() => DateTime.UtcNow);
-        this.clearRetrievalPlansAsActioned = clearRetrievalPlansAsActioned ?? (() => false);
     }
 
     public bool IsRunning => Volatile.Read(ref running) != 0;
@@ -113,13 +110,6 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                 OperationStatuses.Running,
                 "ExecutionStarted",
                 operation.ExecuteImmediately ? "Automatic live retrieval verification started." : "Reviewed live retrieval verification started.");
-            if (clearRetrievalPlansAsActioned())
-                journal.ClearSatisfiedRetrievalPlanItems(
-                    operationId,
-                    operation.Lines
-                        .Where(line => remaining.GetValueOrDefault(RetrievalKey(line.ItemId, line.Quality)) <= 0)
-                        .Select(line => line.ItemId)
-                        .ToHashSet());
             if (plan.NeededQuantity == 0)
             {
                 journal.Transition(
@@ -192,11 +182,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         candidate.Route.RetainerId,
                         result.Transferred,
                         result.Code,
-                        result.Message,
-                        clearRetrievalPlansAsActioned() &&
-                        operation.Lines
-                            .Where(line => line.ItemId == stack.ItemId)
-                            .All(line => remaining.GetValueOrDefault(RetrievalKey(line.ItemId, line.Quality)) <= 0));
+                        result.Message);
                     journal.ResolveCacheInvalidation(operationId, candidate.Route.RetainerId);
                 }
                 await driver.CloseRetainerAsync(token).ConfigureAwait(false);

@@ -10,8 +10,9 @@ public sealed class AgentBridgeTests
     public void Provider_ExposesQuartermasterReviewSurfacesWithoutTransferActions()
     {
         var truth = new QuartermasterBridgeTruth(
-            1, "provider", 42, "1.0", false, "Wei Ning @ Maduin", true,
-            2, DateTimeOffset.UtcNow, 3, 2, "operation", "accepted", true, false, "Ready", false);
+            2, "provider", 42, "1.0", false, "Wei Ning @ Maduin", true,
+            2, DateTimeOffset.UtcNow, 3, 2, 1, null, "Workshop", 12,
+            "operation", "accepted", true, false, "Ready", false);
         var openedTarget = string.Empty;
         var invoked = false;
         var registry = new AgentBridgeUiReviewRegistry();

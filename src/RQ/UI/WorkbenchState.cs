@@ -5,11 +5,14 @@ using Franthropy.Dalamud.UI.Filtering;
 namespace RQ.UI;
 
 public enum WorkbenchView { StockAndPlan, Listings, Operation }
+public enum PlanMode { Restock, Stowage }
 
 public sealed class WorkbenchState
 {
     private readonly HashSet<uint> expanded = [];
     public WorkbenchView View { get; set; }
+    public PlanMode PlanMode { get; set; } = PlanMode.Restock;
+    public Guid? SelectedRestockPlanId { get; set; }
     public string ScopeKey { get; set; } = BrowserScope.AllKey;
     public string ItemFilter { get; set; } = string.Empty;
     public string ListingFilter { get; set; } = string.Empty;

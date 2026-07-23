@@ -106,8 +106,7 @@ public sealed class Plugin : IDalamudPlugin
             cache,
             CurrentOwner,
             scanner.CountPlayerItems,
-            automation,
-            clearRetrievalPlansAsActioned: () => configuration.ClearRetrievalPlansAsActioned);
+            automation);
         automaticRetrievals = new(journal, transfers, CurrentOwner);
         workQueue = new();
         runtimeSnapshots = new(scanner, cache, state, CurrentOwner);
@@ -295,7 +294,7 @@ public sealed class Plugin : IDalamudPlugin
             .OrderByDescending(candidate => candidate.UpdatedAtUtc)
             .FirstOrDefault();
         return new QuartermasterBridgeTruth(
-            1,
+            2,
             configuration.PluginInstanceId,
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
@@ -306,6 +305,10 @@ public sealed class Plugin : IDalamudPlugin
             retainers.Length == 0 ? null : retainers.Min(retainer => new DateTimeOffset(DateTime.SpecifyKind(retainer.ObservedAtUtc, DateTimeKind.Utc))),
             StowagePlanMigration.OwnerRules(runtime.State, runtime.Owner, enabledPlansOnly: false).Count,
             StowagePlanMigration.OwnerRules(runtime.State, runtime.Owner).Count(item => item.Enabled),
+            RestockPlanCatalog.OwnerPlans(runtime.State, runtime.Owner).Count,
+            window.SelectedRestockPlanId,
+            window.SelectedRestockPlanName,
+            window.SelectedRestockNeededQuantity,
             operation?.OperationId,
             operation?.Status,
             autoRetainer.IsAvailable,

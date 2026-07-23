@@ -67,6 +67,24 @@ public sealed class OperationJournal
     }
 
     public OperationRecord CreateManual(OwnerScope owner, IReadOnlyList<TargetPlanItem> plan, string kind = OperationKinds.Retrieval)
+        => CreateManual(owner, plan, kind, null, null, null);
+
+    public OperationRecord CreateRestock(OwnerScope owner, RestockPlan plan) =>
+        CreateManual(
+            owner,
+            RestockPlanCatalog.ToExecutionRows(plan),
+            OperationKinds.Retrieval,
+            plan.Id,
+            plan.Revision,
+            plan.Name);
+
+    private OperationRecord CreateManual(
+        OwnerScope owner,
+        IReadOnlyList<TargetPlanItem> plan,
+        string kind,
+        Guid? sourcePlanId,
+        long? sourcePlanRevision,
+        string? sourcePlanName)
     {
         if (kind is not (OperationKinds.Retrieval or OperationKinds.Deposit))
             throw new ArgumentOutOfRangeException(nameof(kind));
@@ -84,6 +102,9 @@ public sealed class OperationJournal
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
             Message = "Plan is ready for explicit execution.",
+            SourcePlanId = sourcePlanId,
+            SourcePlanRevision = sourcePlanRevision,
+            SourcePlanName = sourcePlanName,
             SourcePlanItems = enabledPlan.Select(Copy).ToList(),
             Lines = enabledPlan
                 .GroupBy(item => (item.ItemId, item.Quality))
@@ -264,7 +285,7 @@ public sealed class OperationJournal
         return changed;
     }
 
-    public void RecordTransfer(string operationId, uint itemId, ulong retainerId, int quantity, string code, string message, bool clearRetrievalPlanItem = false)
+    public void RecordTransfer(string operationId, uint itemId, ulong retainerId, int quantity, string code, string message)
     {
         if (quantity <= 0)
             throw new ArgumentOutOfRangeException(nameof(quantity));
@@ -292,8 +313,6 @@ public sealed class OperationJournal
                 RetainerId = retainerId,
                 Quantity = quantity,
             });
-            if (clearRetrievalPlanItem)
-                ClearMatchingPlanItems(state, operation, new HashSet<uint> { itemId });
             changed = Copy(operation);
         });
         OperationChanged?.Invoke(changed);
@@ -347,8 +366,7 @@ public sealed class OperationJournal
         ulong retainerId,
         int quantity,
         string code,
-        string message,
-        bool clearRetrievalPlanItem = false)
+        string message)
     {
         if (quantity <= 0)
             throw new ArgumentOutOfRangeException(nameof(quantity));
@@ -380,24 +398,9 @@ public sealed class OperationJournal
                 RetainerId = retainerId,
                 Quantity = quantity,
             });
-            if (clearRetrievalPlanItem)
-                ClearMatchingPlanItems(state, operation, new HashSet<uint> { itemId });
             changed = Copy(operation);
         });
         OperationChanged?.Invoke(changed);
-    }
-
-    public void ClearSatisfiedRetrievalPlanItems(string operationId, IReadOnlySet<uint> itemIds)
-    {
-        if (itemIds.Count == 0)
-            return;
-        repository.Mutate(state =>
-        {
-            var operation = state.Operations.Single(candidate => candidate.OperationId == operationId);
-            if (operation.Kind != OperationKinds.Retrieval || operation.Status != OperationStatuses.Running)
-                throw new InvalidOperationException("Satisfied retrieval plan items can only be cleared during a running retrieval operation.");
-            ClearMatchingPlanItems(state, operation, itemIds);
-        });
     }
 
     public void RecordWarning(string operationId, string code, string message)
@@ -458,6 +461,9 @@ public sealed class OperationJournal
         CreatedAtUtc = operation.CreatedAtUtc,
         UpdatedAtUtc = operation.UpdatedAtUtc,
         Message = operation.Message,
+        SourcePlanId = operation.SourcePlanId,
+        SourcePlanRevision = operation.SourcePlanRevision,
+        SourcePlanName = operation.SourcePlanName,
         SourcePlanItems = operation.SourcePlanItems.Select(Copy).ToList(),
         DepositCandidates = operation.DepositCandidates.Select(candidate => new DepositCandidateAuthorization
         {
@@ -480,21 +486,6 @@ public sealed class OperationJournal
             TransferredQuantity = line.TransferredQuantity,
         }).ToList(),
     };
-
-    private static void ClearMatchingPlanItems(QuartermasterState state, OperationRecord operation, IReadOnlySet<uint> itemIds)
-    {
-        var authorized = operation.SourcePlanItems.Where(item => itemIds.Contains(item.ItemId)).ToDictionary(item => item.Id);
-        state.PlanItems.RemoveAll(item => authorized.TryGetValue(item.Id, out var source) && Matches(item, source));
-    }
-
-    private static bool Matches(TargetPlanItem current, TargetPlanItem source) =>
-        current.StowagePlanId == source.StowagePlanId &&
-        current.ItemId == source.ItemId &&
-        current.ItemName == source.ItemName &&
-        current.TargetQuantity == source.TargetQuantity &&
-        current.Quality == source.Quality &&
-        current.Notes == source.Notes &&
-        current.Enabled == source.Enabled;
 
     private static TargetPlanItem Copy(TargetPlanItem item) => new()
     {

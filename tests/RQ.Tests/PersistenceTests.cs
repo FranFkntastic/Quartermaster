@@ -1,4 +1,3 @@
-using System.Text.Json;
 using RQ;
 using RQ.Domain;
 using RQ.Persistence;
@@ -7,13 +6,6 @@ namespace RQ.Tests;
 
 public sealed class PersistenceTests
 {
-    [Fact]
-    public void Configuration_ClearsRetrievalPlansAsActionedByDefault()
-    {
-        Assert.True(new PluginConfiguration().ClearRetrievalPlansAsActioned);
-        Assert.True(JsonSerializer.Deserialize<PluginConfiguration>("{}")!.ClearRetrievalPlansAsActioned);
-    }
-
     [Fact]
     public void RetainerCache_RoundTripsOwnerBagsListingsAndObservationTimes()
     {

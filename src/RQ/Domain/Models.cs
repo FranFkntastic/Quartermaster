@@ -155,6 +155,27 @@ public sealed class StowageMigrationRecord
     public DateTime CompletedAtUtc { get; set; }
 }
 
+public sealed class RestockPlan
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public long Revision { get; set; } = 1;
+    public OwnerScope Owner { get; set; } = new();
+    public string Name { get; set; } = "Restock plan";
+    public bool Enabled { get; set; } = true;
+    public List<RestockPlanItem> Items { get; set; } = [];
+}
+
+public sealed class RestockPlanItem
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public uint ItemId { get; set; }
+    public string ItemName { get; set; } = string.Empty;
+    public int TargetQuantity { get; set; }
+    public ItemQualityPolicy Quality { get; set; } = ItemQualityPolicy.Any;
+    public string Notes { get; set; } = string.Empty;
+    public bool Enabled { get; set; } = true;
+}
+
 public static class OperationStatuses
 {
     public const string Queued = "queued";
@@ -198,6 +219,9 @@ public sealed class OperationRecord
     public DateTime CreatedAtUtc { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
     public string Message { get; set; } = string.Empty;
+    public Guid? SourcePlanId { get; set; }
+    public long? SourcePlanRevision { get; set; }
+    public string? SourcePlanName { get; set; }
     public List<TargetPlanItem> SourcePlanItems { get; set; } = [];
     public List<OperationLine> Lines { get; set; } = [];
     public List<DepositCandidateAuthorization> DepositCandidates { get; set; } = [];
@@ -247,11 +271,12 @@ public sealed class OperationReceipt
 
 public sealed class QuartermasterState
 {
-    public string Schema { get; set; } = "gooseworks-quartermaster-state/v2";
+    public string Schema { get; set; } = "gooseworks-quartermaster-state/v3";
     public long Revision { get; set; }
     public List<StowagePlan> StowagePlans { get; set; } = [];
     public List<StowageMigrationRecord> StowageMigrations { get; set; } = [];
     public List<TargetPlanItem> PlanItems { get; set; } = [];
+    public List<RestockPlan> RestockPlans { get; set; } = [];
     public List<SubmittedRequestRecord> Requests { get; set; } = [];
     public List<OperationRecord> Operations { get; set; } = [];
     public List<OperationReceipt> Receipts { get; set; } = [];

@@ -52,8 +52,10 @@ public sealed class OperationTests
     {
         using var directory = new TemporaryDirectory();
         var repository = TestData.Repository(directory.Path);
+        repository.Mutate(state =>
+            state.PlanItems.Add(new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }));
         var journal = new OperationJournal(repository);
-        var operation = journal.CreateManual(TestData.Owner, [new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }]);
+        var operation = journal.CreateManual(TestData.Owner, repository.Snapshot().PlanItems);
         var cacheStore = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
         cacheStore.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
         var cache = new RetainerCacheRepository(cacheStore);
@@ -67,130 +69,7 @@ public sealed class OperationTests
         Assert.Equal(10, Assert.Single(completed.Lines).TransferredQuantity);
         Assert.True(driver.Calls > 0);
         Assert.Empty(cache.Snapshot());
-    }
-
-    [Theory]
-    [InlineData(true, 0)]
-    [InlineData(false, 1)]
-    public async Task RetrievalPlanClearing_RespectsConfiguration(bool clearAsActioned, int expectedPlanRows)
-    {
-        using var directory = new TemporaryDirectory();
-        var repository = TestData.Repository(directory.Path);
-        repository.Mutate(state => state.PlanItems.Add(new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }));
-        var journal = new OperationJournal(repository);
-        var operation = journal.CreateManual(TestData.Owner, repository.Snapshot().PlanItems);
-        var cacheStore = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
-        cacheStore.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
-        var coordinator = new TransferCoordinator(
-            journal,
-            new SuccessfulDriver(),
-            new RetainerCacheRepository(cacheStore),
-            () => TestData.Owner,
-            () => new Dictionary<uint, int>(),
-            clearRetrievalPlansAsActioned: () => clearAsActioned);
-
-        await coordinator.ExecuteRetrievalAsync(operation.OperationId);
-
-        Assert.Equal(OperationStatuses.Succeeded, journal.Get(operation.OperationId)!.Status);
-        Assert.Equal(expectedPlanRows, repository.Snapshot().PlanItems.Count);
-    }
-
-    [Fact]
-    public async Task RetrievalPlanClearing_RemovesAlreadySatisfiedLineButKeepsPartialLine()
-    {
-        using var directory = new TemporaryDirectory();
-        var repository = TestData.Repository(directory.Path);
-        repository.Mutate(state => state.PlanItems.AddRange(
-        [
-            new TargetPlanItem { ItemId = 100, ItemName = "Satisfied Ore", TargetQuantity = 10 },
-            new TargetPlanItem { ItemId = 200, ItemName = "Partial Log", TargetQuantity = 5 },
-        ]));
-        var journal = new OperationJournal(repository);
-        var operation = journal.CreateManual(TestData.Owner, repository.Snapshot().PlanItems);
-        var cacheStore = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
-        cacheStore.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (200, "Partial Log", 2)) });
-        var coordinator = new TransferCoordinator(
-            journal,
-            new PartialDriver(),
-            new RetainerCacheRepository(cacheStore),
-            () => TestData.Owner,
-            () => new Dictionary<uint, int> { [100] = 10 },
-            clearRetrievalPlansAsActioned: () => true);
-
-        await coordinator.ExecuteRetrievalAsync(operation.OperationId);
-
-        Assert.Equal(OperationStatuses.PartiallySucceeded, journal.Get(operation.OperationId)!.Status);
-        var remaining = Assert.Single(repository.Snapshot().PlanItems);
-        Assert.Equal((uint)200, remaining.ItemId);
-    }
-
-    [Fact]
-    public async Task RetrievalPlanClearing_PreservesEditedAndReaddedRows()
-    {
-        using var directory = new TemporaryDirectory();
-        var repository = TestData.Repository(directory.Path);
-        var originalId = Guid.NewGuid();
-        repository.Mutate(state => state.PlanItems.Add(new TargetPlanItem
-        {
-            Id = originalId,
-            ItemId = 100,
-            ItemName = "Ore",
-            TargetQuantity = 10,
-        }));
-        var journal = new OperationJournal(repository);
-        var operation = journal.CreateManual(TestData.Owner, repository.Snapshot().PlanItems);
-        repository.Mutate(state =>
-        {
-            state.PlanItems.Single(item => item.Id == originalId).TargetQuantity = 20;
-            state.PlanItems.Add(new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 30 });
-        });
-        var cacheStore = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
-        cacheStore.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
-        var coordinator = new TransferCoordinator(
-            journal,
-            new SuccessfulDriver(),
-            new RetainerCacheRepository(cacheStore),
-            () => TestData.Owner,
-            () => new Dictionary<uint, int>(),
-            clearRetrievalPlansAsActioned: () => true);
-
-        await coordinator.ExecuteRetrievalAsync(operation.OperationId);
-
-        Assert.Equal(OperationStatuses.Succeeded, journal.Get(operation.OperationId)!.Status);
-        Assert.Equal([20, 30], repository.Snapshot().PlanItems.Select(item => item.TargetQuantity).Order());
-    }
-
-    [Fact]
-    public void RetrievalPlanClearing_AfterIpcPersistenceReloadOnlyRemovesUnchangedAuthorizedRows()
-    {
-        using var directory = new TemporaryDirectory();
-        var repository = TestData.Repository(directory.Path);
-        var queue = new TestWorkQueue();
-        var request = TestData.Request() with
-        {
-            Items =
-            [
-                new ShortageRequestItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10, ShortageQuantity = 10 },
-                new ShortageRequestItem { ItemId = 200, ItemName = "Log", TargetQuantity = 20, ShortageQuantity = 20 },
-            ],
-        };
-        var submissions = new ShortageSubmissionService("provider-1", repository, queue, () => TestData.Owner);
-        submissions.Submit(TestData.Json(request));
-        queue.Drain();
-        repository.Mutate(state =>
-        {
-            state.PlanItems.Single(item => item.ItemId == 100).TargetQuantity = 15;
-            state.PlanItems.Add(new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 30 });
-        });
-
-        var reloadedRepository = TestData.Repository(directory.Path);
-        var reloadedJournal = new OperationJournal(reloadedRepository);
-        reloadedJournal.Transition(request.OperationId, OperationStatuses.Running, "start", "start");
-        reloadedJournal.ClearSatisfiedRetrievalPlanItems(request.OperationId, new HashSet<uint> { 100, 200 });
-
-        var remaining = reloadedRepository.Snapshot().PlanItems.OrderBy(item => item.TargetQuantity).ToArray();
-        Assert.Equal([15, 30], remaining.Select(item => item.TargetQuantity));
-        Assert.All(remaining, item => Assert.Equal((uint)100, item.ItemId));
+        Assert.Single(repository.Snapshot().PlanItems);
     }
 
     [Fact]

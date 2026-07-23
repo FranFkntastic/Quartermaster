@@ -11,6 +11,7 @@ public sealed class SnapshotPublisher
 {
     public const string AutomaticRetrievalCapability = "automaticRetrieval";
     public const string StowagePlansCapability = "stowagePlans.v1";
+    public const string RestockPlansCapability = "restockPlans.v1";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string providerInstanceId;
     private readonly StateRepository state;
@@ -77,6 +78,7 @@ public sealed class SnapshotPublisher
             retainers,
             planItems = stateSnapshot.PlanItems,
             stowagePlans = StowageContract(stateSnapshot, owner, stowage ?? []),
+            restockPlans = RestockContract(stateSnapshot, owner),
             currentOperation = current is null ? null : OperationContract(current),
         };
         var operations = scopedOperations.ToDictionary(
@@ -102,7 +104,7 @@ public sealed class SnapshotPublisher
         providerInstanceId,
         revision = Revision,
         channels = new[] { IpcChannels.GetCapabilities, IpcChannels.GetSnapshot, IpcChannels.SubmitShortages, IpcChannels.GetOperation, IpcChannels.Changed },
-        capabilities = new[] { AutomaticRetrievalCapability, StowagePlansCapability },
+        capabilities = new[] { AutomaticRetrievalCapability, StowagePlansCapability, RestockPlansCapability },
         requestSchemas = new[] { ShortageSubmissionService.RequestSchema },
         statusVocabulary = new[] { OperationStatuses.Queued, OperationStatuses.Accepted, OperationStatuses.Running, OperationStatuses.Succeeded, OperationStatuses.PartiallySucceeded, OperationStatuses.Indeterminate, OperationStatuses.Failed, OperationStatuses.Cancelled, OperationStatuses.Rejected },
         executionPolicy = "request_selected",
@@ -134,8 +136,33 @@ public sealed class SnapshotPublisher
         operation.CreatedAtUtc,
         operation.UpdatedAtUtc,
         operation.Message,
+        operation.SourcePlanId,
+        operation.SourcePlanRevision,
+        operation.SourcePlanName,
         operation.Lines,
         operation.DepositCandidates,
+    };
+
+    private static object RestockContract(QuartermasterState state, OwnerScope owner) => new
+    {
+        schema = "gooseworks-quartermaster-restock-plans/v1",
+        plans = RestockPlanCatalog.OwnerPlans(state, owner).Select(plan => new
+        {
+            plan.Id,
+            plan.Revision,
+            plan.Owner,
+            plan.Name,
+            plan.Enabled,
+            lines = plan.Items.Select(item => new
+            {
+                item.Id,
+                item.ItemId,
+                item.ItemName,
+                desiredPlayerQuantity = item.TargetQuantity,
+                quality = item.Quality.ToString(),
+                item.Enabled,
+            }),
+        }),
     };
 
     private static object StowageContract(
@@ -205,6 +232,9 @@ public sealed class SnapshotPublisher
         operation.UpdatedAtUtc,
         completedAtUtc = OperationStatuses.IsTerminal(operation.Status) ? operation.UpdatedAtUtc : (DateTime?)null,
         operation.Message,
+        operation.SourcePlanId,
+        operation.SourcePlanRevision,
+        operation.SourcePlanName,
         operation.Lines,
         operation.DepositCandidates,
         receipts,

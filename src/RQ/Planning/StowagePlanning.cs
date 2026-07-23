@@ -83,7 +83,7 @@ public static class StowagePlanMigration
                 });
             }
 
-            state.Schema = "gooseworks-quartermaster-state/v2";
+            state.Schema = "gooseworks-quartermaster-state/v3";
         });
         return true;
     }
