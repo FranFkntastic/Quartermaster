@@ -42,11 +42,11 @@ public sealed class QuartermasterWindow : Window
     private string stowageItemSearch = string.Empty;
     private string stowageRuleFilter = string.Empty;
     private ItemChoice? selectedStowageChoice;
-    private string itemGroupName = string.Empty;
     private string stowageEditorError = string.Empty;
     private int bulkQuality = -1;
     private int bulkRoutingMode = -1;
     private int bulkOverflow = -1;
+    private int bulkStowageTarget = -1;
     private bool requestStowageEditorOpen;
     private bool stowageEditorVisible;
     private RestockPlanDraft? restockDraft;
@@ -59,10 +59,20 @@ public sealed class QuartermasterWindow : Window
     private string restockEditorError = string.Empty;
     private int bulkRestockQuality = -1;
     private int bulkRestockTarget = -1;
+    private int bulkRestockNoteMode = -1;
     private bool requestRestockEditorOpen;
     private bool restockEditorVisible;
     private Guid? requestDeleteRestockPlanId;
     private Guid? requestDeleteStowagePlanId;
+    private ItemGroupDraft? itemGroupDraft;
+    private WorkbenchView? itemGroupEditorOrigin;
+    private readonly HashSet<ItemGroupItem> selectedItemGroupItems = [];
+    private string itemGroupFilter = string.Empty;
+    private string itemGroupItemSearch = string.Empty;
+    private ItemChoice? selectedItemGroupChoice;
+    private ItemQualityPolicy itemGroupAddQuality = ItemQualityPolicy.Any;
+    private string itemGroupEditorError = string.Empty;
+    private bool requestDeleteItemGroup;
 
     public QuartermasterWindow(
         StateRepository state,
@@ -107,8 +117,25 @@ public sealed class QuartermasterWindow : Window
     }
 
     public string CurrentWorkspace => workbench.View.ToString().ToLowerInvariant();
+    public string CurrentTransferDirection =>
+        workbench.View == WorkbenchView.Stowage ? "stowage" : "restock";
     public bool StowageEditorOpen => stowageDraft is not null && (requestStowageEditorOpen || stowageEditorVisible);
     public bool RestockEditorOpen => restockDraft is not null && (requestRestockEditorOpen || restockEditorVisible);
+    public bool ItemGroupEditorOpen => itemGroupDraft is not null;
+    public Guid? SelectedItemGroupId => itemGroupDraft is { IsNew: false } ? itemGroupDraft.GroupId : null;
+    public string? SelectedItemGroupName => itemGroupDraft?.Name;
+    public bool ItemGroupEditorHasUnsavedChanges =>
+        itemGroupDraft is not null && ItemGroupCatalog.HasChanges(state.Snapshot(), itemGroupDraft);
+    public bool PlanEditorHasUnsavedChanges
+    {
+        get
+        {
+            var snapshot = state.Snapshot();
+            var owner = runtimeSnapshots.Current.Owner;
+            return (restockDraft is not null && RestockPlanCatalog.HasChanges(snapshot, owner, restockDraft)) ||
+                   (stowageDraft is not null && StowagePlanCatalog.HasChanges(snapshot, owner, stowageDraft));
+        }
+    }
 
     public Guid? SelectedStowagePlanId =>
         ResolveSelectedStowagePlan(runtimeSnapshots.Current.State, runtimeSnapshots.Current.Owner)?.Id;
@@ -217,33 +244,48 @@ public sealed class QuartermasterWindow : Window
         ImGui.EndChild();
 
         ImGui.TableNextColumn();
-        if (ImGui.BeginChild("RQPlanPane", Vector2.Zero, false) && ImGui.BeginTabBar("RQPlanModes"))
+        if (ImGui.BeginChild("RQPlanPane", Vector2.Zero, false))
         {
-            var restockOpen = ImGui.BeginTabItem(
-                "Restock",
-                requestedView == WorkbenchView.Restock ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None);
-            RegisterWorkspaceControl("restock", WorkbenchView.Restock);
-            if (restockOpen)
-            {
-                workbench.View = WorkbenchView.Restock;
-                DrawRestockPlan(runtime);
-                ImGui.EndTabItem();
-            }
-
-            var stowageOpen = ImGui.BeginTabItem(
-                "Stowage",
-                requestedView == WorkbenchView.Stowage ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None);
-            RegisterWorkspaceControl("stowage", WorkbenchView.Stowage);
-            if (stowageOpen)
-            {
-                workbench.View = WorkbenchView.Stowage;
+            if (requestedView is WorkbenchView.Restock or WorkbenchView.Stowage)
+                workbench.View = requestedView.Value;
+            ImGui.TextUnformatted("Transfer plans");
+            ImGui.SameLine();
+            DrawTransferModeButton("Restock <- from retainers", "restock", WorkbenchView.Restock);
+            ImGui.SameLine();
+            DrawTransferModeButton("Stowage -> to retainers", "stowage", WorkbenchView.Stowage);
+            ImGui.SameLine();
+            ImGui.TextDisabled(workbench.View == WorkbenchView.Stowage
+                ? "Put carried surplus away using explicit routing."
+                : "Bring missing stock onto this character.");
+            ImGui.Separator();
+            if (workbench.View == WorkbenchView.Stowage)
                 DrawStowageWorkspace(runtime);
-                ImGui.EndTabItem();
-            }
-            ImGui.EndTabBar();
+            else
+                DrawRestockPlan(runtime);
         }
         ImGui.EndChild();
         ImGui.EndTable();
+    }
+
+    private void DrawTransferModeButton(string label, string id, WorkbenchView view)
+    {
+        var active = workbench.View == view;
+        if (active)
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(.18f, .35f, .46f, 1f));
+        if (ImGui.Button(label))
+            workbench.View = view;
+        if (active)
+            ImGui.PopStyleColor();
+        reviewRegistry.RegisterLastButton(
+            $"quartermaster.workspace.{id}",
+            $"Show {view} transfer direction",
+            true,
+            () =>
+            {
+                workbench.View = view;
+                requestedView = view;
+            },
+            active ? "Selected" : "Available");
     }
 
     private void RegisterWorkspaceControl(string id, WorkbenchView view) =>
@@ -313,50 +355,60 @@ public sealed class QuartermasterWindow : Window
 
         if (workbench.SelectedStock is { } selected)
         {
+            var stowageMode = workbench.View == WorkbenchView.Stowage;
             ImGui.TextUnformatted(selected.ItemName);
             ImGui.SameLine();
             ImGui.SetNextItemWidth(90);
             var stagedTarget = workbench.StagedTargetText;
-            if (ImGui.InputText("Keep##RQStockTarget", ref stagedTarget, 12, ImGuiInputTextFlags.CharsDecimal))
+            if (ImGui.InputText(
+                    $"{(stowageMode ? "Keep on player" : "Target on player")}##RQStockTarget",
+                    ref stagedTarget,
+                    12,
+                    ImGuiInputTextFlags.CharsDecimal))
                 workbench.StagedTargetText = stagedTarget;
-            var restockPlan = ResolveSelectedRestockPlan(runtime.State, runtime.Owner)
-                ?? RestockPlanCatalog.OwnerPlans(runtime.State, runtime.Owner).FirstOrDefault();
-            var stowagePlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner)
-                ?? StowagePlanCatalog.OwnerPlans(runtime.State, runtime.Owner).FirstOrDefault();
-            var canAdd = runtime.Owner.HasStableIdentity && workbench.StagedTarget is > 0;
-            var availableWidth = ImGui.GetContentRegionAvail().X;
-            var buttonWidth = Math.Max(150, (availableWidth - ImGui.GetStyle().ItemSpacing.X) / 2);
+            var canAdd = runtime.Owner.HasStableIdentity &&
+                         workbench.StagedTarget is { } target &&
+                         (stowageMode ? target >= 0 : target > 0);
             if (!canAdd)
                 ImGui.BeginDisabled();
-            var restockLabel = restockPlan is null ? "Add to new Restock Plan" : $"Add to {restockPlan.Name}";
-            if (ImGui.Button(restockLabel, new Vector2(buttonWidth, 0)) && workbench.StagedTarget is { } restockTarget)
-                AddStockSelectionToRestock(runtime, selected, restockTarget, restockPlan);
-            reviewRegistry.RegisterLastButton(
-                $"quartermaster.restock.stage.{selected.ItemId}",
-                $"{restockLabel}: {selected.ItemName}",
-                canAdd,
-                () =>
-                {
-                    var current = runtimeSnapshots.Current;
-                    if (workbench.SelectedStock is { } stock && workbench.StagedTarget is { } target)
-                        AddStockSelectionToRestock(current, stock, target, ResolveSelectedRestockPlan(current.State, current.Owner));
-                },
-                canAdd ? "Opens a review draft" : "Enter a carried target");
-            ImGui.SameLine();
-            var stowageLabel = stowagePlan is null ? "Add to new Stowage Plan" : $"Add to {stowagePlan.Name}";
-            if (ImGui.Button(stowageLabel, new Vector2(buttonWidth, 0)) && workbench.StagedTarget is { } stowageTarget)
-                AddStockSelectionToStowage(runtime, selected, stowageTarget, stowagePlan);
-            reviewRegistry.RegisterLastButton(
-                $"quartermaster.stowage.stage-rule.{selected.ItemId}",
-                $"{stowageLabel}: {selected.ItemName}",
-                canAdd,
-                () =>
-                {
-                    var current = runtimeSnapshots.Current;
-                    if (workbench.SelectedStock is { } stock && workbench.StagedTarget is { } target)
-                        AddStockSelectionToStowage(current, stock, target, ResolveSelectedStowagePlan(current.State, current.Owner));
-                },
-                canAdd ? "Opens a review draft" : "Enter a carried target");
+            if (stowageMode)
+            {
+                var plan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner)
+                           ?? StowagePlanCatalog.OwnerPlans(runtime.State, runtime.Owner).FirstOrDefault();
+                var label = plan is null ? "Add to new Stowage Plan" : $"Add to {plan.Name}";
+                if (ImGui.Button(label, new Vector2(-1, 0)) && workbench.StagedTarget is { } keep)
+                    AddStockSelectionToStowage(runtime, selected, keep, plan);
+                reviewRegistry.RegisterLastButton(
+                    $"quartermaster.stowage.stage-rule.{selected.ItemId}",
+                    $"{label}: {selected.ItemName}",
+                    canAdd,
+                    () =>
+                    {
+                        var current = runtimeSnapshots.Current;
+                        if (workbench.SelectedStock is { } stock && workbench.StagedTarget is { } keep)
+                            AddStockSelectionToStowage(current, stock, keep, ResolveSelectedStowagePlan(current.State, current.Owner));
+                    },
+                    canAdd ? "Opens a review draft" : "Enter a carried keep quantity");
+            }
+            else
+            {
+                var plan = ResolveSelectedRestockPlan(runtime.State, runtime.Owner)
+                           ?? RestockPlanCatalog.OwnerPlans(runtime.State, runtime.Owner).FirstOrDefault();
+                var label = plan is null ? "Add to new Restock Plan" : $"Add to {plan.Name}";
+                if (ImGui.Button(label, new Vector2(-1, 0)) && workbench.StagedTarget is { } targetQuantity)
+                    AddStockSelectionToRestock(runtime, selected, targetQuantity, plan);
+                reviewRegistry.RegisterLastButton(
+                    $"quartermaster.restock.stage.{selected.ItemId}",
+                    $"{label}: {selected.ItemName}",
+                    canAdd,
+                    () =>
+                    {
+                        var current = runtimeSnapshots.Current;
+                        if (workbench.SelectedStock is { } stock && workbench.StagedTarget is { } targetQuantity)
+                            AddStockSelectionToRestock(current, stock, targetQuantity, ResolveSelectedRestockPlan(current.State, current.Owner));
+                    },
+                    canAdd ? "Opens a review draft" : "Enter a carried target");
+            }
             if (!canAdd)
                 ImGui.EndDisabled();
         }
@@ -600,6 +652,7 @@ public sealed class QuartermasterWindow : Window
     private void OpenRestockEditor(RestockPlanDraft draft)
     {
         CloseStowageEditor();
+        CloseItemGroupEditor();
         restockDraft = draft;
         selectedRestockItemIds.Clear();
         activeRestockItemId = draft.Items.FirstOrDefault()?.Id;
@@ -610,6 +663,7 @@ public sealed class QuartermasterWindow : Window
         restockEditorError = string.Empty;
         bulkRestockQuality = -1;
         bulkRestockTarget = -1;
+        bulkRestockNoteMode = -1;
         requestRestockEditorOpen = true;
         workbench.View = WorkbenchView.Restock;
         requestedView = WorkbenchView.Restock;
@@ -637,11 +691,21 @@ public sealed class QuartermasterWindow : Window
             return;
         }
         restockEditorVisible = true;
+        if (itemGroupDraft is not null && itemGroupEditorOrigin == WorkbenchView.Restock)
+        {
+            DrawItemGroupEditor(runtime);
+            ImGui.EndPopup();
+            return;
+        }
 
         var draft = restockDraft;
+        ImGui.TextUnformatted("Edit plan");
+        ImGui.SameLine();
+        ImGui.TextColored(new Vector4(.55f, .8f, .95f, 1f), "<- Restock");
+        ImGui.SameLine();
         var planName = draft.Name;
         ImGui.SetNextItemWidth(300);
-        if (ImGui.InputText("Name##restockdraft", ref planName, 80))
+        if (ImGui.InputText("##restockdraftname", ref planName, 80))
             draft.Name = planName;
         ImGui.SameLine();
         var planEnabled = draft.Enabled;
@@ -655,13 +719,8 @@ public sealed class QuartermasterWindow : Window
         if (!string.IsNullOrWhiteSpace(restockEditorError))
             ImGui.TextColored(new Vector4(1f, .45f, .4f, 1f), restockEditorError);
 
-        var inspectorWidth = Math.Clamp(ImGui.GetContentRegionAvail().X * .28f, 270f, 330f);
-        if (ImGui.BeginChild("RQRestockItemTable", new Vector2(-inspectorWidth - 8, -42), true))
+        if (ImGui.BeginChild("RQRestockItemTable", new Vector2(0, -42), true))
             DrawRestockDraftItems(draft);
-        ImGui.EndChild();
-        ImGui.SameLine();
-        if (ImGui.BeginChild("RQRestockItemInspector", new Vector2(0, -42), true))
-            DrawRestockItemInspector(draft);
         ImGui.EndChild();
 
         var snapshot = state.Snapshot();
@@ -684,7 +743,7 @@ public sealed class QuartermasterWindow : Window
         ImGui.SameLine();
         if (!canApply)
             ImGui.BeginDisabled();
-        if (ImGui.Button("Apply##restockeditor"))
+        if (ImGui.Button("Save plan##restockeditor"))
         {
             try
             {
@@ -707,22 +766,15 @@ public sealed class QuartermasterWindow : Window
     private void DrawRestockEditorToolbar(RestockPlanDraft draft)
     {
         ImGui.Separator();
-        ImGui.SetNextItemWidth(210);
-        ImGui.InputTextWithHint("##restockitemfilter", "Filter items", ref restockItemFilter, 80);
+        ImGui.TextDisabled("Add items");
         ImGui.SameLine();
-        if (ImGui.SmallButton("Select visible##restock"))
-        {
-            foreach (var item in FilteredRestockDraftItems(draft))
-                selectedRestockItemIds.Add(item.Id);
-        }
+        DrawRestockDraftAdd(draft);
         ImGui.SameLine();
-        if (ImGui.SmallButton("Clear selection##restock"))
-            selectedRestockItemIds.Clear();
-
+        ImGui.TextDisabled("or group");
+        ImGui.SameLine();
         var groups = ItemGroupCatalog.All(state.Snapshot());
         var selectedGroup = groups.FirstOrDefault(group => group.Id == selectedRestockItemGroupId);
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(155);
+        ImGui.SetNextItemWidth(185);
         if (ImGui.BeginCombo("##restockgroup", selectedGroup is null ? "@item group" : $"@{selectedGroup.Name}"))
         {
             foreach (var group in groups)
@@ -738,31 +790,36 @@ public sealed class QuartermasterWindow : Window
             ItemGroupCatalog.AddMissing(selectedGroup, draft);
             activeRestockItemId ??= draft.Items.FirstOrDefault()?.Id;
         }
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Select group##restock") && selectedGroup is not null)
-        {
-            selectedRestockItemIds.Clear();
-            selectedRestockItemIds.UnionWith(ItemGroupCatalog.MatchingItemIds(selectedGroup, draft));
-        }
         if (selectedGroup is null)
             ImGui.EndDisabled();
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Manage groups...##restock"))
+            OpenItemGroupEditor(WorkbenchView.Restock);
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.item-groups.open.restock",
+            "Open Item Groups from the Restock Plan editor",
+            true,
+            () => OpenItemGroupEditor(WorkbenchView.Restock),
+            "Plan draft remains open");
+
+        ImGui.SetNextItemWidth(210);
+        ImGui.InputTextWithHint("##restockitemfilter", "Filter plan items", ref restockItemFilter, 80);
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Select visible##restock"))
+        {
+            foreach (var item in FilteredRestockDraftItems(draft))
+                selectedRestockItemIds.Add(item.Id);
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Clear selection##restock"))
+            selectedRestockItemIds.Clear();
         ImGui.SameLine();
         if (selectedRestockItemIds.Count == 0)
             ImGui.BeginDisabled();
         if (ImGui.SmallButton("Save as @group##restock"))
-        {
-            itemGroupName = string.Empty;
-            ImGui.OpenPopup("Save Restock Item Group##RQ");
-        }
+            OpenNewItemGroupFromRestockSelection();
         if (selectedRestockItemIds.Count == 0)
             ImGui.EndDisabled();
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Manage groups##restock"))
-            ImGui.OpenPopup("Manage Restock Item Groups##RQ");
-
-        DrawSaveRestockItemGroupPopup(draft);
-        DrawManageRestockItemGroupsPopup(draft);
-        DrawRestockDraftAdd(draft);
     }
 
     private void DrawRestockDraftAdd(RestockPlanDraft draft)
@@ -808,72 +865,437 @@ public sealed class QuartermasterWindow : Window
         }
     }
 
-    private void DrawSaveRestockItemGroupPopup(RestockPlanDraft draft)
+    private void OpenItemGroupEditor(WorkbenchView origin)
     {
-        if (!ImGui.BeginPopupModal("Save Restock Item Group##RQ", ImGuiWindowFlags.AlwaysAutoResize))
-            return;
-        ImGui.TextUnformatted("Save selected item identities as a reusable shorthand.");
-        ImGui.SetNextItemWidth(300);
-        ImGui.InputTextWithHint("##restockitemgroupname", "@group name", ref itemGroupName, 80);
-        var canSave = !string.IsNullOrWhiteSpace(itemGroupName) && selectedRestockItemIds.Count > 0;
-        if (!canSave)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Save group##restock"))
-        {
-            var selected = draft.Items.Where(item => selectedRestockItemIds.Contains(item.Id)).ToArray();
-            selectedRestockItemGroupId = state.Mutate(document =>
-                ItemGroupCatalog.Create(document, itemGroupName, selected).Id);
-            itemGroupName = string.Empty;
-            ImGui.CloseCurrentPopup();
-        }
-        if (!canSave)
-            ImGui.EndDisabled();
-        ImGui.SameLine();
-        if (ImGui.Button("Cancel##restockitemgroup"))
-            ImGui.CloseCurrentPopup();
-        ImGui.EndPopup();
+        itemGroupEditorOrigin = origin;
+        var snapshot = state.Snapshot();
+        var preferredId = origin == WorkbenchView.Restock
+            ? selectedRestockItemGroupId
+            : selectedItemGroupId;
+        var group = snapshot.ItemGroups.FirstOrDefault(candidate => candidate.Id == preferredId)
+                    ?? ItemGroupCatalog.All(snapshot).FirstOrDefault();
+        itemGroupDraft = group is null
+            ? ItemGroupCatalog.NewDraft(snapshot)
+            : ItemGroupCatalog.Draft(snapshot, group.Id);
+        ResetItemGroupEditorInput();
     }
 
-    private void DrawManageRestockItemGroupsPopup(RestockPlanDraft draft)
+    private void OpenNewItemGroupFromRestockSelection()
     {
-        if (!ImGui.BeginPopupModal("Manage Restock Item Groups##RQ", ImGuiWindowFlags.AlwaysAutoResize))
+        if (restockDraft is null)
             return;
-        var groups = ItemGroupCatalog.All(state.Snapshot());
-        if (groups.Count == 0)
-            ImGui.TextDisabled("No Item Groups saved. Select plan items, then save the selection as a group.");
-        foreach (var group in groups)
+        var selected = restockDraft.Items
+            .Where(item => selectedRestockItemIds.Contains(item.Id))
+            .ToArray();
+        itemGroupEditorOrigin = WorkbenchView.Restock;
+        itemGroupDraft = ItemGroupCatalog.NewDraft(state.Snapshot(), "Item group", selected);
+        ResetItemGroupEditorInput();
+    }
+
+    private void OpenNewItemGroupFromStowageSelection()
+    {
+        if (stowageDraft is null)
+            return;
+        var selected = stowageDraft.Rules
+            .Where(rule => selectedStowageRuleIds.Contains(rule.Id))
+            .ToArray();
+        itemGroupEditorOrigin = WorkbenchView.Stowage;
+        itemGroupDraft = ItemGroupCatalog.NewDraft(state.Snapshot(), "Item group", selected);
+        ResetItemGroupEditorInput();
+    }
+
+    private void ResetItemGroupEditorInput()
+    {
+        selectedItemGroupItems.Clear();
+        itemGroupFilter = string.Empty;
+        itemGroupItemSearch = string.Empty;
+        selectedItemGroupChoice = null;
+        itemGroupAddQuality = ItemQualityPolicy.Any;
+        itemGroupEditorError = string.Empty;
+        requestDeleteItemGroup = false;
+    }
+
+    private void CloseItemGroupEditor()
+    {
+        itemGroupDraft = null;
+        itemGroupEditorOrigin = null;
+        selectedItemGroupItems.Clear();
+        selectedItemGroupChoice = null;
+        itemGroupEditorError = string.Empty;
+        requestDeleteItemGroup = false;
+    }
+
+    private void DrawItemGroupEditor(QuartermasterRuntimeSnapshot runtime)
+    {
+        var draft = itemGroupDraft;
+        if (draft is null)
+            return;
+
+        if (ImGui.Button("<- Back to plan##itemgroups"))
         {
-            var name = group.Name;
-            ImGui.SetNextItemWidth(210);
-            if (ImGui.InputText($"##restockgroupname{group.Id}", ref name, 80) &&
-                !string.IsNullOrWhiteSpace(name))
+            if (ItemGroupCatalog.HasChanges(state.Snapshot(), draft))
+                itemGroupEditorError = "Save or discard this Item Group before returning to the plan.";
+            else
+                CloseItemGroupEditor();
+        }
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.item-groups.back",
+            "Return to the suspended Transfer Plan draft",
+            true,
+            () =>
             {
-                var groupId = group.Id;
-                state.Mutate(document => ItemGroupCatalog.Rename(document, groupId, name));
+                if (itemGroupDraft is not null &&
+                    !ItemGroupCatalog.HasChanges(state.Snapshot(), itemGroupDraft))
+                    CloseItemGroupEditor();
+            },
+            ItemGroupCatalog.HasChanges(state.Snapshot(), draft) ? "Unsaved group changes" : "Available");
+        ImGui.SameLine();
+        ImGui.TextUnformatted("Item groups");
+        ImGui.SameLine();
+        ImGui.TextDisabled("Shared by Restock and Stowage");
+
+        if (!string.IsNullOrWhiteSpace(itemGroupEditorError))
+            ImGui.TextColored(new Vector4(1f, .45f, .4f, 1f), itemGroupEditorError);
+
+        var bodyHeight = Math.Max(260, ImGui.GetContentRegionAvail().Y - 42);
+        var flags = ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
+        if (ImGui.BeginTable("RQItemGroupEditor", 2, flags, new Vector2(0, bodyHeight)))
+        {
+            ImGui.TableSetupColumn("Groups", ImGuiTableColumnFlags.WidthFixed, 290);
+            ImGui.TableSetupColumn("Members", ImGuiTableColumnFlags.WidthStretch, 1f);
+            ImGui.TableNextRow();
+            ImGui.TableNextColumn();
+            if (ImGui.BeginChild("RQItemGroupList", Vector2.Zero, false))
+                DrawItemGroupList(draft);
+            ImGui.EndChild();
+            ImGui.TableNextColumn();
+            if (ImGui.BeginChild("RQItemGroupMembers", Vector2.Zero, false))
+                DrawItemGroupMembers(draft, runtime);
+            ImGui.EndChild();
+            ImGui.EndTable();
+        }
+
+        var snapshot = state.Snapshot();
+        var canApply = ItemGroupCatalog.CanApply(snapshot, draft);
+        ImGui.TextDisabled(draft.IsNew && draft.Items.Count == 0
+            ? "Add at least one item to save this group."
+            : canApply ? "Unsaved changes - groups remember item and quality; plans own quantities and routing." : "No unsaved changes.");
+        ImGui.SameLine(ImGui.GetContentRegionAvail().X - 190);
+        if (ImGui.Button("Discard##itemgroupeditor"))
+            CloseItemGroupEditor();
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.item-groups.discard",
+            "Discard the open Item Group draft",
+            true,
+            CloseItemGroupEditor,
+            "The Transfer Plan draft remains open");
+        ImGui.SameLine();
+        if (!canApply)
+            ImGui.BeginDisabled();
+        if (ImGui.Button("Save group##itemgroupeditor"))
+        {
+            try
+            {
+                var groupId = state.Mutate(document => ItemGroupCatalog.Apply(document, draft).Id);
+                if (itemGroupEditorOrigin == WorkbenchView.Restock)
+                    selectedRestockItemGroupId = groupId;
+                else
+                    selectedItemGroupId = groupId;
+                itemGroupDraft = ItemGroupCatalog.Draft(state.Snapshot(), groupId);
+                selectedItemGroupItems.Clear();
+                itemGroupEditorError = string.Empty;
             }
-            ImGui.SameLine();
-            ImGui.TextDisabled($"{group.Items.Count:N0} items");
-            ImGui.SameLine();
-            if (selectedRestockItemIds.Count == 0)
-                ImGui.BeginDisabled();
-            if (ImGui.SmallButton($"Replace##restockgroup{group.Id}"))
+            catch (InvalidOperationException exception)
             {
-                var groupId = group.Id;
-                var selected = draft.Items.Where(item => selectedRestockItemIds.Contains(item.Id)).ToArray();
-                state.Mutate(document => ItemGroupCatalog.ReplaceItems(document, groupId, selected));
-            }
-            if (selectedRestockItemIds.Count == 0)
-                ImGui.EndDisabled();
-            ImGui.SameLine();
-            if (ImGui.SmallButton($"Delete##restockgroup{group.Id}"))
-            {
-                var groupId = group.Id;
-                state.Mutate(document => document.ItemGroups.RemoveAll(candidate => candidate.Id == groupId));
-                if (selectedRestockItemGroupId == groupId)
-                    selectedRestockItemGroupId = null;
+                itemGroupEditorError = exception.Message;
             }
         }
-        if (ImGui.Button("Close##restockgroups"))
+        if (!canApply)
+            ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.item-groups.save",
+            "Save the open Item Group draft",
+            canApply,
+            () =>
+            {
+                if (itemGroupDraft is null)
+                    return;
+                var groupId = state.Mutate(document => ItemGroupCatalog.Apply(document, itemGroupDraft).Id);
+                if (itemGroupEditorOrigin == WorkbenchView.Restock)
+                    selectedRestockItemGroupId = groupId;
+                else
+                    selectedItemGroupId = groupId;
+                itemGroupDraft = ItemGroupCatalog.Draft(state.Snapshot(), groupId);
+            },
+            canApply ? "Changes are saved together" : "No valid changes");
+
+        DrawDeleteItemGroupPopup();
+    }
+
+    private void DrawItemGroupList(ItemGroupDraft draft)
+    {
+        ImGui.SetNextItemWidth(-1);
+        ImGui.InputTextWithHint("##itemgroupfilter", "Filter groups", ref itemGroupFilter, 80);
+        ImGui.Separator();
+        var groups = ItemGroupCatalog.All(state.Snapshot())
+            .Where(group => itemGroupFilter.Trim().Length == 0 ||
+                            group.Name.Contains(itemGroupFilter.Trim(), StringComparison.OrdinalIgnoreCase) ||
+                            group.Items.Any(item => item.ItemName.Contains(itemGroupFilter.Trim(), StringComparison.OrdinalIgnoreCase)))
+            .ToArray();
+        foreach (var group in groups)
+        {
+            var preview = string.Join(", ", group.Items.Select(item => item.ItemName).Take(3));
+            if (group.Items.Count > 3)
+                preview += "...";
+            var selected = !draft.IsNew && draft.GroupId == group.Id;
+            if (ImGui.Selectable(
+                    $"@{group.Name}  ({group.Items.Count:N0})##itemgroup{group.Id}",
+                    selected,
+                    ImGuiSelectableFlags.AllowDoubleClick))
+                TrySwitchItemGroup(group.Id);
+            var groupId = group.Id;
+            reviewRegistry.RegisterLastButton(
+                $"quartermaster.item-groups.select.{group.Id}",
+                $"Edit Item Group {group.Name}",
+                true,
+                () => TrySwitchItemGroup(groupId),
+                selected ? "Selected" : $"{group.Items.Count:N0} items");
+            if (!string.IsNullOrWhiteSpace(preview))
+                ImGui.TextDisabled(preview);
+        }
+        ImGui.Separator();
+        if (ImGui.Button("New item group", new Vector2(-1, 0)))
+        {
+            if (ItemGroupCatalog.HasChanges(state.Snapshot(), draft))
+                itemGroupEditorError = "Save or discard this Item Group before creating another.";
+            else
+            {
+                itemGroupDraft = ItemGroupCatalog.NewDraft(state.Snapshot());
+                selectedItemGroupItems.Clear();
+                itemGroupEditorError = string.Empty;
+            }
+        }
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.item-groups.new",
+            "Open a new Item Group draft",
+            true,
+            () =>
+            {
+                if (itemGroupDraft is not null &&
+                    !ItemGroupCatalog.HasChanges(state.Snapshot(), itemGroupDraft))
+                    itemGroupDraft = ItemGroupCatalog.NewDraft(state.Snapshot());
+            },
+            "Nothing is saved until Save group");
+    }
+
+    private void TrySwitchItemGroup(Guid groupId)
+    {
+        if (itemGroupDraft is null || itemGroupDraft.GroupId == groupId)
+            return;
+        if (ItemGroupCatalog.HasChanges(state.Snapshot(), itemGroupDraft))
+        {
+            itemGroupEditorError = "Save or discard this Item Group before switching.";
+            return;
+        }
+        itemGroupDraft = ItemGroupCatalog.Draft(state.Snapshot(), groupId);
+        selectedItemGroupItems.Clear();
+        itemGroupItemSearch = string.Empty;
+        selectedItemGroupChoice = null;
+        itemGroupEditorError = string.Empty;
+    }
+
+    private void DrawItemGroupMembers(ItemGroupDraft draft, QuartermasterRuntimeSnapshot runtime)
+    {
+        ImGui.TextDisabled("Name");
+        ImGui.SameLine();
+        var name = draft.Name;
+        ImGui.SetNextItemWidth(300);
+        if (ImGui.InputText("##itemgroupname", ref name, 80))
+            draft.Name = name;
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{draft.Items.Count:N0} items");
+        ImGui.SameLine(ImGui.GetContentRegionAvail().X - 100);
+        if (draft.IsNew)
+            ImGui.BeginDisabled();
+        if (ImGui.Button("Delete group##itemgroup"))
+            requestDeleteItemGroup = true;
+        if (draft.IsNew)
+            ImGui.EndDisabled();
+
+        ImGui.Separator();
+        ImGui.TextDisabled("Add member");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(260);
+        if (ImGui.InputTextWithHint("##itemgroupitemsearch", "Search by item name", ref itemGroupItemSearch, 96))
+            selectedItemGroupChoice = null;
+        if (itemGroupItemSearch.Trim().Length >= 2 && selectedItemGroupChoice is null)
+        {
+            foreach (var match in SearchItems(itemGroupItemSearch, 5))
+                if (ImGui.Selectable(
+                        $"{match.Label}##itemgroupchoice{match.ItemId}",
+                        false,
+                        ImGuiSelectableFlags.DontClosePopups))
+                {
+                    selectedItemGroupChoice = match;
+                    itemGroupItemSearch = match.Name;
+                }
+        }
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(130);
+        if (ImGui.BeginCombo("##itemgroupaddquality", QualityChoiceLabel(itemGroupAddQuality)))
+        {
+            foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
+                if (ImGui.Selectable(QualityChoiceLabel(quality), itemGroupAddQuality == quality))
+                    itemGroupAddQuality = quality;
+            ImGui.EndCombo();
+        }
+        ImGui.SameLine();
+        var canAddItem = selectedItemGroupChoice is not null;
+        if (!canAddItem)
+            ImGui.BeginDisabled();
+        if (ImGui.Button("Add item##itemgroup") && selectedItemGroupChoice is { } choice)
+        {
+            ItemGroupCatalog.AddMissing(draft,
+            [
+                new ItemGroupItem
+                {
+                    ItemId = choice.ItemId,
+                    ItemName = choice.Name,
+                    Quality = itemGroupAddQuality,
+                },
+            ]);
+            selectedItemGroupChoice = null;
+            itemGroupItemSearch = string.Empty;
+        }
+        if (!canAddItem)
+            ImGui.EndDisabled();
+
+        var planSelectionCount = ItemGroupPlanSelectionCount();
+        ImGui.SameLine();
+        if (planSelectionCount == 0)
+            ImGui.BeginDisabled();
+        if (ImGui.Button($"Add {planSelectionCount:N0} selected from plan##itemgroup"))
+            AddPlanSelectionToItemGroup(draft);
+        if (planSelectionCount == 0)
+            ImGui.EndDisabled();
+
+        var hasSelectedMembers = selectedItemGroupItems.Count > 0;
+        if (!hasSelectedMembers)
+            ImGui.BeginDisabled();
+        if (ImGui.Button($"Remove selected ({selectedItemGroupItems.Count:N0})##itemgroup"))
+        {
+            draft.Items.RemoveAll(selectedItemGroupItems.Contains);
+            selectedItemGroupItems.Clear();
+        }
+        if (!hasSelectedMembers)
+            ImGui.EndDisabled();
+
+        var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY |
+                    ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
+        if (!ImGui.BeginTable("RQItemGroupMembersTable", 4, flags, new Vector2(0, Math.Max(180, ImGui.GetContentRegionAvail().Y))))
+            return;
+        ImGui.TableSetupColumn("Select", ImGuiTableColumnFlags.WidthFixed, 48);
+        ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.7f);
+        ImGui.TableSetupColumn("Quality identity", ImGuiTableColumnFlags.WidthFixed, 180);
+        ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 28);
+        ImGui.TableHeadersRow();
+        foreach (var item in draft.Items.ToArray())
+        {
+            ImGui.TableNextRow();
+            ImGui.TableNextColumn();
+            var selected = selectedItemGroupItems.Contains(item);
+            if (ImGui.Checkbox($"##selectgroupitem{item.ItemId}:{(int)item.Quality}:{item.GetHashCode()}", ref selected))
+            {
+                if (selected)
+                    selectedItemGroupItems.Add(item);
+                else
+                    selectedItemGroupItems.Remove(item);
+            }
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(item.ItemName);
+            ImGui.TableNextColumn();
+            ImGui.SetNextItemWidth(-1);
+            if (ImGui.BeginCombo($"##groupitemquality{item.GetHashCode()}", QualityChoiceLabel(item.Quality)))
+            {
+                foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
+                    if (ImGui.Selectable(QualityChoiceLabel(quality), item.Quality == quality))
+                        item.Quality = quality;
+                ImGui.EndCombo();
+            }
+            ImGui.TableNextColumn();
+            if (ImGui.SmallButton($"X##removegroupitem{item.GetHashCode()}"))
+            {
+                draft.Items.Remove(item);
+                selectedItemGroupItems.Remove(item);
+            }
+        }
+        ImGui.EndTable();
+    }
+
+    private int ItemGroupPlanSelectionCount() =>
+        itemGroupEditorOrigin switch
+        {
+            WorkbenchView.Restock when restockDraft is not null =>
+                restockDraft.Items.Count(item => selectedRestockItemIds.Contains(item.Id)),
+            WorkbenchView.Stowage when stowageDraft is not null =>
+                stowageDraft.Rules.Count(rule => selectedStowageRuleIds.Contains(rule.Id)),
+            _ => 0,
+        };
+
+    private void AddPlanSelectionToItemGroup(ItemGroupDraft draft)
+    {
+        if (itemGroupEditorOrigin == WorkbenchView.Restock && restockDraft is not null)
+            ItemGroupCatalog.AddMissing(
+                draft,
+                restockDraft.Items.Where(item => selectedRestockItemIds.Contains(item.Id)));
+        else if (itemGroupEditorOrigin == WorkbenchView.Stowage && stowageDraft is not null)
+            ItemGroupCatalog.AddMissing(
+                draft,
+                stowageDraft.Rules.Where(rule => selectedStowageRuleIds.Contains(rule.Id)));
+    }
+
+    private void DrawDeleteItemGroupPopup()
+    {
+        if (requestDeleteItemGroup)
+        {
+            ImGui.OpenPopup("Delete Item Group##RQ");
+            requestDeleteItemGroup = false;
+        }
+        if (!ImGui.BeginPopupModal("Delete Item Group##RQ", ImGuiWindowFlags.AlwaysAutoResize))
+            return;
+        var draft = itemGroupDraft;
+        if (draft is null || draft.IsNew)
+        {
+            ImGui.CloseCurrentPopup();
+            ImGui.EndPopup();
+            return;
+        }
+        ImGui.TextUnformatted($"Delete \"@{draft.Name}\"?");
+        ImGui.TextDisabled("Existing plan items are not changed.");
+        if (ImGui.Button("Delete##itemgroupconfirm"))
+        {
+            try
+            {
+                state.Mutate(document => ItemGroupCatalog.Delete(document, draft.GroupId, draft.SourceRevision));
+                if (selectedRestockItemGroupId == draft.GroupId)
+                    selectedRestockItemGroupId = null;
+                if (selectedItemGroupId == draft.GroupId)
+                    selectedItemGroupId = null;
+                var next = ItemGroupCatalog.All(state.Snapshot()).FirstOrDefault();
+                itemGroupDraft = next is null
+                    ? ItemGroupCatalog.NewDraft(state.Snapshot())
+                    : ItemGroupCatalog.Draft(state.Snapshot(), next.Id);
+                selectedItemGroupItems.Clear();
+                itemGroupEditorError = string.Empty;
+                ImGui.CloseCurrentPopup();
+            }
+            catch (InvalidOperationException exception)
+            {
+                itemGroupEditorError = exception.Message;
+            }
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Cancel##itemgroupdelete"))
             ImGui.CloseCurrentPopup();
         ImGui.EndPopup();
     }
@@ -881,13 +1303,31 @@ public sealed class QuartermasterWindow : Window
     private void DrawRestockEditorBulkBar(RestockPlanDraft draft)
     {
         ImGui.Separator();
-        DrawOptionalEnumCombo("Quality##restockbulk", ref bulkRestockQuality, Enum.GetValues<ItemQualityPolicy>(), QualityChoiceLabel);
+        ImGui.TextUnformatted($"{selectedRestockItemIds.Count:N0} selected");
         ImGui.SameLine();
-        ImGui.SetNextItemWidth(150);
-        ImGui.InputInt("Keep (-1 = no change)##restockbulk", ref bulkRestockTarget);
+        ImGui.TextDisabled("Target");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(80);
+        ImGui.InputInt("##restockbulktarget", ref bulkRestockTarget);
+        ImGui.SameLine();
+        ImGui.TextDisabled("Quality");
+        ImGui.SameLine();
+        DrawOptionalEnumCombo("##restockbulkquality", ref bulkRestockQuality, Enum.GetValues<ItemQualityPolicy>(), QualityChoiceLabel);
+        ImGui.SameLine();
+        ImGui.TextDisabled("Note");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(125);
+        if (ImGui.BeginCombo("##restockbulknote", bulkRestockNoteMode < 0 ? "Leave unchanged" : "Clear notes"))
+        {
+            if (ImGui.Selectable("Leave unchanged", bulkRestockNoteMode < 0))
+                bulkRestockNoteMode = -1;
+            if (ImGui.Selectable("Clear notes", bulkRestockNoteMode == 0))
+                bulkRestockNoteMode = 0;
+            ImGui.EndCombo();
+        }
         ImGui.SameLine();
         var canApply = selectedRestockItemIds.Count > 0 &&
-                       (bulkRestockQuality >= 0 || bulkRestockTarget >= 0);
+                       (bulkRestockQuality >= 0 || bulkRestockTarget >= 0 || bulkRestockNoteMode >= 0);
         if (!canApply)
             ImGui.BeginDisabled();
         if (ImGui.Button("Apply to selected##restockbulk"))
@@ -898,10 +1338,23 @@ public sealed class QuartermasterWindow : Window
                     item.Quality = (ItemQualityPolicy)bulkRestockQuality;
                 if (bulkRestockTarget >= 0)
                     item.TargetQuantity = bulkRestockTarget;
+                if (bulkRestockNoteMode == 0)
+                    item.Notes = string.Empty;
             }
-            bulkRestockQuality = bulkRestockTarget = -1;
+            bulkRestockQuality = bulkRestockTarget = bulkRestockNoteMode = -1;
         }
         if (!canApply)
+            ImGui.EndDisabled();
+        ImGui.SameLine();
+        var hasSelection = selectedRestockItemIds.Count > 0;
+        if (!hasSelection)
+            ImGui.BeginDisabled();
+        if (ImGui.Button("Remove selected##restockbulk"))
+        {
+            draft.Items.RemoveAll(item => selectedRestockItemIds.Contains(item.Id));
+            selectedRestockItemIds.Clear();
+        }
+        if (!hasSelection)
             ImGui.EndDisabled();
     }
 
@@ -909,17 +1362,19 @@ public sealed class QuartermasterWindow : Window
     {
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY |
                     ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
-        if (!ImGui.BeginTable("RQRestockDraftItems", 7, flags, new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y))))
+        if (!ImGui.BeginTable("RQRestockDraftItems", 8, flags, new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y))))
             return;
-        ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 28);
-        ImGui.TableSetupColumn("On", ImGuiTableColumnFlags.WidthFixed, 30);
+        ImGui.TableSetupColumn("Select", ImGuiTableColumnFlags.WidthFixed, 46);
+        ImGui.TableSetupColumn("Rule", ImGuiTableColumnFlags.WidthFixed, 52);
         ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.5f);
-        ImGui.TableSetupColumn("Keep", ImGuiTableColumnFlags.WidthFixed, 75);
-        ImGui.TableSetupColumn("Quality", ImGuiTableColumnFlags.WidthFixed, 70);
+        ImGui.TableSetupColumn("Target", ImGuiTableColumnFlags.WidthFixed, 80);
+        ImGui.TableSetupColumn("Quality", ImGuiTableColumnFlags.WidthFixed, 112);
         ImGui.TableSetupColumn("Note", ImGuiTableColumnFlags.WidthStretch, 1f);
+        ImGui.TableSetupColumn("Item group", ImGuiTableColumnFlags.WidthStretch, .8f);
         ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 28);
         ImGui.TableHeadersRow();
         var filtered = FilteredRestockDraftItems(draft);
+        var groups = ItemGroupCatalog.All(state.Snapshot());
         if (filtered.Count == 0)
         {
             ImGui.TableNextRow();
@@ -943,15 +1398,9 @@ public sealed class QuartermasterWindow : Window
                     selectedRestockItemIds.Remove(item.Id);
             }
             ImGui.TableNextColumn();
-            var enabled = item.Enabled;
-            if (ImGui.Checkbox($"##draftrestockon{item.Id}", ref enabled))
-                item.Enabled = enabled;
+            item.Enabled = DrawRuleToggle($"restock{item.Id}", item.Enabled);
             ImGui.TableNextColumn();
-            if (ImGui.Selectable(
-                    $"{item.ItemName}##draftrestockitem{item.Id}",
-                    activeRestockItemId == item.Id,
-                    ImGuiSelectableFlags.DontClosePopups))
-                activeRestockItemId = item.Id;
+            ImGui.TextUnformatted(item.ItemName);
             ImGui.TableNextColumn();
             var target = item.TargetQuantity;
             ImGui.SetNextItemWidth(-1);
@@ -960,12 +1409,18 @@ public sealed class QuartermasterWindow : Window
             ImGui.TableNextColumn();
             DrawRestockDraftQuality(item);
             ImGui.TableNextColumn();
-            var note = string.IsNullOrWhiteSpace(item.Notes) ? "No note" : item.Notes;
-            if (ImGui.Selectable(
-                    $"{note}##draftrestocknote{item.Id}",
-                    activeRestockItemId == item.Id,
-                    ImGuiSelectableFlags.DontClosePopups))
-                activeRestockItemId = item.Id;
+            var note = item.Notes;
+            ImGui.SetNextItemWidth(-1);
+            if (ImGui.InputText($"##draftrestocknote{item.Id}", ref note, 160))
+                item.Notes = note;
+            ImGui.TableNextColumn();
+            var matchingGroups = groups
+                .Where(group => group.Items.Any(member =>
+                    member.ItemId == item.ItemId && member.Quality == item.Quality))
+                .Select(group => $"@{group.Name}")
+                .Take(2)
+                .ToArray();
+            ImGui.TextDisabled(matchingGroups.Length == 0 ? "Ungrouped" : string.Join(", ", matchingGroups));
             ImGui.TableNextColumn();
             if (ImGui.SmallButton($"X##draftrestockremove{item.Id}"))
             {
@@ -987,43 +1442,6 @@ public sealed class QuartermasterWindow : Window
             if (ImGui.Selectable(QualityChoiceLabel(quality), item.Quality == quality))
                 item.Quality = quality;
         ImGui.EndCombo();
-    }
-
-    private void DrawRestockItemInspector(RestockPlanDraft draft)
-    {
-        var item = draft.Items.FirstOrDefault(candidate => candidate.Id == activeRestockItemId);
-        if (item is null)
-        {
-            ImGui.TextDisabled(draft.Items.Count == 0
-                ? "Add an item to begin."
-                : "Select an item to edit it.");
-            return;
-        }
-
-        ImGui.TextUnformatted(item.ItemName);
-        ImGui.TextDisabled("Restock settings for this item.");
-        ImGui.Separator();
-        ImGui.TextDisabled("Quality");
-        ImGui.SetNextItemWidth(-1);
-        if (ImGui.BeginCombo("##inspectrestockquality", QualityLabel(item.Quality)))
-        {
-            foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
-                if (ImGui.Selectable(QualityChoiceLabel(quality), item.Quality == quality))
-                    item.Quality = quality;
-            ImGui.EndCombo();
-        }
-        ImGui.Spacing();
-        ImGui.TextDisabled("Keep on player");
-        var target = item.TargetQuantity;
-        ImGui.SetNextItemWidth(-1);
-        if (ImGui.InputInt("##inspectrestocktarget", ref target))
-            item.TargetQuantity = Math.Max(0, target);
-        ImGui.Spacing();
-        ImGui.TextDisabled("Note");
-        var notes = item.Notes;
-        ImGui.SetNextItemWidth(-1);
-        if (ImGui.InputTextMultiline("##inspectrestocknotes", ref notes, 240, new Vector2(-1, 72)))
-            item.Notes = notes;
     }
 
     private IReadOnlyList<RestockPlanItem> FilteredRestockDraftItems(RestockPlanDraft draft)
@@ -1168,6 +1586,8 @@ public sealed class QuartermasterWindow : Window
 
     private void CloseRestockEditor()
     {
+        if (itemGroupEditorOrigin == WorkbenchView.Restock)
+            CloseItemGroupEditor();
         restockDraft = null;
         requestRestockEditorOpen = false;
         restockEditorVisible = false;
@@ -1179,6 +1599,8 @@ public sealed class QuartermasterWindow : Window
 
     private void CloseStowageEditor()
     {
+        if (itemGroupEditorOrigin == WorkbenchView.Stowage)
+            CloseItemGroupEditor();
         stowageDraft = null;
         requestStowageEditorOpen = false;
         stowageEditorVisible = false;
@@ -1279,7 +1701,6 @@ public sealed class QuartermasterWindow : Window
             .Where(rule => rule.StowagePlanId == selected.Id)
             .ToArray();
         var stowage = StowageEvaluator.BuildPlan(runtime.State, runtime.Browser, owner, selected.Id);
-        var retrieval = BuildStowageRetrieval(runtime, ownerRules);
         DrawQuickDeposit(runtime, ownerRules);
         ImGui.Separator();
 
@@ -1287,24 +1708,8 @@ public sealed class QuartermasterWindow : Window
         ImGui.SameLine();
         ImGui.TextDisabled(selected.Enabled ? "Enabled" : "Disabled");
         ImGui.SameLine();
-        ImGui.TextDisabled($"{ownerRules.Length:N0} rules | retrieve {stowage?.RetrieveQuantity ?? 0:N0} | stow {stowage?.DepositQuantity ?? 0:N0}");
+        ImGui.TextDisabled($"{ownerRules.Length:N0} rules | stow {stowage?.DepositQuantity ?? 0:N0}");
 
-        var canRetrieve = selected.Enabled &&
-                          retrieval.NeededQuantity > 0 &&
-                          owner.HasStableIdentity &&
-                          transfers.CanStart &&
-                          !autoRetainer.IsRefreshing &&
-                          !autoRetainer.IsQueued;
-        if (!canRetrieve)
-            ImGui.BeginDisabled();
-        if (ImGui.Button($"Retrieve shortages ({retrieval.NeededQuantity:N0})"))
-        {
-            var operation = journal.CreateManual(owner, ownerRules, OperationKinds.Retrieval);
-            StartTransfer(transfers.ExecuteRetrievalAsync(operation.OperationId));
-        }
-        if (!canRetrieve)
-            ImGui.EndDisabled();
-        ImGui.SameLine();
         var surplusBatch = BuildSurplusBatch(runtime, stowage);
         var canStow = selected.Enabled &&
                       surplusBatch.PlannedQuantity > 0 &&
@@ -1314,7 +1719,7 @@ public sealed class QuartermasterWindow : Window
                       !autoRetainer.IsQueued;
         if (!canStow)
             ImGui.BeginDisabled();
-        if (ImGui.Button($"Stow surplus ({surplusBatch.PlannedQuantity:N0})"))
+        if (ImGui.Button($"Stow reviewed items ({surplusBatch.PlannedQuantity:N0})"))
         {
             var operation = journal.CreateDeposit(owner, surplusBatch, OperationKinds.StowageSurplus);
             StartTransfer(transfers.ExecuteDepositAsync(operation.OperationId));
@@ -1347,7 +1752,6 @@ public sealed class QuartermasterWindow : Window
             ImGui.TableNextColumn();
             ImGui.TextUnformatted(!rule.Enabled ? "Off" : line?.Action switch
             {
-                StowageAction.Retrieve => $"Retrieve {line.RetrieveQuantity:N0}",
                 StowageAction.Deposit => $"Stow {line.DepositQuantity:N0}",
                 _ => "Hold",
             });
@@ -1363,6 +1767,7 @@ public sealed class QuartermasterWindow : Window
     private void OpenStowageEditor(StowagePlanDraft draft)
     {
         CloseRestockEditor();
+        CloseItemGroupEditor();
         stowageDraft = draft;
         selectedStowageRuleIds.Clear();
         activeStowageRuleId = stowageDraft.Rules.FirstOrDefault()?.Id;
@@ -1374,6 +1779,7 @@ public sealed class QuartermasterWindow : Window
         bulkQuality = -1;
         bulkRoutingMode = -1;
         bulkOverflow = -1;
+        bulkStowageTarget = -1;
         requestStowageEditorOpen = true;
         workbench.View = WorkbenchView.Stowage;
         requestedView = WorkbenchView.Stowage;
@@ -1401,11 +1807,21 @@ public sealed class QuartermasterWindow : Window
             return;
         }
         stowageEditorVisible = true;
+        if (itemGroupDraft is not null && itemGroupEditorOrigin == WorkbenchView.Stowage)
+        {
+            DrawItemGroupEditor(runtime);
+            ImGui.EndPopup();
+            return;
+        }
 
         var draft = stowageDraft;
+        ImGui.TextUnformatted("Edit plan");
+        ImGui.SameLine();
+        ImGui.TextColored(new Vector4(.55f, .8f, .95f, 1f), "Stowage ->");
+        ImGui.SameLine();
         var planName = draft.Name;
         ImGui.SetNextItemWidth(300);
-        if (ImGui.InputText("Name##stowagedraft", ref planName, 80))
+        if (ImGui.InputText("##stowagedraftname", ref planName, 80))
             draft.Name = planName;
         ImGui.SameLine();
         var planEnabled = draft.Enabled;
@@ -1419,13 +1835,8 @@ public sealed class QuartermasterWindow : Window
         if (!string.IsNullOrWhiteSpace(stowageEditorError))
             ImGui.TextColored(new Vector4(1f, .45f, .4f, 1f), stowageEditorError);
 
-        var inspectorWidth = Math.Clamp(ImGui.GetContentRegionAvail().X * .28f, 285f, 350f);
-        if (ImGui.BeginChild("RQStowageRuleTable", new Vector2(-inspectorWidth - 8, -42), true))
+        if (ImGui.BeginChild("RQStowageRuleTable", new Vector2(0, -42), true))
             DrawStowageDraftRules(draft, runtime);
-        ImGui.EndChild();
-        ImGui.SameLine();
-        if (ImGui.BeginChild("RQStowageRouteInspector", new Vector2(0, -42), true))
-            DrawStowageRouteInspector(draft, runtime);
         ImGui.EndChild();
 
         var canApply = StowagePlanCatalog.CanApply(state.Snapshot(), runtime.Owner, draft);
@@ -1447,7 +1858,7 @@ public sealed class QuartermasterWindow : Window
         ImGui.SameLine();
         if (!canApply)
             ImGui.BeginDisabled();
-        if (ImGui.Button("Apply##stowageeditor"))
+        if (ImGui.Button("Save plan##stowageeditor"))
         {
             try
             {
@@ -1470,23 +1881,16 @@ public sealed class QuartermasterWindow : Window
     private void DrawStowageEditorToolbar(StowagePlanDraft draft)
     {
         ImGui.Separator();
-        ImGui.SetNextItemWidth(220);
-        ImGui.InputTextWithHint("##stowagerulefilter", "Filter rules", ref stowageRuleFilter, 80);
+        ImGui.TextDisabled("Add items");
         ImGui.SameLine();
-        if (ImGui.SmallButton("Select visible"))
-        {
-            foreach (var rule in FilteredDraftRules(draft))
-                selectedStowageRuleIds.Add(rule.Id);
-        }
+        DrawStowageDraftAdd(draft);
         ImGui.SameLine();
-        if (ImGui.SmallButton("Clear selection"))
-            selectedStowageRuleIds.Clear();
-
+        ImGui.TextDisabled("or group");
+        ImGui.SameLine();
         var snapshot = state.Snapshot();
         var groups = ItemGroupCatalog.All(snapshot);
         var selectedGroup = groups.FirstOrDefault(group => group.Id == selectedItemGroupId);
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(170);
+        ImGui.SetNextItemWidth(185);
         if (ImGui.BeginCombo("##stowagegroup", selectedGroup is null ? "@item group" : $"@{selectedGroup.Name}"))
         {
             foreach (var group in groups)
@@ -1502,31 +1906,36 @@ public sealed class QuartermasterWindow : Window
             ItemGroupCatalog.AddMissing(selectedGroup, draft);
             activeStowageRuleId ??= draft.Rules.FirstOrDefault()?.Id;
         }
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Select group") && selectedGroup is not null)
-        {
-            selectedStowageRuleIds.Clear();
-            selectedStowageRuleIds.UnionWith(ItemGroupCatalog.MatchingRuleIds(selectedGroup, draft));
-        }
         if (selectedGroup is null)
             ImGui.EndDisabled();
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Manage groups...##stowage"))
+            OpenItemGroupEditor(WorkbenchView.Stowage);
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.item-groups.open.stowage",
+            "Open Item Groups from the Stowage Plan editor",
+            true,
+            () => OpenItemGroupEditor(WorkbenchView.Stowage),
+            "Plan draft remains open");
+
+        ImGui.SetNextItemWidth(210);
+        ImGui.InputTextWithHint("##stowagerulefilter", "Filter plan items", ref stowageRuleFilter, 80);
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Select visible"))
+        {
+            foreach (var rule in FilteredDraftRules(draft))
+                selectedStowageRuleIds.Add(rule.Id);
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Clear selection"))
+            selectedStowageRuleIds.Clear();
         ImGui.SameLine();
         if (selectedStowageRuleIds.Count == 0)
             ImGui.BeginDisabled();
         if (ImGui.SmallButton("Save as @group"))
-        {
-            itemGroupName = string.Empty;
-            ImGui.OpenPopup("Save Item Group##RQ");
-        }
+            OpenNewItemGroupFromStowageSelection();
         if (selectedStowageRuleIds.Count == 0)
             ImGui.EndDisabled();
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Manage groups"))
-            ImGui.OpenPopup("Manage Item Groups##RQ");
-
-        DrawSaveItemGroupPopup(draft);
-        DrawManageItemGroupsPopup(draft);
-        DrawStowageDraftAdd(draft);
     }
 
     private void DrawStowageDraftAdd(StowagePlanDraft draft)
@@ -1574,93 +1983,38 @@ public sealed class QuartermasterWindow : Window
         }
     }
 
-    private void DrawSaveItemGroupPopup(StowagePlanDraft draft)
-    {
-        if (!ImGui.BeginPopupModal("Save Item Group##RQ", ImGuiWindowFlags.AlwaysAutoResize))
-            return;
-        ImGui.TextUnformatted("Save selected item identities as a reusable shorthand.");
-        ImGui.SetNextItemWidth(300);
-        ImGui.InputTextWithHint("##itemgroupname", "@group name", ref itemGroupName, 80);
-        var canSave = !string.IsNullOrWhiteSpace(itemGroupName) && selectedStowageRuleIds.Count > 0;
-        if (!canSave)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Save group"))
-        {
-            var selected = draft.Rules.Where(rule => selectedStowageRuleIds.Contains(rule.Id)).ToArray();
-            selectedItemGroupId = state.Mutate(document =>
-                ItemGroupCatalog.Create(document, itemGroupName, selected).Id);
-            itemGroupName = string.Empty;
-            ImGui.CloseCurrentPopup();
-        }
-        if (!canSave)
-            ImGui.EndDisabled();
-        ImGui.SameLine();
-        if (ImGui.Button("Cancel##itemgroup"))
-            ImGui.CloseCurrentPopup();
-        ImGui.EndPopup();
-    }
-
-    private void DrawManageItemGroupsPopup(StowagePlanDraft draft)
-    {
-        if (!ImGui.BeginPopupModal("Manage Item Groups##RQ", ImGuiWindowFlags.AlwaysAutoResize))
-            return;
-        var groups = ItemGroupCatalog.All(state.Snapshot());
-        if (groups.Count == 0)
-            ImGui.TextDisabled("No Item Groups saved. Select plan rules, then save the selection as a group.");
-        foreach (var group in groups)
-        {
-            var name = group.Name;
-            ImGui.SetNextItemWidth(210);
-            if (ImGui.InputText($"##groupname{group.Id}", ref name, 80) &&
-                !string.IsNullOrWhiteSpace(name))
-            {
-                var groupId = group.Id;
-                state.Mutate(document => ItemGroupCatalog.Rename(document, groupId, name));
-            }
-            ImGui.SameLine();
-            ImGui.TextDisabled($"{group.Items.Count:N0} items");
-            ImGui.SameLine();
-            if (selectedStowageRuleIds.Count == 0)
-                ImGui.BeginDisabled();
-            if (ImGui.SmallButton($"Replace##group{group.Id}"))
-            {
-                var groupId = group.Id;
-                var selected = draft.Rules.Where(rule => selectedStowageRuleIds.Contains(rule.Id)).ToArray();
-                state.Mutate(document => ItemGroupCatalog.ReplaceItems(document, groupId, selected));
-            }
-            if (selectedStowageRuleIds.Count == 0)
-                ImGui.EndDisabled();
-            ImGui.SameLine();
-            if (ImGui.SmallButton($"Delete##group{group.Id}"))
-            {
-                var groupId = group.Id;
-                state.Mutate(document => document.ItemGroups.RemoveAll(candidate => candidate.Id == groupId));
-                if (selectedItemGroupId == groupId)
-                    selectedItemGroupId = null;
-            }
-        }
-        if (ImGui.Button("Close##groups"))
-            ImGui.CloseCurrentPopup();
-        ImGui.EndPopup();
-    }
-
     private void DrawStowageEditorBulkBar(StowagePlanDraft draft)
     {
         ImGui.Separator();
-        DrawOptionalEnumCombo("Quality##bulk", ref bulkQuality, Enum.GetValues<ItemQualityPolicy>(), QualityChoiceLabel);
+        ImGui.TextUnformatted($"{selectedStowageRuleIds.Count:N0} selected");
         ImGui.SameLine();
-        DrawOptionalEnumCombo("Placement##bulk", ref bulkRoutingMode, Enum.GetValues<StowageRoutingMode>(), RoutingModeLabel);
+        ImGui.TextDisabled("Keep");
         ImGui.SameLine();
-        DrawOptionalEnumCombo("Overflow##bulk", ref bulkOverflow, Enum.GetValues<StowageOverflowPolicy>(), OverflowLabel);
+        ImGui.SetNextItemWidth(80);
+        ImGui.InputInt("##stowagebulktarget", ref bulkStowageTarget);
+        ImGui.SameLine();
+        ImGui.TextDisabled("Quality");
+        ImGui.SameLine();
+        DrawOptionalEnumCombo("##stowagebulkquality", ref bulkQuality, Enum.GetValues<ItemQualityPolicy>(), QualityChoiceLabel);
+        ImGui.SameLine();
+        ImGui.TextDisabled("Destination");
+        ImGui.SameLine();
+        DrawOptionalEnumCombo("##stowagebulkdestination", ref bulkRoutingMode, Enum.GetValues<StowageRoutingMode>(), RoutingModeLabel);
+        ImGui.SameLine();
+        ImGui.TextDisabled("Overflow");
+        ImGui.SameLine();
+        DrawOptionalEnumCombo("##stowagebulkoverflow", ref bulkOverflow, Enum.GetValues<StowageOverflowPolicy>(), OverflowLabel);
         ImGui.SameLine();
         var canApply = selectedStowageRuleIds.Count > 0 &&
-                       (bulkQuality >= 0 || bulkRoutingMode >= 0 || bulkOverflow >= 0);
+                       (bulkStowageTarget >= 0 || bulkQuality >= 0 || bulkRoutingMode >= 0 || bulkOverflow >= 0);
         if (!canApply)
             ImGui.BeginDisabled();
         if (ImGui.Button("Apply to selected##stowagebulk"))
         {
             foreach (var rule in draft.Rules.Where(rule => selectedStowageRuleIds.Contains(rule.Id)))
             {
+                if (bulkStowageTarget >= 0)
+                    rule.TargetQuantity = bulkStowageTarget;
                 if (bulkQuality >= 0)
                     rule.Quality = (ItemQualityPolicy)bulkQuality;
                 if (bulkRoutingMode >= 0)
@@ -1668,9 +2022,20 @@ public sealed class QuartermasterWindow : Window
                 if (bulkOverflow >= 0)
                     rule.Routing.Overflow = (StowageOverflowPolicy)bulkOverflow;
             }
-            bulkQuality = bulkRoutingMode = bulkOverflow = -1;
+            bulkStowageTarget = bulkQuality = bulkRoutingMode = bulkOverflow = -1;
         }
         if (!canApply)
+            ImGui.EndDisabled();
+        ImGui.SameLine();
+        var hasSelection = selectedStowageRuleIds.Count > 0;
+        if (!hasSelection)
+            ImGui.BeginDisabled();
+        if (ImGui.Button("Remove selected##stowagebulk"))
+        {
+            draft.Rules.RemoveAll(rule => selectedStowageRuleIds.Contains(rule.Id));
+            selectedStowageRuleIds.Clear();
+        }
+        if (!hasSelection)
             ImGui.EndDisabled();
     }
 
@@ -1702,13 +2067,13 @@ public sealed class QuartermasterWindow : Window
                     ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
         if (!ImGui.BeginTable("RQStowageDraftRules", 8, flags, new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y))))
             return;
-        ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 28);
-        ImGui.TableSetupColumn("On", ImGuiTableColumnFlags.WidthFixed, 30);
+        ImGui.TableSetupColumn("Select", ImGuiTableColumnFlags.WidthFixed, 46);
+        ImGui.TableSetupColumn("Rule", ImGuiTableColumnFlags.WidthFixed, 52);
         ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.5f);
-        ImGui.TableSetupColumn("Keep", ImGuiTableColumnFlags.WidthFixed, 75);
-        ImGui.TableSetupColumn("Quality", ImGuiTableColumnFlags.WidthFixed, 70);
-        ImGui.TableSetupColumn("Preferred route", ImGuiTableColumnFlags.WidthStretch, 1.1f);
-        ImGui.TableSetupColumn("Overflow", ImGuiTableColumnFlags.WidthFixed, 80);
+        ImGui.TableSetupColumn("Keep", ImGuiTableColumnFlags.WidthFixed, 80);
+        ImGui.TableSetupColumn("Quality", ImGuiTableColumnFlags.WidthFixed, 112);
+        ImGui.TableSetupColumn("Destination", ImGuiTableColumnFlags.WidthStretch, 1.1f);
+        ImGui.TableSetupColumn("Overflow", ImGuiTableColumnFlags.WidthFixed, 112);
         ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 28);
         ImGui.TableHeadersRow();
         var filtered = FilteredDraftRules(draft);
@@ -1735,15 +2100,9 @@ public sealed class QuartermasterWindow : Window
                     selectedStowageRuleIds.Remove(rule.Id);
             }
             ImGui.TableNextColumn();
-            var enabled = rule.Enabled;
-            if (ImGui.Checkbox($"##drafton{rule.Id}", ref enabled))
-                rule.Enabled = enabled;
+            rule.Enabled = DrawRuleToggle($"stowage{rule.Id}", rule.Enabled);
             ImGui.TableNextColumn();
-            if (ImGui.Selectable(
-                    $"{rule.ItemName}##draftrule{rule.Id}",
-                    activeStowageRuleId == rule.Id,
-                    ImGuiSelectableFlags.DontClosePopups))
-                activeStowageRuleId = rule.Id;
+            ImGui.TextUnformatted(rule.ItemName);
             ImGui.TableNextColumn();
             var target = rule.TargetQuantity;
             ImGui.SetNextItemWidth(-1);
@@ -1752,13 +2111,9 @@ public sealed class QuartermasterWindow : Window
             ImGui.TableNextColumn();
             DrawDraftQuality(rule);
             ImGui.TableNextColumn();
-            if (ImGui.Selectable(
-                    $"{RouteSummary(rule.Routing, runtime.Retainers, runtime.Owner)}##route{rule.Id}",
-                    activeStowageRuleId == rule.Id,
-                    ImGuiSelectableFlags.DontClosePopups))
-                activeStowageRuleId = rule.Id;
+            DrawStowageRouteCombo(rule, runtime);
             ImGui.TableNextColumn();
-            ImGui.TextUnformatted(OverflowLabel(rule.Routing.Overflow));
+            DrawStowageOverflowCombo(rule);
             ImGui.TableNextColumn();
             if (ImGui.SmallButton($"X##draftremove{rule.Id}"))
             {
@@ -1782,29 +2137,34 @@ public sealed class QuartermasterWindow : Window
         ImGui.EndCombo();
     }
 
-    private void DrawStowageRouteInspector(StowagePlanDraft draft, QuartermasterRuntimeSnapshot runtime)
+    private static bool DrawRuleToggle(string id, bool enabled)
     {
-        var rule = draft.Rules.FirstOrDefault(candidate => candidate.Id == activeStowageRuleId);
-        if (rule is null)
-        {
-            ImGui.TextDisabled("Select a rule to edit its route.");
-            return;
-        }
+        ImGui.PushStyleColor(
+            ImGuiCol.Button,
+            enabled ? new Vector4(.16f, .34f, .24f, 1f) : new Vector4(.13f, .15f, .17f, 1f));
+        ImGui.PushStyleColor(
+            ImGuiCol.ButtonHovered,
+            enabled ? new Vector4(.2f, .43f, .3f, 1f) : new Vector4(.22f, .25f, .28f, 1f));
+        if (ImGui.SmallButton($"{(enabled ? "On" : "Off")}##rule{id}"))
+            enabled = !enabled;
+        ImGui.PopStyleColor(2);
+        return enabled;
+    }
 
-        ImGui.TextUnformatted(rule.ItemName);
-        ImGui.TextDisabled("Exact destination policy for this rule.");
-        ImGui.Separator();
-        ImGui.TextDisabled("Placement");
+    private void DrawStowageRouteCombo(TargetPlanItem rule, QuartermasterRuntimeSnapshot runtime)
+    {
         ImGui.SetNextItemWidth(-1);
-        if (ImGui.BeginCombo("##inspectorplacement", RoutingModeLabel(rule.Routing.Mode)))
-        {
-            foreach (var mode in Enum.GetValues<StowageRoutingMode>())
-                if (ImGui.Selectable(RoutingModeLabel(mode), rule.Routing.Mode == mode))
-                    rule.Routing.Mode = mode;
-            ImGui.EndCombo();
-        }
+        if (!ImGui.BeginCombo(
+                $"##draftdestination{rule.Id}",
+                RouteSummary(rule.Routing, runtime.Retainers, runtime.Owner)))
+            return;
 
-        ImGui.Spacing();
+        ImGui.TextDisabled("Placement");
+        foreach (var mode in Enum.GetValues<StowageRoutingMode>())
+            if (ImGui.Selectable(RoutingModeLabel(mode), rule.Routing.Mode == mode))
+                rule.Routing.Mode = mode;
+
+        ImGui.Separator();
         ImGui.TextDisabled("Preferred retainers - in order");
         var ownerRetainers = runtime.Retainers.Values
             .Where(retainer => retainer.Owner.Matches(runtime.Owner))
@@ -1815,7 +2175,7 @@ public sealed class QuartermasterWindow : Window
         {
             var retainerId = rule.Routing.PreferredRetainerIds[index];
             var retainer = ownerRetainers.FirstOrDefault(candidate => candidate.RetainerId == retainerId);
-            ImGui.PushID($"route{rule.Id}:{retainerId}:{index}");
+            ImGui.PushID($"inline-route{rule.Id}:{retainerId}:{index}");
             ImGui.TextUnformatted(retainer?.RetainerName ?? $"Retainer {retainerId}");
             ImGui.SameLine();
             if (index > 0 && ImGui.SmallButton("Up"))
@@ -1837,32 +2197,33 @@ public sealed class QuartermasterWindow : Window
         var available = ownerRetainers
             .Where(retainer => !rule.Routing.PreferredRetainerIds.Contains(retainer.RetainerId))
             .ToArray();
-        ImGui.SetNextItemWidth(-1);
-        if (ImGui.BeginCombo("##addpreferred", "Add retainer"))
+        ImGui.SetNextItemWidth(240);
+        if (ImGui.BeginCombo($"##addinlinepreferred{rule.Id}", "Add preferred retainer"))
         {
             foreach (var retainer in available)
-                if (ImGui.Selectable($"{retainer.RetainerName}##add{retainer.RetainerId}"))
+                if (ImGui.Selectable($"{retainer.RetainerName}##addinline{retainer.RetainerId}"))
                     rule.Routing.PreferredRetainerIds.Add(retainer.RetainerId);
             ImGui.EndCombo();
         }
 
-        ImGui.Spacing();
-        ImGui.TextDisabled("If preferred storage is full");
-        ImGui.SetNextItemWidth(-1);
-        if (ImGui.BeginCombo("##inspectoroverflow", OverflowLabel(rule.Routing.Overflow)))
-        {
-            foreach (var overflow in Enum.GetValues<StowageOverflowPolicy>())
-                if (ImGui.Selectable(OverflowLabel(overflow), rule.Routing.Overflow == overflow))
-                    rule.Routing.Overflow = overflow;
-            ImGui.EndCombo();
-        }
-
-        ImGui.Spacing();
+        ImGui.Separator();
         ImGui.TextDisabled("Note");
         var notes = rule.Notes;
-        ImGui.SetNextItemWidth(-1);
-        if (ImGui.InputTextMultiline("##inspectornotes", ref notes, 240, new Vector2(-1, 72)))
+        ImGui.SetNextItemWidth(300);
+        if (ImGui.InputText($"##draftstowagenote{rule.Id}", ref notes, 160))
             rule.Notes = notes;
+        ImGui.EndCombo();
+    }
+
+    private static void DrawStowageOverflowCombo(TargetPlanItem rule)
+    {
+        ImGui.SetNextItemWidth(-1);
+        if (!ImGui.BeginCombo($"##draftoverflow{rule.Id}", OverflowLabel(rule.Routing.Overflow)))
+            return;
+        foreach (var overflow in Enum.GetValues<StowageOverflowPolicy>())
+            if (ImGui.Selectable(OverflowLabel(overflow), rule.Routing.Overflow == overflow))
+                rule.Routing.Overflow = overflow;
+        ImGui.EndCombo();
     }
 
     private IReadOnlyList<TargetPlanItem> FilteredDraftRules(StowagePlanDraft draft)
@@ -2324,23 +2685,6 @@ public sealed class QuartermasterWindow : Window
             .ToDictionary(group => group.Key, group => group.Sum(item => checked((int)item.Quantity)));
         return RestockPlanner.Build(
             RestockPlanCatalog.ToExecutionRows(plan),
-            playerCounts,
-            runtime.Retainers,
-            runtime.Owner,
-            DateTime.UtcNow,
-            runtime.Browser);
-    }
-
-    private static RetrievalPlan BuildStowageRetrieval(
-        QuartermasterRuntimeSnapshot runtime,
-        IReadOnlyList<TargetPlanItem> rules)
-    {
-        var playerCounts = runtime.PlayerStorage.Bags
-            .SelectMany(bag => bag.Items)
-            .GroupBy(item => item.ItemId)
-            .ToDictionary(group => group.Key, group => group.Sum(item => checked((int)item.Quantity)));
-        return RestockPlanner.Build(
-            rules,
             playerCounts,
             runtime.Retainers,
             runtime.Owner,

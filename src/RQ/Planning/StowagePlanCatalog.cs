@@ -262,6 +262,15 @@ public static class StowagePlanCatalog
     }
 }
 
+public sealed class ItemGroupDraft
+{
+    public Guid GroupId { get; init; }
+    public long SourceRevision { get; init; }
+    public bool IsNew { get; init; }
+    public string Name { get; set; } = "Item group";
+    public List<ItemGroupItem> Items { get; set; } = [];
+}
+
 public static class ItemGroupCatalog
 {
     public static IReadOnlyList<ItemGroup> All(QuartermasterState state) =>
@@ -270,22 +279,127 @@ public static class ItemGroupCatalog
             .ThenBy(group => group.Id)
             .ToArray();
 
+    public static ItemGroupDraft NewDraft(
+        QuartermasterState state,
+        string requestedName = "Item group",
+        IEnumerable<ItemGroupItem>? items = null) =>
+        new()
+        {
+            GroupId = Guid.NewGuid(),
+            IsNew = true,
+            Name = UniqueName(state, requestedName),
+            Items = NormalizeItems(items ?? []),
+        };
+
+    public static ItemGroupDraft NewDraft(
+        QuartermasterState state,
+        string requestedName,
+        IEnumerable<TargetPlanItem> rules) =>
+        NewDraft(state, requestedName, ItemsFrom(rules));
+
+    public static ItemGroupDraft NewDraft(
+        QuartermasterState state,
+        string requestedName,
+        IEnumerable<RestockPlanItem> items) =>
+        NewDraft(state, requestedName, ItemsFrom(items));
+
+    public static ItemGroupDraft Draft(QuartermasterState state, Guid groupId)
+    {
+        var group = state.ItemGroups.Single(candidate => candidate.Id == groupId);
+        return new ItemGroupDraft
+        {
+            GroupId = group.Id,
+            SourceRevision = group.Revision,
+            Name = group.Name,
+            Items = NormalizeItems(group.Items),
+        };
+    }
+
+    public static bool CanApply(QuartermasterState state, ItemGroupDraft draft) =>
+        !string.IsNullOrWhiteSpace(draft.Name) &&
+        draft.Items.Any(item => item.ItemId > 0) &&
+        HasChanges(state, draft);
+
+    public static bool HasChanges(QuartermasterState state, ItemGroupDraft draft)
+    {
+        if (draft.IsNew)
+            return true;
+        var source = state.ItemGroups.FirstOrDefault(candidate => candidate.Id == draft.GroupId);
+        return source is null ||
+               source.Revision != draft.SourceRevision ||
+               !string.Equals(source.Name, draft.Name, StringComparison.Ordinal) ||
+               !ItemsEqual(source.Items, draft.Items);
+    }
+
+    public static ItemGroup Apply(QuartermasterState state, ItemGroupDraft draft)
+    {
+        if (string.IsNullOrWhiteSpace(draft.Name))
+            throw new InvalidOperationException("An Item Group needs a name.");
+        var items = NormalizeItems(draft.Items);
+        if (items.Count == 0)
+            throw new InvalidOperationException("An Item Group needs at least one item.");
+
+        ItemGroup group;
+        if (draft.IsNew)
+        {
+            if (state.ItemGroups.Any(candidate => candidate.Id == draft.GroupId))
+                throw new InvalidOperationException("This new Item Group was already saved.");
+            group = new ItemGroup
+            {
+                Id = draft.GroupId,
+                Revision = 1,
+            };
+            state.ItemGroups.Add(group);
+        }
+        else
+        {
+            group = state.ItemGroups.Single(candidate => candidate.Id == draft.GroupId);
+            if (group.Revision != draft.SourceRevision)
+                throw new InvalidOperationException("This Item Group changed after the editor opened. Reopen it to continue.");
+            group.Revision = checked(group.Revision + 1);
+        }
+
+        group.Name = UniqueName(state, draft.Name, group.Id);
+        group.Items = items;
+        state.Schema = "gooseworks-quartermaster-state/v4";
+        return group;
+    }
+
+    public static void Delete(QuartermasterState state, Guid groupId, long expectedRevision)
+    {
+        var group = state.ItemGroups.Single(candidate => candidate.Id == groupId);
+        if (group.Revision != expectedRevision)
+            throw new InvalidOperationException("This Item Group changed after the editor opened. Reopen it to continue.");
+        state.ItemGroups.Remove(group);
+        state.Schema = "gooseworks-quartermaster-state/v4";
+    }
+
+    public static int AddMissing(ItemGroupDraft draft, IEnumerable<ItemGroupItem> items)
+    {
+        var existing = draft.Items.Select(item => (item.ItemId, item.Quality)).ToHashSet();
+        var added = 0;
+        foreach (var item in items.Where(item => item.ItemId > 0 && existing.Add((item.ItemId, item.Quality))))
+        {
+            draft.Items.Add(CopyItem(item));
+            added++;
+        }
+        SortItems(draft.Items);
+        return added;
+    }
+
+    public static int AddMissing(ItemGroupDraft draft, IEnumerable<TargetPlanItem> rules) =>
+        AddMissing(draft, ItemsFrom(rules));
+
+    public static int AddMissing(ItemGroupDraft draft, IEnumerable<RestockPlanItem> items) =>
+        AddMissing(draft, ItemsFrom(items));
+
     public static ItemGroup Create(
         QuartermasterState state,
         string requestedName,
         IEnumerable<TargetPlanItem> rules)
     {
-        var items = ItemsFrom(rules);
-        if (items.Count == 0)
-            throw new InvalidOperationException("An Item Group needs at least one item.");
-        var group = new ItemGroup
-        {
-            Name = UniqueName(state, requestedName),
-            Items = items,
-        };
-        state.ItemGroups.Add(group);
-        state.Schema = "gooseworks-quartermaster-state/v4";
-        return group;
+        var draft = NewDraft(state, requestedName, rules);
+        return Apply(state, draft);
     }
 
     public static void Rename(QuartermasterState state, Guid groupId, string requestedName)
@@ -404,18 +518,63 @@ public static class ItemGroupCatalog
     }
 
     private static List<ItemGroupItem> ItemsFrom(IEnumerable<TargetPlanItem> rules) =>
-        rules
+        NormalizeItems(rules
             .Where(rule => rule.ItemId > 0)
-            .GroupBy(rule => (rule.ItemId, rule.Quality))
-            .Select(group => new ItemGroupItem
+            .Select(rule => new ItemGroupItem
             {
-                ItemId = group.Key.ItemId,
-                ItemName = group.First().ItemName,
-                Quality = group.Key.Quality,
-            })
-            .OrderBy(item => item.ItemName, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(item => item.ItemId)
+                ItemId = rule.ItemId,
+                ItemName = rule.ItemName,
+                Quality = rule.Quality,
+            }));
+
+    private static List<ItemGroupItem> ItemsFrom(IEnumerable<RestockPlanItem> items) =>
+        NormalizeItems(items
+            .Where(item => item.ItemId > 0)
+            .Select(item => new ItemGroupItem
+            {
+                ItemId = item.ItemId,
+                ItemName = item.ItemName,
+                Quality = item.Quality,
+            }));
+
+    private static List<ItemGroupItem> NormalizeItems(IEnumerable<ItemGroupItem> items)
+    {
+        var normalized = items
+            .Where(item => item.ItemId > 0)
+            .GroupBy(item => (item.ItemId, item.Quality))
+            .Select(group => CopyItem(group.First()))
             .ToList();
+        SortItems(normalized);
+        return normalized;
+    }
+
+    private static void SortItems(List<ItemGroupItem> items) =>
+        items.Sort((left, right) =>
+        {
+            var name = StringComparer.OrdinalIgnoreCase.Compare(left.ItemName, right.ItemName);
+            if (name != 0)
+                return name;
+            var id = left.ItemId.CompareTo(right.ItemId);
+            return id != 0 ? id : left.Quality.CompareTo(right.Quality);
+        });
+
+    private static ItemGroupItem CopyItem(ItemGroupItem item) => new()
+    {
+        ItemId = item.ItemId,
+        ItemName = item.ItemName,
+        Quality = item.Quality,
+    };
+
+    private static bool ItemsEqual(IReadOnlyList<ItemGroupItem> left, IReadOnlyList<ItemGroupItem> right)
+    {
+        var normalizedLeft = NormalizeItems(left);
+        var normalizedRight = NormalizeItems(right);
+        return normalizedLeft.Count == normalizedRight.Count &&
+               normalizedLeft.Zip(normalizedRight).All(pair =>
+                   pair.First.ItemId == pair.Second.ItemId &&
+                   pair.First.ItemName == pair.Second.ItemName &&
+                   pair.First.Quality == pair.Second.Quality);
+    }
 
     private static TargetPlanItem ItemAsRule(RestockPlanItem item) => new()
     {

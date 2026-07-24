@@ -202,6 +202,108 @@ public sealed class PlanWorkspaceTests
     }
 
     [Fact]
+    public void ItemGroupDraft_NewDoesNotPersistAndRejectsEmptySave()
+    {
+        var state = new QuartermasterState();
+        var draft = ItemGroupCatalog.NewDraft(state);
+
+        Assert.Empty(state.ItemGroups);
+        Assert.False(ItemGroupCatalog.CanApply(state, draft));
+
+        draft.Items.Add(new ItemGroupItem { ItemId = 100, ItemName = "Ore" });
+
+        Assert.True(ItemGroupCatalog.CanApply(state, draft));
+        var applied = ItemGroupCatalog.Apply(state, draft);
+
+        Assert.Equal(draft.GroupId, applied.Id);
+        Assert.Single(state.ItemGroups);
+    }
+
+    [Fact]
+    public void ItemGroupDraft_ApplyIsAtomicAndDeduplicatesIdentity()
+    {
+        var state = new QuartermasterState();
+        var group = ItemGroupCatalog.Create(state, "Metals", [Rule(Guid.NewGuid(), 100, "Ore", 1)]);
+        var draft = ItemGroupCatalog.Draft(state, group.Id);
+        draft.Name = "Workshop metals";
+        draft.Items.Add(new ItemGroupItem { ItemId = 100, ItemName = "Duplicate ore" });
+        draft.Items.Add(new ItemGroupItem { ItemId = 100, ItemName = "HQ ore", Quality = ItemQualityPolicy.HqOnly });
+
+        var applied = ItemGroupCatalog.Apply(state, draft);
+
+        Assert.Equal("Workshop metals", applied.Name);
+        Assert.Equal(2, applied.Revision);
+        Assert.Equal(2, applied.Items.Count);
+        Assert.Contains(applied.Items, item => item.ItemId == 100 && item.Quality == ItemQualityPolicy.Any);
+        Assert.Contains(applied.Items, item => item.ItemId == 100 && item.Quality == ItemQualityPolicy.HqOnly);
+    }
+
+    [Fact]
+    public void ItemGroupDraft_RejectsStaleApplyAndDelete()
+    {
+        var state = new QuartermasterState();
+        var group = ItemGroupCatalog.Create(state, "Metals", [Rule(Guid.NewGuid(), 100, "Ore", 1)]);
+        var draft = ItemGroupCatalog.Draft(state, group.Id);
+        draft.Name = "Changed";
+        group.Revision++;
+
+        var applyError = Assert.Throws<InvalidOperationException>(() => ItemGroupCatalog.Apply(state, draft));
+        var deleteError = Assert.Throws<InvalidOperationException>(() =>
+            ItemGroupCatalog.Delete(state, group.Id, draft.SourceRevision));
+
+        Assert.Contains("changed after the editor opened", applyError.Message);
+        Assert.Contains("changed after the editor opened", deleteError.Message);
+        Assert.Equal("Metals", group.Name);
+        Assert.Single(state.ItemGroups);
+    }
+
+    [Fact]
+    public void ItemGroupDraft_DeleteDoesNotMutateExistingPlans()
+    {
+        var stowage = new StowagePlan { Owner = TestData.Owner };
+        var stowageRule = Rule(stowage.Id, 100, "Ore", 10);
+        var restock = new RestockPlan
+        {
+            Owner = TestData.Owner,
+            Items = [new RestockPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }],
+        };
+        var state = new QuartermasterState
+        {
+            StowagePlans = [stowage],
+            PlanItems = [stowageRule],
+            RestockPlans = [restock],
+        };
+        var group = ItemGroupCatalog.Create(state, "Metals", [stowageRule]);
+
+        ItemGroupCatalog.Delete(state, group.Id, group.Revision);
+
+        Assert.Empty(state.ItemGroups);
+        Assert.Equal(10, Assert.Single(state.PlanItems).TargetQuantity);
+        Assert.Equal(10, Assert.Single(Assert.Single(state.RestockPlans).Items).TargetQuantity);
+    }
+
+    [Fact]
+    public void ItemGroupDraft_AddMissingCopiesPlanSelectionWithoutLiveLinks()
+    {
+        var state = new QuartermasterState();
+        var source = new RestockPlanItem
+        {
+            ItemId = 100,
+            ItemName = "Ore",
+            Quality = ItemQualityPolicy.NqOnly,
+        };
+        var draft = ItemGroupCatalog.NewDraft(state);
+
+        var added = ItemGroupCatalog.AddMissing(draft, [source, source]);
+        source.ItemName = "Changed source";
+
+        Assert.Equal(1, added);
+        var member = Assert.Single(draft.Items);
+        Assert.Equal("Ore", member.ItemName);
+        Assert.Equal(ItemQualityPolicy.NqOnly, member.Quality);
+    }
+
+    [Fact]
     public void Repository_RoundTripsItemGroups()
     {
         using var directory = new TemporaryDirectory();

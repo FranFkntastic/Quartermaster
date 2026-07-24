@@ -34,7 +34,7 @@ public sealed class AgentBridgeHost : IDisposable
             AgentBridgeRuntimeIdentity.FromAssembly("RQ", Assembly.GetExecutingAssembly(), mainDllPath),
             profile.Id,
             profile.Alias,
-            "Quartermaster.truth.v4",
+            "Quartermaster.truth.v5",
             [new("snapshot"), new("reviewed-actions"), new("operations")],
             provider.GetReviewSurfaces(),
             [],

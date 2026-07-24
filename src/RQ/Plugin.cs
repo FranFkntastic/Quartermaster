@@ -294,12 +294,20 @@ public sealed class Plugin : IDalamudPlugin
             .OrderByDescending(candidate => candidate.UpdatedAtUtc)
             .FirstOrDefault();
         return new QuartermasterBridgeTruth(
-            4,
+            5,
             configuration.PluginInstanceId,
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
             window.IsOpen,
             window.CurrentWorkspace,
+            window.CurrentTransferDirection,
+            window.RestockEditorOpen || window.StowageEditorOpen,
+            window.PlanEditorHasUnsavedChanges,
+            runtime.State.ItemGroups.Count,
+            window.SelectedItemGroupId,
+            window.SelectedItemGroupName,
+            window.ItemGroupEditorOpen,
+            window.ItemGroupEditorHasUnsavedChanges,
             runtime.Owner.HasStableIdentity ? $"{runtime.Owner.CharacterName} @ {runtime.Owner.HomeWorldName}" : "Unavailable",
             runtime.Owner.HasStableIdentity,
             retainers.Length,

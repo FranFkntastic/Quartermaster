@@ -10,6 +10,14 @@ public sealed record QuartermasterBridgeTruth(
     string PluginVersion,
     bool MainWindowOpen,
     string CurrentWorkspace,
+    string TransferDirection,
+    bool PlanEditorOpen,
+    bool PlanEditorHasUnsavedChanges,
+    int ItemGroupCount,
+    Guid? SelectedItemGroupId,
+    string? SelectedItemGroupName,
+    bool ItemGroupEditorOpen,
+    bool ItemGroupEditorHasUnsavedChanges,
     string Owner,
     bool OwnerScopeAvailable,
     int ObservedRetainerCount,
@@ -36,7 +44,7 @@ public sealed class QuartermasterBridgeProvider
 {
     private static readonly IReadOnlyList<AgentBridgeReviewSurfaceDescriptor> ReviewSurfaces =
     [
-        new("stock", "Stock and plans", "open-main-window", "stock", 10),
+        new("stock", "Stock and transfers", "open-main-window", "stock", 10),
         new("restock", "Reusable Restock Plans", "open-main-window", "restock", 20),
         new("stowage", "Stowage Plans and Quick Deposit", "open-main-window", "stowage", 30),
         new("listings", "Retainer listings", "open-main-window", "listings", 40),
