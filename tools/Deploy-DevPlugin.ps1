@@ -4,19 +4,22 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$Target,
 
+    [ValidateSet('Debug', 'Release')]
+    [string]$Configuration = 'Release',
+
     [switch]$SkipBuild
 )
 
 $ErrorActionPreference = 'Stop'
 $repository = Split-Path -Parent $PSScriptRoot
 $project = Join-Path $repository 'src\RQ\RQ.csproj'
-$source = Join-Path $repository 'src\RQ\bin\Release'
+$source = Join-Path $repository "src\RQ\bin\$Configuration"
 $targetPath = [System.IO.Path]::GetFullPath($Target)
 
 if (-not $SkipBuild) {
-    & dotnet build $project -c Release
+    & dotnet build $project -c $Configuration
     if ($LASTEXITCODE -ne 0) {
-        throw "Quartermaster Release build failed with exit code $LASTEXITCODE."
+        throw "Quartermaster $Configuration build failed with exit code $LASTEXITCODE."
     }
 }
 

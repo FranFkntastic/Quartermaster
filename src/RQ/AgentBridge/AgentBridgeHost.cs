@@ -34,14 +34,14 @@ public sealed class AgentBridgeHost : IDisposable
             AgentBridgeRuntimeIdentity.FromAssembly("RQ", Assembly.GetExecutingAssembly(), mainDllPath),
             profile.Id,
             profile.Alias,
-            "Quartermaster.truth.v5",
+            "Quartermaster.truth.v6",
             [new("snapshot"), new("reviewed-actions"), new("operations")],
             provider.GetReviewSurfaces(),
             [],
             [new(
                 "quartermaster.refresh-retainers",
                 "Refresh retainers",
-                "stock",
+                "transfer",
                 AgentBridgeUiControlKind.Button,
                 true,
                 CompletionOperationKind: "retainer-refresh")]);
