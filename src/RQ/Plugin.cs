@@ -19,6 +19,8 @@ namespace RQ;
 
 public sealed class Plugin : IDalamudPlugin
 {
+    private static readonly TimeSpan SnapshotRefreshInterval = TimeSpan.FromMinutes(1);
+
     private const string Command = "/rq";
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly ICommandManager commands;
@@ -38,6 +40,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly QuartermasterRuntimeSnapshotSource runtimeSnapshots;
     private readonly SnapshotPublisher snapshots;
     private readonly ShortageSubmissionService submissions;
+    private readonly ElementalDepositSubmissionService deposits;
     private readonly QuartermasterIpcProvider ipc;
     private readonly RQ.AgentBridge.AgentBridgeHost agentBridge;
     private readonly AgentBridgeViewportCaptureService agentBridgeViewportCapture;
@@ -97,7 +100,8 @@ public sealed class Plugin : IDalamudPlugin
         captures = new(addonLifecycle, log, scanner, cache, CurrentOwner);
         var automation = new AutomationLease();
         var retainerSession = new DalamudRetainerAutomationSession(framework, gameGui, dataManager, log, objects, targets, sigScanner);
-        autoRetainer = new(framework, log, captures, retainerSession, new DalamudAutoRetainerIpc(pluginInterface), automation);
+        var autoRetainerIpc = new DalamudAutoRetainerIpc(pluginInterface);
+        autoRetainer = new(framework, log, captures, retainerSession, autoRetainerIpc, automation);
         journal = new OperationJournal(state);
         RecoverPendingCacheInvalidations();
         foreach (var operation in state.Snapshot().Operations.Where(operation => operation.Status == OperationStatuses.Running))
@@ -111,15 +115,16 @@ public sealed class Plugin : IDalamudPlugin
             CurrentOwner,
             scanner.CountPlayerItems,
             automation);
-        automaticRetrievals = new(journal, transfers, CurrentOwner);
+        automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerIpc);
         workQueue = new();
         runtimeSnapshots = new(scanner, cache, state, CurrentOwner);
         var initialSnapshot = runtimeSnapshots.Refresh();
         snapshots = new(providerInstanceId, state, cache.Snapshot);
         snapshots.Refresh(initialSnapshot);
-        nextSnapshotAt = DateTime.UtcNow.AddSeconds(1);
+        nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
         submissions = new ShortageSubmissionService(providerInstanceId, state, workQueue, CurrentOwner);
-        ipc = new(new DalamudIpcRegistrar(pluginInterface), snapshots, submissions);
+        deposits = new ElementalDepositSubmissionService(providerInstanceId, state, workQueue, journal, cache.Snapshot, CurrentOwner);
+        ipc = new(new DalamudIpcRegistrar(pluginInterface), snapshots, submissions, deposits);
         window = new(state, runtimeSnapshots, journal, transfers, autoRetainer, dataManager, configuration, SaveConfiguration, agentReviewRegistry);
         agentBridgeViewportCapture = new(
             configDirectory,
@@ -150,6 +155,7 @@ public sealed class Plugin : IDalamudPlugin
             cache.Changed += OnCacheChanged;
             journal.OperationChanged += OnOperationChanged;
             submissions.OperationChanged += OnSubmittedOperationChanged;
+            deposits.OperationChanged += OnSubmittedOperationChanged;
             var commandHelp = "Open Quartermaster.";
 #if DEBUG
             commandHelp += " Use '/rq bridge on|off' to control the local development bridge.";
@@ -235,7 +241,7 @@ public sealed class Plugin : IDalamudPlugin
     private void RefreshSnapshot()
     {
         snapshots.Refresh(runtimeSnapshots.Refresh());
-        nextSnapshotAt = DateTime.UtcNow.AddSeconds(1);
+        nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
     }
 
     private void OnStateChanged()
@@ -361,6 +367,7 @@ public sealed class Plugin : IDalamudPlugin
         pluginInterface.UiBuilder.OpenMainUi -= OpenMainUi;
         commands.RemoveHandler(Command);
         submissions.OperationChanged -= OnSubmittedOperationChanged;
+        deposits.OperationChanged -= OnSubmittedOperationChanged;
         state.Changed -= OnStateChanged;
         cache.Changed -= OnCacheChanged;
         journal.OperationChanged -= OnOperationChanged;

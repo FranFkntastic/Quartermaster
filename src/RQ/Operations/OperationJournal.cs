@@ -29,11 +29,17 @@ public sealed class OperationJournal
         .FirstOrDefault());
 
     public OperationRecord? NextAutomaticRetrieval(OwnerScope owner)
+        => NextAutomaticOperation(owner, OperationKinds.Retrieval);
+
+    public OperationRecord? NextAutomaticOperation(OwnerScope owner)
+        => NextAutomaticOperation(owner, kind: null);
+
+    private OperationRecord? NextAutomaticOperation(OwnerScope owner, string? kind)
     {
         if (!owner.HasStableIdentity)
             return null;
         return repository.Read(state => state.Operations
-            .Where(operation => operation.Kind == OperationKinds.Retrieval &&
+            .Where(operation => (kind == null || operation.Kind == kind) &&
                                 operation.ExecuteImmediately &&
                                 operation.Status == OperationStatuses.Accepted &&
                                 operation.Owner.HasStableIdentity &&
@@ -143,22 +149,31 @@ public sealed class OperationJournal
         return copy;
     }
 
-    public OperationRecord CreateDeposit(OwnerScope owner, ElementalDepositPlan plan)
+    public OperationRecord CreateDeposit(
+        OwnerScope owner,
+        ElementalDepositPlan plan,
+        string? requestId = null,
+        string? operationId = null,
+        bool executeImmediately = false,
+        string? canonicalHash = null)
     {
         if (!owner.HasStableIdentity)
             throw new InvalidOperationException("Deposit operations require stable owner identity.");
         var now = utcNow();
         var operation = new OperationRecord
         {
-            OperationId = $"rq-{Guid.NewGuid():N}",
-            RequestId = string.Empty,
+            OperationId = operationId ?? $"rq-{Guid.NewGuid():N}",
+            RequestId = requestId ?? string.Empty,
             Kind = OperationKinds.Deposit,
+            ExecuteImmediately = executeImmediately,
             Owner = owner,
             Status = OperationStatuses.Accepted,
             Revision = 1,
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
-            Message = "Exact crystal deposit authorization is ready for explicit execution.",
+            Message = executeImmediately
+                ? "Exact elemental deposit authorization is ready for automatic execution."
+                : "Exact elemental deposit authorization is ready for explicit execution.",
             Lines = plan.Lines.Where(line => line.PlannedQuantity > 0).Select(line => new OperationLine
             {
                 ItemId = line.ItemId,
@@ -174,11 +189,26 @@ public sealed class OperationJournal
                 CapacityByItem = candidate.CapacityByItem.ToDictionary(entry => entry.Key, entry => entry.Value),
             }).ToList(),
         };
-        operation.RequestId = operation.OperationId;
+        if (string.IsNullOrWhiteSpace(operation.RequestId))
+            operation.RequestId = operation.OperationId;
         if (operation.Lines.Count == 0 || operation.DepositCandidates.Count == 0)
             throw new InvalidOperationException("Deposit plan has no executable reviewed authorization.");
         repository.Mutate(state =>
         {
+            if (state.Operations.Any(candidate => candidate.OperationId == operation.OperationId))
+                throw new InvalidOperationException($"Operation ID '{operation.OperationId}' is already in use.");
+            if (!string.IsNullOrWhiteSpace(canonicalHash))
+            {
+                if (state.Requests.Any(candidate => candidate.RequestId == operation.RequestId))
+                    throw new InvalidOperationException($"Request ID '{operation.RequestId}' is already in use.");
+                state.Requests.Add(new SubmittedRequestRecord
+                {
+                    RequestId = operation.RequestId,
+                    OperationId = operation.OperationId,
+                    CanonicalHash = canonicalHash,
+                    AcceptedAtUtc = now,
+                });
+            }
             state.Operations.Add(operation);
             AddReceipt(state, operation, "DepositAuthorizationPersisted", operation.Message);
         });

@@ -45,6 +45,8 @@ public static class ElementalDepositPlanner
             .OrderByDescending(candidate => candidate.UsableCapacity)
             .ThenByDescending(candidate => candidate.CapacityKnown)
             .ThenByDescending(candidate => candidate.ObservedAtUtc)
+            .ThenBy(candidate => candidate.RetainerName, StringComparer.Ordinal)
+            .ThenBy(candidate => candidate.RetainerId)
             .ToArray();
         var lines = carried.OrderBy(entry => entry.Key).Select(entry =>
         {

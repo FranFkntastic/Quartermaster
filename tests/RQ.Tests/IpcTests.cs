@@ -16,6 +16,98 @@ namespace RQ.Tests;
 public sealed class IpcTests
 {
     [Fact]
+    public void SubmitElementalDeposit_PersistsExactAutomaticAuthorizationIdempotently()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var queue = new TestWorkQueue();
+        var journal = new OperationJournal(repository);
+        var retainer = TestData.Retainer(10, "Alpha");
+        retainer.Bags.Add(new CachedBag
+        {
+            BagName = "RetainerCrystals",
+            ObservedAtUtc = retainer.ObservedAtUtc,
+            Items = [new CachedItem { ItemId = 2, ItemName = "Fire Shard", Quantity = 9_000 }],
+        });
+        var service = new ElementalDepositSubmissionService(
+            "provider-1",
+            repository,
+            queue,
+            journal,
+            () => new Dictionary<ulong, CachedRetainer> { [retainer.RetainerId] = retainer },
+            () => TestData.Owner);
+        var request = new ElementalDepositRequest
+        {
+            Schema = ElementalDepositSubmissionService.RequestSchema,
+            ProviderInstanceId = "provider-1",
+            RequestId = "deposit-request",
+            OperationId = "deposit-operation",
+            SubmittedAtUtc = DateTimeOffset.UtcNow,
+            ExecuteImmediately = true,
+            Owner = new RequestOwner
+            {
+                LocalContentId = TestData.Owner.LocalContentId!.Value,
+                HomeWorldId = TestData.Owner.HomeWorldId!.Value,
+                CharacterName = TestData.Owner.CharacterName,
+            },
+            Items = [new ElementalDepositRequestItem { ItemId = 2, ItemName = "Fire Shard", MaximumQuantity = 500 }],
+        };
+
+        Assert.Equal(OperationStatuses.Queued, Parse(service.Submit(TestData.Json(request))).GetProperty("status").GetString());
+        queue.Drain();
+        Assert.Equal(OperationStatuses.Accepted, Parse(service.Submit(TestData.Json(request))).GetProperty("status").GetString());
+
+        var operation = Assert.Single(repository.Snapshot().Operations);
+        Assert.True(operation.ExecuteImmediately);
+        Assert.Equal(OperationKinds.Deposit, operation.Kind);
+        Assert.Equal(500, Assert.Single(operation.Lines).TargetQuantity);
+        Assert.Equal(999, Assert.Single(operation.DepositCandidates).CapacityByItem[2]);
+        Assert.Single(repository.Snapshot().Requests);
+    }
+
+    [Fact]
+    public void SubmitElementalDeposit_RejectsIncompleteKnownCapacity()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var retainer = TestData.Retainer(10, "Alpha");
+        retainer.Bags.Add(new CachedBag
+        {
+            BagName = "RetainerCrystals",
+            ObservedAtUtc = retainer.ObservedAtUtc,
+            Items = [new CachedItem { ItemId = 2, ItemName = "Fire Shard", Quantity = 9_900 }],
+        });
+        var service = new ElementalDepositSubmissionService(
+            "provider-1",
+            repository,
+            new TestWorkQueue(),
+            new OperationJournal(repository),
+            () => new Dictionary<ulong, CachedRetainer> { [retainer.RetainerId] = retainer },
+            () => TestData.Owner);
+        var request = new ElementalDepositRequest
+        {
+            Schema = ElementalDepositSubmissionService.RequestSchema,
+            ProviderInstanceId = "provider-1",
+            RequestId = "deposit-request",
+            OperationId = "deposit-operation",
+            SubmittedAtUtc = DateTimeOffset.UtcNow,
+            ExecuteImmediately = true,
+            Owner = new RequestOwner
+            {
+                LocalContentId = TestData.Owner.LocalContentId!.Value,
+                HomeWorldId = TestData.Owner.HomeWorldId!.Value,
+                CharacterName = TestData.Owner.CharacterName,
+            },
+            Items = [new ElementalDepositRequestItem { ItemId = 2, ItemName = "Fire Shard", MaximumQuantity = 500 }],
+        };
+
+        var response = Parse(service.Submit(TestData.Json(request)));
+
+        Assert.Equal(OperationStatuses.Rejected, response.GetProperty("status").GetString());
+        Assert.Equal("insufficient_retainer_capacity", response.GetProperty("errorCode").GetString());
+    }
+
+    [Fact]
     public void Capabilities_AdvertiseCanonicalTransferPlansAndCompatibilityContracts()
     {
         using var directory = new TemporaryDirectory();
@@ -172,7 +264,7 @@ public sealed class IpcTests
     }
 
     [Fact]
-    public void Submit_ExecuteImmediatelyPersistsAndParticipatesInCanonicalHash()
+    public void Submit_ExecuteImmediatelyPersistsEphemeralOperationWithoutPlans()
     {
         using var directory = new TemporaryDirectory();
         var repository = TestData.Repository(directory.Path);
@@ -189,6 +281,13 @@ public sealed class IpcTests
         var persisted = Assert.Single(TestData.Repository(directory.Path).Snapshot().Operations);
         Assert.True(persisted.ExecuteImmediately);
         Assert.Contains("automatic", persisted.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("ephemeral", persisted.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(repository.Snapshot().PlanItems);
+        Assert.Empty(repository.Snapshot().RestockPlans);
+        Assert.Empty(repository.Snapshot().StowagePlans);
+        var source = Assert.Single(persisted.SourcePlanItems);
+        Assert.Equal(100U, source.ItemId);
+        Assert.Equal(50, source.TargetQuantity);
 
         var conflict = Parse(service.Submit(TestData.Json(request with { ExecuteImmediately = false })));
         Assert.Equal(OperationStatuses.Rejected, conflict.GetProperty("status").GetString());
@@ -365,12 +464,18 @@ public sealed class IpcTests
         var snapshots = new SnapshotPublisher("provider", repository, () => new Dictionary<ulong, CachedRetainer>());
         snapshots.Refresh(TestData.Owner, []);
         var registrar = new RecordingIpcRegistrar();
-        var provider = new QuartermasterIpcProvider(registrar, snapshots, new ShortageSubmissionService("provider-1", repository, new TestWorkQueue(), () => TestData.Owner));
+        var queue = new TestWorkQueue();
+        var journal = new OperationJournal(repository);
+        var provider = new QuartermasterIpcProvider(
+            registrar,
+            snapshots,
+            new ShortageSubmissionService("provider-1", repository, queue, () => TestData.Owner),
+            new ElementalDepositSubmissionService("provider-1", repository, queue, journal, () => new Dictionary<ulong, CachedRetainer>(), () => TestData.Owner));
 
         provider.Dispose();
 
         Assert.Equal(
-            [IpcChannels.GetCapabilities, IpcChannels.GetSnapshot, IpcChannels.SubmitShortages, IpcChannels.GetOperation, IpcChannels.Changed],
+            [IpcChannels.GetCapabilities, IpcChannels.GetSnapshot, IpcChannels.SubmitShortages, IpcChannels.SubmitElementalDeposit, IpcChannels.GetOperation, IpcChannels.Changed],
             registrar.Unregistered);
     }
 
@@ -384,7 +489,14 @@ public sealed class IpcTests
         var snapshots = new SnapshotPublisher("provider-1", repository, () => new Dictionary<ulong, CachedRetainer>());
         snapshots.Refresh(TestData.Owner, []);
         var registrar = new RecordingIpcRegistrar();
-        using var provider = new QuartermasterIpcProvider(registrar, snapshots, submissions);
+        var deposits = new ElementalDepositSubmissionService(
+            "provider-1",
+            repository,
+            queue,
+            new OperationJournal(repository),
+            () => new Dictionary<ulong, CachedRetainer>(),
+            () => TestData.Owner);
+        using var provider = new QuartermasterIpcProvider(registrar, snapshots, submissions, deposits);
         submissions.Submit(TestData.Json(TestData.Request()));
 
         var getOperation = Assert.IsType<Func<string, string>>(registrar.Registrations[IpcChannels.GetOperation]);

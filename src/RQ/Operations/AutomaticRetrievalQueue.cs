@@ -1,3 +1,4 @@
+using Franthropy.Dalamud.Automation.Retainers;
 using RQ.Domain;
 
 namespace RQ.Operations;
@@ -6,6 +7,7 @@ public interface IRetrievalOperationExecutor
 {
     bool CanStart { get; }
     Task<TransferExecutionResult> ExecuteRetrievalAsync(string operationId, CancellationToken cancellationToken = default);
+    Task<TransferExecutionResult> ExecuteDepositAsync(string operationId, CancellationToken cancellationToken = default);
     void CancelActive();
 }
 
@@ -14,20 +16,27 @@ public sealed class AutomaticRetrievalQueue : IDisposable
     private readonly OperationJournal journal;
     private readonly IRetrievalOperationExecutor executor;
     private readonly Func<OwnerScope> currentOwner;
+    private readonly IAutoRetainerIpc? autoRetainer;
     private readonly CancellationTokenSource lifetime = new();
     private Task<TransferExecutionResult>? activeTask;
     private bool stopping;
     private bool disposed;
+    private bool restoreAutoRetainerSuppression;
 
-    public AutomaticRetrievalQueue(OperationJournal journal, IRetrievalOperationExecutor executor, Func<OwnerScope> currentOwner)
+    public AutomaticRetrievalQueue(
+        OperationJournal journal,
+        IRetrievalOperationExecutor executor,
+        Func<OwnerScope> currentOwner,
+        IAutoRetainerIpc? autoRetainer = null)
     {
         this.journal = journal;
         this.executor = executor;
         this.currentOwner = currentOwner;
+        this.autoRetainer = autoRetainer;
     }
 
     public string? ActiveOperationId { get; private set; }
-    public string LastMessage { get; private set; } = "No automatic retrieval has run.";
+    public string LastMessage { get; private set; } = "No automatic transfer has run.";
 
     public void Tick()
     {
@@ -40,15 +49,29 @@ public sealed class AutomaticRetrievalQueue : IDisposable
             Observe(completed);
             activeTask = null;
             ActiveOperationId = null;
+            RestoreAutoRetainer();
             return;
         }
         if (!executor.CanStart)
             return;
         var owner = currentOwner();
-        if (!owner.HasStableIdentity || journal.NextAutomaticRetrieval(owner) is not { } operation)
+        if (!owner.HasStableIdentity || journal.NextAutomaticOperation(owner) is not { } operation)
+            return;
+        if (!TrySuppressAutoRetainer())
             return;
         ActiveOperationId = operation.OperationId;
-        activeTask = executor.ExecuteRetrievalAsync(operation.OperationId, lifetime.Token);
+        try
+        {
+            activeTask = operation.Kind == OperationKinds.Deposit
+                ? executor.ExecuteDepositAsync(operation.OperationId, lifetime.Token)
+                : executor.ExecuteRetrievalAsync(operation.OperationId, lifetime.Token);
+        }
+        catch
+        {
+            ActiveOperationId = null;
+            RestoreAutoRetainer();
+            throw;
+        }
     }
 
     public bool CancelAndWait(TimeSpan timeout)
@@ -58,6 +81,7 @@ public sealed class AutomaticRetrievalQueue : IDisposable
         if (task is null)
         {
             lifetime.Cancel();
+            RestoreAutoRetainer();
             return true;
         }
         if (task.IsCompleted)
@@ -66,6 +90,7 @@ public sealed class AutomaticRetrievalQueue : IDisposable
             activeTask = null;
             ActiveOperationId = null;
             lifetime.Cancel();
+            RestoreAutoRetainer();
             return true;
         }
         lifetime.Cancel();
@@ -82,6 +107,10 @@ public sealed class AutomaticRetrievalQueue : IDisposable
         {
             return true;
         }
+        finally
+        {
+            RestoreAutoRetainer();
+        }
     }
 
     public void Dispose()
@@ -96,7 +125,37 @@ public sealed class AutomaticRetrievalQueue : IDisposable
     private void Observe(Task<TransferExecutionResult> task)
     {
         try { LastMessage = task.GetAwaiter().GetResult().Message; }
-        catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { LastMessage = "Automatic retrieval cancelled during plugin disposal."; }
-        catch (Exception exception) { LastMessage = $"Automatic retrieval failed: {exception.Message}"; }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { LastMessage = "Automatic transfer cancelled during plugin disposal."; }
+        catch (Exception exception) { LastMessage = $"Automatic transfer failed: {exception.Message}"; }
+    }
+
+    private bool TrySuppressAutoRetainer()
+    {
+        if (autoRetainer is null || !autoRetainer.IsAvailable)
+            return true;
+        try
+        {
+            if (autoRetainer.IsBusy)
+                return false;
+            if (autoRetainer.IsSuppressed)
+                return true;
+            autoRetainer.SetSuppressed(true);
+            restoreAutoRetainerSuppression = true;
+            return true;
+        }
+        catch (Exception exception)
+        {
+            LastMessage = $"Automatic transfer is waiting for AutoRetainer coordination: {exception.Message}";
+            return false;
+        }
+    }
+
+    private void RestoreAutoRetainer()
+    {
+        if (!restoreAutoRetainerSuppression || autoRetainer is null)
+            return;
+        restoreAutoRetainerSuppression = false;
+        try { autoRetainer.SetSuppressed(false); }
+        catch (Exception exception) { LastMessage = $"Transfer ended, but AutoRetainer suppression could not be restored: {exception.Message}"; }
     }
 }

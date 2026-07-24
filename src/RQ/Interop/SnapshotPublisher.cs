@@ -13,6 +13,7 @@ public sealed class SnapshotPublisher
     public const string TransferPlansCapability = "transferPlans.v1";
     public const string StowagePlansCapability = "stowagePlans.v1";
     public const string RestockPlansCapability = "restockPlans.v1";
+    public const string AutomaticElementalDepositCapability = "automaticElementalDeposit";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string providerInstanceId;
     private readonly StateRepository state;
@@ -105,9 +106,9 @@ public sealed class SnapshotPublisher
         schema = "gooseworks-quartermaster-capabilities/v1",
         providerInstanceId,
         revision = Revision,
-        channels = new[] { IpcChannels.GetCapabilities, IpcChannels.GetSnapshot, IpcChannels.SubmitShortages, IpcChannels.GetOperation, IpcChannels.Changed },
-        capabilities = new[] { AutomaticRetrievalCapability, TransferPlansCapability, StowagePlansCapability, RestockPlansCapability },
-        requestSchemas = new[] { ShortageSubmissionService.RequestSchema },
+        channels = new[] { IpcChannels.GetCapabilities, IpcChannels.GetSnapshot, IpcChannels.SubmitShortages, IpcChannels.SubmitElementalDeposit, IpcChannels.GetOperation, IpcChannels.Changed },
+        capabilities = new[] { AutomaticRetrievalCapability, AutomaticElementalDepositCapability, TransferPlansCapability, StowagePlansCapability, RestockPlansCapability },
+        requestSchemas = new[] { ShortageSubmissionService.RequestSchema, ElementalDepositSubmissionService.RequestSchema },
         statusVocabulary = new[] { OperationStatuses.Queued, OperationStatuses.Accepted, OperationStatuses.Running, OperationStatuses.Succeeded, OperationStatuses.PartiallySucceeded, OperationStatuses.Indeterminate, OperationStatuses.Failed, OperationStatuses.Cancelled, OperationStatuses.Rejected },
         executionPolicy = "request_selected",
         automaticExecutionField = "executeImmediately",

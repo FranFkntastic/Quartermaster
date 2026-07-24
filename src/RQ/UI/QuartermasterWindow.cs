@@ -31,6 +31,7 @@ public sealed class QuartermasterWindow : Window
     private readonly AgentBridgeUiCaptureTransactionManager captureTransactions;
     private readonly WorkbenchState workbench = new();
     private readonly BrowserQueryController queries = new();
+    private readonly RootConfirmationDialog confirmationDialog = new();
     private readonly Dictionary<(uint ItemId, bool IsHighQuality), QuickDepositSelection> quickDeposits = [];
     private string transferStatus = "No transfer has run.";
     private WorkbenchView? requestedView;
@@ -63,8 +64,6 @@ public sealed class QuartermasterWindow : Window
     private int bulkRestockNoteMode = -1;
     private bool requestRestockEditorOpen;
     private bool restockEditorVisible;
-    private Guid? requestDeleteRestockPlanId;
-    private Guid? requestDeleteStowagePlanId;
     private ItemGroupDraft? itemGroupDraft;
     private WorkbenchView? itemGroupEditorOrigin;
     private readonly HashSet<ItemGroupItem> selectedItemGroupItems = [];
@@ -320,6 +319,7 @@ public sealed class QuartermasterWindow : Window
             requestedView = null;
         }
         DrawStowageEditorModal(runtime);
+        confirmationDialog.Draw();
     }
 
     private void DrawStockAndPlans(QuartermasterRuntimeSnapshot runtime)
@@ -588,12 +588,11 @@ public sealed class QuartermasterWindow : Window
             if (selected is null)
                 ImGui.BeginDisabled();
             if (ImGui.Selectable("Delete plan") && selected is not null)
-                requestDeleteRestockPlanId = selected.Id;
+                RequestDeleteRestockPlan(selected, owner);
             if (selected is null)
                 ImGui.EndDisabled();
             ImGui.EndPopup();
         }
-        DrawDeleteRestockPlanPopup(owner, runtime.State);
 
         selected = ResolveSelectedRestockPlan(state.Snapshot(), owner);
         if (selected is null)
@@ -1479,33 +1478,41 @@ public sealed class QuartermasterWindow : Window
             .ToArray();
     }
 
-    private void DrawDeleteRestockPlanPopup(OwnerScope owner, QuartermasterState snapshot)
+    private void RequestDeleteRestockPlan(RestockPlan plan, OwnerScope owner)
     {
-        if (requestDeleteRestockPlanId is { } requestedId)
-        {
-            ImGui.OpenPopup($"Delete Restock Plan##{requestedId}");
-            requestDeleteRestockPlanId = null;
-        }
-        var plan = snapshot.RestockPlans.FirstOrDefault(candidate =>
-            candidate.Owner.Matches(owner) &&
-            ImGui.IsPopupOpen($"Delete Restock Plan##{candidate.Id}"));
-        if (plan is null || !ImGui.BeginPopupModal($"Delete Restock Plan##{plan.Id}", ImGuiWindowFlags.AlwaysAutoResize))
-            return;
-        ImGui.TextUnformatted($"Delete \"{plan.Name}\"?");
-        if (ImGui.Button("Delete"))
-        {
-            var planId = plan.Id;
-            workbench.SelectedRestockPlanId = state.Mutate(document =>
+        var planId = plan.Id;
+        confirmationDialog.Request(
+            $"restock-plan:{planId}",
+            "Delete Restock Plan?",
+            $"Delete \"{plan.Name}\"? This cannot be undone.",
+            "Delete plan",
+            () =>
             {
-                document.RestockPlans.RemoveAll(candidate => candidate.Id == planId && candidate.Owner.Matches(owner));
-                return RestockPlanCatalog.OwnerPlans(document, owner).FirstOrDefault()?.Id;
+                workbench.SelectedRestockPlanId = state.Mutate(document =>
+                {
+                    document.RestockPlans.RemoveAll(candidate => candidate.Id == planId && candidate.Owner.Matches(owner));
+                    return RestockPlanCatalog.OwnerPlans(document, owner).FirstOrDefault()?.Id;
+                });
             });
-            ImGui.CloseCurrentPopup();
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("Cancel"))
-            ImGui.CloseCurrentPopup();
-        ImGui.EndPopup();
+    }
+
+    private void RequestDeleteStowagePlan(StowagePlan plan, OwnerScope owner)
+    {
+        var planId = plan.Id;
+        confirmationDialog.Request(
+            $"transfer-plan:{planId}",
+            "Delete Transfer Plan?",
+            $"Delete \"{plan.Name}\" and all of its target rules? This cannot be undone.",
+            "Delete plan",
+            () =>
+            {
+                workbench.SelectedStowagePlanId = state.Mutate(document =>
+                {
+                    document.PlanItems.RemoveAll(rule => rule.StowagePlanId == planId);
+                    document.StowagePlans.RemoveAll(candidate => candidate.Id == planId && candidate.Owner.Matches(owner));
+                    return StowagePlanCatalog.OwnerPlans(document, owner).FirstOrDefault()?.Id;
+                });
+            });
     }
 
     private void AddStockSelectionToRestock(
@@ -1577,36 +1584,6 @@ public sealed class QuartermasterWindow : Window
         activeStowageRuleId = rule.Id;
         selectedStowageRuleIds.Add(rule.Id);
         workbench.ClearSelection();
-    }
-
-    private void DrawDeleteStowagePlanPopup(OwnerScope owner, QuartermasterState snapshot)
-    {
-        if (requestDeleteStowagePlanId is { } requestedId)
-        {
-            ImGui.OpenPopup($"Delete Transfer Plan##{requestedId}");
-            requestDeleteStowagePlanId = null;
-        }
-        var plan = snapshot.StowagePlans.FirstOrDefault(candidate =>
-            candidate.Owner.Matches(owner) &&
-            ImGui.IsPopupOpen($"Delete Transfer Plan##{candidate.Id}"));
-        if (plan is null || !ImGui.BeginPopupModal($"Delete Transfer Plan##{plan.Id}", ImGuiWindowFlags.AlwaysAutoResize))
-            return;
-        ImGui.TextUnformatted($"Delete \"{plan.Name}\"?");
-        if (ImGui.Button("Delete"))
-        {
-            var planId = plan.Id;
-            workbench.SelectedStowagePlanId = state.Mutate(document =>
-            {
-                document.PlanItems.RemoveAll(rule => rule.StowagePlanId == planId);
-                document.StowagePlans.RemoveAll(candidate => candidate.Id == planId && candidate.Owner.Matches(owner));
-                return StowagePlanCatalog.OwnerPlans(document, owner).FirstOrDefault()?.Id;
-            });
-            ImGui.CloseCurrentPopup();
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("Cancel"))
-            ImGui.CloseCurrentPopup();
-        ImGui.EndPopup();
     }
 
     private void CloseRestockEditor()
@@ -1694,12 +1671,11 @@ public sealed class QuartermasterWindow : Window
             if (ImGui.Selectable("Duplicate plan") && selected is not null)
                 OpenStowageEditor(StowagePlanCatalog.DuplicateDraft(state.Snapshot(), owner, selected.Id));
             if (ImGui.Selectable("Delete plan") && selected is not null)
-                requestDeleteStowagePlanId = selected.Id;
+                RequestDeleteStowagePlan(selected, owner);
             if (selected is null)
                 ImGui.EndDisabled();
             ImGui.EndPopup();
         }
-        DrawDeleteStowagePlanPopup(owner, runtime.State);
 
         selected = ResolveSelectedStowagePlan(state.Snapshot(), owner);
         if (selected is null)

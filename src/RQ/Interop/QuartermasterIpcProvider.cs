@@ -14,17 +14,27 @@ public sealed class QuartermasterIpcProvider : IDisposable
     private readonly IIpcRegistrar registrar;
     private readonly SnapshotPublisher snapshots;
     private readonly ShortageSubmissionService submissions;
+    private readonly ElementalDepositSubmissionService deposits;
     private bool disposed;
 
-    public QuartermasterIpcProvider(IIpcRegistrar registrar, SnapshotPublisher snapshots, ShortageSubmissionService submissions)
+    public QuartermasterIpcProvider(
+        IIpcRegistrar registrar,
+        SnapshotPublisher snapshots,
+        ShortageSubmissionService submissions,
+        ElementalDepositSubmissionService deposits)
     {
         this.registrar = registrar;
         this.snapshots = snapshots;
         this.submissions = submissions;
+        this.deposits = deposits;
         registrar.Register(IpcChannels.GetCapabilities, snapshots.GetCapabilities);
         registrar.Register(IpcChannels.GetSnapshot, snapshots.GetSnapshot);
         registrar.Register(IpcChannels.SubmitShortages, submissions.Submit);
-        registrar.Register(IpcChannels.GetOperation, operationId => submissions.GetPendingOperation(operationId) ?? snapshots.GetOperation(operationId));
+        registrar.Register(IpcChannels.SubmitElementalDeposit, deposits.Submit);
+        registrar.Register(IpcChannels.GetOperation, operationId =>
+            submissions.GetPendingOperation(operationId) ??
+            deposits.GetPendingOperation(operationId) ??
+            snapshots.GetOperation(operationId));
         registrar.RegisterNotification(IpcChannels.Changed);
     }
 
@@ -42,6 +52,7 @@ public sealed class QuartermasterIpcProvider : IDisposable
         registrar.Unregister(IpcChannels.GetCapabilities);
         registrar.Unregister(IpcChannels.GetSnapshot);
         registrar.Unregister(IpcChannels.SubmitShortages);
+        registrar.Unregister(IpcChannels.SubmitElementalDeposit);
         registrar.Unregister(IpcChannels.GetOperation);
         registrar.Unregister(IpcChannels.Changed);
     }

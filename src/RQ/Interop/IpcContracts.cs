@@ -8,8 +8,28 @@ public static class IpcChannels
     public const string GetCapabilities = "Quartermaster.v1.GetCapabilities";
     public const string GetSnapshot = "Quartermaster.v1.GetSnapshot";
     public const string SubmitShortages = "Quartermaster.v1.SubmitShortages";
+    public const string SubmitElementalDeposit = "Quartermaster.v1.SubmitElementalDeposit";
     public const string GetOperation = "Quartermaster.v1.GetOperation";
     public const string Changed = "Quartermaster.v1.Changed";
+}
+
+public sealed record ElementalDepositRequest
+{
+    public string Schema { get; init; } = string.Empty;
+    public string ProviderInstanceId { get; init; } = string.Empty;
+    public string RequestId { get; init; } = string.Empty;
+    public string OperationId { get; init; } = string.Empty;
+    public DateTimeOffset SubmittedAtUtc { get; init; }
+    public bool ExecuteImmediately { get; init; }
+    public required RequestOwner Owner { get; init; }
+    public IReadOnlyList<ElementalDepositRequestItem> Items { get; init; } = [];
+}
+
+public sealed record ElementalDepositRequestItem
+{
+    public uint ItemId { get; init; }
+    public string ItemName { get; init; } = string.Empty;
+    public int MaximumQuantity { get; init; }
 }
 
 public sealed record ShortageRequest

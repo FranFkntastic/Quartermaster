@@ -146,24 +146,38 @@ public sealed class ShortageSubmissionService
                 if (state.Requests.Any(record => record.RequestId == request.RequestId))
                     return;
                 var now = utcNow();
-                foreach (var source in request.Items)
+                var operationPlanItems = request.Items.Select(source => new TargetPlanItem
                 {
-                    var existing = state.PlanItems.FirstOrDefault(item => item.ItemId == source.ItemId);
-                    if (existing is null)
+                    ItemId = source.ItemId,
+                    ItemName = source.ItemName.Trim(),
+                    TargetQuantity = source.TargetQuantity,
+                    Enabled = true,
+                }).ToList();
+                if (!request.ExecuteImmediately)
+                {
+                    foreach (var source in request.Items)
                     {
-                        state.PlanItems.Add(new TargetPlanItem
+                        var existing = state.PlanItems.FirstOrDefault(item => item.ItemId == source.ItemId);
+                        if (existing is null)
                         {
-                            ItemId = source.ItemId,
-                            ItemName = source.ItemName.Trim(),
-                            TargetQuantity = source.TargetQuantity,
-                            Enabled = true,
-                        });
+                            existing = new TargetPlanItem
+                            {
+                                ItemId = source.ItemId,
+                                ItemName = source.ItemName.Trim(),
+                                TargetQuantity = source.TargetQuantity,
+                                Enabled = true,
+                            };
+                            state.PlanItems.Add(existing);
+                        }
+                        else
+                        {
+                            existing.ItemName = source.ItemName.Trim();
+                            existing.TargetQuantity = source.TargetQuantity;
+                        }
                     }
-                    else
-                    {
-                        existing.ItemName = source.ItemName.Trim();
-                        existing.TargetQuantity = source.TargetQuantity;
-                    }
+                    operationPlanItems = request.Items
+                        .Select(source => Copy(state.PlanItems.First(item => item.ItemId == source.ItemId)))
+                        .ToList();
                 }
                 state.Requests.Add(new SubmittedRequestRecord
                 {
@@ -189,9 +203,9 @@ public sealed class ShortageSubmissionService
                     CreatedAtUtc = now,
                     UpdatedAtUtc = now,
                     Message = request.ExecuteImmediately
-                        ? "Shortages accepted; automatic execution will start when matching owner and automation are ready."
+                        ? "Ephemeral shortages accepted; automatic execution will start when matching owner and automation are ready."
                         : "Shortages accepted into the plan; review and explicit execution are required.",
-                    SourcePlanItems = request.Items.Select(item => Copy(state.PlanItems.First(plan => plan.ItemId == item.ItemId))).ToList(),
+                    SourcePlanItems = operationPlanItems.Select(Copy).ToList(),
                     Lines = request.Items.Select(item => new OperationLine
                     {
                         ItemId = item.ItemId,

@@ -5,6 +5,7 @@ using Franthropy.Dalamud.Automation.Inventory;
 using Franthropy.Dalamud.Automation.Retainers;
 using RQ.Automation;
 using RQ.Domain;
+using RQ.Interop;
 using RQ.Inventory;
 using RQ.Operations;
 using RQ.Persistence;
@@ -432,6 +433,28 @@ public sealed class AutomationTests
     }
 
     [Fact]
+    public void AutomaticRetrievalQueue_StartsSubmittedEphemeralRequestOnNextTick()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var framework = new TestWorkQueue();
+        var request = TestData.Request() with { ExecuteImmediately = true };
+        var submissions = new ShortageSubmissionService("provider-1", repository, framework, () => TestData.Owner);
+        var executor = new RecordingRetrievalExecutor { CanStart = true };
+        using var automatic = new AutomaticRetrievalQueue(new OperationJournal(repository), executor, () => TestData.Owner);
+
+        submissions.Submit(TestData.Json(request));
+        framework.Drain();
+        automatic.Tick();
+
+        Assert.Equal(1, executor.Starts);
+        Assert.Equal(request.OperationId, automatic.ActiveOperationId);
+        Assert.Empty(repository.Snapshot().PlanItems);
+        Assert.Empty(repository.Snapshot().RestockPlans);
+        Assert.Empty(repository.Snapshot().StowagePlans);
+    }
+
+    [Fact]
     public void AutomaticRetrievalQueue_CancelsAndWaitsForActiveExecution()
     {
         using var directory = new TemporaryDirectory();
@@ -446,6 +469,32 @@ public sealed class AutomationTests
         Assert.True(queue.CancelAndWait(TimeSpan.FromSeconds(1)));
         Assert.Equal(1, executor.CancelCalls);
         queue.Dispose();
+    }
+
+    [Fact]
+    public void AutomaticRetrievalQueue_RunsDepositAndRestoresAutoRetainerSuppression()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateManual(
+            TestData.Owner,
+            [new TargetPlanItem { ItemId = 2, ItemName = "Fire Shard", TargetQuantity = 100 }],
+            OperationKinds.Deposit);
+        repository.Mutate(state => state.Operations.Single(candidate => candidate.OperationId == operation.OperationId).ExecuteImmediately = true);
+        var executor = new RecordingRetrievalExecutor { CanStart = true };
+        var autoRetainer = new FakeAutoRetainerIpc();
+        using var queue = new AutomaticRetrievalQueue(journal, executor, () => TestData.Owner, autoRetainer);
+
+        queue.Tick();
+
+        Assert.Equal(1, executor.DepositStarts);
+        Assert.True(autoRetainer.IsSuppressed);
+        executor.Complete();
+        queue.Tick();
+
+        Assert.False(autoRetainer.IsSuppressed);
+        Assert.Equal([true, false], autoRetainer.SuppressionChanges);
     }
 
     private static T CreateProxy<T>(Func<MethodInfo, object?[]?, object?> handler) where T : class
@@ -488,11 +537,19 @@ public sealed class AutomationTests
 
         public bool CanStart { get; set; }
         public int Starts { get; private set; }
+        public int DepositStarts { get; private set; }
         public int CancelCalls { get; private set; }
 
         public Task<TransferExecutionResult> ExecuteRetrievalAsync(string operationId, CancellationToken cancellationToken = default)
         {
             Starts++;
+            cancellationToken.Register(() => completion.TrySetCanceled(cancellationToken));
+            return completion.Task;
+        }
+
+        public Task<TransferExecutionResult> ExecuteDepositAsync(string operationId, CancellationToken cancellationToken = default)
+        {
+            DepositStarts++;
             cancellationToken.Register(() => completion.TrySetCanceled(cancellationToken));
             return completion.Task;
         }
@@ -505,11 +562,18 @@ public sealed class AutomationTests
     {
         public bool IsAvailable { get; set; } = true;
         public bool IsBusy { get; set; }
+        public bool IsSuppressed { get; set; }
+        public List<bool> SuppressionChanges { get; } = [];
         public AutoRetainerIpcCallbacks? Callbacks { get; private set; }
         public void Register(AutoRetainerIpcCallbacks callbacks) => Callbacks = callbacks;
         public void QueueRetainerListTask(string consumer) { }
         public void RequestPostprocess(string consumer) { }
         public void FinishPostprocess() { }
+        public void SetSuppressed(bool suppressed)
+        {
+            IsSuppressed = suppressed;
+            SuppressionChanges.Add(suppressed);
+        }
         public void Dispose() => Callbacks = null;
     }
 }
