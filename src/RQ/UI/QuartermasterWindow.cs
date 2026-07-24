@@ -28,6 +28,7 @@ public sealed class QuartermasterWindow : Window
     private readonly PluginConfiguration configuration;
     private readonly System.Action saveConfiguration;
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
+    private readonly AgentBridgeUiCaptureTransactionManager captureTransactions;
     private readonly WorkbenchState workbench = new();
     private readonly BrowserQueryController queries = new();
     private readonly Dictionary<(uint ItemId, bool IsHighQuality), QuickDepositSelection> quickDeposits = [];
@@ -73,6 +74,7 @@ public sealed class QuartermasterWindow : Window
     private ItemQualityPolicy itemGroupAddQuality = ItemQualityPolicy.Any;
     private string itemGroupEditorError = string.Empty;
     private bool requestDeleteItemGroup;
+    private WorkbenchView? capturePreviousView;
 
     public QuartermasterWindow(
         StateRepository state,
@@ -95,6 +97,17 @@ public sealed class QuartermasterWindow : Window
         this.configuration = configuration;
         this.saveConfiguration = saveConfiguration;
         this.reviewRegistry = reviewRegistry;
+        captureTransactions = new(
+            () => IsOpen,
+            value => IsOpen = value,
+            () => Collapsed == true,
+            value =>
+            {
+                Collapsed = value;
+                CollapsedCondition = ImGuiCond.Always;
+            },
+            beginPresentation: BeginCapturePresentation,
+            restorePresentation: RestoreCapturePresentation);
         Size = new Vector2(1280, 760);
         SizeCondition = ImGuiCond.FirstUseEver;
         SizeConstraints = new WindowSizeConstraints { MinimumSize = new Vector2(980, 520), MaximumSize = new Vector2(float.MaxValue, float.MaxValue) };
@@ -129,6 +142,7 @@ public sealed class QuartermasterWindow : Window
     public string? SelectedItemGroupName => itemGroupDraft?.Name;
     public bool ItemGroupEditorHasUnsavedChanges =>
         itemGroupDraft is not null && ItemGroupCatalog.HasChanges(state.Snapshot(), itemGroupDraft);
+    public AgentBridgeCaptureRegion? AgentCaptureRegion { get; private set; }
     public bool PlanEditorHasUnsavedChanges
     {
         get
@@ -163,12 +177,75 @@ public sealed class QuartermasterWindow : Window
         reviewRegistry.BeginFrame();
         try
         {
+            var viewport = ImGui.GetWindowViewport();
+            var windowPosition = ImGui.GetWindowPos();
+            var windowSize = ImGui.GetWindowSize();
+            if (windowSize.X > 0f && windowSize.Y > 0f && viewport.Size.X > 0f && viewport.Size.Y > 0f)
+            {
+                AgentCaptureRegion = new AgentBridgeCaptureRegion(
+                    windowPosition,
+                    windowSize,
+                    viewport.Pos,
+                    viewport.Size,
+                    DateTimeOffset.UtcNow);
+            }
             DrawContent();
         }
         finally
         {
-            reviewRegistry.EndFrame();
+            var frame = reviewRegistry.EndFrame();
+            if (ActiveCapturePresentationTarget() is { } target)
+                captureTransactions.MarkRendered(target, frame.FrameId);
         }
+    }
+
+    public override void PreDraw()
+    {
+        if (ActiveCapturePresentationTarget() is null)
+            return;
+
+        var viewport = ImGui.GetMainViewport();
+        ImGui.SetNextWindowViewport(viewport.ID);
+        ImGui.SetNextWindowPos(viewport.WorkPos + new Vector2(16, 16), ImGuiCond.Always);
+        ImGui.SetNextWindowSize(
+            Vector2.Min(new Vector2(1440, 900), viewport.WorkSize - new Vector2(32, 32)),
+            ImGuiCond.Always);
+        ImGui.SetNextWindowFocus();
+    }
+
+    public AgentBridgeUiCaptureTransactionHandle BeginAgentCapturePresentation(string target) =>
+        captureTransactions.Begin(target);
+
+    public AgentBridgeUiCaptureTransactionResult CompleteAgentCapturePresentation(string transactionId) =>
+        captureTransactions.Complete(transactionId);
+
+    public AgentBridgeUiCaptureTransactionResult CancelAgentCapturePresentation(string transactionId) =>
+        captureTransactions.Cancel(transactionId);
+
+    private string? ActiveCapturePresentationTarget()
+    {
+        foreach (var target in new[] { "transfer", "listings", "activity" })
+            if (captureTransactions.ShouldPresentInMainViewport(target))
+                return target;
+        return null;
+    }
+
+    private void BeginCapturePresentation()
+    {
+        capturePreviousView = workbench.View;
+        requestedView = ActiveCapturePresentationTarget() switch
+        {
+            "listings" => WorkbenchView.Listings,
+            "activity" => WorkbenchView.Activity,
+            _ => WorkbenchView.Stowage,
+        };
+    }
+
+    private void RestoreCapturePresentation()
+    {
+        if (capturePreviousView is { } previous)
+            requestedView = previous;
+        capturePreviousView = null;
     }
 
     private void DrawContent()

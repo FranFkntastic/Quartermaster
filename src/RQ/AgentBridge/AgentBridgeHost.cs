@@ -10,6 +10,10 @@ public sealed class AgentBridgeHost : IDisposable
     private readonly PluginConfiguration configuration;
     private readonly Func<Action, CancellationToken, Task> dispatchOnFramework;
     private readonly QuartermasterBridgeProvider provider;
+    private readonly Func<string, AgentBridgeUiCaptureTransactionHandle> beginCapturePresentation;
+    private readonly Func<string, AgentBridgeUiCaptureTransactionResult> completeCapturePresentation;
+    private readonly Func<string, AgentBridgeUiCaptureTransactionResult> cancelCapturePresentation;
+    private readonly Func<bool, CancellationToken, Task<AgentBridgeCaptureReceipt>> captureViewport;
     private readonly AgentBridgeCommandRouter router = new();
     private readonly AgentBridgeOperationRegistry operations = new();
     private readonly SharedAgentBridgeHost host;
@@ -23,11 +27,19 @@ public sealed class AgentBridgeHost : IDisposable
         string mainDllPath,
         Action saveConfiguration,
         Func<Action, CancellationToken, Task> dispatchOnFramework,
-        QuartermasterBridgeProvider provider)
+        QuartermasterBridgeProvider provider,
+        Func<string, AgentBridgeUiCaptureTransactionHandle> beginCapturePresentation,
+        Func<string, AgentBridgeUiCaptureTransactionResult> completeCapturePresentation,
+        Func<string, AgentBridgeUiCaptureTransactionResult> cancelCapturePresentation,
+        Func<bool, CancellationToken, Task<AgentBridgeCaptureReceipt>> captureViewport)
     {
         this.configuration = configuration;
         this.dispatchOnFramework = dispatchOnFramework;
         this.provider = provider;
+        this.beginCapturePresentation = beginCapturePresentation;
+        this.completeCapturePresentation = completeCapturePresentation;
+        this.cancelCapturePresentation = cancelCapturePresentation;
+        this.captureViewport = captureViewport;
         var profile = AgentBridgeProfileIdentity.FromPluginConfigDirectory(configDirectory);
         manifest = new AgentBridgeManifest(
             2,
@@ -35,9 +47,9 @@ public sealed class AgentBridgeHost : IDisposable
             profile.Id,
             profile.Alias,
             "Quartermaster.truth.v6",
-            [new("snapshot"), new("reviewed-actions"), new("operations")],
+            [new("snapshot"), new("reviewed-actions"), new("operations"), new("encrypted-capture"), new("capture-transactions")],
             provider.GetReviewSurfaces(),
-            [],
+            provider.GetCaptureSurfaces(),
             [new(
                 "quartermaster.refresh-retainers",
                 "Refresh retainers",
@@ -83,6 +95,7 @@ public sealed class AgentBridgeHost : IDisposable
             AgentBridgeResponse.Ok("Quartermaster truth captured.", await OnFrameworkAsync(provider.CreateTruth, cancellationToken).ConfigureAwait(false)));
         router.Register("get-control-surface", _ => AgentBridgeResponse.Ok("Control surface captured.", provider.GetControlSurface()));
         router.Register("get-review-surfaces", _ => AgentBridgeResponse.Ok("Review surfaces captured.", manifest.ReviewSurfaces));
+        router.Register("get-capture-surfaces", _ => AgentBridgeResponse.Ok("Capture surfaces captured.", manifest.CaptureSurfaces));
         router.Register("get-control", request =>
         {
             if (string.IsNullOrWhiteSpace(request.Target)) return AgentBridgeResponse.Fail("A control ID is required.");
@@ -109,6 +122,77 @@ public sealed class AgentBridgeHost : IDisposable
             await dispatchOnFramework(provider.CloseMainWindow, cancellationToken).ConfigureAwait(false);
             return AgentBridgeResponse.Ok("Quartermaster closed.");
         });
+        router.Register("begin-capture-presentation", BeginCapturePresentationAsync);
+        router.Register("complete-capture-presentation", CompleteCapturePresentationAsync);
+        router.Register("cancel-capture-presentation", CompleteCapturePresentationAsync);
+        router.Register("capture-screen", CaptureScreenAsync);
+    }
+
+    private async ValueTask<AgentBridgeResponse> BeginCapturePresentationAsync(
+        AgentBridgeRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.Target) ||
+            !provider.GetCaptureSurfaces().Any(surface => surface.Id == request.Target))
+            return AgentBridgeResponse.Fail("The requested capture presentation target is not registered.");
+
+        AgentBridgeUiCaptureTransactionHandle? handle = null;
+        try
+        {
+            await dispatchOnFramework(
+                () => handle = beginCapturePresentation(request.Target),
+                cancellationToken).ConfigureAwait(false);
+            return AgentBridgeResponse.Ok(
+                "Capture presentation rendered and ready.",
+                await handle!.Ready.WaitAsync(cancellationToken).ConfigureAwait(false));
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException or TimeoutException or OperationCanceledException)
+        {
+            if (handle is not null)
+                await dispatchOnFramework(
+                    () => cancelCapturePresentation(handle.TransactionId),
+                    CancellationToken.None).ConfigureAwait(false);
+            return AgentBridgeResponse.Fail($"Capture presentation failed: {exception.Message}");
+        }
+    }
+
+    private async ValueTask<AgentBridgeResponse> CompleteCapturePresentationAsync(
+        AgentBridgeRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.TransactionId))
+            return AgentBridgeResponse.Fail("A capture transaction identifier is required.");
+
+        AgentBridgeUiCaptureTransactionResult? result = null;
+        await dispatchOnFramework(
+            () => result = request.Command == "complete-capture-presentation"
+                ? completeCapturePresentation(request.TransactionId)
+                : cancelCapturePresentation(request.TransactionId),
+            cancellationToken).ConfigureAwait(false);
+        return result!.Success
+            ? AgentBridgeResponse.Ok(result.Message, result)
+            : AgentBridgeResponse.Fail(result.Message);
+    }
+
+    private async ValueTask<AgentBridgeResponse> CaptureScreenAsync(
+        AgentBridgeRequest request,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return AgentBridgeResponse.Ok(
+                "Rendered Quartermaster viewport captured.",
+                await captureViewport(request.FullViewport, cancellationToken).ConfigureAwait(false));
+        }
+        catch (OperationCanceledException)
+        {
+            return AgentBridgeResponse.Fail("Rendered viewport capture timed out.");
+        }
+        catch (Exception exception)
+        {
+            return AgentBridgeResponse.Fail($"Rendered viewport capture failed: {exception.Message}");
+        }
     }
 
     private async ValueTask<AgentBridgeResponse> InvokeControlAsync(AgentBridgeRequest request, CancellationToken cancellationToken)

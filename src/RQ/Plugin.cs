@@ -40,6 +40,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly ShortageSubmissionService submissions;
     private readonly QuartermasterIpcProvider ipc;
     private readonly RQ.AgentBridge.AgentBridgeHost agentBridge;
+    private readonly AgentBridgeViewportCaptureService agentBridgeViewportCapture;
     private readonly AgentBridgeUiReviewRegistry agentReviewRegistry = new();
     private readonly WindowSystem windows = new("RQ");
     private readonly QuartermasterWindow window;
@@ -55,6 +56,8 @@ public sealed class Plugin : IDalamudPlugin
         IAddonLifecycle addonLifecycle,
         IGameGui gameGui,
         IDataManager dataManager,
+        ITextureProvider textureProvider,
+        ITextureReadbackProvider textureReadbackProvider,
         IPluginLog log,
         IObjectTable objects,
         ITargetManager targets,
@@ -118,13 +121,25 @@ public sealed class Plugin : IDalamudPlugin
         submissions = new ShortageSubmissionService(providerInstanceId, state, workQueue, CurrentOwner);
         ipc = new(new DalamudIpcRegistrar(pluginInterface), snapshots, submissions);
         window = new(state, runtimeSnapshots, journal, transfers, autoRetainer, dataManager, configuration, SaveConfiguration, agentReviewRegistry);
+        agentBridgeViewportCapture = new(
+            configDirectory,
+            configuration.PluginInstanceId,
+            "Quartermaster",
+            () => window.AgentCaptureRegion,
+            DispatchOnFramework,
+            textureProvider,
+            textureReadbackProvider);
         agentBridge = new(
             configuration,
             configDirectory,
             pluginInterface.AssemblyLocation.FullName,
             SaveConfiguration,
             DispatchOnFramework,
-            new QuartermasterBridgeProvider(CreateAgentBridgeTruth, window.OpenReviewSurface, window.CloseReviewSurface, agentReviewRegistry));
+            new QuartermasterBridgeProvider(CreateAgentBridgeTruth, window.OpenReviewSurface, window.CloseReviewSurface, agentReviewRegistry),
+            window.BeginAgentCapturePresentation,
+            window.CompleteAgentCapturePresentation,
+            window.CancelAgentCapturePresentation,
+            agentBridgeViewportCapture.CaptureAsync);
         windows.AddWindow(window);
 
         try

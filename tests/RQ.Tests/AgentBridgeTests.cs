@@ -34,6 +34,8 @@ public sealed class AgentBridgeTests
 
         Assert.Same(truth, provider.CreateTruth());
         Assert.Equal(["transfer", "listings", "activity"], provider.GetReviewSurfaces().Select(surface => surface.Id));
+        Assert.Equal(["transfer", "listings", "activity"], provider.GetCaptureSurfaces().Select(surface => surface.Id));
+        Assert.True(provider.GetCaptureSurfaces().Single(surface => surface.Id == "transfer").IsDefault);
         Assert.All(provider.GetReviewSurfaces(), surface => Assert.Equal("open-main-window", surface.Command));
         Assert.True(provider.TryOpenMainWindow("listings"));
         Assert.Equal("listings", openedTarget);

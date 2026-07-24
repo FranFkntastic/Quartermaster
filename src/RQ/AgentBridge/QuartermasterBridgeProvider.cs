@@ -45,6 +45,12 @@ public sealed class QuartermasterBridgeProvider
         new("listings", "Retainer listings", "open-main-window", "listings", 20),
         new("activity", "Operations and receipts", "open-main-window", "activity", 30),
     ];
+    private static readonly IReadOnlyList<AgentBridgeCaptureSurfaceDescriptor> CaptureSurfaces =
+    [
+        new("transfer", "Stock and Transfer Plans", 10, IsDefault: true),
+        new("listings", "Retainer listings", 20),
+        new("activity", "Operations and receipts", 30),
+    ];
 
     private readonly Func<QuartermasterBridgeTruth> createTruth;
     private readonly Action<string> openMainWindow;
@@ -65,6 +71,7 @@ public sealed class QuartermasterBridgeProvider
 
     public QuartermasterBridgeTruth CreateTruth() => createTruth();
     public IReadOnlyList<AgentBridgeReviewSurfaceDescriptor> GetReviewSurfaces() => ReviewSurfaces;
+    public IReadOnlyList<AgentBridgeCaptureSurfaceDescriptor> GetCaptureSurfaces() => CaptureSurfaces;
     public AgentBridgeUiReviewFrame GetControlSurface() => reviewRegistry.Snapshot();
     public AgentBridgeUiControlReview ReviewControl(string id) => reviewRegistry.Review(id);
     public AgentBridgeUiControlInvocation InvokeControl(string id, long frameId, System.Text.Json.JsonElement? arguments = null) =>
