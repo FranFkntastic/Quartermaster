@@ -29,22 +29,15 @@ public sealed class AgentBridgeHost : IDisposable
         this.dispatchOnFramework = dispatchOnFramework;
         this.provider = provider;
         var profile = AgentBridgeProfileIdentity.FromPluginConfigDirectory(configDirectory);
-        var reviewSurfaces = provider.GetReviewSurfaces();
         manifest = new AgentBridgeManifest(
             2,
             AgentBridgeRuntimeIdentity.FromAssembly("RQ", Assembly.GetExecutingAssembly(), mainDllPath),
             profile.Id,
             profile.Alias,
             "Quartermaster.truth.v5",
-            [new("snapshot"), new("reviewed-actions"), new("operations"), new("encrypted-capture")],
-            reviewSurfaces,
-            reviewSurfaces
-                .Select(surface => new AgentBridgeCaptureSurfaceDescriptor(
-                    surface.Id,
-                    surface.Label,
-                    surface.Order,
-                    IsDefault: surface.Id == "stock"))
-                .ToArray(),
+            [new("snapshot"), new("reviewed-actions"), new("operations")],
+            provider.GetReviewSurfaces(),
+            [],
             [new(
                 "quartermaster.refresh-retainers",
                 "Refresh retainers",
