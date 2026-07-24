@@ -25,6 +25,7 @@ public sealed class AutoRetainerRefreshService : IDisposable
     private AutoRetainerRefreshPhase phase;
     private int expected;
     private int processed;
+    private bool automaticRefreshPending = true;
     private volatile bool disposed;
 
     public AutoRetainerRefreshService(
@@ -67,6 +68,33 @@ public sealed class AutoRetainerRefreshService : IDisposable
     public string Status { get; private set; } = "Retainer refresh has not run.";
 
     public bool IsAvailable => autoRetainer.IsAvailable;
+
+    public void TickAutomatic(bool stockBrowserVisible)
+    {
+        if (disposed ||
+            !automaticRefreshPending ||
+            !stockBrowserVisible ||
+            phase != AutoRetainerRefreshPhase.Idle ||
+            !IsAvailable)
+            return;
+
+        if (autoRetainer.IsBusy)
+        {
+            // AutoRetainer's normal postprocess callbacks will refresh the cache
+            // without Quartermaster queueing a second pass behind it.
+            automaticRefreshPending = false;
+            return;
+        }
+
+        // Automatic refresh is deliberately opportunistic: it joins an already
+        // open retainer-list context, but never opens UI or starts travel merely
+        // because the browser is visible.
+        if (!session.IsRetainerListReady)
+            return;
+
+        if (Start())
+            automaticRefreshPending = false;
+    }
 
     public bool Start()
     {

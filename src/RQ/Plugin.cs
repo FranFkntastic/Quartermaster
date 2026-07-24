@@ -224,6 +224,7 @@ public sealed class Plugin : IDalamudPlugin
         TransferPlanMigration.EnsureOwnerPlans(state, CurrentOwner());
         workQueue.Drain();
         automaticRetrievals.Tick();
+        autoRetainer.TickAutomatic(window.StockBrowserVisible);
         agentBridge.Tick();
         if (Interlocked.Exchange(ref snapshotDirty, 0) != 0 || DateTime.UtcNow >= nextSnapshotAt)
             RefreshSnapshot();
@@ -260,7 +261,11 @@ public sealed class Plugin : IDalamudPlugin
         Interlocked.Exchange(ref snapshotDirty, 1);
     }
 
-    private void OpenMainUi() => window.IsOpen = true;
+    private void OpenMainUi()
+    {
+        RefreshSnapshot();
+        window.IsOpen = true;
+    }
 
     private void HandleCommand(string arguments)
     {
@@ -274,6 +279,7 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 #endif
+        RefreshSnapshot();
         window.IsOpen = true;
     }
 

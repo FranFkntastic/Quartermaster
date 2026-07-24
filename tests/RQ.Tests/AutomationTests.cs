@@ -182,6 +182,95 @@ public sealed class AutomationTests
     }
 
     [Fact]
+    public void AutomaticRefresh_StartsOnceBrowserAndRetainerListAreBothVisible()
+    {
+        using var directory = new TemporaryDirectory();
+        var unused = new Func<MethodInfo, object?[]?, object?>((method, _) =>
+            throw new InvalidOperationException($"Unexpected dependency call: {method.Name}."));
+        var framework = CreateProxy<IFramework>((method, arguments) =>
+        {
+            Assert.Equal(nameof(IFramework.RunOnTick), method.Name);
+            var callback = Assert.IsAssignableFrom<Delegate>(arguments![0]);
+            return CreateCompletedTask(method.ReturnType, callback.DynamicInvoke());
+        });
+        var listReady = false;
+        var ensureCalls = 0;
+        var session = CreateProxy<IRetainerAutomationSession>((method, _) => method.Name switch
+        {
+            "get_IsRetainerListReady" => listReady,
+            nameof(IRetainerAutomationSession.EnsureRetainerListAsync) => Task.FromResult(
+                (++ensureCalls, RetainerAutomationResult.Succeeded("RetainerListReady", "Retainer list is ready.")).Item2),
+            _ => throw new InvalidOperationException($"Unexpected session call: {method.Name}."),
+        });
+        var log = CreateProxy<IPluginLog>((_, _) => null);
+        var scanner = new InventoryScanner(CreateProxy<IDataManager>(unused), log);
+        using var captures = new RetainerCaptureService(
+            CreateProxy<IAddonLifecycle>(unused),
+            log,
+            scanner,
+            new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory.Path, "retainers.json"))),
+            () => TestData.Owner);
+        using var refresh = new AutoRetainerRefreshService(
+            framework,
+            log,
+            captures,
+            session,
+            new FakeAutoRetainerIpc(),
+            automation: null,
+            countAvailableRetainers: () => 2);
+
+        refresh.TickAutomatic(stockBrowserVisible: false);
+        refresh.TickAutomatic(stockBrowserVisible: true);
+        Assert.Equal(0, ensureCalls);
+
+        listReady = true;
+        refresh.TickAutomatic(stockBrowserVisible: true);
+
+        Assert.True(SpinWait.SpinUntil(
+            () => refresh.Status == "Retainer refresh queued.",
+            TimeSpan.FromSeconds(2)));
+        Assert.Equal(1, ensureCalls);
+        Assert.True(refresh.IsQueued);
+    }
+
+    [Fact]
+    public void AutomaticRefresh_DoesNotQueueSecondPassBehindBusyAutoRetainer()
+    {
+        using var directory = new TemporaryDirectory();
+        var unused = new Func<MethodInfo, object?[]?, object?>((method, _) =>
+            throw new InvalidOperationException($"Unexpected dependency call: {method.Name}."));
+        var listChecks = 0;
+        var session = CreateProxy<IRetainerAutomationSession>((method, _) => method.Name switch
+        {
+            "get_IsRetainerListReady" => (++listChecks, true).Item2,
+            _ => throw new InvalidOperationException($"Unexpected session call: {method.Name}."),
+        });
+        var log = CreateProxy<IPluginLog>((_, _) => null);
+        var scanner = new InventoryScanner(CreateProxy<IDataManager>(unused), log);
+        using var captures = new RetainerCaptureService(
+            CreateProxy<IAddonLifecycle>(unused),
+            log,
+            scanner,
+            new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory.Path, "retainers.json"))),
+            () => TestData.Owner);
+        var autoRetainer = new FakeAutoRetainerIpc { IsBusy = true };
+        using var refresh = new AutoRetainerRefreshService(
+            CreateProxy<IFramework>(unused),
+            log,
+            captures,
+            session,
+            autoRetainer);
+
+        refresh.TickAutomatic(stockBrowserVisible: true);
+        autoRetainer.IsBusy = false;
+        refresh.TickAutomatic(stockBrowserVisible: true);
+
+        Assert.Equal(0, listChecks);
+        Assert.False(refresh.IsQueued);
+        Assert.Equal("Retainer refresh has not run.", refresh.Status);
+    }
+
+    [Fact]
     public async Task RetainerLiveDriver_PropagatesCancellationIntoFrameworkWork()
     {
         using var cancellation = new CancellationTokenSource();

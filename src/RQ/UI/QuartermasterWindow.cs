@@ -119,6 +119,9 @@ public sealed class QuartermasterWindow : Window
     public string? SelectedRestockPlanName =>
         SelectedStowagePlanName;
 
+    public bool StockBrowserVisible =>
+        IsOpen && workbench.View is not (WorkbenchView.Listings or WorkbenchView.Activity);
+
     public int SelectedRestockNeededQuantity
     {
         get
@@ -1778,11 +1781,12 @@ public sealed class QuartermasterWindow : Window
         var retrievalLines = retrieval.Lines.ToDictionary(line => line.PlanItemId);
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY |
                     ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
-        if (!ImGui.BeginTable("RQStowageOverview", 5, flags, new Vector2(0, Math.Max(220, ImGui.GetContentRegionAvail().Y))))
+        if (!ImGui.BeginTable("RQTransferOverviewV2", 6, flags, new Vector2(0, Math.Max(220, ImGui.GetContentRegionAvail().Y))))
             return;
         ImGui.TableSetupColumn("State", ImGuiTableColumnFlags.WidthFixed, 44);
         ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.6f);
         ImGui.TableSetupColumn("Player / target", ImGuiTableColumnFlags.WidthFixed, 120);
+        ImGui.TableSetupColumn("Diff", ImGuiTableColumnFlags.WidthFixed, 68);
         ImGui.TableSetupColumn("Planned action", ImGuiTableColumnFlags.WidthFixed, 120);
         ImGui.TableSetupColumn("Route / evidence", ImGuiTableColumnFlags.WidthStretch, 1.2f);
         ImGui.TableHeadersRow();
@@ -1799,6 +1803,9 @@ public sealed class QuartermasterWindow : Window
             ImGui.TextDisabled(QualityLabel(rule.Quality));
             ImGui.TableNextColumn();
             ImGui.TextUnformatted($"{line?.PlayerQuantity ?? 0:N0} / {rule.TargetQuantity:N0}");
+            ImGui.TableNextColumn();
+            var difference = rule.TargetQuantity - (line?.PlayerQuantity ?? 0);
+            ImGui.TextUnformatted(difference > 0 ? $"+{difference:N0}" : difference.ToString("N0", CultureInfo.CurrentCulture));
             ImGui.TableNextColumn();
             ImGui.TextUnformatted(!rule.Enabled ? "Off" : line?.Action switch
             {
