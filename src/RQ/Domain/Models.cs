@@ -155,6 +155,16 @@ public sealed class StowageMigrationRecord
     public DateTime CompletedAtUtc { get; set; }
 }
 
+public sealed class TransferPlanMigrationRecord
+{
+    public string MigrationId { get; set; } = "restock-plans-to-transfer-plans-v1";
+    public Guid SourceRestockPlanId { get; set; }
+    public Guid TransferPlanId { get; set; }
+    public OwnerScope Owner { get; set; } = new();
+    public int RuleCount { get; set; }
+    public DateTime CompletedAtUtc { get; set; }
+}
+
 public sealed class RestockPlan
 {
     public Guid Id { get; set; } = Guid.NewGuid();
@@ -286,10 +296,11 @@ public sealed class OperationReceipt
 
 public sealed class QuartermasterState
 {
-    public string Schema { get; set; } = "gooseworks-quartermaster-state/v4";
+    public string Schema { get; set; } = "gooseworks-quartermaster-state/v5";
     public long Revision { get; set; }
     public List<StowagePlan> StowagePlans { get; set; } = [];
     public List<StowageMigrationRecord> StowageMigrations { get; set; } = [];
+    public List<TransferPlanMigrationRecord> TransferPlanMigrations { get; set; } = [];
     public List<TargetPlanItem> PlanItems { get; set; } = [];
     public List<RestockPlan> RestockPlans { get; set; } = [];
     public List<ItemGroup> ItemGroups { get; set; } = [];

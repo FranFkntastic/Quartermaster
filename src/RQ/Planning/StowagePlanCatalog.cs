@@ -26,10 +26,10 @@ public static class StowagePlanCatalog
     public static StowagePlan Create(
         QuartermasterState state,
         OwnerScope owner,
-        string requestedName = "Stowage plan")
+        string requestedName = "Transfer plan")
     {
         if (!owner.HasStableIdentity)
-            throw new InvalidOperationException("Stowage plans require stable owner identity.");
+            throw new InvalidOperationException("Transfer plans require stable owner identity.");
         var hasEnabledPlan = state.StowagePlans.Any(plan => plan.Owner.Matches(owner) && plan.Enabled);
         var plan = new StowagePlan
         {
@@ -39,7 +39,7 @@ public static class StowagePlanCatalog
             Priority = OwnerPlans(state, owner).Count,
         };
         state.StowagePlans.Add(plan);
-        state.Schema = "gooseworks-quartermaster-state/v4";
+        state.Schema = "gooseworks-quartermaster-state/v5";
         return plan;
     }
 
@@ -80,10 +80,10 @@ public static class StowagePlanCatalog
     public static StowagePlanDraft NewDraft(
         QuartermasterState state,
         OwnerScope owner,
-        string requestedName = "Stowage plan")
+        string requestedName = "Transfer plan")
     {
         if (!owner.HasStableIdentity)
-            throw new InvalidOperationException("Stowage plans require stable owner identity.");
+            throw new InvalidOperationException("Transfer plans require stable owner identity.");
         return new StowagePlanDraft
         {
             PlanId = Guid.NewGuid(),
@@ -150,17 +150,17 @@ public static class StowagePlanCatalog
         StowagePlanDraft draft)
     {
         if (!owner.HasStableIdentity)
-            throw new InvalidOperationException("Stowage plans require stable owner identity.");
+            throw new InvalidOperationException("Transfer plans require stable owner identity.");
         if (string.IsNullOrWhiteSpace(draft.Name))
-            throw new InvalidOperationException("A Stowage Plan needs a name.");
+            throw new InvalidOperationException("A Transfer Plan needs a name.");
         if (draft.IsNew && draft.Rules.All(rule => rule.ItemId == 0))
-            throw new InvalidOperationException("Add at least one item before saving a new Stowage Plan.");
+            throw new InvalidOperationException("Add at least one item before saving a new Transfer Plan.");
 
         StowagePlan plan;
         if (draft.IsNew)
         {
             if (state.StowagePlans.Any(candidate => candidate.Id == draft.PlanId))
-                throw new InvalidOperationException("This new Stowage Plan was already saved.");
+                throw new InvalidOperationException("This new Transfer Plan was already saved.");
             plan = new StowagePlan
             {
                 Id = draft.PlanId,
@@ -175,7 +175,7 @@ public static class StowagePlanCatalog
             plan = state.StowagePlans.Single(candidate =>
                 candidate.Id == draft.PlanId && candidate.Owner.Matches(owner));
             if (plan.Revision != draft.SourceRevision)
-                throw new InvalidOperationException("This Stowage Plan changed after the editor opened. Reopen it to continue.");
+                throw new InvalidOperationException("This Transfer Plan changed after the editor opened. Reopen it to continue.");
             plan.Revision = checked(plan.Revision + 1);
         }
 
@@ -196,7 +196,7 @@ public static class StowagePlanCatalog
             .Where(rule => rule.ItemId > 0)
             .GroupBy(rule => (rule.ItemId, rule.Quality))
             .Select(group => CopyRule(group.First(), plan.Id, newIdentity: false)));
-        state.Schema = "gooseworks-quartermaster-state/v4";
+        state.Schema = "gooseworks-quartermaster-state/v5";
         return plan;
     }
 
@@ -206,7 +206,7 @@ public static class StowagePlanCatalog
         string requestedName,
         Guid? excludingPlanId = null)
     {
-        var basis = string.IsNullOrWhiteSpace(requestedName) ? "Stowage plan" : requestedName.Trim();
+        var basis = string.IsNullOrWhiteSpace(requestedName) ? "Transfer plan" : requestedName.Trim();
         var used = state.StowagePlans
             .Where(plan => plan.Owner.Matches(owner) && plan.Id != excludingPlanId)
             .Select(plan => plan.Name)
@@ -361,7 +361,7 @@ public static class ItemGroupCatalog
 
         group.Name = UniqueName(state, draft.Name, group.Id);
         group.Items = items;
-        state.Schema = "gooseworks-quartermaster-state/v4";
+        state.Schema = "gooseworks-quartermaster-state/v5";
         return group;
     }
 
@@ -371,7 +371,7 @@ public static class ItemGroupCatalog
         if (group.Revision != expectedRevision)
             throw new InvalidOperationException("This Item Group changed after the editor opened. Reopen it to continue.");
         state.ItemGroups.Remove(group);
-        state.Schema = "gooseworks-quartermaster-state/v4";
+        state.Schema = "gooseworks-quartermaster-state/v5";
     }
 
     public static int AddMissing(ItemGroupDraft draft, IEnumerable<ItemGroupItem> items)
@@ -407,7 +407,7 @@ public static class ItemGroupCatalog
         var group = state.ItemGroups.Single(candidate => candidate.Id == groupId);
         group.Name = UniqueName(state, requestedName, groupId);
         group.Revision = checked(group.Revision + 1);
-        state.Schema = "gooseworks-quartermaster-state/v4";
+        state.Schema = "gooseworks-quartermaster-state/v5";
     }
 
     public static void ReplaceItems(
@@ -421,7 +421,7 @@ public static class ItemGroupCatalog
         var group = state.ItemGroups.Single(candidate => candidate.Id == groupId);
         group.Items = items;
         group.Revision = checked(group.Revision + 1);
-        state.Schema = "gooseworks-quartermaster-state/v4";
+        state.Schema = "gooseworks-quartermaster-state/v5";
     }
 
     public static int AddMissing(ItemGroup group, StowagePlanDraft draft)

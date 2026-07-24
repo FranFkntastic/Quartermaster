@@ -68,6 +68,38 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
     public bool IsRunning => Volatile.Read(ref running) != 0;
     public bool CanStart => !automation.IsHeld && !IsRunning;
 
+    public async Task<TransferExecutionResult> ExecutePlanAsync(
+        string? retrievalOperationId,
+        string? depositOperationId,
+        CancellationToken cancellationToken = default)
+    {
+        if (retrievalOperationId is null && depositOperationId is null)
+            return new(false, "The transfer plan has no movement to execute.");
+
+        if (retrievalOperationId is not null)
+        {
+            var retrieval = await ExecuteRetrievalAsync(retrievalOperationId, cancellationToken).ConfigureAwait(false);
+            if (!retrieval.Started)
+            {
+                CancelAccepted(depositOperationId, "The deposit actions were cancelled because the transfer plan could not start.");
+                return retrieval;
+            }
+            if (journal.Get(retrievalOperationId)?.Status != OperationStatuses.Succeeded)
+            {
+                CancelAccepted(depositOperationId, "The deposit actions were cancelled because retrieval did not complete.");
+                return new(true, $"{retrieval.Message} Deposit actions were not started.");
+            }
+        }
+
+        if (depositOperationId is null)
+            return new(true, "Transfer plan completed.");
+
+        var deposit = await ExecuteDepositAsync(depositOperationId, cancellationToken).ConfigureAwait(false);
+        return deposit.Started
+            ? new(true, deposit.Message)
+            : deposit;
+    }
+
     public async Task<TransferExecutionResult> ExecuteRetrievalAsync(string operationId, CancellationToken cancellationToken = default)
     {
         if (!automation.TryAcquire("retainer transfer", out var lease))
@@ -411,6 +443,13 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         catch (InvalidOperationException) when (journal.Get(operationId) is { Status: var status } && OperationStatuses.IsTerminal(status))
         {
         }
+    }
+
+    private void CancelAccepted(string? operationId, string message)
+    {
+        if (operationId is null || journal.Get(operationId) is not { Status: OperationStatuses.Accepted })
+            return;
+        journal.Transition(operationId, OperationStatuses.Cancelled, "PlanSequenceStopped", message);
     }
 
     private void RecordInvalidation(string operationId, ulong retainerId)

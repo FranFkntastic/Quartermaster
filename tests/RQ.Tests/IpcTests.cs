@@ -16,7 +16,7 @@ namespace RQ.Tests;
 public sealed class IpcTests
 {
     [Fact]
-    public void Capabilities_AdvertiseAutomaticRetrievalAndStowageSupport()
+    public void Capabilities_AdvertiseCanonicalTransferPlansAndCompatibilityContracts()
     {
         using var directory = new TemporaryDirectory();
         var snapshots = new SnapshotPublisher("provider", TestData.Repository(directory.Path), () => new Dictionary<ulong, CachedRetainer>());
@@ -27,15 +27,52 @@ public sealed class IpcTests
             SnapshotPublisher.AutomaticRetrievalCapability,
             document.RootElement.GetProperty("capabilities").EnumerateArray().Select(value => value.GetString()));
         Assert.Contains(
+            SnapshotPublisher.TransferPlansCapability,
+            document.RootElement.GetProperty("capabilities").EnumerateArray().Select(value => value.GetString()));
+        Assert.Contains(
             SnapshotPublisher.StowagePlansCapability,
             document.RootElement.GetProperty("capabilities").EnumerateArray().Select(value => value.GetString()));
         Assert.Contains(
             SnapshotPublisher.RestockPlansCapability,
             document.RootElement.GetProperty("capabilities").EnumerateArray().Select(value => value.GetString()));
         Assert.Equal(
-            ["stock", "restock", "stowage", "listings", "activity"],
+            ["transfer", "listings", "activity"],
             document.RootElement.GetProperty("reviewSurfaces").EnumerateArray()
                 .Select(surface => surface.GetProperty("id").GetString()));
+    }
+
+    [Fact]
+    public void Snapshot_PublishesTargetRulesAsCanonicalTransferPlans()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        repository.Mutate(state =>
+        {
+            var plan = new StowagePlan
+            {
+                Owner = TestData.Owner,
+                Name = "Workshop supply",
+            };
+            state.StowagePlans.Add(plan);
+            state.PlanItems.Add(new TargetPlanItem
+            {
+                StowagePlanId = plan.Id,
+                ItemId = 100,
+                ItemName = "Darksteel Ore",
+                TargetQuantity = 50,
+            });
+        });
+        var snapshots = new SnapshotPublisher("provider", repository, () => new Dictionary<ulong, CachedRetainer>());
+
+        snapshots.Refresh(TestData.Owner, []);
+        using var document = JsonDocument.Parse(snapshots.GetSnapshot());
+
+        var transfer = document.RootElement.GetProperty("transferPlans");
+        Assert.Equal("gooseworks-quartermaster-transfer-plans/v1", transfer.GetProperty("schema").GetString());
+        var plan = Assert.Single(transfer.GetProperty("plans").EnumerateArray());
+        Assert.Equal("Workshop supply", plan.GetProperty("name").GetString());
+        var rule = Assert.Single(plan.GetProperty("rules").EnumerateArray());
+        Assert.Equal(50, rule.GetProperty("desiredPlayerQuantity").GetInt32());
     }
 
     [Fact]

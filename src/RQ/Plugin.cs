@@ -90,6 +90,7 @@ public sealed class Plugin : IDalamudPlugin
         cache = new(new RetainerCacheStore(cachePath));
         state = new(new QuartermasterStateStore(statePath));
         StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
+        TransferPlanMigration.EnsureOwnerPlans(state, CurrentOwner());
         captures = new(addonLifecycle, log, scanner, cache, CurrentOwner);
         var automation = new AutomationLease();
         var retainerSession = new DalamudRetainerAutomationSession(framework, gameGui, dataManager, log, objects, targets, sigScanner);
@@ -205,6 +206,7 @@ public sealed class Plugin : IDalamudPlugin
     private void OnFrameworkUpdate(IFramework _)
     {
         StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
+        TransferPlanMigration.EnsureOwnerPlans(state, CurrentOwner());
         workQueue.Drain();
         automaticRetrievals.Tick();
         agentBridge.Tick();
@@ -294,7 +296,7 @@ public sealed class Plugin : IDalamudPlugin
             .OrderByDescending(candidate => candidate.UpdatedAtUtc)
             .FirstOrDefault();
         return new QuartermasterBridgeTruth(
-            5,
+            6,
             configuration.PluginInstanceId,
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
@@ -317,12 +319,9 @@ public sealed class Plugin : IDalamudPlugin
             StowagePlanCatalog.OwnerPlans(runtime.State, runtime.Owner).Count,
             window.SelectedStowagePlanId,
             window.SelectedStowagePlanName,
-            window.StowageEditorOpen,
-            RestockPlanCatalog.OwnerPlans(runtime.State, runtime.Owner).Count,
-            window.SelectedRestockPlanId,
-            window.SelectedRestockPlanName,
             window.SelectedRestockNeededQuantity,
-            window.RestockEditorOpen,
+            window.SelectedTransferDepositQuantity,
+            window.StowageEditorOpen,
             operation?.OperationId,
             operation?.Status,
             autoRetainer.IsAvailable,

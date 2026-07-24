@@ -10,6 +10,7 @@ namespace RQ.Interop;
 public sealed class SnapshotPublisher
 {
     public const string AutomaticRetrievalCapability = "automaticRetrieval";
+    public const string TransferPlansCapability = "transferPlans.v1";
     public const string StowagePlansCapability = "stowagePlans.v1";
     public const string RestockPlansCapability = "restockPlans.v1";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -77,6 +78,7 @@ public sealed class SnapshotPublisher
             playerStorage = new { requestedSources = playerStorage.RequestedSources, observedSources = playerStorage.ObservedSources },
             retainers,
             planItems = stateSnapshot.PlanItems,
+            transferPlans = TransferPlanContract(stateSnapshot, owner, stowage ?? []),
             stowagePlans = StowageContract(stateSnapshot, owner, stowage ?? []),
             restockPlans = RestockContract(stateSnapshot, owner),
             currentOperation = current is null ? null : OperationContract(current),
@@ -104,16 +106,14 @@ public sealed class SnapshotPublisher
         providerInstanceId,
         revision = Revision,
         channels = new[] { IpcChannels.GetCapabilities, IpcChannels.GetSnapshot, IpcChannels.SubmitShortages, IpcChannels.GetOperation, IpcChannels.Changed },
-        capabilities = new[] { AutomaticRetrievalCapability, StowagePlansCapability, RestockPlansCapability },
+        capabilities = new[] { AutomaticRetrievalCapability, TransferPlansCapability, StowagePlansCapability, RestockPlansCapability },
         requestSchemas = new[] { ShortageSubmissionService.RequestSchema },
         statusVocabulary = new[] { OperationStatuses.Queued, OperationStatuses.Accepted, OperationStatuses.Running, OperationStatuses.Succeeded, OperationStatuses.PartiallySucceeded, OperationStatuses.Indeterminate, OperationStatuses.Failed, OperationStatuses.Cancelled, OperationStatuses.Rejected },
         executionPolicy = "request_selected",
         automaticExecutionField = "executeImmediately",
         reviewSurfaces = new[]
         {
-            new { id = "stock", label = "Stock and plans", command = "/rq", target = "stock" },
-            new { id = "restock", label = "Reusable Restock Plans", command = "/rq", target = "restock" },
-            new { id = "stowage", label = "Stowage Plans and Quick Deposit", command = "/rq", target = "stowage" },
+            new { id = "transfer", label = "Stock and Transfer Plans", command = "/rq", target = "transfer" },
             new { id = "listings", label = "Retainer listings", command = "/rq", target = "listings" },
             new { id = "activity", label = "Operations and receipts", command = "/rq", target = "activity" },
         },
@@ -170,14 +170,27 @@ public sealed class SnapshotPublisher
     private static object StowageContract(
         QuartermasterState state,
         OwnerScope owner,
-        IReadOnlyList<StowageEvaluation> evaluations)
+        IReadOnlyList<StowageEvaluation> evaluations) =>
+        TransferPlanContract(state, owner, evaluations, "gooseworks-quartermaster-stowage-plans/v1");
+
+    private static object TransferPlanContract(
+        QuartermasterState state,
+        OwnerScope owner,
+        IReadOnlyList<StowageEvaluation> evaluations) =>
+        TransferPlanContract(state, owner, evaluations, "gooseworks-quartermaster-transfer-plans/v1");
+
+    private static object TransferPlanContract(
+        QuartermasterState state,
+        OwnerScope owner,
+        IReadOnlyList<StowageEvaluation> evaluations,
+        string schema)
     {
         var evaluated = evaluations
             .SelectMany(plan => plan.Lines)
             .ToDictionary(line => line.RuleId);
         return new
         {
-            schema = "gooseworks-quartermaster-stowage-plans/v1",
+            schema,
             plans = state.StowagePlans
                 .Where(plan => plan.Owner.Matches(owner))
                 .OrderBy(plan => plan.Priority)

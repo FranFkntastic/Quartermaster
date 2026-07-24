@@ -78,6 +78,18 @@ public sealed class OperationJournal
             plan.Revision,
             plan.Name);
 
+    public OperationRecord CreateTransferRetrieval(
+        OwnerScope owner,
+        StowagePlan plan,
+        IReadOnlyList<TargetPlanItem> rules) =>
+        CreateManual(
+            owner,
+            rules,
+            OperationKinds.Retrieval,
+            plan.Id,
+            plan.Revision,
+            plan.Name);
+
     private OperationRecord CreateManual(
         OwnerScope owner,
         IReadOnlyList<TargetPlanItem> plan,
@@ -178,7 +190,20 @@ public sealed class OperationJournal
     public OperationRecord CreateDeposit(
         OwnerScope owner,
         StowageDepositBatch batch,
-        string kind = OperationKinds.QuickDeposit)
+        string kind = OperationKinds.QuickDeposit) =>
+        CreateDeposit(owner, batch, kind, null);
+
+    public OperationRecord CreateTransferDeposit(
+        OwnerScope owner,
+        StowagePlan plan,
+        StowageDepositBatch batch) =>
+        CreateDeposit(owner, batch, OperationKinds.StowageSurplus, plan);
+
+    private OperationRecord CreateDeposit(
+        OwnerScope owner,
+        StowageDepositBatch batch,
+        string kind,
+        StowagePlan? sourcePlan)
     {
         if (!owner.HasStableIdentity)
             throw new InvalidOperationException("Deposit operations require stable owner identity.");
@@ -197,6 +222,9 @@ public sealed class OperationJournal
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
             Message = "Reviewed stowage authorization is ready for explicit execution.",
+            SourcePlanId = sourcePlan?.Id,
+            SourcePlanRevision = sourcePlan?.Revision,
+            SourcePlanName = sourcePlan?.Name,
             Lines = routes
                 .GroupBy(route => (route.Request.ItemId, route.Request.IsHighQuality))
                 .Select(group => new OperationLine

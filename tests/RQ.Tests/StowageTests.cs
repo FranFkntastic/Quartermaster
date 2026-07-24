@@ -37,6 +37,52 @@ public sealed class StowageTests
         Assert.Single(state.StowageMigrations);
     }
 
+    [Fact]
+    public void RestockMigration_CopiesEachLegacyPlanOnceWithoutDeletingItsSource()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var sourceId = Guid.NewGuid();
+        repository.Mutate(state => state.RestockPlans.Add(new RestockPlan
+        {
+            Id = sourceId,
+            Owner = TestData.Owner,
+            Name = "Workshop supply",
+            Items =
+            [
+                new RestockPlanItem
+                {
+                    ItemId = 100,
+                    ItemName = "Darksteel Ore",
+                    TargetQuantity = 12,
+                    Quality = ItemQualityPolicy.HqOnly,
+                    Notes = "Keep",
+                },
+            ],
+        }));
+
+        var completedAt = new DateTime(2026, 7, 24, 12, 0, 0, DateTimeKind.Utc);
+        Assert.True(TransferPlanMigration.EnsureOwnerPlans(repository, TestData.Owner, () => completedAt));
+        Assert.False(TransferPlanMigration.EnsureOwnerPlans(repository, TestData.Owner));
+
+        var state = repository.Snapshot();
+        Assert.Single(state.RestockPlans);
+        var target = Assert.Single(state.StowagePlans);
+        Assert.Equal("Workshop supply", target.Name);
+        Assert.True(target.Enabled);
+        var rule = Assert.Single(state.PlanItems);
+        Assert.Equal(target.Id, rule.StowagePlanId);
+        Assert.Equal(100u, rule.ItemId);
+        Assert.Equal(12, rule.TargetQuantity);
+        Assert.Equal(ItemQualityPolicy.HqOnly, rule.Quality);
+        Assert.Equal("Keep", rule.Notes);
+        var receipt = Assert.Single(state.TransferPlanMigrations);
+        Assert.Equal(sourceId, receipt.SourceRestockPlanId);
+        Assert.Equal(target.Id, receipt.TransferPlanId);
+        Assert.Equal(completedAt, receipt.CompletedAtUtc);
+        Assert.Equal("gooseworks-quartermaster-state/v5", state.Schema);
+    }
+
     [Theory]
     [InlineData(4, 10, 6, 0, StowageAction.Retrieve)]
     [InlineData(10, 10, 0, 0, StowageAction.None)]

@@ -139,7 +139,7 @@ public sealed class RestockPlanTests
         var reloaded = TestData.Repository(directory.Path).Snapshot();
         var plan = Assert.Single(reloaded.RestockPlans);
 
-        Assert.Equal("gooseworks-quartermaster-state/v4", reloaded.Schema);
+        Assert.Equal("gooseworks-quartermaster-state/v5", reloaded.Schema);
         Assert.Equal(planId, plan.Id);
         Assert.Equal(lineId, Assert.Single(plan.Items).Id);
     }

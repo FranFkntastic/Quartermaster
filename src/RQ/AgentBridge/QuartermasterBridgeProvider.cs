@@ -24,15 +24,12 @@ public sealed record QuartermasterBridgeTruth(
     DateTimeOffset? OldestRetainerObservedAtUtc,
     int PlanLineCount,
     int EnabledPlanLineCount,
-    int StowagePlanCount,
-    Guid? SelectedStowagePlanId,
-    string? SelectedStowagePlanName,
-    bool StowageEditorOpen,
-    int RestockPlanCount,
-    Guid? SelectedRestockPlanId,
-    string? SelectedRestockPlanName,
-    int SelectedRestockNeededQuantity,
-    bool RestockEditorOpen,
+    int TransferPlanCount,
+    Guid? SelectedTransferPlanId,
+    string? SelectedTransferPlanName,
+    int SelectedTransferRetrieveQuantity,
+    int SelectedTransferDepositQuantity,
+    bool TransferEditorOpen,
     string? CurrentOperationId,
     string? CurrentOperationStatus,
     bool RefreshAvailable,
@@ -44,11 +41,9 @@ public sealed class QuartermasterBridgeProvider
 {
     private static readonly IReadOnlyList<AgentBridgeReviewSurfaceDescriptor> ReviewSurfaces =
     [
-        new("stock", "Stock and transfers", "open-main-window", "stock", 10),
-        new("restock", "Reusable Restock Plans", "open-main-window", "restock", 20),
-        new("stowage", "Stowage Plans and Quick Deposit", "open-main-window", "stowage", 30),
-        new("listings", "Retainer listings", "open-main-window", "listings", 40),
-        new("activity", "Operations and receipts", "open-main-window", "activity", 50),
+        new("transfer", "Stock and Transfer Plans", "open-main-window", "transfer", 10),
+        new("listings", "Retainer listings", "open-main-window", "listings", 20),
+        new("activity", "Operations and receipts", "open-main-window", "activity", 30),
     ];
 
     private readonly Func<QuartermasterBridgeTruth> createTruth;
@@ -76,7 +71,7 @@ public sealed class QuartermasterBridgeProvider
         reviewRegistry.Invoke(id, frameId, arguments);
     public bool TryOpenMainWindow(string target)
     {
-        if (target.Trim().ToLowerInvariant() is not ("stock" or "stock-and-plan" or "restock" or "stowage" or "listings" or "operation" or "activity"))
+        if (target.Trim().ToLowerInvariant() is not ("stock" or "stock-and-plan" or "transfer" or "restock" or "stowage" or "listings" or "operation" or "activity"))
             return false;
         openMainWindow(target);
         return true;

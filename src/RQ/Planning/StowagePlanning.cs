@@ -83,7 +83,7 @@ public static class StowagePlanMigration
                 });
             }
 
-            state.Schema = "gooseworks-quartermaster-state/v4";
+            state.Schema = "gooseworks-quartermaster-state/v5";
         });
         return true;
     }
@@ -113,6 +113,94 @@ public static class StowagePlanMigration
             .Select(plan => plan.Id)
             .ToHashSet();
         return state.PlanItems.Where(rule => planIds.Contains(rule.StowagePlanId)).ToArray();
+    }
+}
+
+public static class TransferPlanMigration
+{
+    public const string MigrationId = "restock-plans-to-transfer-plans-v1";
+
+    public static bool EnsureOwnerPlans(StateRepository repository, OwnerScope owner, Func<DateTime>? utcNow = null)
+    {
+        if (!owner.HasStableIdentity || !repository.Read(state => NeedsMigration(state, owner)))
+            return false;
+
+        repository.Mutate(state =>
+        {
+            var migratedSourceIds = state.TransferPlanMigrations
+                .Where(record => record.MigrationId == MigrationId && record.Owner.Matches(owner))
+                .Select(record => record.SourceRestockPlanId)
+                .ToHashSet();
+            var sources = state.RestockPlans
+                .Where(plan => plan.Owner.Matches(owner) && !migratedSourceIds.Contains(plan.Id))
+                .OrderBy(plan => plan.Name, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(plan => plan.Id)
+                .ToArray();
+            var emptyPlaceholder = state.StowagePlans.FirstOrDefault(plan =>
+                plan.Owner.Matches(owner) &&
+                plan.Enabled &&
+                state.PlanItems.All(rule => rule.StowagePlanId != plan.Id));
+            if (sources.Any(source => source.Enabled) && emptyPlaceholder is not null)
+            {
+                emptyPlaceholder.Enabled = false;
+                emptyPlaceholder.Revision = checked(emptyPlaceholder.Revision + 1);
+            }
+            foreach (var source in sources)
+            {
+                var target = new StowagePlan
+                {
+                    Owner = owner with { },
+                    Name = StowagePlanCatalog.UniqueName(state, owner, source.Name),
+                    Enabled = source.Enabled &&
+                              state.StowagePlans.All(plan => !plan.Owner.Matches(owner) || !plan.Enabled),
+                    Priority = StowagePlanCatalog.OwnerPlans(state, owner).Count,
+                    Revision = 1,
+                };
+                state.StowagePlans.Add(target);
+                var rules = source.Items
+                    .Where(item => item.ItemId > 0)
+                    .GroupBy(item => (item.ItemId, item.Quality))
+                    .Select(group =>
+                    {
+                        var item = group.First();
+                        return new TargetPlanItem
+                        {
+                            StowagePlanId = target.Id,
+                            ItemId = item.ItemId,
+                            ItemName = item.ItemName,
+                            TargetQuantity = Math.Max(0, item.TargetQuantity),
+                            Quality = item.Quality,
+                            Notes = item.Notes,
+                            Enabled = item.Enabled,
+                        };
+                    })
+                    .ToArray();
+                state.PlanItems.AddRange(rules);
+                state.TransferPlanMigrations.Add(new TransferPlanMigrationRecord
+                {
+                    MigrationId = MigrationId,
+                    SourceRestockPlanId = source.Id,
+                    TransferPlanId = target.Id,
+                    Owner = owner with { },
+                    RuleCount = rules.Length,
+                    CompletedAtUtc = (utcNow ?? (() => DateTime.UtcNow))(),
+                });
+            }
+            state.Schema = "gooseworks-quartermaster-state/v5";
+        });
+        return true;
+    }
+
+    public static bool NeedsMigration(QuartermasterState state, OwnerScope owner)
+    {
+        if (!owner.HasStableIdentity)
+            return false;
+        var migratedSourceIds = state.TransferPlanMigrations
+            .Where(record => record.MigrationId == MigrationId && record.Owner.Matches(owner))
+            .Select(record => record.SourceRestockPlanId)
+            .ToHashSet();
+        return state.Schema != "gooseworks-quartermaster-state/v5" ||
+               state.RestockPlans.Any(plan => plan.Owner.Matches(owner) && !migratedSourceIds.Contains(plan.Id));
     }
 }
 

@@ -37,7 +37,7 @@ public static class RestockPlanCatalog
             Items = items?.Select(CopyWithNewIdentity).ToList() ?? [],
         };
         state.RestockPlans.Add(plan);
-        state.Schema = "gooseworks-quartermaster-state/v4";
+        state.Schema = "gooseworks-quartermaster-state/v5";
         return plan;
     }
 
@@ -205,7 +205,7 @@ public static class RestockPlanCatalog
             .GroupBy(item => (item.ItemId, item.Quality))
             .Select(group => CopyWithIdentity(group.First()))
             .ToList();
-        state.Schema = "gooseworks-quartermaster-state/v4";
+        state.Schema = "gooseworks-quartermaster-state/v5";
         return plan;
     }
 

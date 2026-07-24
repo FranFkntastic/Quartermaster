@@ -10,11 +10,10 @@ public sealed class AgentBridgeTests
     public void Provider_ExposesQuartermasterReviewSurfacesWithoutTransferActions()
     {
         var truth = new QuartermasterBridgeTruth(
-            5, "provider", 42, "1.0", false, "stock",
-            "restock", false, false, 2, null, null, false, false,
+            6, "provider", 42, "1.0", false, "transfer",
+            "mixed", false, false, 2, null, null, false, false,
             "Wei Ning @ Maduin", true,
-            2, DateTimeOffset.UtcNow, 3, 2, 1, null, "General", false,
-            1, null, "Workshop", 12, false,
+            2, DateTimeOffset.UtcNow, 3, 2, 1, null, "General", 12, 4, false,
             "operation", "accepted", true, false, "Ready", false);
         var openedTarget = string.Empty;
         var invoked = false;
@@ -34,12 +33,14 @@ public sealed class AgentBridgeTests
         var provider = new QuartermasterBridgeProvider(() => truth, target => openedTarget = target, () => { }, registry);
 
         Assert.Same(truth, provider.CreateTruth());
-        Assert.Equal(["stock", "restock", "stowage", "listings", "activity"], provider.GetReviewSurfaces().Select(surface => surface.Id));
+        Assert.Equal(["transfer", "listings", "activity"], provider.GetReviewSurfaces().Select(surface => surface.Id));
         Assert.All(provider.GetReviewSurfaces(), surface => Assert.Equal("open-main-window", surface.Command));
         Assert.True(provider.TryOpenMainWindow("listings"));
         Assert.Equal("listings", openedTarget);
         Assert.True(provider.TryOpenMainWindow("stowage"));
         Assert.Equal("stowage", openedTarget);
+        Assert.True(provider.TryOpenMainWindow("transfer"));
+        Assert.Equal("transfer", openedTarget);
         Assert.True(provider.TryOpenMainWindow("stock-and-plan"));
         Assert.Equal("stock-and-plan", openedTarget);
         Assert.False(provider.TryOpenMainWindow("unknown"));

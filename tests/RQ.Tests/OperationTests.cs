@@ -73,6 +73,48 @@ public sealed class OperationTests
     }
 
     [Fact]
+    public async Task MixedPlan_DoesNotStartStowageWhenRetrievalFails()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var plan = new StowagePlan { Owner = TestData.Owner, Name = "Workshop supply" };
+        var retrieval = journal.CreateTransferRetrieval(
+            TestData.Owner,
+            plan,
+            [new TargetPlanItem { StowagePlanId = plan.Id, ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }]);
+        var deposit = journal.CreateTransferDeposit(
+            TestData.Owner,
+            plan,
+            new StowageDepositBatch(
+                DateTime.UtcNow,
+                [
+                    new StowageRoute(
+                        new StowageDepositRequest(plan.Id, Guid.NewGuid(), 200, "Ingot", false, 4, new StowageRoutingPolicy()),
+                        [new StowageAllocation(10, "Eris", 4, 20, DateTime.UtcNow)],
+                        4,
+                        0),
+                ]));
+        Assert.Equal(plan.Id, retrieval.SourcePlanId);
+        Assert.Equal(plan.Id, deposit.SourcePlanId);
+        Assert.Equal(plan.Name, retrieval.SourcePlanName);
+        Assert.Equal(plan.Name, deposit.SourcePlanName);
+        var cacheStore = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        cacheStore.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
+        var coordinator = new TransferCoordinator(
+            journal,
+            new FailedRetrievalDriver(false),
+            new RetainerCacheRepository(cacheStore),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>());
+
+        await coordinator.ExecutePlanAsync(retrieval.OperationId, deposit.OperationId);
+
+        Assert.Equal(OperationStatuses.Failed, journal.Get(retrieval.OperationId)!.Status);
+        Assert.Equal(OperationStatuses.Cancelled, journal.Get(deposit.OperationId)!.Status);
+    }
+
+    [Fact]
     public async Task OwnerMismatch_FailsBeforeDriverInteraction()
     {
         using var directory = new TemporaryDirectory();

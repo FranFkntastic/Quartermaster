@@ -16,7 +16,7 @@ public sealed class PlanWorkspaceTests
         Assert.True(first.Enabled);
         Assert.False(second.Enabled);
         Assert.Equal("workshop 2", second.Name);
-        Assert.Equal("gooseworks-quartermaster-state/v4", state.Schema);
+        Assert.Equal("gooseworks-quartermaster-state/v5", state.Schema);
     }
 
     [Fact]
@@ -318,7 +318,7 @@ public sealed class PlanWorkspaceTests
         var group = Assert.Single(reloaded.ItemGroups);
         Assert.Equal("Workshop metals", group.Name);
         Assert.Equal((uint)100, Assert.Single(group.Items).ItemId);
-        Assert.Equal("gooseworks-quartermaster-state/v4", reloaded.Schema);
+        Assert.Equal("gooseworks-quartermaster-state/v5", reloaded.Schema);
     }
 
     private static TargetPlanItem Rule(Guid planId, uint itemId, string itemName, int target) => new()
