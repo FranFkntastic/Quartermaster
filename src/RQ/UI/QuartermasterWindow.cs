@@ -930,13 +930,17 @@ public sealed class QuartermasterWindow : Window
         var draft = itemGroupDraft;
         if (draft is null)
             return;
+        var hasChanges = ItemGroupCatalog.HasChanges(state.Snapshot(), draft);
 
         if (ImGui.Button("<- Back to plan##itemgroups"))
         {
-            if (ItemGroupCatalog.HasChanges(state.Snapshot(), draft))
+            if (hasChanges)
                 itemGroupEditorError = "Save or discard this Item Group before returning to the plan.";
             else
+            {
                 CloseItemGroupEditor();
+                return;
+            }
         }
         reviewRegistry.RegisterLastButton(
             "quartermaster.item-groups.back",
@@ -948,7 +952,22 @@ public sealed class QuartermasterWindow : Window
                     !ItemGroupCatalog.HasChanges(state.Snapshot(), itemGroupDraft))
                     CloseItemGroupEditor();
             },
-            ItemGroupCatalog.HasChanges(state.Snapshot(), draft) ? "Unsaved group changes" : "Available");
+            hasChanges ? "Unsaved group changes" : "Available");
+        if (hasChanges)
+        {
+            ImGui.SameLine();
+            if (ImGui.Button("Discard and return##itemgroups"))
+            {
+                CloseItemGroupEditor();
+                return;
+            }
+            reviewRegistry.RegisterLastButton(
+                "quartermaster.item-groups.discard-and-return",
+                "Discard the open Item Group draft and return to the Transfer Plan",
+                true,
+                CloseItemGroupEditor,
+                "The Transfer Plan draft remains open");
+        }
         ImGui.SameLine();
         ImGui.TextUnformatted("Item groups");
         ImGui.SameLine();
