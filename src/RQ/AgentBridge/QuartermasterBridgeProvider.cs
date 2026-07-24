@@ -42,14 +42,18 @@ public sealed class QuartermasterBridgeProvider
     private static readonly IReadOnlyList<AgentBridgeReviewSurfaceDescriptor> ReviewSurfaces =
     [
         new("transfer", "Stock and Transfer Plans", "open-main-window", "transfer", 10),
-        new("listings", "Retainer listings", "open-main-window", "listings", 20),
-        new("activity", "Operations and receipts", "open-main-window", "activity", 30),
+        new("transfer-review", "Transfer Plan review", "open-main-window", "transfer-review", 20),
+        new("item-groups", "Item Groups", "open-main-window", "item-groups", 30),
+        new("listings", "Retainer listings", "open-main-window", "listings", 40),
+        new("activity", "Operations and receipts", "open-main-window", "activity", 50),
     ];
     private static readonly IReadOnlyList<AgentBridgeCaptureSurfaceDescriptor> CaptureSurfaces =
     [
         new("transfer", "Stock and Transfer Plans", 10, IsDefault: true),
-        new("listings", "Retainer listings", 20),
-        new("activity", "Operations and receipts", 30),
+        new("transfer-review", "Transfer Plan review", 20),
+        new("item-groups", "Item Groups", 30),
+        new("listings", "Retainer listings", 40),
+        new("activity", "Operations and receipts", 50),
     ];
 
     private readonly Func<QuartermasterBridgeTruth> createTruth;
@@ -78,7 +82,7 @@ public sealed class QuartermasterBridgeProvider
         reviewRegistry.Invoke(id, frameId, arguments);
     public bool TryOpenMainWindow(string target)
     {
-        if (target.Trim().ToLowerInvariant() is not ("stock" or "stock-and-plan" or "transfer" or "restock" or "stowage" or "listings" or "operation" or "activity"))
+        if (target.Trim().ToLowerInvariant() is not ("stock" or "stock-and-plan" or "transfer" or "transfer-review" or "restock" or "stowage" or "item-groups" or "groups" or "listings" or "operation" or "activity"))
             return false;
         openMainWindow(target);
         return true;

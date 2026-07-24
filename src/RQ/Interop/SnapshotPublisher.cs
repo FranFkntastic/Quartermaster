@@ -115,6 +115,8 @@ public sealed class SnapshotPublisher
         reviewSurfaces = new[]
         {
             new { id = "transfer", label = "Stock and Transfer Plans", command = "/rq", target = "transfer" },
+            new { id = "transfer-review", label = "Transfer Plan review", command = "/rq", target = "transfer-review" },
+            new { id = "item-groups", label = "Item Groups", command = "/rq", target = "item-groups" },
             new { id = "listings", label = "Retainer listings", command = "/rq", target = "listings" },
             new { id = "activity", label = "Operations and receipts", command = "/rq", target = "activity" },
         },

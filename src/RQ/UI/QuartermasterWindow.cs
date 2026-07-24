@@ -6,6 +6,7 @@ using Dalamud.Plugin.Services;
 using Dalamud.Utility;
 using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.UI.Filtering;
+using Franthropy.Dalamud.UI.Tables;
 using Lumina.Excel.Sheets;
 using RQ.Automation;
 using RQ.Domain;
@@ -30,13 +31,14 @@ public sealed class QuartermasterWindow : Window
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
     private readonly AgentBridgeUiCaptureTransactionManager captureTransactions;
     private readonly WorkbenchState workbench = new();
+    private readonly TableSelectionModel<uint> stockSelection = new();
     private readonly BrowserQueryController queries = new();
     private readonly RootConfirmationDialog confirmationDialog = new();
-    private readonly Dictionary<(uint ItemId, bool IsHighQuality), QuickDepositSelection> quickDeposits = [];
     private string transferStatus = "No transfer has run.";
     private WorkbenchView? requestedView;
     private Task? activeTransferTask;
     private bool clearAgentReviewWindowOverride;
+    private bool requestCaptureFocus;
     private StowagePlanDraft? stowageDraft;
     private readonly HashSet<Guid> selectedStowageRuleIds = [];
     private Guid? activeStowageRuleId;
@@ -72,8 +74,17 @@ public sealed class QuartermasterWindow : Window
     private ItemChoice? selectedItemGroupChoice;
     private ItemQualityPolicy itemGroupAddQuality = ItemQualityPolicy.Any;
     private string itemGroupEditorError = string.Empty;
+    private string inlineTransferError = string.Empty;
+    private string itemGroupWorkspaceStatus = string.Empty;
     private bool requestDeleteItemGroup;
+    private bool requestHistoryOpen;
+    private bool requestHistoryClose;
+    private bool capturePresentingHistory;
+    private bool requestTransferReviewOpen;
+    private TransferReviewRequest? transferReview;
     private WorkbenchView? capturePreviousView;
+    private TransferReviewRequest? capturePreviousTransferReview;
+    private bool capturePreviousTransferReviewOpenRequest;
 
     public QuartermasterWindow(
         StateRepository state,
@@ -107,6 +118,7 @@ public sealed class QuartermasterWindow : Window
             },
             beginPresentation: BeginCapturePresentation,
             restorePresentation: RestoreCapturePresentation);
+        BgAlpha = 1f;
         Size = new Vector2(1280, 760);
         SizeCondition = ImGuiCond.FirstUseEver;
         SizeConstraints = new WindowSizeConstraints { MinimumSize = new Vector2(980, 520), MaximumSize = new Vector2(float.MaxValue, float.MaxValue) };
@@ -139,7 +151,8 @@ public sealed class QuartermasterWindow : Window
     public string CurrentTransferDirection => "mixed";
     public bool StowageEditorOpen => stowageDraft is not null && (requestStowageEditorOpen || stowageEditorVisible);
     public bool RestockEditorOpen => restockDraft is not null && (requestRestockEditorOpen || restockEditorVisible);
-    public bool ItemGroupEditorOpen => itemGroupDraft is not null;
+    public bool ItemGroupEditorOpen =>
+        IsOpen && workbench.View == WorkbenchView.ItemGroups && itemGroupDraft is not null;
     public Guid? SelectedItemGroupId => itemGroupDraft is { IsNew: false } ? itemGroupDraft.GroupId : null;
     public string? SelectedItemGroupName => itemGroupDraft?.Name;
     public bool ItemGroupEditorHasUnsavedChanges =>
@@ -212,7 +225,11 @@ public sealed class QuartermasterWindow : Window
         ImGui.SetNextWindowSize(
             Vector2.Min(new Vector2(1440, 900), viewport.WorkSize - new Vector2(32, 32)),
             ImGuiCond.Always);
-        ImGui.SetNextWindowFocus();
+        if (requestCaptureFocus)
+        {
+            ImGui.SetNextWindowFocus();
+            requestCaptureFocus = false;
+        }
     }
 
     public AgentBridgeUiCaptureTransactionHandle BeginAgentCapturePresentation(string target) =>
@@ -226,7 +243,7 @@ public sealed class QuartermasterWindow : Window
 
     private string? ActiveCapturePresentationTarget()
     {
-        foreach (var target in new[] { "transfer", "listings", "activity" })
+        foreach (var target in new[] { "transfer", "transfer-review", "item-groups", "listings", "activity" })
             if (captureTransactions.ShouldPresentInMainViewport(target))
                 return target;
         return null;
@@ -235,12 +252,20 @@ public sealed class QuartermasterWindow : Window
     private void BeginCapturePresentation()
     {
         capturePreviousView = workbench.View;
-        requestedView = ActiveCapturePresentationTarget() switch
+        capturePreviousTransferReview = transferReview;
+        capturePreviousTransferReviewOpenRequest = requestTransferReviewOpen;
+        requestCaptureFocus = true;
+        var target = ActiveCapturePresentationTarget();
+        capturePresentingHistory = target == "activity";
+        requestedView = target switch
         {
             "listings" => WorkbenchView.Listings,
+            "item-groups" => WorkbenchView.ItemGroups,
             "activity" => WorkbenchView.Activity,
             _ => WorkbenchView.Stowage,
         };
+        if (target == "transfer-review")
+            RequestSelectedTransferReview();
     }
 
     private void RestoreCapturePresentation()
@@ -248,44 +273,48 @@ public sealed class QuartermasterWindow : Window
         if (capturePreviousView is { } previous)
             requestedView = previous;
         capturePreviousView = null;
+        transferReview = capturePreviousTransferReview;
+        requestTransferReviewOpen = capturePreviousTransferReviewOpenRequest;
+        capturePreviousTransferReview = null;
+        capturePreviousTransferReviewOpenRequest = false;
+        if (capturePresentingHistory)
+            requestHistoryClose = true;
+        capturePresentingHistory = false;
+        requestCaptureFocus = false;
     }
 
     private void DrawContent()
     {
         var runtime = runtimeSnapshots.Current;
         workbench.EnsureScope(runtime.Browser);
-        var scopedRetainerCount = runtime.Retainers.Values.Count(retainer => runtime.Owner.Matches(retainer.Owner));
-
-        ImGui.TextUnformatted(runtime.Owner.HasStableIdentity ? $"{runtime.Owner.CharacterName} @ {runtime.Owner.HomeWorldName}" : "Owner scope unavailable");
-        ImGui.SameLine();
-        ImGui.TextDisabled($"{scopedRetainerCount:N0} cached retainers");
-        ImGui.SameLine();
-        var automationBusy = transfers.IsRunning || autoRetainer.IsRefreshing || autoRetainer.IsQueued;
-        if (automationBusy)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Refresh retainers"))
-            autoRetainer.Start();
-        if (automationBusy)
-            ImGui.EndDisabled();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.refresh-retainers",
-            "Refresh retainers",
-            !automationBusy,
-            () => autoRetainer.Start(),
-            autoRetainer.Status);
-        ImGui.SameLine();
-        ImGui.TextDisabled(autoRetainer.Status);
-
         if (requestedView is { } requested)
         {
-            if (requested is WorkbenchView.Listings or WorkbenchView.Activity)
+            if (requested == WorkbenchView.Activity)
+            {
+                requestHistoryOpen = true;
+                requestedView = WorkbenchView.Stowage;
+            }
+            if (requested == WorkbenchView.Listings)
                 CloseStowageEditor();
             CloseRestockEditor();
         }
 
+        ImGui.TextUnformatted(runtime.Owner.HasStableIdentity ? $"{runtime.Owner.CharacterName} @ {runtime.Owner.HomeWorldName}" : "Owner scope unavailable");
+        var historyWidth = ImGui.CalcTextSize("History").X + (ImGui.GetStyle().FramePadding.X * 2);
+        ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - historyWidth));
+        if (ImGui.SmallButton("History"))
+            requestHistoryOpen = true;
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.history.open",
+            "Open transfer history",
+            true,
+            () => requestHistoryOpen = true,
+            "Recent Quartermaster operations");
+        DrawHistoryPopup(runtime.Owner);
+
         if (ImGui.BeginTabBar("RQViews"))
         {
-            var plansRequested = requestedView is WorkbenchView.Stock or WorkbenchView.Restock or WorkbenchView.Stowage;
+            var plansRequested = requestedView is WorkbenchView.Stock or WorkbenchView.Restock or WorkbenchView.Stowage or WorkbenchView.ItemGroups;
             var stockOpen = ImGui.BeginTabItem("Stock & plans", plansRequested ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None);
             reviewRegistry.RegisterLastButton(
                 "quartermaster.workspace.stock",
@@ -295,7 +324,11 @@ public sealed class QuartermasterWindow : Window
                 workbench.View is not (WorkbenchView.Listings or WorkbenchView.Activity) ? "Selected" : "Available");
             if (stockOpen)
             {
-                workbench.View = WorkbenchView.Stowage;
+                if (requestedView == WorkbenchView.ItemGroups)
+                    workbench.View = WorkbenchView.ItemGroups;
+                else if (requestedView is WorkbenchView.Stock or WorkbenchView.Restock or WorkbenchView.Stowage ||
+                         workbench.View is WorkbenchView.Listings or WorkbenchView.Activity)
+                    workbench.View = WorkbenchView.Stowage;
                 DrawStockAndPlans(runtime);
                 ImGui.EndTabItem();
             }
@@ -307,18 +340,11 @@ public sealed class QuartermasterWindow : Window
                 DrawListings(runtime.Browser, runtime.Revision);
                 ImGui.EndTabItem();
             }
-            var activityOpen = ImGui.BeginTabItem("Activity", requestedView == WorkbenchView.Activity ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None);
-            RegisterWorkspaceControl("activity", WorkbenchView.Activity);
-            if (activityOpen)
-            {
-                workbench.View = WorkbenchView.Activity;
-                DrawOperation(runtime.Owner);
-                ImGui.EndTabItem();
-            }
             ImGui.EndTabBar();
             requestedView = null;
         }
         DrawStowageEditorModal(runtime);
+        DrawTransferReviewModal();
         confirmationDialog.Draw();
     }
 
@@ -338,12 +364,34 @@ public sealed class QuartermasterWindow : Window
         ImGui.TableNextColumn();
         if (ImGui.BeginChild("RQPlanPane", Vector2.Zero, false))
         {
-            workbench.View = WorkbenchView.Stowage;
-            ImGui.TextUnformatted("Transfer plans");
+            var transferSelected = workbench.View != WorkbenchView.ItemGroups;
+            if (ImGui.Selectable("Transfer plan##RQPlannerMode", transferSelected, ImGuiSelectableFlags.None, new Vector2(112, 0)))
+                workbench.View = WorkbenchView.Stowage;
+            reviewRegistry.RegisterLastButton(
+                "quartermaster.workspace.transfer",
+                "Show Transfer Plan workspace",
+                true,
+                () => workbench.View = WorkbenchView.Stowage,
+                transferSelected ? "Selected" : "Available");
             ImGui.SameLine();
-            ImGui.TextDisabled("Each line converges player inventory toward its target.");
+            if (ImGui.Selectable("Item groups##RQPlannerMode", !transferSelected, ImGuiSelectableFlags.None, new Vector2(104, 0)))
+                workbench.View = WorkbenchView.ItemGroups;
+            reviewRegistry.RegisterLastButton(
+                "quartermaster.workspace.item-groups",
+                "Show Item Groups workspace",
+                true,
+                () => workbench.View = WorkbenchView.ItemGroups,
+                transferSelected ? "Available" : "Selected");
+            ImGui.SameLine();
+            ImGui.TextDisabled("Stock stays available while you plan.");
             ImGui.Separator();
-            DrawStowageWorkspace(runtime);
+            if (workbench.View == WorkbenchView.ItemGroups)
+                DrawItemGroupWorkspace(runtime);
+            else
+            {
+                workbench.View = WorkbenchView.Stowage;
+                DrawStowageWorkspace(runtime);
+            }
         }
         ImGui.EndChild();
         ImGui.EndTable();
@@ -359,9 +407,11 @@ public sealed class QuartermasterWindow : Window
 
     public void OpenReviewSurface(string target)
     {
-        var view = target.Trim().ToLowerInvariant() switch
+        var normalizedTarget = target.Trim().ToLowerInvariant();
+        var view = normalizedTarget switch
         {
             "listings" => WorkbenchView.Listings,
+            "item-groups" or "groups" => WorkbenchView.ItemGroups,
             "operation" or "activity" => WorkbenchView.Activity,
             _ => WorkbenchView.Stowage,
         };
@@ -369,6 +419,8 @@ public sealed class QuartermasterWindow : Window
             CloseStowageEditor();
         CloseRestockEditor();
         requestedView = view;
+        if (normalizedTarget == "transfer-review")
+            RequestSelectedTransferReview();
         IsOpen = true;
         Collapsed = false;
         CollapsedCondition = ImGuiCond.Always;
@@ -401,7 +453,7 @@ public sealed class QuartermasterWindow : Window
     private void DrawStock(QuartermasterRuntimeSnapshot runtime)
     {
         var projection = runtime.Browser;
-        DrawBrowserToolbar(projection, listings: false);
+        DrawStockToolbar(projection);
         var result = queries.QueryItems(
             projection,
             workbench.ItemFilter,
@@ -409,115 +461,308 @@ public sealed class QuartermasterWindow : Window
             workbench.ItemFilterState.IsInputActive,
             runtime.Revision);
         if (!result.Filter.IsValid)
-            ImGui.TextColored(new Vector4(1f, .65f, .25f, 1f), result.Filter.Diagnostics.FirstOrDefault()?.Message ?? "Invalid filter");
+            ImGui.TextColored(
+                new Vector4(1f, .65f, .25f, 1f),
+                result.Filter.Diagnostics.FirstOrDefault()?.Message ?? "Invalid filter");
 
-        if (workbench.SelectedStock is { } selected)
-        {
-            ImGui.TextUnformatted(selected.ItemName);
-            ImGui.SameLine();
-            ImGui.SetNextItemWidth(90);
-            var stagedTarget = workbench.StagedTargetText;
-            if (ImGui.InputText(
-                    "Player target##RQStockTarget",
-                    ref stagedTarget,
-                    12,
-                    ImGuiInputTextFlags.CharsDecimal))
-                workbench.StagedTargetText = stagedTarget;
-            var canAdd = runtime.Owner.HasStableIdentity &&
-                         workbench.StagedTarget is { } target &&
-                         target >= 0;
-            if (!canAdd)
-                ImGui.BeginDisabled();
-            var plan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner)
-                       ?? StowagePlanCatalog.OwnerPlans(runtime.State, runtime.Owner).FirstOrDefault();
-            var label = plan is null ? "Add to new Transfer Plan" : $"Add to {plan.Name}";
-            if (ImGui.Button(label, new Vector2(-1, 0)) && workbench.StagedTarget is { } targetQuantity)
-                AddStockSelectionToStowage(runtime, selected, targetQuantity, plan);
-            reviewRegistry.RegisterLastButton(
-                $"quartermaster.transfer.stage-rule.{selected.ItemId}",
-                $"{label}: {selected.ItemName}",
-                canAdd,
-                () =>
-                {
-                    var current = runtimeSnapshots.Current;
-                    if (workbench.SelectedStock is { } stock && workbench.StagedTarget is { } targetQuantity)
-                        AddStockSelectionToStowage(current, stock, targetQuantity, ResolveSelectedStowagePlan(current.State, current.Owner));
-                },
-                canAdd ? "Opens a review draft" : "Enter a player target");
-            if (!canAdd)
-                ImGui.EndDisabled();
-        }
+        var selectedPlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
+        var rules = selectedPlan is null
+            ? new Dictionary<uint, TargetPlanItem>()
+            : runtime.State.PlanItems
+                .Where(rule => rule.StowagePlanId == selectedPlan.Id)
+                .GroupBy(rule => rule.ItemId)
+                .ToDictionary(group => group.Key, group => group.First());
+        var evaluated = selectedPlan is null
+            ? new Dictionary<Guid, StowageEvaluationLine>()
+            : StowageEvaluator.BuildPlan(runtime.State, runtime.Browser, runtime.Owner, selectedPlan.Id)?
+                  .Lines.ToDictionary(line => line.RuleId) ?? [];
 
-        var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
-        if (!ImGui.BeginTable("RQStockTable", 6, flags, new Vector2(0, Math.Max(180, ImGui.GetContentRegionAvail().Y))))
-            return;
-        ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 2f);
-        ImGui.TableSetupColumn("Total", ImGuiTableColumnFlags.WidthFixed, 58);
-        ImGui.TableSetupColumn("Player", ImGuiTableColumnFlags.WidthFixed, 58);
-        ImGui.TableSetupColumn("Retainers", ImGuiTableColumnFlags.WidthFixed, 70);
-        ImGui.TableSetupColumn("Sources", ImGuiTableColumnFlags.WidthStretch, 1.2f);
-        ImGui.TableSetupColumn("Quick deposit", ImGuiTableColumnFlags.WidthFixed, 88);
-        ImGui.TableHeadersRow();
-        foreach (var item in SortItems(result.Items))
+        stockSelection.Retain(projection.Items.Select(item => item.ItemId));
+        var rows = SortItems(result.Items);
+        var rowKeys = rows.Select(item => item.ItemId).ToArray();
+        var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
+                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
+                    ImGuiTableFlags.SizingStretchProp;
+        var actionBarHeight = stockSelection.Count > 0
+            ? ImGui.GetFrameHeightWithSpacing() + 4
+            : 0;
+        var tableHeight = Math.Max(180, ImGui.GetContentRegionAvail().Y - actionBarHeight);
+        if (ImGui.BeginTable("RQStockWorkbench", 5, flags, new Vector2(0, tableHeight)))
         {
-            ImGui.TableNextRow();
-            ImGui.TableNextColumn();
-            if (ImGui.SmallButton($"{(workbench.IsExpanded(item.ItemId) ? "v" : "> ")}##expand{item.ItemId}"))
-                workbench.ToggleExpanded(item.ItemId);
-            ImGui.SameLine();
-            if (ImGui.Selectable($"{item.ItemName}##stock{item.ItemId}", workbench.SelectedStock?.ItemId == item.ItemId))
-                workbench.Select(item);
-            reviewRegistry.RegisterLastButton(
-                $"quartermaster.stock.select.{item.ItemId}",
-                $"Select {item.ItemName} in Stock",
-                true,
-                () => workbench.Select(item),
-                workbench.SelectedStock?.ItemId == item.ItemId ? "Selected" : "Available");
-            ImGui.TableNextColumn(); ImGui.TextUnformatted(item.TotalQuantity.ToString("N0"));
-            ImGui.TableNextColumn(); ImGui.TextUnformatted(item.PlayerQuantity.ToString("N0"));
-            ImGui.TableNextColumn(); ImGui.TextUnformatted(item.RetainerQuantity.ToString("N0"));
-            ImGui.TableNextColumn(); ImGui.TextUnformatted(string.Join(", ", item.Stacks.Select(stack => stack.OwnerName).Distinct().Take(2)));
-            ImGui.TableNextColumn();
-            var playerStacks = item.Stacks.Where(stack => stack.ScopeKind == BrowserScopeKind.Player).ToArray();
-            if (playerStacks.Length > 0)
+            ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.8f);
+            ImGui.TableSetupColumn("Player", ImGuiTableColumnFlags.WidthFixed, 58);
+            ImGui.TableSetupColumn("Stored", ImGuiTableColumnFlags.WidthFixed, 66);
+            ImGui.TableSetupColumn("Target", ImGuiTableColumnFlags.WidthFixed, 68);
+            ImGui.TableSetupColumn("Plan state", ImGuiTableColumnFlags.WidthStretch, 1f);
+            ImGui.TableHeadersRow();
+            for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
             {
-                if (ImGui.SmallButton($"Stage##quick{item.ItemId}"))
-                    StageQuickDeposit(item);
+                var item = rows[rowIndex];
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn();
+                var itemCursor = ImGui.GetCursorPos();
+                var itemWidth = Math.Max(1, ImGui.GetContentRegionAvail().X);
+                var itemHeight = Math.Max(
+                    ImGui.GetTextLineHeightWithSpacing(),
+                    ImGui.CalcTextSize(item.ItemName, false, itemWidth).Y);
+                DalamudTableSelectionRenderer.DrawRow(
+                    stockSelection,
+                    rowKeys,
+                    rowIndex,
+                    $"##stock-row:{item.ItemId}",
+                    new Vector2(0, itemHeight));
+                var stockSelected = stockSelection.IsSelected(item.ItemId);
                 reviewRegistry.RegisterLastButton(
-                    $"quartermaster.quick-deposit.stage.{item.ItemId}",
-                    $"Stage {item.ItemName} for Quick Deposit",
+                    $"quartermaster.stock.select.{item.ItemId}",
+                    $"Select {item.ItemName} for stock actions",
                     true,
-                    () => StageQuickDeposit(item),
-                    $"{playerStacks.Sum(stack => stack.Quantity):N0} carried");
-            }
-            if (workbench.IsExpanded(item.ItemId))
-            {
-                foreach (var stack in item.Stacks)
+                    () => stockSelection.SetSelected(
+                        item.ItemId,
+                        !stockSelection.IsSelected(item.ItemId)),
+                    stockSelected ? "Selected" : "Available");
+                ImGui.SetCursorPos(itemCursor);
+                ImGui.TextUnformatted(item.ItemName);
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted(item.PlayerQuantity.ToString("N0"));
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted(item.RetainerQuantity.ToString("N0"));
+                ImGui.TableNextColumn();
+                if (rules.TryGetValue(item.ItemId, out var rule))
                 {
-                    ImGui.TableNextRow();
-                    ImGui.TableNextColumn(); ImGui.TextDisabled($"  {stack.Storage} · slot {(stack.SlotIndex is { } slot ? slot + 1 : 0)}");
-                    ImGui.TableNextColumn(); ImGui.TextDisabled(stack.Quantity.ToString("N0"));
-                    ImGui.TableNextColumn(); ImGui.TextDisabled(stack.ScopeKind == BrowserScopeKind.Player ? stack.Quantity.ToString("N0") : "-");
-                    ImGui.TableNextColumn(); ImGui.TextDisabled(stack.ScopeKind == BrowserScopeKind.Retainer ? stack.Quantity.ToString("N0") : "-");
-                    ImGui.TableNextColumn(); ImGui.TextDisabled($"{stack.OwnerName} · {stack.Quality}");
+                    ImGui.TextUnformatted(rule.TargetQuantity.ToString("N0"));
                     ImGui.TableNextColumn();
-                    if (stack.ScopeKind == BrowserScopeKind.Player)
-                    {
-                        var highQuality = stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ;
-                        if (ImGui.SmallButton($"Stage##quick{item.ItemId}:{stack.Storage}:{stack.SlotIndex}"))
-                            StageQuickDeposit(item, highQuality);
-                        reviewRegistry.RegisterLastButton(
-                            $"quartermaster.quick-deposit.stage.{item.ItemId}.{(highQuality ? "hq" : "nq")}.{stack.Storage}.{stack.SlotIndex}",
-                            $"Stage {item.ItemName}{(highQuality ? " HQ" : string.Empty)} stack for Quick Deposit",
-                            true,
-                            () => StageQuickDeposit(item, highQuality),
-                            $"{stack.Quantity:N0} carried");
-                    }
+                    evaluated.TryGetValue(rule.Id, out var line);
+                    ImGui.TextColored(
+                        TransferActionColor(line?.Action),
+                        !rule.Enabled ? "Off" : line?.Action switch
+                        {
+                            StowageAction.Retrieve => $"Retrieve {line.RetrieveQuantity:N0}",
+                            StowageAction.Deposit => $"Stow {line.DepositQuantity:N0}",
+                            _ => "On target",
+                        });
+                }
+                else
+                {
+                    ImGui.TextDisabled("—");
+                    ImGui.TableNextColumn();
+                    ImGui.TextDisabled("Not in plan");
                 }
             }
+            DalamudTableSelectionRenderer.EndRows(stockSelection);
+            ImGui.EndTable();
         }
-        ImGui.EndTable();
+        DrawStockSelectionBar(runtime);
     }
+
+    private void DrawStockToolbar(BrowserProjection projection)
+    {
+        var sourceItems = projection.GetItems(workbench.ScopeKey);
+        var context = BrowserQueryController.CreateItemContext(sourceItems, projection.Owner);
+        var trailingWidth = 204f;
+        if (DalamudFilterAutocompleteRenderer.Draw(
+                "RQStockWorkbench",
+                "Search accessible stock by item name",
+                context,
+                workbench.ItemFilterState,
+                Math.Max(220, ImGui.GetContentRegionAvail().X - trailingWidth)))
+            workbench.ItemFilter = workbench.ItemFilterState.Expression;
+
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(150);
+        var selectedScope = projection.Scopes.First(scope => scope.Key == workbench.ScopeKey);
+        if (ImGui.BeginCombo("##RQStockScope", selectedScope.Label))
+        {
+            foreach (var scope in projection.Scopes)
+            {
+                if (ImGui.Selectable($"{scope.Label}##stock-scope:{scope.Key}", scope.Key == workbench.ScopeKey))
+                    workbench.ScopeKey = scope.Key;
+            }
+            ImGui.EndCombo();
+        }
+
+        ImGui.SameLine();
+        var direction = workbench.ItemSortDescending ? "↓" : "↑";
+        if (ImGui.SmallButton($"{direction}##RQStockSort"))
+            ImGui.OpenPopup("RQStockSortMenu");
+        if (ImGui.BeginPopup("RQStockSortMenu"))
+        {
+            foreach (var option in new[] { "Name", "Total", "Player", "Retainers" })
+            {
+                if (ImGui.Selectable(option, workbench.ItemSort == option))
+                    workbench.ItemSort = option;
+            }
+            ImGui.Separator();
+            if (ImGui.Selectable(workbench.ItemSortDescending ? "Ascending" : "Descending"))
+                workbench.ItemSortDescending = !workbench.ItemSortDescending;
+            ImGui.EndPopup();
+        }
+
+        ImGui.SameLine();
+        if (ImGui.SmallButton("…##RQStockOptions"))
+            ImGui.OpenPopup("RQStockOptions");
+        if (ImGui.BeginPopup("RQStockOptions"))
+        {
+            ImGui.TextDisabled("Included player storage");
+            var includeCrystals = configuration.IncludeCrystals;
+            var includeEquipped = configuration.IncludeEquipped;
+            var includeArmoury = configuration.IncludeArmoury;
+            var includeSaddlebag = configuration.IncludeSaddlebag;
+            var changed = false;
+            changed |= ImGui.Checkbox("Crystals", ref includeCrystals);
+            changed |= ImGui.Checkbox("Equipped", ref includeEquipped);
+            changed |= ImGui.Checkbox("Armoury", ref includeArmoury);
+            changed |= ImGui.Checkbox("Saddlebags", ref includeSaddlebag);
+            if (changed)
+            {
+                configuration.IncludeCrystals = includeCrystals;
+                configuration.IncludeEquipped = includeEquipped;
+                configuration.IncludeArmoury = includeArmoury;
+                configuration.IncludeSaddlebag = includeSaddlebag;
+                saveConfiguration();
+            }
+            ImGui.EndPopup();
+        }
+    }
+
+    private void DrawStockSelectionBar(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (stockSelection.Count == 0)
+            return;
+
+        var selected = runtime.Browser.Items
+            .Where(item => stockSelection.IsSelected(item.ItemId))
+            .ToArray();
+        if (selected.Length == 0)
+        {
+            stockSelection.Clear();
+            return;
+        }
+
+        ImGui.TextUnformatted($"{selected.Length:N0} selected");
+        ImGui.SameLine();
+        var canPlan = runtime.Owner.HasStableIdentity;
+        if (!canPlan)
+            ImGui.BeginDisabled();
+        if (ImGui.Button("Add to plan"))
+        {
+            UpsertSelectedStockRules(runtime, selected, stowCarried: false);
+            stockSelection.Clear();
+        }
+        if (!canPlan)
+            ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.stock.add-selected-to-plan",
+            "Add selected stock to the current Transfer Plan",
+            canPlan,
+            () =>
+            {
+                var current = runtimeSnapshots.Current;
+                var currentItems = current.Browser.Items
+                    .Where(item => stockSelection.IsSelected(item.ItemId))
+                    .ToArray();
+                UpsertSelectedStockRules(current, currentItems, stowCarried: false);
+                stockSelection.Clear();
+            },
+            $"{selected.Length:N0} selected");
+
+        ImGui.SameLine();
+        if (ImGui.Button("Add to item group"))
+        {
+            workbench.View = WorkbenchView.ItemGroups;
+            EnsureItemGroupDraft(runtime.State);
+            if (itemGroupDraft is null)
+            {
+                itemGroupDraft = ItemGroupCatalog.NewDraft(runtime.State);
+                itemGroupEditorOrigin = WorkbenchView.ItemGroups;
+            }
+            if (itemGroupDraft is not null)
+            {
+                var added = ItemGroupCatalog.AddMissing(
+                    itemGroupDraft,
+                    selected.Select(item => new ItemGroupItem
+                    {
+                        ItemId = item.ItemId,
+                        ItemName = item.ItemName,
+                        Quality = ItemQualityPolicy.Any,
+                    }));
+                itemGroupWorkspaceStatus = added == 0
+                    ? "Selected items are already in this group."
+                    : $"Added {added:N0} selected {(added == 1 ? "item" : "items")}.";
+            }
+            stockSelection.Clear();
+        }
+
+        ImGui.SameLine();
+        var carried = selected.Where(item => item.PlayerQuantity > 0).ToArray();
+        if (carried.Length == 0)
+            ImGui.BeginDisabled();
+        if (ImGui.Button("Stow carried"))
+        {
+            UpsertSelectedStockRules(runtime, carried, stowCarried: true);
+            stockSelection.Clear();
+        }
+        if (carried.Length == 0)
+            ImGui.EndDisabled();
+
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Clear"))
+            stockSelection.Clear();
+    }
+
+    private void UpsertSelectedStockRules(
+        QuartermasterRuntimeSnapshot runtime,
+        IReadOnlyList<StockGroup> items,
+        bool stowCarried)
+    {
+        if (!runtime.Owner.HasStableIdentity || items.Count == 0)
+            return;
+        try
+        {
+            workbench.SelectedStowagePlanId = state.Mutate(document =>
+            {
+                var plan = ResolveSelectedStowagePlan(document, runtime.Owner)
+                           ?? StowagePlanCatalog.Create(document, runtime.Owner, "Transfer plan");
+                var draft = StowagePlanCatalog.Draft(document, runtime.Owner, plan.Id);
+                foreach (var item in items)
+                {
+                    var rule = draft.Rules.FirstOrDefault(candidate =>
+                        candidate.ItemId == item.ItemId &&
+                        candidate.Quality == ItemQualityPolicy.Any);
+                    if (rule is null)
+                    {
+                        draft.Rules.Add(new TargetPlanItem
+                        {
+                            StowagePlanId = plan.Id,
+                            ItemId = item.ItemId,
+                            ItemName = item.ItemName,
+                            TargetQuantity = stowCarried ? 0 : item.PlayerQuantity,
+                            Quality = ItemQualityPolicy.Any,
+                            Enabled = true,
+                        });
+                    }
+                    else
+                    {
+                        rule.Enabled = true;
+                        if (stowCarried)
+                            rule.TargetQuantity = 0;
+                    }
+                }
+                return StowagePlanCatalog.Apply(document, runtime.Owner, draft).Id;
+            });
+            inlineTransferError = string.Empty;
+        }
+        catch (Exception exception)
+        {
+            inlineTransferError = exception.Message;
+        }
+    }
+
+    private static Vector4 TransferActionColor(StowageAction? action) => action switch
+    {
+        StowageAction.Retrieve => new Vector4(.52f, .79f, .94f, 1f),
+        StowageAction.Deposit => new Vector4(.53f, .83f, .64f, 1f),
+        _ => new Vector4(.69f, .74f, .77f, 1f),
+    };
 
     private void DrawRestockPlan(QuartermasterRuntimeSnapshot runtime)
     {
@@ -897,6 +1142,335 @@ public sealed class QuartermasterWindow : Window
             selectedRestockChoice = null;
             restockItemSearch = string.Empty;
         }
+    }
+
+    private void DrawItemGroupWorkspace(QuartermasterRuntimeSnapshot runtime)
+    {
+        EnsureItemGroupDraft(runtime.State);
+        var groups = ItemGroupCatalog.All(runtime.State);
+        var flags = ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.Resizable |
+                    ImGuiTableFlags.SizingStretchProp;
+        if (!ImGui.BeginTable(
+                "RQItemGroupWorkspace",
+                2,
+                flags,
+                new Vector2(0, Math.Max(260, ImGui.GetContentRegionAvail().Y))))
+            return;
+
+        ImGui.TableSetupColumn("Groups", ImGuiTableColumnFlags.WidthFixed, 210);
+        ImGui.TableSetupColumn("Members", ImGuiTableColumnFlags.WidthStretch, 1f);
+        ImGui.TableNextRow();
+        ImGui.TableNextColumn();
+        if (ImGui.BeginChild("RQItemGroupList", Vector2.Zero, false))
+        {
+            ImGui.TextUnformatted("Item groups");
+            ImGui.TextDisabled("Reusable item-name shorthands");
+            ImGui.Separator();
+            foreach (var group in groups)
+            {
+                var selected = itemGroupDraft?.GroupId == group.Id;
+                if (ImGui.Selectable(
+                        $"{group.Name}##group-workspace:{group.Id}",
+                        selected,
+                        ImGuiSelectableFlags.None,
+                        new Vector2(0, ImGui.GetTextLineHeightWithSpacing() * 1.8f)))
+                    RequestItemGroupSwitch(group.Id);
+                if (ImGui.IsItemVisible())
+                {
+                    var cursor = ImGui.GetCursorPos();
+                    ImGui.SetCursorPosY(cursor.Y - ImGui.GetTextLineHeightWithSpacing());
+                    ImGui.Indent();
+                    ImGui.TextDisabled($"{group.Items.Count:N0} items");
+                    ImGui.Unindent();
+                }
+            }
+            if (groups.Count == 0)
+                ImGui.TextDisabled("No item groups yet.");
+            ImGui.Separator();
+            if (ImGui.Button("New item group", new Vector2(-1, 0)))
+                OpenNewItemGroupWorkspace();
+            reviewRegistry.RegisterLastButton(
+                "quartermaster.item-groups.new",
+                "Create a new Item Group draft",
+                true,
+                OpenNewItemGroupWorkspace,
+                "Nothing is saved until Save group");
+        }
+        ImGui.EndChild();
+
+        ImGui.TableNextColumn();
+        if (ImGui.BeginChild("RQItemGroupDetail", Vector2.Zero, false))
+        {
+            var draft = itemGroupDraft;
+            if (draft is null)
+            {
+                ImGui.TextUnformatted("Choose an Item Group or create a new one.");
+                ImGui.TextDisabled("Selecting stock on the left can then add several items at once.");
+            }
+            else
+            {
+                DrawItemGroupWorkspaceDetail(draft, runtime);
+            }
+        }
+        ImGui.EndChild();
+        ImGui.EndTable();
+    }
+
+    private void OpenNewItemGroupWorkspace()
+    {
+        itemGroupDraft = ItemGroupCatalog.NewDraft(state.Snapshot());
+        itemGroupEditorOrigin = WorkbenchView.ItemGroups;
+        selectedItemGroupItems.Clear();
+        itemGroupItemSearch = string.Empty;
+        itemGroupWorkspaceStatus = string.Empty;
+    }
+
+    private void DiscardItemGroupWorkspace()
+    {
+        if (itemGroupDraft is not { } draft)
+            return;
+        var snapshot = state.Snapshot();
+        if (draft.IsNew)
+        {
+            itemGroupDraft = ItemGroupCatalog.All(snapshot).FirstOrDefault() is { } first
+                ? ItemGroupCatalog.Draft(snapshot, first.Id)
+                : null;
+            selectedItemGroupId = itemGroupDraft?.GroupId;
+            selectedItemGroupItems.Clear();
+            itemGroupItemSearch = string.Empty;
+        }
+        else
+        {
+            LoadItemGroupDraft(draft.GroupId);
+        }
+        itemGroupWorkspaceStatus = string.Empty;
+        itemGroupEditorError = string.Empty;
+    }
+
+    private void EnsureItemGroupDraft(QuartermasterState snapshot)
+    {
+        if (itemGroupDraft is not null)
+            return;
+        var groups = ItemGroupCatalog.All(snapshot);
+        var selected = selectedItemGroupId is { } selectedId
+            ? groups.FirstOrDefault(group => group.Id == selectedId)
+            : groups.FirstOrDefault();
+        if (selected is null)
+            return;
+        itemGroupDraft = ItemGroupCatalog.Draft(snapshot, selected.Id);
+        itemGroupEditorOrigin = WorkbenchView.ItemGroups;
+        selectedItemGroupId = selected.Id;
+    }
+
+    private void RequestItemGroupSwitch(Guid groupId)
+    {
+        if (itemGroupDraft?.GroupId == groupId)
+            return;
+        if (itemGroupDraft is not null &&
+            ItemGroupCatalog.HasChanges(state.Snapshot(), itemGroupDraft))
+        {
+            confirmationDialog.Request(
+                $"switch-item-group:{groupId}",
+                "Discard unsaved Item Group changes?",
+                "The selected Item Group will open and the current draft will be discarded.",
+                "Discard and switch",
+                () => LoadItemGroupDraft(groupId));
+            return;
+        }
+        LoadItemGroupDraft(groupId);
+    }
+
+    private void LoadItemGroupDraft(Guid groupId)
+    {
+        itemGroupDraft = ItemGroupCatalog.Draft(state.Snapshot(), groupId);
+        itemGroupEditorOrigin = WorkbenchView.ItemGroups;
+        selectedItemGroupId = groupId;
+        selectedItemGroupItems.Clear();
+        itemGroupItemSearch = string.Empty;
+        itemGroupWorkspaceStatus = string.Empty;
+        itemGroupEditorError = string.Empty;
+    }
+
+    private void DrawItemGroupWorkspaceDetail(
+        ItemGroupDraft draft,
+        QuartermasterRuntimeSnapshot runtime)
+    {
+        ImGui.SetNextItemWidth(Math.Max(220, ImGui.GetContentRegionAvail().X - 150));
+        var name = draft.Name;
+        if (ImGui.InputText("##item-group-name", ref name, 80))
+            draft.Name = name;
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{draft.Items.Count:N0} items");
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Delete##item-group-workspace"))
+            RequestDeleteItemGroupWorkspace(draft);
+
+        ImGui.SetNextItemWidth(Math.Max(220, ImGui.GetContentRegionAvail().X - 140));
+        if (ImGui.InputTextWithHint(
+                "##item-group-add",
+                "Add an item by name",
+                ref itemGroupItemSearch,
+                120))
+            selectedItemGroupChoice = null;
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(120);
+        if (ImGui.BeginCombo("##item-group-add-quality", QualityChoiceLabel(itemGroupAddQuality)))
+        {
+            foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
+            {
+                if (ImGui.Selectable(QualityChoiceLabel(quality), itemGroupAddQuality == quality))
+                    itemGroupAddQuality = quality;
+            }
+            ImGui.EndCombo();
+        }
+
+        var matches = SearchItems(itemGroupItemSearch, 6);
+        if (!string.IsNullOrWhiteSpace(itemGroupItemSearch) && matches.Count > 0)
+        {
+            if (ImGui.BeginChild(
+                    "RQItemGroupSearchResults",
+                    new Vector2(0, Math.Min(150, matches.Count * ImGui.GetTextLineHeightWithSpacing() + 8)),
+                    true))
+            {
+                foreach (var choice in matches)
+                {
+                    if (!ImGui.Selectable($"{choice.Label}##group-add:{choice.ItemId}"))
+                        continue;
+                    var added = ItemGroupCatalog.AddMissing(
+                        draft,
+                        [new ItemGroupItem
+                        {
+                            ItemId = choice.ItemId,
+                            ItemName = choice.Name,
+                            Quality = itemGroupAddQuality,
+                        }]);
+                    itemGroupWorkspaceStatus = added == 0
+                        ? $"{choice.Name} is already in this group."
+                        : $"Added {choice.Name}.";
+                    itemGroupItemSearch = string.Empty;
+                    selectedItemGroupChoice = null;
+                    break;
+                }
+            }
+            ImGui.EndChild();
+        }
+
+        ImGui.Separator();
+        var footerHeight = (ImGui.GetFrameHeightWithSpacing() * 2) + 8;
+        if (ImGui.BeginTable(
+                "RQItemGroupMembersWorkbench",
+                3,
+                ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
+                ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp,
+                new Vector2(0, Math.Max(130, ImGui.GetContentRegionAvail().Y - footerHeight))))
+        {
+            ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.4f);
+            ImGui.TableSetupColumn("Quality", ImGuiTableColumnFlags.WidthFixed, 145);
+            ImGui.TableSetupColumn("##remove", ImGuiTableColumnFlags.WidthFixed, 62);
+            ImGui.TableHeadersRow();
+            foreach (var member in draft.Items.ToArray())
+            {
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted(member.ItemName);
+                ImGui.TableNextColumn();
+                ImGui.SetNextItemWidth(-1);
+                if (ImGui.BeginCombo(
+                        $"##group-quality:{member.ItemId}:{member.Quality}",
+                        QualityChoiceLabel(member.Quality)))
+                {
+                    foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
+                    {
+                        if (ImGui.Selectable(QualityChoiceLabel(quality), member.Quality == quality))
+                            member.Quality = quality;
+                    }
+                    ImGui.EndCombo();
+                }
+                ImGui.TableNextColumn();
+                if (ImGui.SmallButton($"Remove##group-member:{member.ItemId}:{member.Quality}"))
+                    draft.Items.Remove(member);
+            }
+            ImGui.EndTable();
+        }
+
+        if (!string.IsNullOrWhiteSpace(itemGroupEditorError))
+            ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), itemGroupEditorError);
+        else if (!string.IsNullOrWhiteSpace(itemGroupWorkspaceStatus))
+            ImGui.TextDisabled(itemGroupWorkspaceStatus);
+        else
+            ImGui.TextDisabled("Select stock on the left to add several items at once.");
+
+        var snapshot = state.Snapshot();
+        var canApply = ItemGroupCatalog.CanApply(snapshot, draft);
+        var hasChanges = ItemGroupCatalog.HasChanges(snapshot, draft);
+        ImGui.SameLine();
+        if (!hasChanges)
+            ImGui.BeginDisabled();
+        if (ImGui.Button("Discard"))
+            DiscardItemGroupWorkspace();
+        if (!hasChanges)
+            ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.item-groups.discard",
+            "Discard changes to the current Item Group",
+            hasChanges,
+            DiscardItemGroupWorkspace,
+            hasChanges ? "Unsaved changes will be discarded" : "No unsaved changes");
+        ImGui.SameLine();
+        if (!canApply)
+            ImGui.BeginDisabled();
+        if (ImGui.Button("Save group"))
+            SaveItemGroupWorkspace(draft);
+        if (!canApply)
+            ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.item-groups.save",
+            "Save the current Item Group",
+            canApply,
+            () =>
+            {
+                if (itemGroupDraft is not null)
+                    SaveItemGroupWorkspace(itemGroupDraft);
+            },
+            canApply ? "Valid changes" : "No valid changes");
+    }
+
+    private void SaveItemGroupWorkspace(ItemGroupDraft draft)
+    {
+        try
+        {
+            var groupId = state.Mutate(document => ItemGroupCatalog.Apply(document, draft).Id);
+            LoadItemGroupDraft(groupId);
+            itemGroupWorkspaceStatus = "Item Group saved.";
+        }
+        catch (Exception exception)
+        {
+            itemGroupEditorError = exception.Message;
+        }
+    }
+
+    private void RequestDeleteItemGroupWorkspace(ItemGroupDraft draft)
+    {
+        if (draft.IsNew)
+        {
+            itemGroupDraft = ItemGroupCatalog.All(state.Snapshot()).FirstOrDefault() is { } first
+                ? ItemGroupCatalog.Draft(state.Snapshot(), first.Id)
+                : null;
+            return;
+        }
+        confirmationDialog.Request(
+            $"delete-item-group:{draft.GroupId}",
+            $"Delete \"{draft.Name}\"?",
+            "Existing Transfer Plan items will not be changed.",
+            "Delete group",
+            () =>
+            {
+                state.Mutate(document =>
+                    ItemGroupCatalog.Delete(document, draft.GroupId, draft.SourceRevision));
+                itemGroupDraft = null;
+                selectedItemGroupId = null;
+                EnsureItemGroupDraft(state.Snapshot());
+            });
     }
 
     private void OpenItemGroupEditor(WorkbenchView origin)
@@ -1629,47 +2203,44 @@ public sealed class QuartermasterWindow : Window
             workbench.SelectedStowagePlanId = selected.Id;
         }
 
-        ImGui.SetNextItemWidth(Math.Max(180, ImGui.GetContentRegionAvail().X - 230));
-        if (ImGui.BeginCombo("##RQStowagePlan", selected?.Name ?? "Choose a Transfer Plan"))
+        ImGui.SetNextItemWidth(Math.Max(180, ImGui.GetContentRegionAvail().X - 330));
+        if (ImGui.BeginCombo("##RQTransferPlan", selected?.Name ?? "Choose a Transfer Plan"))
         {
             foreach (var plan in plans)
-                if (ImGui.Selectable($"{plan.Name}##stowage{plan.Id}", selected?.Id == plan.Id))
+            {
+                if (ImGui.Selectable($"{plan.Name}##transfer:{plan.Id}", selected?.Id == plan.Id))
+                {
                     workbench.SelectedStowagePlanId = plan.Id;
+                    selected = plan;
+                }
+            }
             ImGui.EndCombo();
         }
         ImGui.SameLine();
+        if (!owner.HasStableIdentity)
+            ImGui.BeginDisabled();
+        if (ImGui.Button("New"))
+            OpenStowageEditor(StowagePlanCatalog.NewDraft(state.Snapshot(), owner));
+        if (!owner.HasStableIdentity)
+            ImGui.EndDisabled();
+
+        ImGui.SameLine();
         if (selected is null)
             ImGui.BeginDisabled();
-        if (ImGui.Button("Edit plan") && selected is not null)
-            OpenStowageEditor(selected.Id, owner);
+        if (ImGui.Button("Duplicate") && selected is not null)
+            OpenStowageEditor(StowagePlanCatalog.DuplicateDraft(state.Snapshot(), owner, selected.Id));
         if (selected is null)
             ImGui.EndDisabled();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.transfer.edit",
-            "Open the selected Transfer Plan editor",
-            selected is not null,
-            () =>
-            {
-                var current = ResolveSelectedStowagePlan(state.Snapshot(), runtimeSnapshots.Current.Owner);
-                if (current is not null)
-                    OpenStowageEditor(current.Id, runtimeSnapshots.Current.Owner);
-            },
-            selected is null ? "No plan selected" : selected.Name);
+
         ImGui.SameLine();
-        if (ImGui.Button("Manage...##stowage"))
-            ImGui.OpenPopup("RQStowagePlanManage");
-        if (ImGui.BeginPopup("RQStowagePlanManage"))
+        if (ImGui.SmallButton("…##RQTransferPlanMenu"))
+            ImGui.OpenPopup("RQTransferPlanMenu");
+        if (ImGui.BeginPopup("RQTransferPlanMenu"))
         {
-            if (!owner.HasStableIdentity)
-                ImGui.BeginDisabled();
-            if (ImGui.Selectable("New plan"))
-                OpenStowageEditor(StowagePlanCatalog.NewDraft(state.Snapshot(), owner));
-            if (!owner.HasStableIdentity)
-                ImGui.EndDisabled();
             if (selected is null)
                 ImGui.BeginDisabled();
-            if (ImGui.Selectable("Duplicate plan") && selected is not null)
-                OpenStowageEditor(StowagePlanCatalog.DuplicateDraft(state.Snapshot(), owner, selected.Id));
+            if (ImGui.Selectable("Rename or edit details") && selected is not null)
+                OpenStowageEditor(selected.Id, owner);
             if (ImGui.Selectable("Delete plan") && selected is not null)
                 RequestDeleteStowagePlan(selected, owner);
             if (selected is null)
@@ -1682,38 +2253,21 @@ public sealed class QuartermasterWindow : Window
         {
             ImGui.Spacing();
             ImGui.TextUnformatted("No Transfer Plans yet.");
-            ImGui.TextDisabled("Create one here, then add target rules from Stock or by name.");
-            if (!owner.HasStableIdentity)
-                ImGui.BeginDisabled();
-            if (ImGui.Button("New Transfer Plan"))
-                OpenStowageEditor(StowagePlanCatalog.NewDraft(state.Snapshot(), owner));
-            reviewRegistry.RegisterLastButton(
-                "quartermaster.transfer.new",
-                "Open a new Transfer Plan draft",
-                owner.HasStableIdentity,
-                () => OpenStowageEditor(StowagePlanCatalog.NewDraft(state.Snapshot(), runtimeSnapshots.Current.Owner)),
-                owner.HasStableIdentity ? "Nothing is saved until Apply" : "Owner unavailable");
-            if (!owner.HasStableIdentity)
-                ImGui.EndDisabled();
+            ImGui.TextDisabled("Create one, then select stock on the left or add items by name.");
             return;
         }
 
         var ownerRules = runtime.State.PlanItems
             .Where(rule => rule.StowagePlanId == selected.Id)
+            .OrderBy(rule => rule.ItemName, StringComparer.OrdinalIgnoreCase)
             .ToArray();
         var stowage = StowageEvaluator.BuildPlan(runtime.State, runtime.Browser, owner, selected.Id);
         var retrieval = BuildTransferRetrievalEvaluation(runtime, ownerRules);
-        DrawQuickDeposit(runtime, ownerRules);
-        ImGui.Separator();
-
-        ImGui.TextUnformatted(selected.Name);
-        ImGui.SameLine();
-        ImGui.TextDisabled(selected.Enabled ? "Enabled" : "Disabled");
-        ImGui.SameLine();
-        ImGui.TextDisabled(
-            $"{ownerRules.Length:N0} rules | retrieve {retrieval.NeededQuantity:N0} | stow {stowage?.DepositQuantity ?? 0:N0}");
-
         var surplusBatch = BuildSurplusBatch(runtime, stowage);
+        var evaluated = stowage?.Lines.ToDictionary(line => line.RuleId) ?? [];
+        var retrievalLines = retrieval.Lines.ToDictionary(line => line.PlanItemId);
+        var movements = evaluated.Values.Count(line =>
+            line.Action is StowageAction.Retrieve or StowageAction.Deposit);
         var hasMovement = retrieval.NeededQuantity > 0 || surplusBatch.PlannedQuantity > 0;
         var canExecute = selected.Enabled &&
                          hasMovement &&
@@ -1721,83 +2275,232 @@ public sealed class QuartermasterWindow : Window
                          transfers.CanStart &&
                          !autoRetainer.IsRefreshing &&
                          !autoRetainer.IsQueued;
+
+        ImGui.SameLine();
         if (!canExecute)
             ImGui.BeginDisabled();
         if (ImGui.Button("Execute plan"))
         {
-            var current = runtimeSnapshots.Current;
-            var currentPlan = ResolveSelectedStowagePlan(current.State, current.Owner);
-            if (currentPlan is not null && currentPlan.Enabled)
-            {
-                var currentRules = current.State.PlanItems
-                    .Where(rule => rule.StowagePlanId == currentPlan.Id)
-                    .ToArray();
-                var currentStowage = StowageEvaluator.BuildPlan(
-                    current.State,
-                    current.Browser,
-                    current.Owner,
-                    currentPlan.Id);
-                var currentRetrieval = BuildTransferRetrievalEvaluation(current, currentRules);
-                var currentBatch = BuildSurplusBatch(current, currentStowage);
-                var retrievalOperationId = currentRetrieval.NeededQuantity > 0
-                    ? journal.CreateTransferRetrieval(current.Owner, currentPlan, currentRules).OperationId
-                    : null;
-                var depositOperationId = currentBatch.PlannedQuantity > 0
-                    ? journal.CreateTransferDeposit(current.Owner, currentPlan, currentBatch).OperationId
-                    : null;
-                StartTransfer(transfers.ExecutePlanAsync(retrievalOperationId, depositOperationId));
-            }
+            transferReview = new(selected.Id, selected.Name);
+            requestTransferReviewOpen = true;
         }
         if (!canExecute)
             ImGui.EndDisabled();
-        ImGui.SameLine();
-        ImGui.TextDisabled(transferStatus);
-
-        var evaluated = stowage?.Lines.ToDictionary(line => line.RuleId) ?? [];
-        var retrievalLines = retrieval.Lines.ToDictionary(line => line.PlanItemId);
-        var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY |
-                    ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
-        if (!ImGui.BeginTable("RQTransferOverviewV2", 6, flags, new Vector2(0, Math.Max(220, ImGui.GetContentRegionAvail().Y))))
-            return;
-        ImGui.TableSetupColumn("State", ImGuiTableColumnFlags.WidthFixed, 44);
-        ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.6f);
-        ImGui.TableSetupColumn("Player / target", ImGuiTableColumnFlags.WidthFixed, 120);
-        ImGui.TableSetupColumn("Diff", ImGuiTableColumnFlags.WidthFixed, 68);
-        ImGui.TableSetupColumn("Planned action", ImGuiTableColumnFlags.WidthFixed, 120);
-        ImGui.TableSetupColumn("Route / evidence", ImGuiTableColumnFlags.WidthStretch, 1.2f);
-        ImGui.TableHeadersRow();
-        foreach (var rule in ownerRules.OrderBy(rule => rule.ItemName, StringComparer.OrdinalIgnoreCase))
-        {
-            evaluated.TryGetValue(rule.Id, out var line);
-            retrievalLines.TryGetValue(rule.Id, out var retrievalLine);
-            ImGui.TableNextRow();
-            ImGui.TableNextColumn();
-            ImGui.TextDisabled(rule.Enabled ? "On" : "Off");
-            ImGui.TableNextColumn();
-            ImGui.TextUnformatted(rule.ItemName);
-            ImGui.SameLine();
-            ImGui.TextDisabled(QualityLabel(rule.Quality));
-            ImGui.TableNextColumn();
-            ImGui.TextUnformatted($"{line?.PlayerQuantity ?? 0:N0} / {rule.TargetQuantity:N0}");
-            ImGui.TableNextColumn();
-            var difference = rule.TargetQuantity - (line?.PlayerQuantity ?? 0);
-            ImGui.TextUnformatted(difference > 0 ? $"+{difference:N0}" : difference.ToString("N0", CultureInfo.CurrentCulture));
-            ImGui.TableNextColumn();
-            ImGui.TextUnformatted(!rule.Enabled ? "Off" : line?.Action switch
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.transfer.execute",
+            "Review and execute the selected Transfer Plan",
+            canExecute,
+            () =>
             {
-                StowageAction.Retrieve => $"Retrieve {line.RetrieveQuantity:N0}",
-                StowageAction.Deposit => $"Stow {line.DepositQuantity:N0}",
-                _ => "Balanced",
-            });
-            ImGui.TableNextColumn();
-            ImGui.TextUnformatted(line?.Action == StowageAction.Retrieve
-                ? $"{retrievalLine?.CachedRetainerQuantity ?? 0:N0} stored" +
-                  (retrievalLine?.MissingQuantity > 0 ? $" | {retrievalLine.MissingQuantity:N0} missing" : string.Empty)
-                : line?.Action == StowageAction.Deposit
-                    ? RouteSummary(rule.Routing, runtime.Retainers, owner)
-                    : "No movement");
+                var current = runtimeSnapshots.Current;
+                var currentPlan = ResolveSelectedStowagePlan(current.State, current.Owner);
+                if (currentPlan is not null)
+                {
+                    transferReview = new(currentPlan.Id, currentPlan.Name);
+                    requestTransferReviewOpen = true;
+                }
+            },
+            canExecute ? $"{movements:N0} movements" : hasMovement ? "Transfer unavailable" : "Already at target");
+
+        ImGui.Separator();
+        ImGui.TextUnformatted($"{ownerRules.Length:N0} items");
+        ImGui.SameLine();
+        ImGui.TextDisabled("·");
+        ImGui.SameLine();
+        ImGui.TextUnformatted($"{movements:N0} movements");
+        ImGui.SameLine();
+        ImGui.TextColored(new Vector4(.52f, .79f, .94f, 1f), $"Retrieve {retrieval.NeededQuantity:N0}");
+        ImGui.SameLine();
+        ImGui.TextColored(new Vector4(.53f, .83f, .64f, 1f), $"Stow {surplusBatch.PlannedQuantity:N0}");
+        if (!string.IsNullOrWhiteSpace(inlineTransferError))
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), inlineTransferError);
         }
-        ImGui.EndTable();
+
+        var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
+                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
+                    ImGuiTableFlags.SizingStretchProp;
+        var footerHeight = ImGui.GetTextLineHeightWithSpacing() + 4;
+        if (ImGui.BeginTable(
+                "RQTransferWorkbench",
+                7,
+                flags,
+                new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y - footerHeight))))
+        {
+            ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.5f);
+            ImGui.TableSetupColumn("Player", ImGuiTableColumnFlags.WidthFixed, 64);
+            ImGui.TableSetupColumn("Target", ImGuiTableColumnFlags.WidthFixed, 82);
+            ImGui.TableSetupColumn("Diff", ImGuiTableColumnFlags.WidthFixed, 68);
+            ImGui.TableSetupColumn("Outcome", ImGuiTableColumnFlags.WidthFixed, 112);
+            ImGui.TableSetupColumn("Route", ImGuiTableColumnFlags.WidthStretch, 1.1f);
+            ImGui.TableSetupColumn("##remove", ImGuiTableColumnFlags.WidthFixed, 28);
+            ImGui.TableHeadersRow();
+            foreach (var rule in ownerRules)
+            {
+                evaluated.TryGetValue(rule.Id, out var line);
+                retrievalLines.TryGetValue(rule.Id, out var retrievalLine);
+                var playerQuantity = line?.PlayerQuantity ?? 0;
+                var difference = rule.TargetQuantity - playerQuantity;
+
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted(rule.ItemName);
+                ImGui.SameLine();
+                ImGui.TextDisabled(QualityLabel(rule.Quality));
+
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted(playerQuantity.ToString("N0"));
+
+                ImGui.TableNextColumn();
+                ImGui.SetNextItemWidth(-1);
+                var target = rule.TargetQuantity;
+                if (ImGui.InputInt($"##target:{rule.Id}", ref target, 0))
+                    UpdateTransferRule(owner, selected.Id, rule.Id, draftRule =>
+                        draftRule.TargetQuantity = Math.Max(0, target));
+
+                ImGui.TableNextColumn();
+                ImGui.TextColored(
+                    TransferActionColor(line?.Action),
+                    difference > 0
+                        ? $"+{difference:N0}"
+                        : difference.ToString("N0", CultureInfo.CurrentCulture));
+
+                ImGui.TableNextColumn();
+                ImGui.TextColored(
+                    TransferActionColor(line?.Action),
+                    !rule.Enabled ? "Off" : line?.Action switch
+                    {
+                        StowageAction.Retrieve => $"Retrieve {line.RetrieveQuantity:N0}",
+                        StowageAction.Deposit => $"Stow {line.DepositQuantity:N0}",
+                        _ => "On target",
+                    });
+
+                ImGui.TableNextColumn();
+                DrawInlineTransferRoute(owner, selected.Id, rule, runtime);
+
+                ImGui.TableNextColumn();
+                if (ImGui.SmallButton($"×##remove-transfer:{rule.Id}"))
+                    RemoveTransferRule(owner, selected.Id, rule.Id);
+
+                if (line?.Action == StowageAction.Retrieve && retrievalLine?.MissingQuantity > 0)
+                    inlineTransferError = $"{rule.ItemName}: {retrievalLine.MissingQuantity:N0} missing from known retainer stock.";
+            }
+            ImGui.EndTable();
+        }
+
+        ImGui.TextDisabled(
+            hasMovement
+                ? "Balanced items stay visible and are skipped during execution."
+                : "This plan is already satisfied.");
+    }
+
+    private void RequestSelectedTransferReview()
+    {
+        var current = runtimeSnapshots.Current;
+        var plan = ResolveSelectedStowagePlan(current.State, current.Owner);
+        if (plan is null)
+            return;
+        transferReview = new(plan.Id, plan.Name);
+        requestTransferReviewOpen = true;
+    }
+
+    private void DrawInlineTransferRoute(
+        OwnerScope owner,
+        Guid planId,
+        TargetPlanItem rule,
+        QuartermasterRuntimeSnapshot runtime)
+    {
+        ImGui.SetNextItemWidth(-1);
+        if (!ImGui.BeginCombo(
+                $"##inline-route:{rule.Id}",
+                RouteSummary(rule.Routing, runtime.Retainers, owner)))
+            return;
+
+        ImGui.TextDisabled("Placement");
+        foreach (var mode in Enum.GetValues<StowageRoutingMode>())
+        {
+            if (ImGui.Selectable(RoutingModeLabel(mode), rule.Routing.Mode == mode))
+                UpdateTransferRule(owner, planId, rule.Id, draftRule =>
+                    draftRule.Routing.Mode = mode);
+        }
+
+        ImGui.Separator();
+        ImGui.TextDisabled("Fallback");
+        foreach (var overflow in Enum.GetValues<StowageOverflowPolicy>())
+        {
+            if (ImGui.Selectable(OverflowLabel(overflow), rule.Routing.Overflow == overflow))
+                UpdateTransferRule(owner, planId, rule.Id, draftRule =>
+                    draftRule.Routing.Overflow = overflow);
+        }
+
+        var ownerRetainers = runtime.Retainers.Values
+            .Where(retainer => retainer.Owner.Matches(owner))
+            .OrderBy(retainer => retainer.RetainerName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(retainer => retainer.RetainerId)
+            .ToArray();
+        if (ownerRetainers.Length > 0)
+        {
+            ImGui.Separator();
+            ImGui.TextDisabled("Preferred first");
+            foreach (var retainer in ownerRetainers)
+            {
+                var preferred = rule.Routing.PreferredRetainerIds.Contains(retainer.RetainerId);
+                if (ImGui.Selectable(
+                        $"{retainer.RetainerName}##inline-preferred:{rule.Id}:{retainer.RetainerId}",
+                        preferred))
+                {
+                    UpdateTransferRule(owner, planId, rule.Id, draftRule =>
+                    {
+                        if (!draftRule.Routing.PreferredRetainerIds.Remove(retainer.RetainerId))
+                            draftRule.Routing.PreferredRetainerIds.Add(retainer.RetainerId);
+                        draftRule.Routing.Mode = StowageRoutingMode.HomeFirst;
+                    });
+                }
+            }
+        }
+        ImGui.EndCombo();
+    }
+
+    private void UpdateTransferRule(
+        OwnerScope owner,
+        Guid planId,
+        Guid ruleId,
+        Action<TargetPlanItem> update)
+    {
+        try
+        {
+            workbench.SelectedStowagePlanId = state.Mutate(document =>
+            {
+                var draft = StowagePlanCatalog.Draft(document, owner, planId);
+                var draftRule = draft.Rules.Single(rule => rule.Id == ruleId);
+                update(draftRule);
+                return StowagePlanCatalog.Apply(document, owner, draft).Id;
+            });
+            inlineTransferError = string.Empty;
+        }
+        catch (Exception exception)
+        {
+            inlineTransferError = exception.Message;
+        }
+    }
+
+    private void RemoveTransferRule(OwnerScope owner, Guid planId, Guid ruleId)
+    {
+        try
+        {
+            workbench.SelectedStowagePlanId = state.Mutate(document =>
+            {
+                var draft = StowagePlanCatalog.Draft(document, owner, planId);
+                draft.Rules.RemoveAll(rule => rule.Id == ruleId);
+                return StowagePlanCatalog.Apply(document, owner, draft).Id;
+            });
+            inlineTransferError = string.Empty;
+        }
+        catch (Exception exception)
+        {
+            inlineTransferError = exception.Message;
+        }
     }
 
     private void OpenStowageEditor(Guid planId, OwnerScope owner) =>
@@ -2285,7 +2988,28 @@ public sealed class QuartermasterWindow : Window
 
     private void DrawListings(BrowserProjection projection, long revision)
     {
-        DrawBrowserToolbar(projection, listings: true);
+        var sourceListings = projection.GetListings(workbench.ScopeKey);
+        var context = BrowserQueryController.CreateListingContext(sourceListings, projection.Owner);
+        if (DalamudFilterAutocompleteRenderer.Draw(
+                "RQListingsWorkbench",
+                "Search listed items",
+                context,
+                workbench.ListingFilterState,
+                Math.Max(240, ImGui.GetContentRegionAvail().X - 200)))
+            workbench.ListingFilter = workbench.ListingFilterState.Expression;
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(170);
+        var selectedScope = projection.Scopes.First(scope => scope.Key == workbench.ScopeKey);
+        if (ImGui.BeginCombo("##RQListingScope", selectedScope.Label))
+        {
+            foreach (var scope in projection.Scopes)
+            {
+                if (ImGui.Selectable($"{scope.Label}##listing-scope:{scope.Key}", scope.Key == workbench.ScopeKey))
+                    workbench.ScopeKey = scope.Key;
+            }
+            ImGui.EndCombo();
+        }
+
         var result = queries.QueryListings(
             projection,
             workbench.ListingFilter,
@@ -2293,122 +3017,134 @@ public sealed class QuartermasterWindow : Window
             workbench.ListingFilterState.IsInputActive,
             revision);
         if (!result.Filter.IsValid)
-            ImGui.TextColored(new Vector4(1f, .65f, .25f, 1f), result.Filter.Diagnostics.FirstOrDefault()?.Message ?? "Invalid filter");
-        if (!ImGui.BeginTable("RQListings", 6, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable, new Vector2(0, ImGui.GetContentRegionAvail().Y)))
-            return;
-        ImGui.TableSetupColumn("Item"); ImGui.TableSetupColumn("Retainer"); ImGui.TableSetupColumn("Qty"); ImGui.TableSetupColumn("Quality"); ImGui.TableSetupColumn("Unit price"); ImGui.TableSetupColumn("Total");
-        ImGui.TableHeadersRow();
-        foreach (var listing in SortListings(result.Listings))
-        {
-            ImGui.TableNextRow();
-            ImGui.TableNextColumn(); ImGui.TextUnformatted(listing.ItemName);
-            ImGui.TableNextColumn(); ImGui.TextUnformatted(listing.RetainerName);
-            ImGui.TableNextColumn(); ImGui.TextUnformatted(listing.Quantity.ToString("N0"));
-            ImGui.TableNextColumn(); ImGui.TextUnformatted(listing.Quality.ToString());
-            ImGui.TableNextColumn(); ImGui.TextUnformatted(listing.UnitPrice.IsKnown ? $"{listing.UnitPrice.Value:N0}" : "Unknown");
-            ImGui.TableNextColumn(); ImGui.TextUnformatted(listing.TotalPrice.IsKnown ? $"{listing.TotalPrice.Value:N0}" : "Unknown");
-        }
-        ImGui.EndTable();
-    }
+            ImGui.TextColored(
+                new Vector4(1f, .65f, .25f, 1f),
+                result.Filter.Diagnostics.FirstOrDefault()?.Message ?? "Invalid filter");
 
-    private void DrawBrowserToolbar(BrowserProjection projection, bool listings)
-    {
-        ImGui.SetNextItemWidth(190);
-        var selectedScope = projection.Scopes.First(scope => scope.Key == workbench.ScopeKey);
-        if (ImGui.BeginCombo($"##RQScope{(listings ? "Listings" : "Stock")}", selectedScope.Label))
+        var groups = result.Listings
+            .GroupBy(listing => (listing.ItemId, listing.ItemName))
+            .Select(group => new ListingGroupView(
+                group.Key.ItemId,
+                group.Key.ItemName,
+                group.Sum(listing => listing.Quantity),
+                group.Select(listing => listing.RetainerId).Distinct().Count(),
+                group.OrderBy(listing => listing.RetainerName, StringComparer.OrdinalIgnoreCase).ToArray()))
+            .OrderBy(group => group.ItemName, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (groups.Length == 0)
         {
-            foreach (var scope in projection.Scopes)
-                if (ImGui.Selectable($"{scope.Label}##{(listings ? "listing" : "stock")}{scope.Key}", scope.Key == workbench.ScopeKey))
-                    workbench.ScopeKey = scope.Key;
-            ImGui.EndCombo();
+            ImGui.TextDisabled("No listings match this view.");
+            return;
         }
-        ImGui.SameLine();
-        var sourceItems = projection.GetItems(workbench.ScopeKey);
-        var sourceListings = projection.GetListings(workbench.ScopeKey);
-        if (listings)
+
+        if (workbench.SelectedListingItemId is not { } selectedItemId ||
+            groups.All(group => group.ItemId != selectedItemId))
+            workbench.SelectedListingItemId = groups[0].ItemId;
+        var selected = groups.Single(group => group.ItemId == workbench.SelectedListingItemId);
+
+        if (!ImGui.BeginTable(
+                "RQListingsWorkbench",
+                2,
+                ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.Resizable |
+                ImGuiTableFlags.SizingStretchProp,
+                new Vector2(0, Math.Max(260, ImGui.GetContentRegionAvail().Y))))
+            return;
+        ImGui.TableSetupColumn("Items", ImGuiTableColumnFlags.WidthStretch, .9f);
+        ImGui.TableSetupColumn("Listing detail", ImGuiTableColumnFlags.WidthStretch, 1.1f);
+        ImGui.TableNextRow();
+        ImGui.TableNextColumn();
+        if (ImGui.BeginChild("RQListingGroups", Vector2.Zero, false))
         {
-            var context = BrowserQueryController.CreateListingContext(sourceListings, projection.Owner);
-            if (DalamudFilterAutocompleteRenderer.Draw("RQListings", "Filter: is:hq, price<1000, retainer:name", context, workbench.ListingFilterState, Math.Max(220, ImGui.GetContentRegionAvail().X - 190)))
-                workbench.ListingFilter = workbench.ListingFilterState.Expression;
-        }
-        else
-        {
-            var context = BrowserQueryController.CreateItemContext(sourceItems, projection.Owner);
-            if (DalamudFilterAutocompleteRenderer.Draw("RQStock", "Filter: darksteel, ilvl>=600, job:miner", context, workbench.ItemFilterState, Math.Max(220, ImGui.GetContentRegionAvail().X - 190)))
-                workbench.ItemFilter = workbench.ItemFilterState.Expression;
-        }
-        ImGui.SameLine();
-        if (ImGui.SmallButton($"?##RQFilterHelp{listings}"))
-            ImGui.OpenPopup($"RQFilterHelp{listings}");
-        if (ImGui.BeginPopup($"RQFilterHelp{listings}"))
-        {
-            ImGui.TextUnformatted("Filter reference");
-            ImGui.Separator();
-            ImGui.TextDisabled("item/name, ilvl, level, job, slot, rarity, category");
-            ImGui.TextDisabled("unique, tradable, desynth, quantity, retainer");
-            if (listings)
-                ImGui.TextDisabled("is:hq, condition, price, totalPrice");
-            ImGui.TextDisabled("Use AND/OR, comparisons, quotes, and ! for negation.");
-            ImGui.EndPopup();
-        }
-        if (!listings)
-        {
-            ImGui.SameLine();
-            if (ImGui.SmallButton("Storage..."))
-                ImGui.OpenPopup("RQStorageSettings");
-            if (ImGui.BeginPopup("RQStorageSettings"))
+            if (ImGui.BeginTable(
+                    "RQListingGroupRows",
+                    4,
+                    ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
+                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp,
+                    new Vector2(0, ImGui.GetContentRegionAvail().Y)))
             {
-                var includeCrystals = configuration.IncludeCrystals;
-                var includeEquipped = configuration.IncludeEquipped;
-                var includeArmoury = configuration.IncludeArmoury;
-                var includeSaddlebag = configuration.IncludeSaddlebag;
-                var changed = false;
-                changed |= ImGui.Checkbox("Crystals", ref includeCrystals);
-                changed |= ImGui.Checkbox("Equipped", ref includeEquipped);
-                changed |= ImGui.Checkbox("Armoury", ref includeArmoury);
-                changed |= ImGui.Checkbox("Saddlebags", ref includeSaddlebag);
-                if (changed)
+                ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.4f);
+                ImGui.TableSetupColumn("Qty", ImGuiTableColumnFlags.WidthFixed, 58);
+                ImGui.TableSetupColumn("Retainers", ImGuiTableColumnFlags.WidthFixed, 72);
+                ImGui.TableSetupColumn("Price state", ImGuiTableColumnFlags.WidthFixed, 82);
+                ImGui.TableHeadersRow();
+                foreach (var group in groups)
                 {
-                    configuration.IncludeCrystals = includeCrystals;
-                    configuration.IncludeEquipped = includeEquipped;
-                    configuration.IncludeArmoury = includeArmoury;
-                    configuration.IncludeSaddlebag = includeSaddlebag;
-                    saveConfiguration();
+                    ImGui.TableNextRow();
+                    ImGui.TableNextColumn();
+                    if (ImGui.Selectable(
+                            $"{group.ItemName}##listing-group:{group.ItemId}",
+                            group.ItemId == selected.ItemId,
+                            ImGuiSelectableFlags.SpanAllColumns))
+                        workbench.SelectedListingItemId = group.ItemId;
+                    ImGui.TableNextColumn();
+                    ImGui.TextUnformatted(group.Quantity.ToString("N0"));
+                    ImGui.TableNextColumn();
+                    ImGui.TextUnformatted(group.RetainerCount.ToString("N0"));
+                    ImGui.TableNextColumn();
+                    ImGui.TextColored(
+                        group.HasKnownPrice
+                            ? new Vector4(.52f, .79f, .94f, 1f)
+                            : new Vector4(.69f, .74f, .77f, 1f),
+                        group.HasKnownPrice ? "Priced" : "Unknown");
                 }
-                ImGui.EndPopup();
+                ImGui.EndTable();
             }
         }
-        DrawSortControl(listings);
-    }
+        ImGui.EndChild();
 
-    private void DrawSortControl(bool listings)
-    {
-        var options = listings ? new[] { "Item", "Retainer", "Quantity", "Price" } : new[] { "Name", "Total", "Player", "Retainers" };
-        var selected = listings ? workbench.ListingSort : workbench.ItemSort;
-        ImGui.SetNextItemWidth(125);
-        if (ImGui.BeginCombo($"Sort##{listings}", selected))
+        ImGui.TableNextColumn();
+        if (ImGui.BeginChild("RQListingDetail", Vector2.Zero, false))
         {
-            foreach (var option in options)
-                if (ImGui.Selectable(option, selected == option))
+            ImGui.TextUnformatted(selected.ItemName);
+            ImGui.TextDisabled(
+                $"{selected.Listings.Count:N0} physical {(selected.Listings.Count == 1 ? "listing" : "listings")} across {selected.RetainerCount:N0} {(selected.RetainerCount == 1 ? "retainer" : "retainers")}");
+            ImGui.Separator();
+            ImGui.TextDisabled("Total listed");
+            ImGui.SameLine();
+            ImGui.TextUnformatted(selected.Quantity.ToString("N0"));
+            if (selected.HasKnownPrice)
+            {
+                ImGui.SameLine();
+                ImGui.TextDisabled("Lowest");
+                ImGui.SameLine();
+                ImGui.TextUnformatted($"{selected.LowestPrice:N0} gil");
+                ImGui.SameLine();
+                ImGui.TextDisabled("Highest");
+                ImGui.SameLine();
+                ImGui.TextUnformatted($"{selected.HighestPrice:N0} gil");
+            }
+            ImGui.Separator();
+            if (ImGui.BeginTable(
+                    "RQPhysicalListings",
+                    4,
+                    ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
+                    ImGuiTableFlags.SizingStretchProp))
+            {
+                ImGui.TableSetupColumn("Retainer", ImGuiTableColumnFlags.WidthStretch, 1f);
+                ImGui.TableSetupColumn("Qty", ImGuiTableColumnFlags.WidthFixed, 58);
+                ImGui.TableSetupColumn("Quality", ImGuiTableColumnFlags.WidthFixed, 78);
+                ImGui.TableSetupColumn("Unit price", ImGuiTableColumnFlags.WidthFixed, 100);
+                ImGui.TableHeadersRow();
+                foreach (var listing in selected.Listings)
                 {
-                    selected = option;
-                    if (listings)
-                        workbench.ListingSort = selected;
-                    else
-                        workbench.ItemSort = selected;
+                    ImGui.TableNextRow();
+                    ImGui.TableNextColumn();
+                    ImGui.TextUnformatted(listing.RetainerName);
+                    ImGui.TableNextColumn();
+                    ImGui.TextUnformatted(listing.Quantity.ToString("N0"));
+                    ImGui.TableNextColumn();
+                    ImGui.TextUnformatted(listing.Quality.ToString());
+                    ImGui.TableNextColumn();
+                    ImGui.TextUnformatted(
+                        listing.UnitPrice.IsKnown
+                            ? $"{listing.UnitPrice.Value:N0} gil"
+                            : "Unknown");
                 }
-            ImGui.EndCombo();
+                ImGui.EndTable();
+            }
         }
-        ImGui.SameLine();
-        var descending = listings ? workbench.ListingSortDescending : workbench.ItemSortDescending;
-        if (ImGui.SmallButton($"{(descending ? "Desc" : "Asc")}##SortDirection{listings}"))
-        {
-            descending = !descending;
-            if (listings)
-                workbench.ListingSortDescending = descending;
-            else
-                workbench.ItemSortDescending = descending;
-        }
+        ImGui.EndChild();
+        ImGui.EndTable();
     }
 
     private IReadOnlyList<StockGroup> SortItems(IReadOnlyList<StockGroup> rows)
@@ -2421,140 +3157,6 @@ public sealed class QuartermasterWindow : Window
             _ => rows.OrderBy(row => row.ItemName, StringComparer.OrdinalIgnoreCase),
         };
         return (workbench.ItemSortDescending ? sorted.Reverse() : sorted).ToArray();
-    }
-
-    private IReadOnlyList<ListingRow> SortListings(IReadOnlyList<ListingRow> rows)
-    {
-        IEnumerable<ListingRow> sorted = workbench.ListingSort switch
-        {
-            "Retainer" => rows.OrderBy(row => row.RetainerName, StringComparer.OrdinalIgnoreCase),
-            "Quantity" => rows.OrderBy(row => row.Quantity),
-            "Price" => rows.OrderBy(row => row.UnitPrice.IsKnown ? row.UnitPrice.Value : decimal.MaxValue),
-            _ => rows.OrderBy(row => row.ItemName, StringComparer.OrdinalIgnoreCase),
-        };
-        return (workbench.ListingSortDescending ? sorted.Reverse() : sorted).ToArray();
-    }
-
-    private void StageQuickDeposit(StockGroup item, bool? highQuality = null)
-    {
-        foreach (var variant in item.Stacks
-                     .Where(stack => stack.ScopeKind == BrowserScopeKind.Player)
-                     .Where(stack => highQuality is null ||
-                                     (stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ) == highQuality)
-                     .GroupBy(stack => stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ))
-        {
-            var quantity = variant.Sum(stack => stack.Quantity);
-            if (quantity <= 0)
-                continue;
-            var key = (item.ItemId, variant.Key);
-            quickDeposits[key] = new QuickDepositSelection(
-                item.ItemId,
-                item.ItemName,
-                variant.Key,
-                quantity,
-                quantity,
-                null);
-        }
-    }
-
-    private void DrawQuickDeposit(
-        QuartermasterRuntimeSnapshot runtime,
-        IReadOnlyList<TargetPlanItem> ownerRules)
-    {
-        var batch = BuildQuickDepositBatch(runtime, ownerRules);
-        ImGui.TextUnformatted("Quick Deposit");
-        ImGui.SameLine();
-        ImGui.TextDisabled(quickDeposits.Count == 0
-            ? "Stage carried items from the stock table."
-            : $"{batch.PlannedQuantity:N0} ready · {batch.RemainingQuantity:N0} stay with you");
-        if (quickDeposits.Count == 0)
-            return;
-
-        if (ImGui.BeginTable("RQQuickDeposit", 5, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.SizingStretchProp))
-        {
-            ImGui.TableSetupColumn("Item");
-            ImGui.TableSetupColumn("Quantity", ImGuiTableColumnFlags.WidthFixed, 92);
-            ImGui.TableSetupColumn("After", ImGuiTableColumnFlags.WidthFixed, 58);
-            ImGui.TableSetupColumn("Destination");
-            ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 55);
-            ImGui.TableHeadersRow();
-            foreach (var entry in quickDeposits.ToArray())
-            {
-                var selection = entry.Value;
-                ImGui.TableNextRow();
-                ImGui.TableNextColumn();
-                ImGui.TextUnformatted($"{selection.ItemName}{(selection.IsHighQuality ? " HQ" : string.Empty)}");
-                ImGui.TableNextColumn();
-                var quantity = selection.Quantity;
-                ImGui.SetNextItemWidth(-1);
-                if (ImGui.InputInt($"##quickqty{selection.ItemId}:{selection.IsHighQuality}", ref quantity))
-                    quickDeposits[entry.Key] = selection with { Quantity = Math.Clamp(quantity, 1, selection.AvailableQuantity) };
-                ImGui.TableNextColumn();
-                var after = Math.Max(0, selection.AvailableQuantity - selection.Quantity);
-                ImGui.TextUnformatted(after.ToString("N0"));
-                var matchingRule = ownerRules.FirstOrDefault(rule =>
-                    rule.ItemId == selection.ItemId &&
-                    rule.Enabled &&
-                    (rule.Quality == ItemQualityPolicy.Any ||
-                     rule.Quality == (selection.IsHighQuality ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly)));
-                if (matchingRule is not null && after < matchingRule.TargetQuantity)
-                {
-                    ImGui.SameLine();
-                    ImGui.TextColored(new Vector4(1f, .65f, .25f, 1f), "below target");
-                }
-                ImGui.TableNextColumn();
-                DrawQuickDestination(entry.Key, selection, runtime.Retainers, runtime.Owner);
-                ImGui.TableNextColumn();
-                if (ImGui.SmallButton($"Remove##quick{selection.ItemId}:{selection.IsHighQuality}"))
-                    quickDeposits.Remove(entry.Key);
-            }
-            ImGui.EndTable();
-        }
-
-        batch = BuildQuickDepositBatch(runtime, ownerRules);
-        var canDeposit = runtime.Owner.HasStableIdentity &&
-                         batch.PlannedQuantity > 0 &&
-                         transfers.CanStart &&
-                         !autoRetainer.IsRefreshing &&
-                         !autoRetainer.IsQueued;
-        if (!canDeposit)
-            ImGui.BeginDisabled();
-        if (ImGui.Button($"Deposit selected ({batch.PlannedQuantity:N0})"))
-        {
-            var operation = journal.CreateDeposit(runtime.Owner, batch, OperationKinds.QuickDeposit);
-            quickDeposits.Clear();
-            StartTransfer(transfers.ExecuteDepositAsync(operation.OperationId));
-        }
-        if (!canDeposit)
-            ImGui.EndDisabled();
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Clear"))
-            quickDeposits.Clear();
-    }
-
-    private void DrawQuickDestination(
-        (uint ItemId, bool IsHighQuality) key,
-        QuickDepositSelection selection,
-        IReadOnlyDictionary<ulong, CachedRetainer> retainers,
-        OwnerScope owner)
-    {
-        var choices = retainers.Values
-            .Where(retainer => retainer.Owner.Matches(owner))
-            .OrderBy(retainer => retainer.RetainerName, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(retainer => retainer.RetainerId)
-            .ToArray();
-        var label = selection.DestinationOverride is { } id
-            ? choices.FirstOrDefault(retainer => retainer.RetainerId == id)?.RetainerName ?? "Unavailable"
-            : "Use plan routing";
-        ImGui.SetNextItemWidth(-1);
-        if (!ImGui.BeginCombo($"##quickdestination{selection.ItemId}:{selection.IsHighQuality}", label))
-            return;
-        if (ImGui.Selectable("Use plan routing", selection.DestinationOverride is null))
-            quickDeposits[key] = selection with { DestinationOverride = null };
-        foreach (var retainer in choices)
-            if (ImGui.Selectable(retainer.RetainerName, selection.DestinationOverride == retainer.RetainerId))
-                quickDeposits[key] = selection with { DestinationOverride = retainer.RetainerId };
-        ImGui.EndCombo();
     }
 
     private static string QualityLabel(ItemQualityPolicy quality) => quality switch
@@ -2570,35 +3172,6 @@ public sealed class QuartermasterWindow : Window
         ItemQualityPolicy.HqOnly => "HQ only",
         _ => "Any quality",
     };
-
-    private StowageDepositBatch BuildQuickDepositBatch(
-        QuartermasterRuntimeSnapshot runtime,
-        IReadOnlyList<TargetPlanItem> ownerRules)
-    {
-        var requests = quickDeposits.Values.Select(selection =>
-        {
-            var matchingRule = ownerRules.FirstOrDefault(rule =>
-                rule.ItemId == selection.ItemId &&
-                rule.Enabled &&
-                (rule.Quality == ItemQualityPolicy.Any ||
-                 rule.Quality == (selection.IsHighQuality ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly)));
-            return new StowageDepositRequest(
-                null,
-                matchingRule?.Id,
-                selection.ItemId,
-                selection.ItemName,
-                selection.IsHighQuality,
-                Math.Min(selection.Quantity, selection.AvailableQuantity),
-                CopyRouting(matchingRule?.Routing),
-                selection.DestinationOverride);
-        });
-        return StowageRouter.BuildBatch(
-            requests,
-            runtime.Retainers,
-            runtime.Owner,
-            itemId => ResolveMaxStack(runtime.Browser, itemId),
-            DateTime.UtcNow);
-    }
 
     private StowageDepositBatch BuildSurplusBatch(
         QuartermasterRuntimeSnapshot runtime,
@@ -2661,6 +3234,235 @@ public sealed class QuartermasterWindow : Window
         Overflow = routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
         PreferredRetainerIds = routing?.PreferredRetainerIds.ToList() ?? [],
     };
+
+    private void DrawHistoryPopup(OwnerScope owner)
+    {
+        const string popup = "Transfer history##RQ";
+        if (requestHistoryOpen || capturePresentingHistory)
+        {
+            if (!ImGui.IsPopupOpen(popup))
+            {
+                ImGui.SetNextWindowSize(
+                    new Vector2(430, Math.Min(620, ImGui.GetMainViewport().WorkSize.Y - 80)),
+                    ImGuiCond.Appearing);
+                ImGui.OpenPopup(popup);
+            }
+            requestHistoryOpen = false;
+        }
+        if (!ImGui.BeginPopup(popup))
+        {
+            requestHistoryClose = false;
+            return;
+        }
+        if (requestHistoryClose)
+        {
+            requestHistoryClose = false;
+            ImGui.CloseCurrentPopup();
+            ImGui.EndPopup();
+            return;
+        }
+
+        ImGui.TextUnformatted("Transfer history");
+        ImGui.Separator();
+        var operations = state.Snapshot().Operations
+            .Where(operation => operation.Owner.Matches(owner))
+            .OrderByDescending(operation => operation.UpdatedAtUtc)
+            .ThenByDescending(operation => operation.CreatedAtUtc)
+            .Take(30)
+            .ToArray();
+        if (operations.Length == 0)
+        {
+            ImGui.TextDisabled("No Quartermaster operations yet.");
+            ImGui.EndPopup();
+            return;
+        }
+
+        if (ImGui.BeginChild(
+                "RQHistoryRows",
+                new Vector2(410, Math.Min(540, ImGui.GetContentRegionAvail().Y)),
+                false))
+        {
+            foreach (var operation in operations)
+            {
+                var succeeded = operation.Status == OperationStatuses.Succeeded;
+                var failed = operation.Status is OperationStatuses.Failed or OperationStatuses.Indeterminate;
+                ImGui.TextColored(
+                    failed
+                        ? new Vector4(1f, .45f, .45f, 1f)
+                        : succeeded
+                            ? new Vector4(.53f, .83f, .64f, 1f)
+                            : new Vector4(.69f, .74f, .77f, 1f),
+                    operation.Status);
+                ImGui.SameLine();
+                ImGui.TextDisabled(operation.UpdatedAtUtc.ToLocalTime().ToString("g", CultureInfo.CurrentCulture));
+                ImGui.TextUnformatted(operation.SourcePlanName ?? "Quartermaster transfer");
+                ImGui.TextWrapped(operation.Message);
+                ImGui.Separator();
+            }
+        }
+        ImGui.EndChild();
+        ImGui.EndPopup();
+    }
+
+    private void DrawTransferReviewModal()
+    {
+        if (transferReview is not { } review)
+            return;
+        var popup = $"Execute {review.PlanName}##RQTransferReview";
+        if (requestTransferReviewOpen)
+        {
+            ImGui.SetNextWindowSize(
+                new Vector2(Math.Min(860, ImGui.GetMainViewport().WorkSize.X - 80), 520),
+                ImGuiCond.Appearing);
+            ImGui.OpenPopup(popup);
+            requestTransferReviewOpen = false;
+        }
+
+        var open = true;
+        if (!ImGui.BeginPopupModal(popup, ref open, ImGuiWindowFlags.NoScrollbar))
+        {
+            if (!open)
+                transferReview = null;
+            return;
+        }
+
+        var runtime = runtimeSnapshots.Current;
+        var plan = runtime.State.StowagePlans.FirstOrDefault(candidate =>
+            candidate.Id == review.PlanId && candidate.Owner.Matches(runtime.Owner));
+        if (plan is null)
+        {
+            ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), "This Transfer Plan no longer exists.");
+            if (ImGui.Button("Close"))
+            {
+                transferReview = null;
+                ImGui.CloseCurrentPopup();
+            }
+            ImGui.EndPopup();
+            return;
+        }
+
+        var rules = runtime.State.PlanItems
+            .Where(rule => rule.StowagePlanId == plan.Id)
+            .OrderBy(rule => rule.ItemName, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var stowage = StowageEvaluator.BuildPlan(runtime.State, runtime.Browser, runtime.Owner, plan.Id);
+        var retrieval = BuildTransferRetrievalEvaluation(runtime, rules);
+        var deposit = BuildSurplusBatch(runtime, stowage);
+        var evaluated = stowage?.Lines.ToDictionary(line => line.RuleId) ?? [];
+        var movements = evaluated.Values.Count(line =>
+            line.Action is StowageAction.Retrieve or StowageAction.Deposit);
+
+        ImGui.TextUnformatted($"{movements:N0} movements");
+        ImGui.SameLine();
+        ImGui.TextDisabled("·");
+        ImGui.SameLine();
+        ImGui.TextColored(new Vector4(.52f, .79f, .94f, 1f), $"Retrieve {retrieval.NeededQuantity:N0}");
+        ImGui.SameLine();
+        ImGui.TextColored(new Vector4(.53f, .83f, .64f, 1f), $"Stow {deposit.PlannedQuantity:N0}");
+        ImGui.Separator();
+
+        if (ImGui.BeginTable(
+                "RQTransferReviewRows",
+                4,
+                ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
+                ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp,
+                new Vector2(0, Math.Max(260, ImGui.GetContentRegionAvail().Y - 48))))
+        {
+            ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.3f);
+            ImGui.TableSetupColumn("Player / target", ImGuiTableColumnFlags.WidthFixed, 120);
+            ImGui.TableSetupColumn("Diff", ImGuiTableColumnFlags.WidthFixed, 72);
+            ImGui.TableSetupColumn("Planned movement", ImGuiTableColumnFlags.WidthStretch, 1.2f);
+            ImGui.TableHeadersRow();
+            foreach (var rule in rules)
+            {
+                evaluated.TryGetValue(rule.Id, out var line);
+                var player = line?.PlayerQuantity ?? 0;
+                var difference = rule.TargetQuantity - player;
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted(rule.ItemName);
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted($"{player:N0} / {rule.TargetQuantity:N0}");
+                ImGui.TableNextColumn();
+                ImGui.TextColored(
+                    TransferActionColor(line?.Action),
+                    difference > 0
+                        ? $"+{difference:N0}"
+                        : difference.ToString("N0", CultureInfo.CurrentCulture));
+                ImGui.TableNextColumn();
+                ImGui.TextColored(
+                    TransferActionColor(line?.Action),
+                    line?.Action switch
+                    {
+                        StowageAction.Retrieve => $"Retrieve {line.RetrieveQuantity:N0}",
+                        StowageAction.Deposit => $"Stow {line.DepositQuantity:N0} · {RouteSummary(rule.Routing, runtime.Retainers, runtime.Owner)}",
+                        _ => "On target · skip",
+                    });
+            }
+            ImGui.EndTable();
+        }
+
+        if (ImGui.Button("Back"))
+        {
+            transferReview = null;
+            ImGui.CloseCurrentPopup();
+        }
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.transfer.review.back",
+            "Return to the Transfer Plan without executing",
+            true,
+            () => transferReview = null,
+            "No inventory movement");
+        ImGui.SameLine();
+        ImGui.TextDisabled("Balanced items remain in the plan but require no movement.");
+        var canExecute = movements > 0 &&
+                         plan.Enabled &&
+                         runtime.Owner.HasStableIdentity &&
+                         transfers.CanStart &&
+                         !autoRetainer.IsRefreshing &&
+                         !autoRetainer.IsQueued;
+        ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - 110));
+        if (!canExecute)
+            ImGui.BeginDisabled();
+        if (ImGui.Button("Execute plan"))
+        {
+            ExecuteTransferPlan(plan.Id);
+            transferReview = null;
+            ImGui.CloseCurrentPopup();
+        }
+        if (!canExecute)
+            ImGui.EndDisabled();
+
+        ImGui.EndPopup();
+        if (!open)
+            transferReview = null;
+    }
+
+    private void ExecuteTransferPlan(Guid planId)
+    {
+        var current = runtimeSnapshots.Current;
+        var plan = current.State.StowagePlans.FirstOrDefault(candidate =>
+            candidate.Id == planId && candidate.Owner.Matches(current.Owner));
+        if (plan is null || !plan.Enabled)
+            return;
+        var rules = current.State.PlanItems
+            .Where(rule => rule.StowagePlanId == plan.Id)
+            .ToArray();
+        var currentStowage = StowageEvaluator.BuildPlan(
+            current.State,
+            current.Browser,
+            current.Owner,
+            plan.Id);
+        var currentRetrieval = BuildTransferRetrievalEvaluation(current, rules);
+        var currentBatch = BuildSurplusBatch(current, currentStowage);
+        var retrievalOperationId = currentRetrieval.NeededQuantity > 0
+            ? journal.CreateTransferRetrieval(current.Owner, plan, rules).OperationId
+            : null;
+        var depositOperationId = currentBatch.PlannedQuantity > 0
+            ? journal.CreateTransferDeposit(current.Owner, plan, currentBatch).OperationId
+            : null;
+        StartTransfer(transfers.ExecutePlanAsync(retrievalOperationId, depositOperationId));
+    }
 
     private void DrawOperation(OwnerScope owner)
     {
@@ -2828,12 +3630,27 @@ public sealed class QuartermasterWindow : Window
         catch (AggregateException exception) when (exception.InnerExceptions.All(inner => inner is OperationCanceledException)) { return true; }
     }
 
-    private sealed record ItemChoice(uint ItemId, string Name, string Label);
-    private sealed record QuickDepositSelection(
+    private sealed record TransferReviewRequest(Guid PlanId, string PlanName);
+
+    private sealed record ListingGroupView(
         uint ItemId,
         string ItemName,
-        bool IsHighQuality,
-        int AvailableQuantity,
         int Quantity,
-        ulong? DestinationOverride);
+        int RetainerCount,
+        IReadOnlyList<ListingRow> Listings)
+    {
+        public bool HasKnownPrice => Listings.Any(listing => listing.UnitPrice.IsKnown);
+        public decimal LowestPrice => Listings
+            .Where(listing => listing.UnitPrice.IsKnown)
+            .Select(listing => listing.UnitPrice.Value)
+            .DefaultIfEmpty()
+            .Min();
+        public decimal HighestPrice => Listings
+            .Where(listing => listing.UnitPrice.IsKnown)
+            .Select(listing => listing.UnitPrice.Value)
+            .DefaultIfEmpty()
+            .Max();
+    }
+
+    private sealed record ItemChoice(uint ItemId, string Name, string Label);
 }

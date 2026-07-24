@@ -4,7 +4,7 @@ using Franthropy.Dalamud.UI.Filtering;
 
 namespace RQ.UI;
 
-public enum WorkbenchView { Stock, Restock, Stowage, Listings, Activity }
+public enum WorkbenchView { Stock, Restock, Stowage, ItemGroups, Listings, Activity }
 
 public sealed class WorkbenchState
 {
@@ -21,6 +21,7 @@ public sealed class WorkbenchState
     public bool ItemSortDescending { get; set; }
     public string ListingSort { get; set; } = "Item";
     public bool ListingSortDescending { get; set; }
+    public uint? SelectedListingItemId { get; set; }
     public StockGroup? SelectedStock { get; private set; }
     public string StagedTargetText { get; set; } = string.Empty;
 

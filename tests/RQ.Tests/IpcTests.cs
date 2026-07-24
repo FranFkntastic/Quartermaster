@@ -128,7 +128,7 @@ public sealed class IpcTests
             SnapshotPublisher.RestockPlansCapability,
             document.RootElement.GetProperty("capabilities").EnumerateArray().Select(value => value.GetString()));
         Assert.Equal(
-            ["transfer", "listings", "activity"],
+            ["transfer", "transfer-review", "item-groups", "listings", "activity"],
             document.RootElement.GetProperty("reviewSurfaces").EnumerateArray()
                 .Select(surface => surface.GetProperty("id").GetString()));
     }
