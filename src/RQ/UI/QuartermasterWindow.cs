@@ -934,44 +934,21 @@ public sealed class QuartermasterWindow : Window
 
         if (ImGui.Button("<- Back to plan##itemgroups"))
         {
-            if (hasChanges)
-                itemGroupEditorError = "Save or discard this Item Group before returning to the plan.";
-            else
-            {
-                CloseItemGroupEditor();
-                return;
-            }
+            CloseItemGroupEditor();
+            return;
         }
         reviewRegistry.RegisterLastButton(
             "quartermaster.item-groups.back",
-            "Return to the suspended Transfer Plan draft",
+            "Discard the open Item Group draft and return to the Transfer Plan",
             true,
-            () =>
-            {
-                if (itemGroupDraft is not null &&
-                    !ItemGroupCatalog.HasChanges(state.Snapshot(), itemGroupDraft))
-                    CloseItemGroupEditor();
-            },
-            hasChanges ? "Unsaved group changes" : "Available");
-        if (hasChanges)
-        {
-            ImGui.SameLine();
-            if (ImGui.Button("Discard and return##itemgroups"))
-            {
-                CloseItemGroupEditor();
-                return;
-            }
-            reviewRegistry.RegisterLastButton(
-                "quartermaster.item-groups.discard-and-return",
-                "Discard the open Item Group draft and return to the Transfer Plan",
-                true,
-                CloseItemGroupEditor,
-                "The Transfer Plan draft remains open");
-        }
+            CloseItemGroupEditor,
+            hasChanges ? "Unsaved Item Group changes will be discarded" : "The Transfer Plan draft remains open");
         ImGui.SameLine();
         ImGui.TextUnformatted("Item groups");
         ImGui.SameLine();
         ImGui.TextDisabled("Shared by Restock and Stowage");
+        if (hasChanges)
+            ImGui.TextColored(new Vector4(1f, .7f, .3f, 1f), "Returning to the plan will discard unsaved Item Group changes.");
 
         if (!string.IsNullOrWhiteSpace(itemGroupEditorError))
             ImGui.TextColored(new Vector4(1f, .45f, .4f, 1f), itemGroupEditorError);
@@ -999,16 +976,10 @@ public sealed class QuartermasterWindow : Window
         ImGui.TextDisabled(draft.IsNew && draft.Items.Count == 0
             ? "Add at least one item to save this group."
             : canApply ? "Unsaved changes - groups remember item and quality; plans own quantities and routing." : "No unsaved changes.");
-        ImGui.SameLine(ImGui.GetContentRegionAvail().X - 190);
-        if (ImGui.Button("Discard##itemgroupeditor"))
-            CloseItemGroupEditor();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.item-groups.discard",
-            "Discard the open Item Group draft",
-            true,
-            CloseItemGroupEditor,
-            "The Transfer Plan draft remains open");
-        ImGui.SameLine();
+        var saveButtonWidth = ImGui.CalcTextSize("Save group").X + (ImGui.GetStyle().FramePadding.X * 2);
+        ImGui.SameLine(Math.Max(
+            ImGui.GetCursorPosX() + ImGui.GetStyle().ItemSpacing.X,
+            ImGui.GetWindowContentRegionMax().X - saveButtonWidth));
         if (!canApply)
             ImGui.BeginDisabled();
         if (ImGui.Button("Save group##itemgroupeditor"))
