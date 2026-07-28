@@ -3185,7 +3185,7 @@ public sealed class QuartermasterWindow : Window
         ImGui.TableNextColumn();
         if (ImGui.BeginChild("RQListingGroups", Vector2.Zero, false))
         {
-            if (listingGroupTable.Begin("RQListingGroupRows", ImGui.GetContentRegionAvail().Y))
+            if (listingGroupTable.Begin("RQListingGroupRowsV2", ImGui.GetContentRegionAvail().Y))
             {
                 listingGroupTable.DrawFilterRow();
                 var visibleGroups = listingGroupTable.Apply(groups, ImGui.TableGetSortSpecs());
