@@ -3157,7 +3157,7 @@ public sealed class QuartermasterWindow : Window
                     },
                     listingNavigation.IsRunning ? listingNavigation.Status : "Ready");
             }
-            DrawListingNavigationStatus();
+            DrawListingNavigationStatus(showRecovery: true);
             return;
         }
 
@@ -3333,16 +3333,16 @@ public sealed class QuartermasterWindow : Window
         _ = listingNavigation.OpenRetainerListingsAsync(
             new(listing.RetainerId, listing.RetainerName));
 
-    private void DrawListingNavigationStatus()
+    private void DrawListingNavigationStatus(bool showRecovery = false)
     {
-        if (string.IsNullOrWhiteSpace(listingNavigation.Status))
+        if (!string.IsNullOrWhiteSpace(listingNavigation.Status))
+            ImGui.TextDisabled(listingNavigation.Status);
+        if (!showRecovery &&
+            !listingNavigation.Status.StartsWith("Opened ", StringComparison.Ordinal))
             return;
 
-        ImGui.TextDisabled(listingNavigation.Status);
-        if (!listingNavigation.Status.StartsWith("Opened ", StringComparison.Ordinal))
-            return;
-
-        ImGui.SameLine();
+        if (!string.IsNullOrWhiteSpace(listingNavigation.Status))
+            ImGui.SameLine();
         if (listingNavigation.IsRunning)
             ImGui.BeginDisabled();
         if (ImGui.SmallButton("Return to retainer list"))
