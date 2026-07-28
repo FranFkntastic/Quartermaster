@@ -46,6 +46,7 @@ public sealed record ListingRow(
     string ScopeKey,
     ulong RetainerId,
     string RetainerName,
+    int? SlotIndex,
     uint ItemId,
     string ItemName,
     int Quantity,
@@ -137,7 +138,7 @@ public static class BrowserProjectionBuilder
             foreach (var listing in retainer.Listings.Where(listing => listing.ItemId > 0 && listing.Quantity > 0))
             {
                 var price = listing.UnitPrice is { } known ? Evidence.Known((decimal)known) : Evidence.Unknown<decimal>("Unit price was not observed.");
-                listings.Add(new(key, retainer.RetainerId, name, listing.ItemId, DisplayName(listing.ItemId, listing.ItemName), checked((int)listing.Quantity), listing.IsHq ? FfxivItemQuality.HQ : FfxivItemQuality.NQ,
+                listings.Add(new(key, retainer.RetainerId, name, listing.SlotIndex, listing.ItemId, DisplayName(listing.ItemId, listing.ItemName), checked((int)listing.Quantity), listing.IsHq ? FfxivItemQuality.HQ : FfxivItemQuality.NQ,
                     listing.ConditionPercent is >= 0 and <= 100 ? Evidence.Known((decimal)listing.ConditionPercent.Value) : Evidence.Unknown<decimal>("Condition was not observed."),
                     price,
                     price.IsKnown ? Evidence.Known(price.Value * listing.Quantity) : Evidence.Unknown<decimal>("Total price requires a unit price."),

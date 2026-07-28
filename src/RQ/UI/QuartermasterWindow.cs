@@ -1,12 +1,15 @@
 using System.Globalization;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface;
+using Dalamud.Interface.Components;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin.Services;
 using Dalamud.Utility;
 using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.UI.Filtering;
 using Franthropy.Dalamud.UI.Tables;
+using Franthropy.FFXIV.Filtering;
 using Lumina.Excel.Sheets;
 using RQ.Automation;
 using RQ.Domain;
@@ -25,6 +28,7 @@ public sealed class QuartermasterWindow : Window
     private readonly OperationJournal journal;
     private readonly TransferCoordinator transfers;
     private readonly AutoRetainerRefreshService autoRetainer;
+    private readonly ListingNavigationCoordinator listingNavigation;
     private readonly IDataManager dataManager;
     private readonly PluginConfiguration configuration;
     private readonly System.Action saveConfiguration;
@@ -92,6 +96,7 @@ public sealed class QuartermasterWindow : Window
         OperationJournal journal,
         TransferCoordinator transfers,
         AutoRetainerRefreshService autoRetainer,
+        ListingNavigationCoordinator listingNavigation,
         IDataManager dataManager,
         PluginConfiguration configuration,
         System.Action saveConfiguration,
@@ -103,6 +108,7 @@ public sealed class QuartermasterWindow : Window
         this.journal = journal;
         this.transfers = transfers;
         this.autoRetainer = autoRetainer;
+        this.listingNavigation = listingNavigation;
         this.dataManager = dataManager;
         this.configuration = configuration;
         this.saveConfiguration = saveConfiguration;
@@ -642,6 +648,18 @@ public sealed class QuartermasterWindow : Window
             }
             ImGui.EndPopup();
         }
+
+        ImGui.SameLine();
+        if (ImGuiComponents.IconButton("QuartermasterRefresh", FontAwesomeIcon.BookOpen))
+            autoRetainer.Start();
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.refresh-retainers",
+            "Refresh retainers",
+            autoRetainer.IsAvailable,
+            () => autoRetainer.Start(),
+            autoRetainer.Status);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Refresh all Quartermaster retainer inventory caches.");
     }
 
     private void DrawStockSelectionBar(QuartermasterRuntimeSnapshot runtime)
@@ -3145,7 +3163,7 @@ public sealed class QuartermasterWindow : Window
             ImGui.Separator();
             if (ImGui.BeginTable(
                     "RQPhysicalListings",
-                    4,
+                    5,
                     ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
                     ImGuiTableFlags.SizingStretchProp))
             {
@@ -3153,9 +3171,12 @@ public sealed class QuartermasterWindow : Window
                 ImGui.TableSetupColumn("Qty", ImGuiTableColumnFlags.WidthFixed, 58);
                 ImGui.TableSetupColumn("Quality", ImGuiTableColumnFlags.WidthFixed, 78);
                 ImGui.TableSetupColumn("Unit price", ImGuiTableColumnFlags.WidthFixed, 100);
+                ImGui.TableSetupColumn("Action", ImGuiTableColumnFlags.WidthFixed, 92);
                 ImGui.TableHeadersRow();
-                foreach (var listing in selected.Listings)
+                for (var listingIndex = 0; listingIndex < selected.Listings.Count; listingIndex++)
                 {
+                    var listing = selected.Listings[listingIndex];
+                    ImGui.PushID($"{listing.RetainerId}:{listing.SlotIndex}:{listing.ItemId}:{listing.Quantity}");
                     ImGui.TableNextRow();
                     ImGui.TableNextColumn();
                     ImGui.TextUnformatted(listing.RetainerName);
@@ -3168,12 +3189,47 @@ public sealed class QuartermasterWindow : Window
                         listing.UnitPrice.IsKnown
                             ? $"{listing.UnitPrice.Value:N0} gil"
                             : "Unknown");
+                    ImGui.TableNextColumn();
+                    if (listingNavigation.IsRunning)
+                        ImGui.BeginDisabled();
+                    if (ImGui.Button("Open listing"))
+                        OpenListing(listing);
+                    if (listingNavigation.IsRunning)
+                        ImGui.EndDisabled();
+                    reviewRegistry.RegisterLastButton(
+                        listingIndex == 0
+                            ? "quartermaster.listings.open-first"
+                            : $"quartermaster.listings.open.{listing.RetainerId}.{listing.SlotIndex}.{listing.ItemId}",
+                        $"Open {listing.ItemName} on {listing.RetainerName}",
+                        !listingNavigation.IsRunning,
+                        () => OpenListing(listing),
+                        listingNavigation.IsRunning ? listingNavigation.Status : "Ready");
+                    ImGui.PopID();
                 }
                 ImGui.EndTable();
             }
+            if (!string.IsNullOrWhiteSpace(listingNavigation.Status))
+                ImGui.TextDisabled(listingNavigation.Status);
         }
         ImGui.EndChild();
         ImGui.EndTable();
+    }
+
+    private void OpenListing(ListingRow listing)
+    {
+        uint? unitPrice = listing.UnitPrice.IsKnown &&
+                          listing.UnitPrice.Value is > 0 and <= uint.MaxValue
+            ? decimal.ToUInt32(listing.UnitPrice.Value)
+            : null;
+        _ = listingNavigation.OpenAsync(new(
+            listing.RetainerId,
+            listing.RetainerName,
+            listing.SlotIndex,
+            listing.ItemId,
+            listing.ItemName,
+            listing.Quantity,
+            listing.Quality == FfxivItemQuality.HQ,
+            unitPrice));
     }
 
     private IReadOnlyList<StockGroup> SortItems(IReadOnlyList<StockGroup> rows)

@@ -39,6 +39,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly AutoRetainerRefreshService autoRetainer;
     private readonly OperationJournal journal;
     private readonly TransferCoordinator transfers;
+    private readonly ListingNavigationCoordinator listingNavigation;
     private readonly AutomaticRetrievalQueue automaticRetrievals;
     private readonly QuartermasterRuntimeSnapshotSource runtimeSnapshots;
     private readonly SnapshotPublisher snapshots;
@@ -113,6 +114,7 @@ public sealed class Plugin : IDalamudPlugin
         RetainerStockMutationPersistence.RecoverPending(journal, cache);
         journal.ReconcileInterruptedOperations();
         var driver = new RetainerLiveDriver(retainerSession);
+        listingNavigation = new(retainerSession, autoRetainerIpc, automation);
         transfers = new TransferCoordinator(
             journal,
             driver,
@@ -139,6 +141,7 @@ public sealed class Plugin : IDalamudPlugin
             journal,
             transfers,
             autoRetainer,
+            listingNavigation,
             dataManager,
             configuration,
             SaveConfiguration,
@@ -354,7 +357,7 @@ public sealed class Plugin : IDalamudPlugin
             ? runtime.State.PlanItems.Where(item => item.StowagePlanId == planId).ToArray()
             : [];
         return new QuartermasterBridgeTruth(
-            7,
+            8,
             configuration.PluginInstanceId,
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
@@ -387,13 +390,16 @@ public sealed class Plugin : IDalamudPlugin
             autoRetainer.IsAvailable,
             autoRetainer.IsRefreshing || autoRetainer.IsQueued,
             autoRetainer.Status,
-            transfers.IsRunning);
+            transfers.IsRunning,
+            listingNavigation.IsRunning,
+            listingNavigation.Status);
     }
 
     public void Dispose()
     {
         playerInventory.Flush();
         automaticRetrievals.Dispose();
+        listingNavigation.Dispose();
         window.CancelAndWaitForActiveTransfer(TimeSpan.FromSeconds(2));
         agentBridge.Dispose();
         framework.Update -= OnFrameworkUpdate;
