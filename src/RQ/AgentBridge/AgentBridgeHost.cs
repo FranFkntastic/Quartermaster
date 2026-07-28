@@ -276,7 +276,7 @@ public sealed class AgentBridgeHost : IDisposable
                 true),
             new(
                 "quartermaster.listings.open-first",
-                "Open the first visible physical listing",
+                "Open the focused retainer's listings",
                 "listings",
                 AgentBridgeUiControlKind.Button,
                 true),

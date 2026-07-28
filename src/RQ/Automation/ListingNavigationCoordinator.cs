@@ -13,6 +13,7 @@ public sealed record ListingOpenRequest(
     uint? UnitPrice);
 
 public sealed record ListingOpenResult(bool Started, bool Success, string Message);
+public sealed record RetainerListingsOpenRequest(ulong RetainerId, string RetainerName);
 
 /// <summary>
 /// Owns the product workflow for navigating from a cached Quartermaster listing to
@@ -113,6 +114,76 @@ public sealed class ListingNavigationCoordinator : IDisposable
                 {
                     try { autoRetainer.SetSuppressed(false); }
                     catch (Exception exception) { Status = $"The listing opened, but AutoRetainer suppression could not be restored: {exception.Message}"; }
+                }
+                Interlocked.Exchange(ref running, 0);
+            }
+        }
+    }
+
+    public async Task<ListingOpenResult> OpenRetainerListingsAsync(
+        RetainerListingsOpenRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(disposed, this);
+        if (request.RetainerId == 0 || string.IsNullOrWhiteSpace(request.RetainerName))
+            return Complete(false, false, "This retainer does not have a stable identity.");
+        if (!automation.TryAcquire("listing navigation", out var lease))
+            return Complete(false, false, $"Automation is busy with {automation.Holder}.");
+
+        using (lease)
+        {
+            if (Interlocked.CompareExchange(ref running, 1, 0) != 0)
+                return Complete(false, false, "Another listing surface is already opening.");
+
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
+            var token = linked.Token;
+            var restoreSuppression = false;
+            try
+            {
+                if (!await WaitForAutoRetainerAsync(token).ConfigureAwait(false))
+                    return Complete(false, false, "AutoRetainer remained busy; the listings were not opened.");
+
+                if (autoRetainer.IsAvailable && !autoRetainer.IsSuppressed)
+                {
+                    autoRetainer.SetSuppressed(true);
+                    restoreSuppression = true;
+                }
+
+                Status = $"Opening {request.RetainerName}'s listings…";
+                var list = await session.EnsureRetainerListAsync(token).ConfigureAwait(false);
+                if (!list.Success)
+                    return Complete(true, false, Format(list));
+
+                var retainer = await session.OpenRetainerAsync(
+                    new(request.RetainerId, request.RetainerName),
+                    token).ConfigureAwait(false);
+                if (!retainer.Success)
+                    return Complete(true, false, Format(retainer));
+
+                var listings = await session.OpenSellingListAsync(token).ConfigureAwait(false);
+                if (listings.Success)
+                    return Complete(true, true, $"Opened {request.RetainerName}'s listings.");
+
+                var failure = Format(listings);
+                var recovery = await session.ReturnToRetainerListAsync(token).ConfigureAwait(false);
+                return recovery.Success
+                    ? Complete(true, false, failure)
+                    : Complete(true, false, $"{failure} Recovery also failed: {Format(recovery)}");
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                return Complete(true, false, "Listing navigation was cancelled.");
+            }
+            catch (Exception exception)
+            {
+                return Complete(true, false, $"Listing navigation failed: {exception.Message}");
+            }
+            finally
+            {
+                if (restoreSuppression)
+                {
+                    try { autoRetainer.SetSuppressed(false); }
+                    catch (Exception exception) { Status = $"The listings opened, but AutoRetainer suppression could not be restored: {exception.Message}"; }
                 }
                 Interlocked.Exchange(ref running, 0);
             }

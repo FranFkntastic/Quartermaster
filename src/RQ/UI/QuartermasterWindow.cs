@@ -36,6 +36,10 @@ public sealed class QuartermasterWindow : Window
     private readonly AgentBridgeUiCaptureTransactionManager captureTransactions;
     private readonly WorkbenchState workbench = new();
     private readonly TableSelectionModel<uint> stockSelection = new();
+    private readonly TableSelectionModel<uint> listingGroupSelection = new();
+    private readonly TableSelectionModel<ListingRowKey> physicalListingSelection = new();
+    private readonly DalamudTableProjection<ListingGroupView> listingGroupTable;
+    private readonly DalamudTableProjection<ListingRow> physicalListingTable;
     private readonly BrowserQueryController queries = new();
     private readonly RootConfirmationDialog confirmationDialog = new();
     private string transferStatus = "No transfer has run.";
@@ -89,6 +93,7 @@ public sealed class QuartermasterWindow : Window
     private WorkbenchView? capturePreviousView;
     private TransferReviewRequest? capturePreviousTransferReview;
     private bool capturePreviousTransferReviewOpenRequest;
+    private ListingRowKey? focusedListing;
 
     public QuartermasterWindow(
         StateRepository state,
@@ -113,6 +118,66 @@ public sealed class QuartermasterWindow : Window
         this.configuration = configuration;
         this.saveConfiguration = saveConfiguration;
         this.reviewRegistry = reviewRegistry;
+        listingGroupTable = new(
+        [
+            new(
+                "Item",
+                1.45f,
+                row => row.ItemName,
+                row => row.ItemName,
+                ImGuiTableColumnFlags.WidthStretch),
+            new(
+                "Listed",
+                62,
+                row => row.Quantity.ToString("N0"),
+                row => row.Quantity,
+                Alignment: DalamudTableCellAlignment.Right),
+            new(
+                "Unlisted",
+                72,
+                row => row.UnlistedQuantity.IsKnown ? row.UnlistedQuantity.Value.ToString("N0") : "—",
+                row => row.UnlistedQuantity.IsKnown ? row.UnlistedQuantity.Value : -1,
+                Alignment: DalamudTableCellAlignment.Right),
+            new(
+                "Retainers",
+                72,
+                row => row.RetainerCount.ToString("N0"),
+                row => row.RetainerCount,
+                Alignment: DalamudTableCellAlignment.Right),
+            new(
+                "Price range",
+                130,
+                ListingPriceRange,
+                row => row.HasKnownPrice ? row.LowestPrice : decimal.MinValue,
+                Alignment: DalamudTableCellAlignment.Right),
+        ]);
+        physicalListingTable = new(
+        [
+            new(
+                "Retainer",
+                1f,
+                row => row.RetainerName,
+                row => row.RetainerName,
+                ImGuiTableColumnFlags.WidthStretch,
+                Draw: DrawListingRetainerCell),
+            new(
+                "Qty",
+                62,
+                row => row.Quantity.ToString("N0"),
+                row => row.Quantity,
+                Alignment: DalamudTableCellAlignment.Right),
+            new(
+                "Quality",
+                78,
+                row => row.Quality.ToString(),
+                row => row.Quality),
+            new(
+                "Unit price",
+                104,
+                ListingUnitPrice,
+                row => row.UnitPrice.IsKnown ? row.UnitPrice.Value : decimal.MinValue,
+                Alignment: DalamudTableCellAlignment.Right),
+        ]);
         captureTransactions = new(
             () => IsOpen,
             value => IsOpen = value,
@@ -3079,6 +3144,12 @@ public sealed class QuartermasterWindow : Window
             groups.All(group => group.ItemId != selectedItemId))
             workbench.SelectedListingItemId = groups[0].ItemId;
         var selected = groups.Single(group => group.ItemId == workbench.SelectedListingItemId);
+        listingGroupSelection.Retain(groups.Select(group => group.ItemId));
+        listingGroupSelection.SelectOnly(selected.ItemId);
+        var listingKeys = selected.Listings.Select(ListingRowKey.From).ToArray();
+        physicalListingSelection.Retain(listingKeys);
+        if (focusedListing is not { } focusedKey || !listingKeys.Contains(focusedKey))
+            focusedListing = listingKeys.Length > 0 ? listingKeys[0] : null;
 
         if (!ImGui.BeginTable(
                 "RQListingsWorkbench",
@@ -3093,48 +3164,29 @@ public sealed class QuartermasterWindow : Window
         ImGui.TableNextColumn();
         if (ImGui.BeginChild("RQListingGroups", Vector2.Zero, false))
         {
-            if (ImGui.BeginTable(
-                    "RQListingGroupRows",
-                    5,
-                    ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
-                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp |
-                    ImGuiTableFlags.Hideable,
-                    new Vector2(0, ImGui.GetContentRegionAvail().Y)))
+            if (listingGroupTable.Begin("RQListingGroupRows", ImGui.GetContentRegionAvail().Y))
             {
-                ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.4f);
-                ImGui.TableSetupColumn("Qty", ImGuiTableColumnFlags.WidthFixed, 58);
-                ImGui.TableSetupColumn("Unlisted", ImGuiTableColumnFlags.WidthFixed, 68);
-                ImGui.TableSetupColumn("Retainers", ImGuiTableColumnFlags.WidthFixed, 72);
-                ImGui.TableSetupColumn("Price state", ImGuiTableColumnFlags.WidthFixed, 82);
-                ImGui.TableHeadersRow();
-                foreach (var group in groups)
+                listingGroupTable.DrawFilterRow();
+                var visibleGroups = listingGroupTable.Apply(groups, ImGui.TableGetSortSpecs());
+                var groupKeys = visibleGroups.Select(group => group.ItemId).ToArray();
+                for (var groupIndex = 0; groupIndex < visibleGroups.Count; groupIndex++)
                 {
-                    ImGui.TableNextRow();
-                    ImGui.TableNextColumn();
-                    if (ImGui.Selectable(
-                            $"{group.ItemName}##listing-group:{group.ItemId}",
-                            group.ItemId == selected.ItemId,
-                            ImGuiSelectableFlags.SpanAllColumns))
+                    var group = visibleGroups[groupIndex];
+                    if (listingGroupTable.DrawSelectableRow(
+                            group,
+                            listingGroupSelection,
+                            groupKeys,
+                            groupIndex,
+                            $"##listing-group:{group.ItemId}"))
+                    {
+                        listingGroupSelection.SelectOnly(group.ItemId);
                         workbench.SelectedListingItemId = group.ItemId;
-                    ImGui.TableNextColumn();
-                    ImGui.TextUnformatted(group.Quantity.ToString("N0"));
-                    ImGui.TableNextColumn();
-                    ImGui.TextUnformatted(
-                        group.UnlistedQuantity.IsKnown
-                            ? group.UnlistedQuantity.Value.ToString("N0")
-                            : "—");
-                    if (!group.UnlistedQuantity.IsKnown && ImGui.IsItemHovered())
-                        ImGui.SetTooltip(group.UnlistedQuantity.UnknownReason);
-                    ImGui.TableNextColumn();
-                    ImGui.TextUnformatted(group.RetainerCount.ToString("N0"));
-                    ImGui.TableNextColumn();
-                    ImGui.TextColored(
-                        group.HasKnownPrice
-                            ? new Vector4(.52f, .79f, .94f, 1f)
-                            : new Vector4(.69f, .74f, .77f, 1f),
-                        group.HasKnownPrice ? "Priced" : "Unknown");
+                        physicalListingSelection.Clear();
+                        focusedListing = null;
+                    }
                 }
-                ImGui.EndTable();
+                DalamudTableSelectionRenderer.EndRows(listingGroupSelection);
+                listingGroupTable.End();
             }
         }
         ImGui.EndChild();
@@ -3143,6 +3195,31 @@ public sealed class QuartermasterWindow : Window
         if (ImGui.BeginChild("RQListingDetail", Vector2.Zero, false))
         {
             ImGui.TextUnformatted(selected.ItemName);
+            var navigationTarget = ResolveListingNavigationTarget(selected.Listings);
+            var canOpenListings = navigationTarget is not null && !listingNavigation.IsRunning;
+            var openButtonWidth = ImGui.CalcTextSize("Open retainer listings").X +
+                                  ImGui.GetStyle().FramePadding.X * 2;
+            ImGui.SameLine(Math.Max(
+                ImGui.GetCursorPosX(),
+                ImGui.GetWindowContentRegionMax().X - openButtonWidth));
+            if (!canOpenListings)
+                ImGui.BeginDisabled();
+            if (ImGui.Button("Open retainer listings") && navigationTarget is not null)
+                OpenRetainerListings(navigationTarget);
+            if (!canOpenListings)
+                ImGui.EndDisabled();
+            reviewRegistry.RegisterLastButton(
+                "quartermaster.listings.open-first",
+                navigationTarget is null
+                    ? "Open retainer listings"
+                    : $"Open {navigationTarget.RetainerName}'s listings",
+                canOpenListings,
+                () =>
+                {
+                    if (ResolveListingNavigationTarget(selected.Listings) is { } target)
+                        OpenRetainerListings(target);
+                },
+                listingNavigation.IsRunning ? listingNavigation.Status : "Ready");
             ImGui.TextDisabled(
                 $"{selected.Listings.Count:N0} physical {(selected.Listings.Count == 1 ? "listing" : "listings")} across {selected.RetainerCount:N0} {(selected.RetainerCount == 1 ? "retainer" : "retainers")}");
             ImGui.Separator();
@@ -3161,52 +3238,43 @@ public sealed class QuartermasterWindow : Window
                 ImGui.TextUnformatted($"{selected.HighestPrice:N0} gil");
             }
             ImGui.Separator();
-            if (ImGui.BeginTable(
-                    "RQPhysicalListings",
-                    5,
-                    ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
-                    ImGuiTableFlags.SizingStretchProp))
+            if (physicalListingSelection.Count > 0)
             {
-                ImGui.TableSetupColumn("Retainer", ImGuiTableColumnFlags.WidthStretch, 1f);
-                ImGui.TableSetupColumn("Qty", ImGuiTableColumnFlags.WidthFixed, 58);
-                ImGui.TableSetupColumn("Quality", ImGuiTableColumnFlags.WidthFixed, 78);
-                ImGui.TableSetupColumn("Unit price", ImGuiTableColumnFlags.WidthFixed, 100);
-                ImGui.TableSetupColumn("Action", ImGuiTableColumnFlags.WidthFixed, 92);
-                ImGui.TableHeadersRow();
-                for (var listingIndex = 0; listingIndex < selected.Listings.Count; listingIndex++)
+                ImGui.TextDisabled(
+                    $"{physicalListingSelection.Count:N0} selected · Repricing actions will operate on this selection.");
+                ImGui.SameLine();
+                if (ImGui.SmallButton("Clear selection"))
                 {
-                    var listing = selected.Listings[listingIndex];
-                    ImGui.PushID($"{listing.RetainerId}:{listing.SlotIndex}:{listing.ItemId}:{listing.Quantity}");
-                    ImGui.TableNextRow();
-                    ImGui.TableNextColumn();
-                    ImGui.TextUnformatted(listing.RetainerName);
-                    ImGui.TableNextColumn();
-                    ImGui.TextUnformatted(listing.Quantity.ToString("N0"));
-                    ImGui.TableNextColumn();
-                    ImGui.TextUnformatted(listing.Quality.ToString());
-                    ImGui.TableNextColumn();
-                    ImGui.TextUnformatted(
-                        listing.UnitPrice.IsKnown
-                            ? $"{listing.UnitPrice.Value:N0} gil"
-                            : "Unknown");
-                    ImGui.TableNextColumn();
-                    if (listingNavigation.IsRunning)
-                        ImGui.BeginDisabled();
-                    if (ImGui.Button("Open listing"))
-                        OpenListing(listing);
-                    if (listingNavigation.IsRunning)
-                        ImGui.EndDisabled();
-                    reviewRegistry.RegisterLastButton(
-                        listingIndex == 0
-                            ? "quartermaster.listings.open-first"
-                            : $"quartermaster.listings.open.{listing.RetainerId}.{listing.SlotIndex}.{listing.ItemId}",
-                        $"Open {listing.ItemName} on {listing.RetainerName}",
-                        !listingNavigation.IsRunning,
-                        () => OpenListing(listing),
-                        listingNavigation.IsRunning ? listingNavigation.Status : "Ready");
-                    ImGui.PopID();
+                    physicalListingSelection.Clear();
+                    focusedListing = null;
                 }
-                ImGui.EndTable();
+            }
+            var detailHeight = Math.Max(
+                120,
+                ImGui.GetContentRegionAvail().Y -
+                (!string.IsNullOrWhiteSpace(listingNavigation.Status)
+                    ? ImGui.GetTextLineHeightWithSpacing()
+                    : 0));
+            if (physicalListingTable.Begin("RQPhysicalListings", detailHeight))
+            {
+                physicalListingTable.DrawFilterRow();
+                var visibleListings = physicalListingTable.Apply(
+                    selected.Listings,
+                    ImGui.TableGetSortSpecs());
+                var visibleKeys = visibleListings.Select(ListingRowKey.From).ToArray();
+                for (var listingIndex = 0; listingIndex < visibleListings.Count; listingIndex++)
+                {
+                    var listing = visibleListings[listingIndex];
+                    if (physicalListingTable.DrawSelectableRow(
+                            listing,
+                            physicalListingSelection,
+                            visibleKeys,
+                            listingIndex,
+                            $"##physical-listing:{listing.RetainerId}:{listing.SlotIndex}:{listing.ItemId}"))
+                        focusedListing = ListingRowKey.From(listing);
+                }
+                DalamudTableSelectionRenderer.EndRows(physicalListingSelection);
+                physicalListingTable.End();
             }
             if (!string.IsNullOrWhiteSpace(listingNavigation.Status))
                 ImGui.TextDisabled(listingNavigation.Status);
@@ -3215,22 +3283,48 @@ public sealed class QuartermasterWindow : Window
         ImGui.EndTable();
     }
 
-    private void OpenListing(ListingRow listing)
+    private ListingRow? ResolveListingNavigationTarget(IReadOnlyList<ListingRow> listings)
     {
-        uint? unitPrice = listing.UnitPrice.IsKnown &&
-                          listing.UnitPrice.Value is > 0 and <= uint.MaxValue
-            ? decimal.ToUInt32(listing.UnitPrice.Value)
-            : null;
-        _ = listingNavigation.OpenAsync(new(
-            listing.RetainerId,
-            listing.RetainerName,
-            listing.SlotIndex,
-            listing.ItemId,
-            listing.ItemName,
-            listing.Quantity,
-            listing.Quality == FfxivItemQuality.HQ,
-            unitPrice));
+        if (focusedListing is { } key)
+        {
+            var focused = listings.FirstOrDefault(listing => ListingRowKey.From(listing) == key);
+            if (focused is not null)
+                return focused;
+        }
+
+        var selected = listings.FirstOrDefault(
+            listing => physicalListingSelection.IsSelected(ListingRowKey.From(listing)));
+        return selected ?? listings.FirstOrDefault();
     }
+
+    private void OpenRetainerListings(ListingRow listing) =>
+        _ = listingNavigation.OpenRetainerListingsAsync(
+            new(listing.RetainerId, listing.RetainerName));
+
+    private void DrawListingRetainerCell(ListingRow listing)
+    {
+        ImGui.TextUnformatted(listing.RetainerName);
+        if (!ImGui.BeginPopupContextItem(
+                $"##listing-retainer-context:{listing.RetainerId}:{listing.SlotIndex}:{listing.ItemId}"))
+            return;
+        if (listingNavigation.IsRunning)
+            ImGui.BeginDisabled();
+        if (ImGui.MenuItem("Open retainer listings"))
+            OpenRetainerListings(listing);
+        if (listingNavigation.IsRunning)
+            ImGui.EndDisabled();
+        ImGui.EndPopup();
+    }
+
+    private static string ListingUnitPrice(ListingRow listing) =>
+        listing.UnitPrice.IsKnown ? $"{listing.UnitPrice.Value:N0} gil" : "Unknown";
+
+    private static string ListingPriceRange(ListingGroupView group) =>
+        !group.HasKnownPrice
+            ? "Unknown"
+            : group.LowestPrice == group.HighestPrice
+                ? $"{group.LowestPrice:N0} gil"
+                : $"{group.LowestPrice:N0}–{group.HighestPrice:N0}";
 
     private IReadOnlyList<StockGroup> SortItems(IReadOnlyList<StockGroup> rows)
     {
@@ -3749,6 +3843,24 @@ public sealed class QuartermasterWindow : Window
             .Select(listing => listing.UnitPrice.Value)
             .DefaultIfEmpty()
             .Max();
+    }
+
+    private readonly record struct ListingRowKey(
+        ulong RetainerId,
+        int? SlotIndex,
+        uint ItemId,
+        int Quantity,
+        FfxivItemQuality Quality,
+        decimal? UnitPrice)
+    {
+        public static ListingRowKey From(ListingRow listing) =>
+            new(
+                listing.RetainerId,
+                listing.SlotIndex,
+                listing.ItemId,
+                listing.Quantity,
+                listing.Quality,
+                listing.UnitPrice.IsKnown ? listing.UnitPrice.Value : null);
     }
 
     private sealed record ItemChoice(uint ItemId, string Name, string Label);

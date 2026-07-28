@@ -7,6 +7,44 @@ namespace RQ.Tests;
 public sealed class ListingNavigationTests
 {
     [Fact]
+    public async Task OpenRetainerListings_StopsAtTheReusableSellingList()
+    {
+        var calls = new List<string>();
+        RetainerAutomationTarget? openedRetainer = null;
+        var session = DispatchProxy.Create<IRetainerAutomationSession, SessionProxy>();
+        ((SessionProxy)(object)session).Handler = (method, arguments) =>
+        {
+            calls.Add(method.Name);
+            return method.Name switch
+            {
+                nameof(IRetainerAutomationSession.EnsureRetainerListAsync) =>
+                    Task.FromResult(RetainerAutomationResult.Succeeded("ready", "ready")),
+                nameof(IRetainerAutomationSession.OpenRetainerAsync) =>
+                    Task.FromResult(CaptureRetainer(arguments!, out openedRetainer)),
+                nameof(IRetainerAutomationSession.OpenSellingListAsync) =>
+                    Task.FromResult(RetainerAutomationResult.Succeeded("opened", "opened")),
+                _ => throw new InvalidOperationException($"Unexpected call: {method.Name}"),
+            };
+        };
+        var autoRetainer = new FakeAutoRetainer();
+        using var coordinator = new ListingNavigationCoordinator(session, autoRetainer, new AutomationLease());
+
+        var result = await coordinator.OpenRetainerListingsAsync(new(44, "Eris"));
+
+        Assert.True(result.Started);
+        Assert.True(result.Success);
+        Assert.Equal(
+            [
+                nameof(IRetainerAutomationSession.EnsureRetainerListAsync),
+                nameof(IRetainerAutomationSession.OpenRetainerAsync),
+                nameof(IRetainerAutomationSession.OpenSellingListAsync),
+            ],
+            calls);
+        Assert.Equal(new RetainerAutomationTarget(44, "Eris"), openedRetainer);
+        Assert.Equal([true, false], autoRetainer.SuppressionChanges);
+    }
+
+    [Fact]
     public async Task Open_ReconcilesThroughTheGeneralRetainerSessionAndRestoresAutoRetainer()
     {
         var calls = new List<string>();
