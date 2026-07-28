@@ -3359,17 +3359,34 @@ public sealed class QuartermasterWindow : Window
 
     private void DrawListingRetainerCell(ListingRow listing)
     {
+        var cursor = ImGui.GetCursorPos();
+        var hitArea = new Vector2(
+            Math.Max(1, ImGui.GetContentRegionAvail().X),
+            ImGui.GetTextLineHeightWithSpacing());
+        ImGui.InvisibleButton(
+            $"##listing-retainer-cell:{listing.RetainerId}:{listing.SlotIndex}:{listing.ItemId}",
+            hitArea,
+            ImGuiButtonFlags.MouseButtonRight);
+        if (ImGui.IsItemHovered())
+            ImGui.TableSetBgColor(
+                ImGuiTableBgTarget.CellBg,
+                ImGui.GetColorU32(ImGuiCol.HeaderHovered));
+
+        var contextOpen = ImGui.BeginPopupContextItem(
+            $"##listing-retainer-context:{listing.RetainerId}:{listing.SlotIndex}:{listing.ItemId}");
+        if (contextOpen)
+        {
+            if (listingNavigation.IsRunning)
+                ImGui.BeginDisabled();
+            if (ImGui.MenuItem("Open retainer listings"))
+                OpenRetainerListings(listing);
+            if (listingNavigation.IsRunning)
+                ImGui.EndDisabled();
+            ImGui.EndPopup();
+        }
+
+        ImGui.SetCursorPos(cursor);
         ImGui.TextUnformatted(listing.RetainerName);
-        if (!ImGui.BeginPopupContextItem(
-                $"##listing-retainer-context:{listing.RetainerId}:{listing.SlotIndex}:{listing.ItemId}"))
-            return;
-        if (listingNavigation.IsRunning)
-            ImGui.BeginDisabled();
-        if (ImGui.MenuItem("Open retainer listings"))
-            OpenRetainerListings(listing);
-        if (listingNavigation.IsRunning)
-            ImGui.EndDisabled();
-        ImGui.EndPopup();
     }
 
     private static string ListingUnitPrice(ListingRow listing) =>
