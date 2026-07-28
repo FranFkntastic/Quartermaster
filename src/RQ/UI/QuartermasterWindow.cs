@@ -146,7 +146,7 @@ public sealed class QuartermasterWindow : Window
                 Alignment: DalamudTableCellAlignment.Right),
             new(
                 "Price range",
-                130,
+                154,
                 ListingPriceRange,
                 row => row.HasKnownPrice ? row.LowestPrice : decimal.MinValue,
                 Alignment: DalamudTableCellAlignment.Right),
@@ -3137,6 +3137,27 @@ public sealed class QuartermasterWindow : Window
         if (groups.Length == 0)
         {
             ImGui.TextDisabled("No listings match this view.");
+            var navigationTarget = ResolveEmptyListingNavigationTarget(projection);
+            if (navigationTarget is not null)
+            {
+                if (listingNavigation.IsRunning)
+                    ImGui.BeginDisabled();
+                if (ImGui.Button($"Open {navigationTarget.RetainerName}'s listings"))
+                    _ = listingNavigation.OpenRetainerListingsAsync(navigationTarget);
+                if (listingNavigation.IsRunning)
+                    ImGui.EndDisabled();
+                reviewRegistry.RegisterLastButton(
+                    "quartermaster.listings.open-first",
+                    $"Open {navigationTarget.RetainerName}'s listings",
+                    !listingNavigation.IsRunning,
+                    () =>
+                    {
+                        if (ResolveEmptyListingNavigationTarget(projection) is { } target)
+                            _ = listingNavigation.OpenRetainerListingsAsync(target);
+                    },
+                    listingNavigation.IsRunning ? listingNavigation.Status : "Ready");
+            }
+            DrawListingNavigationStatus();
             return;
         }
 
@@ -3276,8 +3297,7 @@ public sealed class QuartermasterWindow : Window
                 DalamudTableSelectionRenderer.EndRows(physicalListingSelection);
                 physicalListingTable.End();
             }
-            if (!string.IsNullOrWhiteSpace(listingNavigation.Status))
-                ImGui.TextDisabled(listingNavigation.Status);
+            DrawListingNavigationStatus();
         }
         ImGui.EndChild();
         ImGui.EndTable();
@@ -3297,9 +3317,45 @@ public sealed class QuartermasterWindow : Window
         return selected ?? listings.FirstOrDefault();
     }
 
+    private RetainerListingsOpenRequest? ResolveEmptyListingNavigationTarget(BrowserProjection projection)
+    {
+        var scope = projection.Scopes.FirstOrDefault(
+                        candidate => candidate.Kind == BrowserScopeKind.Retainer &&
+                                     candidate.Key == workbench.ScopeKey)
+                    ?? projection.Scopes.FirstOrDefault(
+                        candidate => candidate.Kind == BrowserScopeKind.Retainer);
+        return scope?.RetainerId is { } retainerId
+            ? new RetainerListingsOpenRequest(retainerId, scope.Label)
+            : null;
+    }
+
     private void OpenRetainerListings(ListingRow listing) =>
         _ = listingNavigation.OpenRetainerListingsAsync(
             new(listing.RetainerId, listing.RetainerName));
+
+    private void DrawListingNavigationStatus()
+    {
+        if (string.IsNullOrWhiteSpace(listingNavigation.Status))
+            return;
+
+        ImGui.TextDisabled(listingNavigation.Status);
+        if (!listingNavigation.Status.StartsWith("Opened ", StringComparison.Ordinal))
+            return;
+
+        ImGui.SameLine();
+        if (listingNavigation.IsRunning)
+            ImGui.BeginDisabled();
+        if (ImGui.SmallButton("Return to retainer list"))
+            _ = listingNavigation.ReturnToRetainerListAsync();
+        if (listingNavigation.IsRunning)
+            ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.listings.return-to-list",
+            "Return to retainer list",
+            !listingNavigation.IsRunning,
+            () => _ = listingNavigation.ReturnToRetainerListAsync(),
+            listingNavigation.IsRunning ? listingNavigation.Status : "Ready");
+    }
 
     private void DrawListingRetainerCell(ListingRow listing)
     {
