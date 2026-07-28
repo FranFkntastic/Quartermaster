@@ -218,7 +218,12 @@ public sealed class SnapshotPublisher
                                 rule.ItemName,
                                 desiredPlayerQuantity = rule.TargetQuantity,
                                 quality = rule.Quality.ToString(),
-                                routing = rule.Routing,
+                                routing = new
+                                {
+                                    mode = (rule.Routing?.Mode ?? StowageRoutingMode.ConsolidateFirst).ToString(),
+                                    preferredRetainerIds = rule.Routing?.PreferredRetainerIds ?? [],
+                                    overflow = (rule.Routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer).ToString(),
+                                },
                                 rule.Enabled,
                                 evaluated = line is null ? null : new
                                 {

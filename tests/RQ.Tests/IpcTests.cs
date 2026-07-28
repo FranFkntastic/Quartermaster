@@ -205,6 +205,9 @@ public sealed class IpcTests
         Assert.Equal(3, plan.GetProperty("revision").GetInt32());
         var rule = Assert.Single(plan.GetProperty("rules").EnumerateArray());
         Assert.Equal(ruleId, rule.GetProperty("id").GetGuid());
+        var routing = rule.GetProperty("routing");
+        Assert.Equal("ConsolidateFirst", routing.GetProperty("mode").GetString());
+        Assert.Equal("AnyOwnerRetainer", routing.GetProperty("overflow").GetString());
         Assert.False(rule.TryGetProperty("notes", out _));
         Assert.False(rule.TryGetProperty("freshness", out _));
     }
