@@ -62,7 +62,7 @@ public sealed class OperationJournal
                 operation.Status = OperationStatuses.Indeterminate;
                 operation.Revision = checked(operation.Revision + 1);
                 operation.UpdatedAtUtc = utcNow();
-                operation.Message = "Quartermaster reloaded before live transfer completion could be verified; involved cache evidence was invalidated.";
+                operation.Message = "Quartermaster reloaded before live transfer completion could be verified; pending mutation evidence was reconciled.";
                 AddReceipt(state, operation, "InterruptedByReload", operation.Message);
                 reconciled.Add(Copy(operation));
             }

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using Franthropy.Dalamud.Automation.Inventory;
 using Franthropy.Dalamud.Automation.Retainers;
@@ -57,7 +58,10 @@ public sealed class OperationTests
         var journal = new OperationJournal(repository);
         var operation = journal.CreateManual(TestData.Owner, repository.Snapshot().PlanItems);
         var cacheStore = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
-        cacheStore.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
+        cacheStore.Save(new Dictionary<ulong, CachedRetainer>
+        {
+            [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10), (200, "Unrelated Ingot", 7)),
+        });
         var cache = new RetainerCacheRepository(cacheStore);
         var driver = new SuccessfulDriver();
         var coordinator = new TransferCoordinator(journal, driver, cache, () => TestData.Owner, () => new Dictionary<uint, int>());
@@ -68,8 +72,22 @@ public sealed class OperationTests
         Assert.Equal(OperationStatuses.Succeeded, completed.Status);
         Assert.Equal(10, Assert.Single(completed.Lines).TransferredQuantity);
         Assert.True(driver.Calls > 0);
-        Assert.Empty(cache.Snapshot());
+        var cachedRetainer = Assert.Single(cache.Snapshot()).Value;
+        var remainingItem = Assert.Single(cachedRetainer.Bags.SelectMany(bag => bag.Items));
+        Assert.Equal((uint)200, remainingItem.ItemId);
+        Assert.Equal((uint)7, remainingItem.Quantity);
+        Assert.Empty(journal.PendingCacheInvalidations());
         Assert.Single(repository.Snapshot().PlanItems);
+
+        var publisher = new SnapshotPublisher("provider", repository, cache.Snapshot);
+        publisher.Refresh(TestData.Owner, []);
+        using var document = JsonDocument.Parse(publisher.GetSnapshot());
+        var publishedRetainer = Assert.Single(document.RootElement.GetProperty("retainers").EnumerateArray());
+        var publishedItem = Assert.Single(
+            publishedRetainer.GetProperty("bags").EnumerateArray()
+                .SelectMany(bag => bag.GetProperty("items").EnumerateArray()));
+        Assert.Equal((uint)200, publishedItem.GetProperty("itemId").GetUInt32());
+        Assert.Equal((uint)7, publishedItem.GetProperty("quantity").GetUInt32());
     }
 
     [Fact]
@@ -237,7 +255,7 @@ public sealed class OperationTests
     }
 
     [Fact]
-    public void CacheInvalidation_RemovesMemoryWhenPersistenceFails()
+    public void CacheInvalidation_RetryPersistsAnEarlierInMemoryRemoval()
     {
         using var directory = new TemporaryDirectory();
         var cacheDirectory = Path.Combine(directory.Path, "cache");
@@ -253,10 +271,18 @@ public sealed class OperationTests
         Assert.True(result.Removed);
         Assert.False(result.Persisted);
         Assert.Empty(cache.Snapshot());
+
+        File.Delete(cacheDirectory);
+        Directory.CreateDirectory(cacheDirectory);
+        var retry = cache.Invalidate(10);
+
+        Assert.False(retry.Removed);
+        Assert.True(retry.Persisted);
+        Assert.Empty(new RetainerCacheRepository(store).Snapshot());
     }
 
     [Fact]
-    public async Task CancelActive_MarksLiveOperationIndeterminateAndInvalidatesOwnerEvidence()
+    public async Task CancelActive_BeforeMovementRetainsTrustedOwnerEvidence()
     {
         using var directory = new TemporaryDirectory();
         var repository = TestData.Repository(directory.Path);
@@ -274,7 +300,7 @@ public sealed class OperationTests
         await execution.WaitAsync(TimeSpan.FromSeconds(2));
 
         Assert.Equal(OperationStatuses.Indeterminate, journal.Get(operation.OperationId)!.Status);
-        Assert.Empty(cache.Snapshot());
+        Assert.Single(cache.Snapshot());
         Assert.True(driver.Cancelled);
     }
 
@@ -314,7 +340,11 @@ public sealed class OperationTests
             TestData.Owner,
             [new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }]);
         var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
-        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
+        store.Save(new Dictionary<ulong, CachedRetainer>
+        {
+            [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)),
+            [20] = TestData.Retainer(20, "Nyx", (200, "Trusted Ingot", 25)),
+        });
         var cache = new RetainerCacheRepository(store);
         var coordinator = new TransferCoordinator(
             journal,
@@ -326,7 +356,10 @@ public sealed class OperationTests
         await coordinator.ExecuteRetrievalAsync(operation.OperationId);
 
         Assert.Equal(OperationStatuses.Indeterminate, journal.Get(operation.OperationId)!.Status);
-        Assert.Empty(cache.Snapshot());
+        var trustedRetainer = Assert.Single(cache.Snapshot());
+        Assert.Equal((ulong)20, trustedRetainer.Key);
+        Assert.Equal((uint)25, Assert.Single(trustedRetainer.Value.Bags.SelectMany(bag => bag.Items)).Quantity);
+        Assert.Empty(journal.PendingCacheInvalidations());
     }
 
     [Theory]
@@ -355,10 +388,11 @@ public sealed class OperationTests
         var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
         store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris") });
         var driver = new DepositDriver();
+        var cache = new RetainerCacheRepository(store);
         var coordinator = new TransferCoordinator(
             journal,
             driver,
-            new RetainerCacheRepository(store),
+            cache,
             () => TestData.Owner,
             () => new Dictionary<uint, int>());
 
@@ -367,6 +401,9 @@ public sealed class OperationTests
         Assert.Equal(99, driver.RequestedQuantity);
         Assert.Equal(OperationStatuses.Succeeded, journal.Get(operation.OperationId)!.Status);
         Assert.Equal(99, Assert.Single(journal.Get(operation.OperationId)!.Lines).TransferredQuantity);
+        var cachedItem = Assert.Single(Assert.Single(cache.Snapshot()).Value.Bags.SelectMany(bag => bag.Items));
+        Assert.Equal((uint)2, cachedItem.ItemId);
+        Assert.Equal((uint)99, cachedItem.Quantity);
     }
 
     [Fact]
@@ -395,8 +432,34 @@ public sealed class OperationTests
         Assert.Empty(new OperationJournal(TestData.Repository(directory.Path)).PendingCacheInvalidations());
     }
 
+    [Fact]
+    public void PendingMutationRecovery_InvalidatesOnlyTheArmedRetainer()
+    {
+        using var directory = new TemporaryDirectory();
+        var journal = new OperationJournal(TestData.Repository(directory.Path));
+        var operation = journal.CreateManual(
+            TestData.Owner,
+            [new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 5 }]);
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer>
+        {
+            [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)),
+            [20] = TestData.Retainer(20, "Nyx", (200, "Ingot", 25)),
+        });
+        var cache = new RetainerCacheRepository(store);
+        journal.ArmCacheInvalidation(operation.OperationId, 10, TestData.Owner);
+
+        var recovered = RetainerStockMutationPersistence.RecoverPending(journal, cache);
+
+        Assert.Equal(1, recovered);
+        var trustedRetainer = Assert.Single(cache.Snapshot());
+        Assert.Equal((ulong)20, trustedRetainer.Key);
+        Assert.Empty(journal.PendingCacheInvalidations());
+    }
+
     private sealed class SuccessfulDriver : IRetainerTransferDriver
     {
+        private int retainerQuantity = 10;
         public int Calls { get; private set; }
         public Task RequireRetainerListAsync(CancellationToken cancellationToken) { Calls++; return Task.CompletedTask; }
         public Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken cancellationToken) { Calls++; return Task.CompletedTask; }
@@ -404,9 +467,17 @@ public sealed class OperationTests
         public Task<IReadOnlyList<DalamudInventoryStack>> ScanRetainerAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken)
         {
             Calls++;
-            return Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([new(InventoryType.RetainerPage1, 0, 100, 10)]);
+            return Task.FromResult<IReadOnlyList<DalamudInventoryStack>>(
+                retainerQuantity > 0
+                    ? [new(InventoryType.RetainerPage1, 0, 100, retainerQuantity)]
+                    : []);
         }
-        public Task<RetrievalResult> RetrieveAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken) { Calls++; return Task.FromResult(new RetrievalResult(true, quantity, "TransferVerified", "Verified.")); }
+        public Task<RetrievalResult> RetrieveAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken)
+        {
+            Calls++;
+            retainerQuantity -= quantity;
+            return Task.FromResult(new RetrievalResult(true, quantity, "TransferVerified", "Verified."));
+        }
         public Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerCrystalsAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken) { Calls++; return Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([]); }
         public Task<RetainerCrystalTransferResult> DepositCrystalAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken) { Calls++; return Task.FromResult(new RetainerCrystalTransferResult(true, quantity, "TransferVerified", "Verified.")); }
         public Task CloseRetainerAsync(CancellationToken cancellationToken) { Calls++; return Task.CompletedTask; }
@@ -478,17 +549,23 @@ public sealed class OperationTests
 
     private sealed class DepositDriver : IRetainerTransferDriver
     {
+        private int retainerQuantity;
         public int RequestedQuantity { get; private set; }
         public Task RequireRetainerListAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task OpenInventoryAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task<IReadOnlyList<DalamudInventoryStack>> ScanRetainerAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken) => Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([]);
+        public Task<IReadOnlyList<DalamudInventoryStack>> ScanRetainerAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<DalamudInventoryStack>>(
+                retainerQuantity > 0
+                    ? [new(InventoryType.RetainerCrystals, 0, 2, retainerQuantity)]
+                    : []);
         public Task<RetrievalResult> RetrieveAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerCrystalsAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken) =>
             Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([new(InventoryType.Crystals, 0, 2, 500)]);
         public Task<RetainerCrystalTransferResult> DepositCrystalAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken)
         {
             RequestedQuantity = quantity;
+            retainerQuantity += quantity;
             return Task.FromResult(new RetainerCrystalTransferResult(true, quantity, "verified", "verified"));
         }
         public Task CloseRetainerAsync(CancellationToken cancellationToken) => Task.CompletedTask;

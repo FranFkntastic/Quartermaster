@@ -103,9 +103,7 @@ public sealed class Plugin : IDalamudPlugin
         var autoRetainerIpc = new DalamudAutoRetainerIpc(pluginInterface);
         autoRetainer = new(framework, log, captures, retainerSession, autoRetainerIpc, automation);
         journal = new OperationJournal(state);
-        RecoverPendingCacheInvalidations();
-        foreach (var operation in state.Snapshot().Operations.Where(operation => operation.Status == OperationStatuses.Running))
-            InvalidateOwnerEvidence(operation);
+        RetainerStockMutationPersistence.RecoverPending(journal, cache);
         journal.ReconcileInterruptedOperations();
         var driver = new RetainerLiveDriver(retainerSession);
         transfers = new TransferCoordinator(
@@ -169,27 +167,6 @@ public sealed class Plugin : IDalamudPlugin
         {
             Dispose();
             throw;
-        }
-    }
-
-    private void RecoverPendingCacheInvalidations()
-    {
-        foreach (var pending in journal.PendingCacheInvalidations())
-        {
-            var result = cache.Invalidate(pending.RetainerId);
-            if (result.Persisted)
-                journal.ResolveCacheInvalidation(pending.OperationId, pending.RetainerId);
-        }
-    }
-
-    private void InvalidateOwnerEvidence(OperationRecord operation)
-    {
-        foreach (var retainer in cache.Snapshot().Values.Where(retainer => retainer.Owner.Matches(operation.Owner)).ToArray())
-        {
-            journal.ArmCacheInvalidation(operation.OperationId, retainer.RetainerId, operation.Owner);
-            var result = cache.Invalidate(retainer.RetainerId);
-            if (result.Persisted)
-                journal.ResolveCacheInvalidation(operation.OperationId, retainer.RetainerId);
         }
     }
 

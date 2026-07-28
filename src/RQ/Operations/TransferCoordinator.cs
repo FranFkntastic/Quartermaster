@@ -1,5 +1,6 @@
 using Franthropy.Dalamud.Automation.Inventory;
 using Franthropy.Dalamud.Automation.Retainers;
+using Franthropy.Dalamud.Automation.Transactions;
 using RQ.Domain;
 using RQ.Automation;
 using RQ.Inventory;
@@ -42,9 +43,9 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
     private readonly Func<IReadOnlyDictionary<uint, int>> playerInventory;
     private readonly AutomationLease automation;
     private readonly Func<DateTime> utcNow;
+    private readonly RetainerStockMutationPersistence stockMutations;
     private readonly object activeGate = new();
     private CancellationTokenSource? activeCancellation;
-    private string? activeOperationId;
     private int running;
 
     public TransferCoordinator(
@@ -63,6 +64,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         this.playerInventory = playerInventory;
         this.automation = automation ?? new AutomationLease();
         this.utcNow = utcNow ?? (() => DateTime.UtcNow);
+        stockMutations = new(journal, cache);
     }
 
     public bool IsRunning => Volatile.Read(ref running) != 0;
@@ -109,7 +111,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         if (Interlocked.CompareExchange(ref running, 1, 0) != 0)
             return new(false, "Another retainer transfer is already running.");
         var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        SetActive(operationId, linkedCancellation);
+        SetActive(linkedCancellation);
         var token = linkedCancellation.Token;
         var retainerOpen = false;
         var movementAttempted = false;
@@ -193,20 +195,41 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     var quantity = Math.Min(stack.Quantity, remaining.GetValueOrDefault(key));
                     if (quantity <= 0)
                         continue;
-                    journal.ArmCacheInvalidation(operationId, candidate.Route.RetainerId, operation.Owner);
-                    var result = await driver.RetrieveAsync(stack, quantity, token).ConfigureAwait(false);
-                    token.ThrowIfCancellationRequested();
+                    var itemName = operation.Lines.First(line => line.ItemId == stack.ItemId).ItemName;
+                    var previousMovementAttempted = movementAttempted;
+                    var attempt = await VerifiedMutationTransaction.ExecuteAsync(
+                        new RetainerStockMutationIntent(operationId, candidate.Route.RetainerId, operation.Owner),
+                        stockMutations,
+                        async mutationToken =>
+                        {
+                            movementAttempted = true;
+                            var result = await driver.RetrieveAsync(stack, quantity, mutationToken).ConfigureAwait(false);
+                            if (!result.Success)
+                            {
+                                return result.MovementMayHaveOccurred
+                                    ? VerifiedMutationAttempt<RetrievalResult, RetainerVariantObservation>.Indeterminate(result)
+                                    : VerifiedMutationAttempt<RetrievalResult, RetainerVariantObservation>.Unchanged(result);
+                            }
+                            if (result.Transferred <= 0)
+                                return VerifiedMutationAttempt<RetrievalResult, RetainerVariantObservation>.Unchanged(result);
+                            var observation = await ObserveVariantAsync(
+                                candidate.Route.RetainerId,
+                                stack.ItemId,
+                                itemName,
+                                stack.IsHighQuality,
+                                mutationToken).ConfigureAwait(false);
+                            return VerifiedMutationAttempt<RetrievalResult, RetainerVariantObservation>.Verified(result, observation);
+                        },
+                        token).ConfigureAwait(false);
+                    var result = attempt.Result;
+                    movementAttempted = previousMovementAttempted ||
+                                        attempt.Evidence != VerifiedMutationEvidence.Unchanged;
                     if (!result.Success)
                     {
-                        movementAttempted |= result.MovementMayHaveOccurred;
-                        if (!result.MovementMayHaveOccurred)
-                            journal.ResolveCacheInvalidation(operationId, candidate.Route.RetainerId);
                         throw new InvalidOperationException(result.Message);
                     }
-                    movementAttempted = true;
                     remaining[key] -= result.Transferred;
                     transferred += result.Transferred;
-                    RecordInvalidation(operationId, candidate.Route.RetainerId);
                     journal.RecordRetrievalTransfer(
                         operationId,
                         stack.ItemId,
@@ -215,7 +238,6 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         result.Transferred,
                         result.Code,
                         result.Message);
-                    journal.ResolveCacheInvalidation(operationId, candidate.Route.RetainerId);
                 }
                 await driver.CloseRetainerAsync(token).ConfigureAwait(false);
                 retainerOpen = false;
@@ -247,8 +269,6 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             var operation = journal.Get(operationId);
             if (operation is { Status: not OperationStatuses.Failed } && !OperationStatuses.IsTerminal(operation.Status))
             {
-                if (movementAttempted)
-                    InvalidateOwnerEvidence(operationId, operation.Owner);
                 journal.Transition(
                     operationId,
                     movementAttempted ? OperationStatuses.Indeterminate : OperationStatuses.Failed,
@@ -274,7 +294,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         if (Interlocked.CompareExchange(ref running, 1, 0) != 0)
             return new(false, "Another retainer transfer is already running.");
         var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        SetActive(operationId, linkedCancellation);
+        SetActive(linkedCancellation);
         var token = linkedCancellation.Token;
         var retainerOpen = false;
         var movementAttempted = false;
@@ -331,26 +351,50 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     var authorized = Math.Min(remaining.GetValueOrDefault(key), candidateCapacity.GetValueOrDefault(key));
                     if (authorized <= 0)
                         continue;
-                    journal.ArmCacheInvalidation(operationId, candidate.RetainerId, operation.Owner);
-                    movementAttempted = true;
                     var quantity = Math.Min(stack.Quantity, authorized);
-                    (bool Success, int Transferred, string Code, string Message) result;
-                    if (stack.Container == FFXIVClientStructs.FFXIV.Client.Game.InventoryType.Crystals)
-                    {
-                        var crystal = await driver.DepositCrystalAsync(stack, quantity, token).ConfigureAwait(false);
-                        result = (crystal.Success, crystal.Transferred, crystal.Code, crystal.Message);
-                    }
-                    else
-                    {
-                        var item = await driver.DepositAsync(stack, quantity, token).ConfigureAwait(false);
-                        result = (item.Success, item.Transferred, item.Code, item.Message);
-                    }
-                    token.ThrowIfCancellationRequested();
+                    var itemName = operation.Lines.First(line =>
+                        line.ItemId == stack.ItemId &&
+                        line.IsHighQuality == stack.IsHighQuality).ItemName;
+                    var previousMovementAttempted = movementAttempted;
+                    var attempt = await VerifiedMutationTransaction.ExecuteAsync(
+                        new RetainerStockMutationIntent(operationId, candidate.RetainerId, operation.Owner),
+                        stockMutations,
+                        async mutationToken =>
+                        {
+                            movementAttempted = true;
+                            (bool Success, int Transferred, string Code, string Message) result;
+                            if (stack.Container == FFXIVClientStructs.FFXIV.Client.Game.InventoryType.Crystals)
+                            {
+                                var crystal = await driver.DepositCrystalAsync(stack, quantity, mutationToken).ConfigureAwait(false);
+                                result = (crystal.Success, crystal.Transferred, crystal.Code, crystal.Message);
+                            }
+                            else
+                            {
+                                var item = await driver.DepositAsync(stack, quantity, mutationToken).ConfigureAwait(false);
+                                result = (item.Success, item.Transferred, item.Code, item.Message);
+                            }
+                            if (!result.Success)
+                            {
+                                return result.Code == "NoCapacity"
+                                    ? VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Unchanged(result)
+                                    : VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Indeterminate(result);
+                            }
+                            if (result.Transferred <= 0)
+                                return VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Unchanged(result);
+                            var observation = await ObserveVariantAsync(
+                                candidate.RetainerId,
+                                stack.ItemId,
+                                itemName,
+                                stack.IsHighQuality,
+                                mutationToken).ConfigureAwait(false);
+                            return VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Verified(result, observation);
+                        },
+                        token).ConfigureAwait(false);
+                    var result = attempt.Result;
+                    movementAttempted = previousMovementAttempted ||
+                                        attempt.Evidence != VerifiedMutationEvidence.Unchanged;
                     if (!result.Success && result.Code == "NoCapacity")
-                    {
-                        journal.ResolveCacheInvalidation(operationId, candidate.RetainerId);
                         continue;
-                    }
                     if (!result.Success)
                         throw new InvalidOperationException(result.Message);
                     if (result.Transferred == 0)
@@ -358,12 +402,10 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     remaining[key] -= result.Transferred;
                     candidateCapacity[key] -= result.Transferred;
                     transferred += result.Transferred;
-                    RecordInvalidation(operationId, candidate.RetainerId);
                     if (legacyCrystalDeposit)
                         journal.RecordTransfer(operationId, stack.ItemId, candidate.RetainerId, result.Transferred, result.Code, result.Message);
                     else
                         journal.RecordDepositTransfer(operationId, stack.ItemId, stack.IsHighQuality, candidate.RetainerId, result.Transferred, result.Code, result.Message);
-                    journal.ResolveCacheInvalidation(operationId, candidate.RetainerId);
                 }
                 await driver.CloseRetainerAsync(token).ConfigureAwait(false);
                 retainerOpen = false;
@@ -392,8 +434,6 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             var operation = journal.Get(operationId);
             if (operation is not null && !OperationStatuses.IsTerminal(operation.Status))
             {
-                if (movementAttempted)
-                    InvalidateOwnerEvidence(operationId, operation.Owner);
                 journal.Transition(
                     operationId,
                     movementAttempted ? OperationStatuses.Indeterminate : OperationStatuses.Failed,
@@ -412,16 +452,9 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
 
     public void CancelActive()
     {
-        string? operationId;
         lock (activeGate)
-        {
             activeCancellation?.Cancel();
-            operationId = activeOperationId;
-        }
         driver.CancelActive();
-        if (operationId is null)
-            return;
-        MarkCancelled(operationId);
     }
 
     private void MarkCancelled(string operationId)
@@ -436,8 +469,11 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             }
             else if (operation.Status == OperationStatuses.Running)
             {
-                InvalidateOwnerEvidence(operationId, operation.Owner);
-                journal.Transition(operationId, OperationStatuses.Indeterminate, "CancelledDuringExecution", "Transfer was cancelled during live movement; involved cache evidence was invalidated.");
+                journal.Transition(
+                    operationId,
+                    OperationStatuses.Indeterminate,
+                    "CancelledDuringExecution",
+                    "Transfer was cancelled during execution; any active mutation evidence was reconciled by its durable transaction.");
             }
         }
         catch (InvalidOperationException) when (journal.Get(operationId) is { Status: var status } && OperationStatuses.IsTerminal(status))
@@ -452,20 +488,10 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         journal.Transition(operationId, OperationStatuses.Cancelled, "PlanSequenceStopped", message);
     }
 
-    private void RecordInvalidation(string operationId, ulong retainerId)
-    {
-        var invalidation = cache.Invalidate(retainerId);
-        if (!invalidation.Persisted)
-            throw new IOException($"Retainer {retainerId} cache invalidation did not persist: {invalidation.Error}");
-    }
-
-    private void SetActive(string operationId, CancellationTokenSource cancellation)
+    private void SetActive(CancellationTokenSource cancellation)
     {
         lock (activeGate)
-        {
-            activeOperationId = operationId;
             activeCancellation = cancellation;
-        }
     }
 
     private void ClearActive(CancellationTokenSource cancellation)
@@ -473,10 +499,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         lock (activeGate)
         {
             if (ReferenceEquals(activeCancellation, cancellation))
-            {
                 activeCancellation = null;
-                activeOperationId = null;
-            }
         }
         cancellation.Dispose();
     }
@@ -484,14 +507,26 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
     private static string RetrievalKey(uint itemId, ItemQualityPolicy quality) =>
         $"{itemId}:{quality}";
 
-    private void InvalidateOwnerEvidence(string operationId, OwnerScope owner)
+    private async Task<RetainerVariantObservation> ObserveVariantAsync(
+        ulong retainerId,
+        uint itemId,
+        string itemName,
+        bool isHighQuality,
+        CancellationToken cancellationToken)
     {
-        foreach (var retainer in cache.Snapshot().Values.Where(retainer => retainer.Owner.Matches(owner)).ToArray())
-        {
-            journal.ArmCacheInvalidation(operationId, retainer.RetainerId, owner);
-            var result = cache.Invalidate(retainer.RetainerId);
-            if (result.Persisted)
-                journal.ResolveCacheInvalidation(operationId, retainer.RetainerId);
-        }
+        var stacks = await driver.ScanRetainerAsync(
+            new HashSet<uint> { itemId },
+            cancellationToken).ConfigureAwait(false);
+        return new(
+            retainerId,
+            itemId,
+            itemName,
+            isHighQuality,
+            utcNow(),
+            stacks.Where(stack =>
+                    stack.ItemId == itemId &&
+                    stack.IsHighQuality == isHighQuality)
+                .ToArray());
     }
+
 }
