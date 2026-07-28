@@ -46,6 +46,7 @@ public sealed class QuartermasterWindow : Window
     private WorkbenchView? requestedView;
     private Task? activeTransferTask;
     private bool clearAgentReviewWindowOverride;
+    private int captureCollapseRestoreFramesRemaining;
     private bool requestCaptureFocus;
     private StowagePlanDraft? stowageDraft;
     private readonly HashSet<Guid> selectedStowageRuleIds = [];
@@ -184,9 +185,11 @@ public sealed class QuartermasterWindow : Window
             () => Collapsed == true,
             value =>
             {
+                captureCollapseRestoreFramesRemaining = 0;
                 Collapsed = value;
                 CollapsedCondition = ImGuiCond.Always;
             },
+            RestoreCaptureCollapseState,
             beginPresentation: BeginCapturePresentation,
             restorePresentation: RestoreCapturePresentation);
         BgAlpha = 1f;
@@ -262,6 +265,7 @@ public sealed class QuartermasterWindow : Window
 
     public override void Draw()
     {
+        ClearAgentReviewWindowOverride();
         reviewRegistry.BeginFrame();
         try
         {
@@ -289,6 +293,8 @@ public sealed class QuartermasterWindow : Window
 
     public override void PreDraw()
     {
+        ReleaseRestoredCaptureCollapseOverride();
+
         if (ActiveCapturePresentationTarget() is null)
             return;
 
@@ -303,6 +309,34 @@ public sealed class QuartermasterWindow : Window
             ImGui.SetNextWindowFocus();
             requestCaptureFocus = false;
         }
+    }
+
+    private void RestoreCaptureCollapseState(bool wasOpen, bool wasCollapsed)
+    {
+        if (!wasOpen)
+        {
+            captureCollapseRestoreFramesRemaining = 0;
+            Collapsed = null;
+            CollapsedCondition = ImGuiCond.None;
+            return;
+        }
+
+        Collapsed = wasCollapsed;
+        CollapsedCondition = ImGuiCond.Always;
+        captureCollapseRestoreFramesRemaining = 2;
+    }
+
+    private void ReleaseRestoredCaptureCollapseOverride()
+    {
+        if (captureCollapseRestoreFramesRemaining <= 0)
+            return;
+
+        captureCollapseRestoreFramesRemaining--;
+        if (captureCollapseRestoreFramesRemaining > 0)
+            return;
+
+        Collapsed = null;
+        CollapsedCondition = ImGuiCond.None;
     }
 
     public AgentBridgeUiCaptureTransactionHandle BeginAgentCapturePresentation(string target) =>
