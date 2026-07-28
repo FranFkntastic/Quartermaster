@@ -280,6 +280,12 @@ public sealed class AgentBridgeHost : IDisposable
                 "listings",
                 AgentBridgeUiControlKind.Button,
                 true),
+            new(
+                "quartermaster.listings.return-to-list",
+                "Return to the retainer list",
+                "listings",
+                AgentBridgeUiControlKind.Button,
+                true),
         ];
         return actions;
     }

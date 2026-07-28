@@ -45,6 +45,32 @@ public sealed class ListingNavigationTests
     }
 
     [Fact]
+    public async Task ReturnToRetainerList_UsesTheGeneralRecoveryAndRestoresAutoRetainer()
+    {
+        var calls = new List<string>();
+        var session = DispatchProxy.Create<IRetainerAutomationSession, SessionProxy>();
+        ((SessionProxy)(object)session).Handler = (method, _) =>
+        {
+            calls.Add(method.Name);
+            return method.Name switch
+            {
+                nameof(IRetainerAutomationSession.ReturnToRetainerListAsync) =>
+                    Task.FromResult(RetainerAutomationResult.Succeeded("ready", "ready")),
+                _ => throw new InvalidOperationException($"Unexpected call: {method.Name}"),
+            };
+        };
+        var autoRetainer = new FakeAutoRetainer();
+        using var coordinator = new ListingNavigationCoordinator(session, autoRetainer, new AutomationLease());
+
+        var result = await coordinator.ReturnToRetainerListAsync();
+
+        Assert.True(result.Started);
+        Assert.True(result.Success);
+        Assert.Equal([nameof(IRetainerAutomationSession.ReturnToRetainerListAsync)], calls);
+        Assert.Equal([true, false], autoRetainer.SuppressionChanges);
+    }
+
+    [Fact]
     public async Task Open_ReconcilesThroughTheGeneralRetainerSessionAndRestoresAutoRetainer()
     {
         var calls = new List<string>();

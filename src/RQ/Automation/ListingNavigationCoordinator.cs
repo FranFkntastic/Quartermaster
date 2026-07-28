@@ -190,6 +190,58 @@ public sealed class ListingNavigationCoordinator : IDisposable
         }
     }
 
+    public async Task<ListingOpenResult> ReturnToRetainerListAsync(
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(disposed, this);
+        if (!automation.TryAcquire("listing navigation", out var lease))
+            return Complete(false, false, $"Automation is busy with {automation.Holder}.");
+
+        using (lease)
+        {
+            if (Interlocked.CompareExchange(ref running, 1, 0) != 0)
+                return Complete(false, false, "Another listing surface is already opening.");
+
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
+            var token = linked.Token;
+            var restoreSuppression = false;
+            try
+            {
+                if (!await WaitForAutoRetainerAsync(token).ConfigureAwait(false))
+                    return Complete(false, false, "AutoRetainer remained busy; the retainer list was not restored.");
+
+                if (autoRetainer.IsAvailable && !autoRetainer.IsSuppressed)
+                {
+                    autoRetainer.SetSuppressed(true);
+                    restoreSuppression = true;
+                }
+
+                Status = "Returning to the retainer list…";
+                var result = await session.ReturnToRetainerListAsync(token).ConfigureAwait(false);
+                return result.Success
+                    ? Complete(true, true, "Returned to the retainer list.")
+                    : Complete(true, false, Format(result));
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                return Complete(true, false, "Listing navigation was cancelled.");
+            }
+            catch (Exception exception)
+            {
+                return Complete(true, false, $"Listing recovery failed: {exception.Message}");
+            }
+            finally
+            {
+                if (restoreSuppression)
+                {
+                    try { autoRetainer.SetSuppressed(false); }
+                    catch (Exception exception) { Status = $"The retainer list was restored, but AutoRetainer suppression could not be restored: {exception.Message}"; }
+                }
+                Interlocked.Exchange(ref running, 0);
+            }
+        }
+    }
+
     public void Dispose()
     {
         if (disposed)
