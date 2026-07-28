@@ -46,17 +46,11 @@ public sealed class AgentBridgeHost : IDisposable
             AgentBridgeRuntimeIdentity.FromAssembly("RQ", Assembly.GetExecutingAssembly(), mainDllPath),
             profile.Id,
             profile.Alias,
-            "Quartermaster.truth.v6",
+            "Quartermaster.truth.v7",
             [new("snapshot"), new("reviewed-actions"), new("operations"), new("encrypted-capture"), new("capture-transactions")],
             provider.GetReviewSurfaces(),
             provider.GetCaptureSurfaces(),
-            [new(
-                "quartermaster.refresh-retainers",
-                "Refresh retainers",
-                "transfer",
-                AgentBridgeUiControlKind.Button,
-                true,
-                CompletionOperationKind: "retainer-refresh")]);
+            BuildActions());
         RegisterCommands();
         host = new SharedAgentBridgeHost(new AgentBridgeHostOptions
         {
@@ -248,6 +242,41 @@ public sealed class AgentBridgeHost : IDisposable
         || status.Contains("could not", StringComparison.OrdinalIgnoreCase)
         || status.Contains("requires", StringComparison.OrdinalIgnoreCase)
         || status.Contains("disabled", StringComparison.OrdinalIgnoreCase);
+
+    private static IReadOnlyList<AgentBridgeActionDescriptor> BuildActions()
+    {
+        List<AgentBridgeActionDescriptor> actions =
+        [
+            new(
+                "quartermaster.refresh-retainers",
+                "Refresh retainers",
+                "transfer",
+                AgentBridgeUiControlKind.Button,
+                true,
+                CompletionOperationKind: "retainer-refresh"),
+            new(
+                "quartermaster.stock.search",
+                "Search accessible stock",
+                "transfer",
+                AgentBridgeUiControlKind.Input,
+                false,
+                new AgentBridgeActionArgumentSchema(
+                    [new("query", AgentBridgeActionArgumentKind.String, Required: false)])),
+            new(
+                "quartermaster.transfer.execute",
+                "Review and execute the selected Transfer Plan",
+                "transfer",
+                AgentBridgeUiControlKind.Button,
+                true),
+            new(
+                "quartermaster.transfer.review.execute",
+                "Execute the reviewed Transfer Plan",
+                "transfer-review",
+                AgentBridgeUiControlKind.Button,
+                true),
+        ];
+        return actions;
+    }
 
     private async Task<T> OnFrameworkAsync<T>(Func<T> action, CancellationToken cancellationToken)
     {

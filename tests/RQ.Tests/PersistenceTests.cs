@@ -1,11 +1,60 @@
 using RQ;
 using RQ.Domain;
+using RQ.Inventory;
 using RQ.Persistence;
 
 namespace RQ.Tests;
 
 public sealed class PersistenceTests
 {
+    [Fact]
+    public void PlayerInventoryCache_PreservesUnavailableContainersAndClearsObservedEmptyContainers()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "player-inventory-cache.json");
+        var repository = new PlayerInventoryCacheRepository(new PlayerInventoryCacheStore(path));
+        var firstObservation = new PlayerStorageCapture(
+            [
+                PlayerBag("Inventory1", (100, 12)),
+                PlayerBag("Crystals", (2, 8080)),
+            ],
+            ["Inventory1", "Crystals"],
+            ["Inventory1", "Crystals"]);
+
+        Assert.True(repository.Observe(TestData.Owner, firstObservation, new DateTime(2026, 7, 26, 12, 0, 0, DateTimeKind.Utc)));
+        Assert.True(repository.Observe(
+            TestData.Owner,
+            new PlayerStorageCapture(
+                [PlayerBag("Inventory1")],
+                ["Inventory1", "Crystals"],
+                ["Inventory1"]),
+            new DateTime(2026, 7, 26, 12, 0, 1, DateTimeKind.Utc)));
+        repository.Flush();
+
+        var restarted = new PlayerInventoryCacheRepository(new PlayerInventoryCacheStore(path));
+        var snapshot = restarted.Snapshot(TestData.Owner, ["Inventory1", "Crystals"]);
+
+        Assert.Empty(Assert.Single(snapshot.Bags, bag => bag.BagName == "Inventory1").Items);
+        Assert.Equal((uint)8080, Assert.Single(Assert.Single(snapshot.Bags, bag => bag.BagName == "Crystals").Items).Quantity);
+        Assert.Equal(["Inventory1"], snapshot.ObservedSources);
+    }
+
+    [Fact]
+    public void PlayerInventoryCache_IsScopedByStableCharacterIdentity()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = new PlayerInventoryCacheRepository(
+            new PlayerInventoryCacheStore(Path.Combine(directory.Path, "player-inventory-cache.json")));
+        repository.Observe(
+            TestData.Owner,
+            new PlayerStorageCapture([PlayerBag("Inventory1", (100, 12))], ["Inventory1"], ["Inventory1"]),
+            DateTime.UtcNow);
+
+        var other = TestData.Owner with { LocalContentId = TestData.Owner.LocalContentId + 1, CharacterName = "Other" };
+
+        Assert.Empty(repository.Snapshot(other, ["Inventory1"]).Bags);
+    }
+
     [Fact]
     public void RetainerCache_RoundTripsOwnerBagsListingsAndObservationTimes()
     {
@@ -28,6 +77,31 @@ public sealed class PersistenceTests
         Assert.Equal(retainer.ObservedAtUtc, loaded.ObservedAtUtc);
         Assert.Equal((uint)37, Assert.Single(Assert.Single(loaded.Bags).Items).Quantity);
         Assert.Equal(retainer.Listings[0].ListedAtUtc, Assert.Single(loaded.Listings).ListedAtUtc);
+    }
+
+    [Fact]
+    public void ReplaceListings_ReplacesEmptyOrChangedMarketEvidenceWithoutDiscardingInventory()
+    {
+        using var directory = new TemporaryDirectory();
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "retainer-cache.json"));
+        var retainer = TestData.Retainer(10, "Eris", (100, "Darksteel Ore", 37));
+        retainer.Listings.Add(new CachedMarketListing { ItemId = 100, Quantity = 2, UnitPrice = 44 });
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = retainer });
+        var repository = new RetainerCacheRepository(store);
+        var observedAt = new DateTime(2026, 7, 26, 20, 0, 0, DateTimeKind.Utc);
+
+        repository.ReplaceListings(new RetainerListingsObservation(
+            10,
+            "Eris",
+            TestData.Owner,
+            observedAt,
+            []));
+
+        var updated = Assert.Single(repository.Snapshot().Values);
+        Assert.Empty(updated.Listings);
+        Assert.Equal(observedAt, updated.ListingsObservedAtUtc);
+        Assert.Equal((uint)37, Assert.Single(Assert.Single(updated.Bags).Items).Quantity);
+        Assert.Contains("RetainerMarket", updated.ObservedSources);
     }
 
     [Fact]
@@ -56,4 +130,18 @@ public sealed class PersistenceTests
         Assert.Equal(1, restarted.Revision);
         Assert.Equal(20, Assert.Single(restarted.PlanItems).TargetQuantity);
     }
+
+    private static InventoryBag PlayerBag(string name, params (uint ItemId, uint Quantity)[] items) => new()
+    {
+        BagName = name,
+        Location = "Inventory",
+        Items = items.Select((item, index) => new RQ.Domain.InventoryItem
+        {
+            ItemId = item.ItemId,
+            ItemName = $"Item {item.ItemId}",
+            Quantity = item.Quantity,
+            ContainerKey = name,
+            SlotIndex = index,
+        }).ToList(),
+    };
 }

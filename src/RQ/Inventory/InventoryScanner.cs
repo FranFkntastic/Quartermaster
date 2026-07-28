@@ -64,12 +64,7 @@ public sealed class InventoryScanner
     public unsafe PlayerStorageCapture CapturePlayerStorage()
     {
         var options = storageOptions();
-        var types = PlayerBags
-            .Concat(options.IncludeEquipped ? [InventoryType.EquippedItems] : [])
-            .Concat(options.IncludeArmoury ? ArmouryContainers : [])
-            .Concat(options.IncludeCrystals ? [InventoryType.Crystals] : [])
-            .Concat(options.IncludeSaddlebag ? [InventoryType.SaddleBag1, InventoryType.SaddleBag2, InventoryType.PremiumSaddleBag1, InventoryType.PremiumSaddleBag2] : [])
-            .ToArray();
+        var types = PlayerStorageTypes(options);
         var manager = InventoryManager.Instance();
         if (manager is null)
             return new([], types.Select(type => type.ToString()).ToArray(), []);
@@ -106,6 +101,16 @@ public sealed class InventoryScanner
         }
         return new(result, types.Select(type => type.ToString()).ToArray(), observed);
     }
+
+    public IReadOnlyList<string> RequestedPlayerStorageSources() =>
+        PlayerStorageTypes(storageOptions()).Select(type => type.ToString()).ToArray();
+
+    private static InventoryType[] PlayerStorageTypes(PlayerStorageOptions options) => PlayerBags
+        .Concat(options.IncludeEquipped ? [InventoryType.EquippedItems] : [])
+        .Concat(options.IncludeArmoury ? ArmouryContainers : [])
+        .Concat(options.IncludeCrystals ? [InventoryType.Crystals] : [])
+        .Concat(options.IncludeSaddlebag ? [InventoryType.SaddleBag1, InventoryType.SaddleBag2, InventoryType.PremiumSaddleBag1, InventoryType.PremiumSaddleBag2] : [])
+        .ToArray();
 
     public IReadOnlyDictionary<uint, int> CountPlayerItems() => ScanPlayerBags()
         .SelectMany(bag => bag.Items)
@@ -168,6 +173,12 @@ public sealed class InventoryScanner
         return new(bags, loaded, gil, listings);
     }
 
+    public unsafe IReadOnlyList<CachedMarketListing>? CaptureRetainerListings()
+    {
+        var manager = InventoryManager.Instance();
+        return manager is null ? null : ReadListings(manager, new HashSet<InventoryType>());
+    }
+
     public string ResolveItemName(uint itemId)
     {
         try
@@ -214,6 +225,7 @@ public sealed class InventoryScanner
             if (slot is null || slot->ItemId == 0 || slot->Quantity == 0)
                 continue;
             var definition = metadata.Resolve(slot->ItemId);
+            var observedPrice = manager->GetRetainerMarketPrice(checked((short)index));
             result.Add(new CachedMarketListing
             {
                 ItemId = slot->ItemId,
@@ -225,6 +237,7 @@ public sealed class InventoryScanner
                 ConditionPercent = definition.SupportsCondition ? slot->Condition / 300f : null,
                 ContainerKey = InventoryType.RetainerMarket.ToString(),
                 SlotIndex = index,
+                UnitPrice = observedPrice is > 0 and <= uint.MaxValue ? (uint)observedPrice : null,
                 ListedAtUtc = now,
             });
         }

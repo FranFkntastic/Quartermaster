@@ -63,6 +63,45 @@ public sealed class BrowserTests
     }
 
     [Fact]
+    public void Projection_UnlistedQuantityUsesRetainerBagsAndScopeWithoutCountingPlayerStock()
+    {
+        var first = TestData.Retainer(10, "Eris", (100, "Darksteel Ore", 3));
+        var second = TestData.Retainer(11, "Nyx", (100, "Darksteel Ore", 4));
+        MarkInventoryComplete(first);
+        MarkInventoryComplete(second);
+        first.Listings.Add(new CachedMarketListing { ItemId = 100, ItemName = "Darksteel Ore", Quantity = 2 });
+        var projection = BrowserProjectionBuilder.Build(
+            [Bag((100, "Darksteel Ore", 20))],
+            new Dictionary<ulong, CachedRetainer> { [10] = first, [11] = second },
+            TestData.Owner);
+
+        var all = projection.GetUnlistedRetainerQuantity(100, BrowserScope.AllKey);
+        var eris = projection.GetUnlistedRetainerQuantity(100, BrowserScope.RetainerKey(10));
+
+        Assert.True(all.IsKnown);
+        Assert.Equal(7, all.Value);
+        Assert.True(eris.IsKnown);
+        Assert.Equal(3, eris.Value);
+    }
+
+    [Fact]
+    public void Projection_UnlistedQuantityRemainsUnknownUntilEveryRetainerInventoryIsObserved()
+    {
+        var complete = TestData.Retainer(10, "Eris", (100, "Darksteel Ore", 3));
+        var listingsOnly = TestData.Retainer(11, "Nyx");
+        MarkInventoryComplete(complete);
+        listingsOnly.Listings.Add(new CachedMarketListing { ItemId = 100, ItemName = "Darksteel Ore", Quantity = 2 });
+        var projection = BrowserProjectionBuilder.Build(
+            [],
+            new Dictionary<ulong, CachedRetainer> { [10] = complete, [11] = listingsOnly },
+            TestData.Owner);
+
+        Assert.False(projection.GetUnlistedRetainerQuantity(100, BrowserScope.AllKey).IsKnown);
+        Assert.True(projection.GetUnlistedRetainerQuantity(100, BrowserScope.RetainerKey(10)).IsKnown);
+        Assert.False(projection.GetUnlistedRetainerQuantity(100, BrowserScope.RetainerKey(11)).IsKnown);
+    }
+
+    [Fact]
     public void FranthropyQuery_FiltersItemsAndListings()
     {
         var retainer = TestData.Retainer(10, "Eris", (100, "Darksteel Ore", 7), (200, "Spruce Log", 1));
@@ -92,7 +131,7 @@ public sealed class BrowserTests
     }
 
     [Fact]
-    public void ValidIntermediateEdit_KeepsEvaluatedRowsUntilEditingEnds()
+    public void ValidIntermediateEdit_UpdatesRowsWhileTyping()
     {
         var projection = BrowserProjectionBuilder.Build([], new Dictionary<ulong, CachedRetainer>
         {
@@ -105,9 +144,9 @@ public sealed class BrowserTests
         var editing = controller.QueryItems(projection, "spruce", isEditing: true);
 
         Assert.True(editing.Filter.IsValid);
-        Assert.Equal([100U], editing.Items.Select(item => item.ItemId));
+        Assert.Equal([200U], editing.Items.Select(item => item.ItemId));
         Assert.Equal(2, controller.ItemCompilationCount);
-        Assert.Equal(1, controller.ItemEvaluationCount);
+        Assert.Equal(2, controller.ItemEvaluationCount);
 
         var committed = controller.QueryItems(projection, "spruce");
 
@@ -117,7 +156,7 @@ public sealed class BrowserTests
     }
 
     [Fact]
-    public void DataChange_ReevaluatesDisplayedCompilationDuringEdit()
+    public void DataChange_ReevaluatesCurrentCompilationDuringEdit()
     {
         var retainer = TestData.Retainer(10, "Eris", (100, "Darksteel Ore", 3), (200, "Spruce Log", 3));
         var controller = new BrowserQueryController();
@@ -135,7 +174,7 @@ public sealed class BrowserTests
             TestData.Owner);
         var editing = controller.QueryItems(changed, "spruce", isEditing: true, revision: 2);
 
-        Assert.Empty(editing.Items);
+        Assert.Equal([200U], editing.Items.Select(item => item.ItemId));
         Assert.Equal(2, controller.ItemCompilationCount);
         Assert.Equal(2, controller.ItemEvaluationCount);
     }
@@ -157,7 +196,7 @@ public sealed class BrowserTests
     }
 
     [Fact]
-    public void ListingsKeepEvaluatedRowsUntilEditingEnds()
+    public void ListingsUpdateRowsWhileTyping()
     {
         var retainer = TestData.Retainer(10, "Eris");
         retainer.Listings.Add(new CachedMarketListing { ItemId = 100, ItemName = "Darksteel Ore", Quantity = 2, UnitPrice = 40 });
@@ -172,9 +211,9 @@ public sealed class BrowserTests
 
         var editing = controller.QueryListings(projection, "spruce", isEditing: true);
 
-        Assert.Equal([100U], editing.Listings.Select(item => item.ItemId));
+        Assert.Equal([200U], editing.Listings.Select(item => item.ItemId));
         Assert.Equal(2, controller.ListingCompilationCount);
-        Assert.Equal(1, controller.ListingEvaluationCount);
+        Assert.Equal(2, controller.ListingEvaluationCount);
 
         Assert.Equal([200U], controller.QueryListings(projection, "spruce").Listings.Select(item => item.ItemId));
         Assert.Equal(2, controller.ListingCompilationCount);
@@ -265,4 +304,18 @@ public sealed class BrowserTests
         BagName = "Inventory1",
         Items = items.Select(item => new InventoryItem { ItemId = item.Id, ItemName = item.Name, Quantity = item.Quantity }).ToList(),
     };
+
+    private static void MarkInventoryComplete(CachedRetainer retainer)
+    {
+        retainer.ObservedSources =
+        [
+            "RetainerPage1",
+            "RetainerPage2",
+            "RetainerPage3",
+            "RetainerPage4",
+            "RetainerPage5",
+            "RetainerPage6",
+            "RetainerPage7",
+        ];
+    }
 }

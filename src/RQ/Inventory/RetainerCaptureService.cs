@@ -25,6 +25,12 @@ public sealed class RetainerCaptureService : IDisposable
     private long receiptRevision;
     private readonly List<CaptureReceipt> receipts = [];
     private bool registered;
+    private DateTime nextPassiveListingScanAt;
+    private ulong passiveRetainerId;
+    private string? passiveListingFingerprint;
+    private ulong candidateRetainerId;
+    private string? candidateListingFingerprint;
+    private DateTime candidateListingObservedAt;
 
     public RetainerCaptureService(IAddonLifecycle lifecycle, IPluginLog log, InventoryScanner scanner, RetainerCacheRepository cache, Func<OwnerScope> currentOwner)
     {
@@ -59,6 +65,69 @@ public sealed class RetainerCaptureService : IDisposable
     public long Checkpoint => receiptRevision;
     public IReadOnlyList<CaptureReceipt> ReceiptsAfter(long checkpoint) => receipts.Where(receipt => receipt.Revision > checkpoint).ToArray();
     public CaptureWaitSnapshot GetWaitSnapshot() => new(session, receiptRevision);
+
+    public void TickPassive()
+    {
+        var now = DateTime.UtcNow;
+        if (now < nextPassiveListingScanAt)
+            return;
+        nextPassiveListingScanAt = now.AddMilliseconds(250);
+
+        try
+        {
+            var identity = ReadActiveRetainer();
+            if (identity is null)
+            {
+                passiveRetainerId = 0;
+                passiveListingFingerprint = null;
+                candidateRetainerId = 0;
+                candidateListingFingerprint = null;
+                return;
+            }
+
+            var owner = currentOwner();
+            if (!owner.HasStableIdentity)
+                return;
+            var listings = scanner.CaptureRetainerListings();
+            if (listings is null)
+                return;
+            var fingerprint = ListingFingerprint(listings);
+            if (passiveRetainerId == identity.Value.Id &&
+                string.Equals(passiveListingFingerprint, fingerprint, StringComparison.Ordinal))
+                return;
+            if (candidateRetainerId != identity.Value.Id ||
+                !string.Equals(candidateListingFingerprint, fingerprint, StringComparison.Ordinal))
+            {
+                candidateRetainerId = identity.Value.Id;
+                candidateListingFingerprint = fingerprint;
+                candidateListingObservedAt = now;
+                return;
+            }
+            if (now - candidateListingObservedAt < TimeSpan.FromMilliseconds(500))
+                return;
+
+            cache.ReplaceListings(new RetainerListingsObservation(
+                identity.Value.Id,
+                identity.Value.Name,
+                owner,
+                now,
+                listings));
+            passiveRetainerId = identity.Value.Id;
+            passiveListingFingerprint = fingerprint;
+            candidateRetainerId = 0;
+            candidateListingFingerprint = null;
+        }
+        catch (Exception exception)
+        {
+            log.Error(exception, "Quartermaster failed to passively capture retainer listings.");
+        }
+    }
+
+    internal static string ListingFingerprint(IReadOnlyList<CachedMarketListing> listings) =>
+        string.Join("|", listings
+            .OrderBy(listing => listing.SlotIndex)
+            .Select(listing =>
+                $"{listing.SlotIndex}:{listing.ItemId}:{listing.Quantity}:{listing.IsHq}:{listing.UnitPrice?.ToString() ?? "?"}"));
 
     private void Opened(AddonEvent _, AddonArgs __)
     {

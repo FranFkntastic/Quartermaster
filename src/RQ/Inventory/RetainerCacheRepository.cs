@@ -12,6 +12,12 @@ public sealed record RetainerVariantObservation(
     bool IsHighQuality,
     DateTime ObservedAtUtc,
     IReadOnlyList<DalamudInventoryStack> Stacks);
+public sealed record RetainerListingsObservation(
+    ulong RetainerId,
+    string RetainerName,
+    OwnerScope Owner,
+    DateTime ObservedAtUtc,
+    IReadOnlyList<CachedMarketListing> Listings);
 
 public sealed class RetainerCacheRepository
 {
@@ -98,6 +104,42 @@ public sealed class RetainerCacheRepository
                     Equipped = template?.Equipped,
                 });
             }
+
+            var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [observation.RetainerId] = updated };
+            store.Save(candidate);
+            cache = candidate;
+            Revision++;
+        }
+        Changed?.Invoke();
+    }
+
+    public void ReplaceListings(RetainerListingsObservation observation)
+    {
+        if (observation.RetainerId == 0)
+            throw new ArgumentOutOfRangeException(nameof(observation), "A stable retainer identity is required.");
+        if (!observation.Owner.HasStableIdentity)
+            throw new InvalidOperationException("A stable owner identity is required.");
+
+        lock (gate)
+        {
+            var updated = cache.TryGetValue(observation.RetainerId, out var current)
+                ? Copy(current)
+                : new CachedRetainer
+                {
+                    RetainerId = observation.RetainerId,
+                    RetainerName = observation.RetainerName,
+                    Owner = observation.Owner with { },
+                    ObservedAtUtc = observation.ObservedAtUtc,
+                };
+            updated.RetainerName = observation.RetainerName;
+            updated.Owner = observation.Owner with { };
+            updated.ListingsObservedAtUtc = observation.ObservedAtUtc;
+            updated.Listings = observation.Listings.Select(Copy).ToList();
+            var marketSource = FFXIVClientStructs.FFXIV.Client.Game.InventoryType.RetainerMarket.ToString();
+            if (!updated.RequestedSources.Contains(marketSource, StringComparer.Ordinal))
+                updated.RequestedSources.Add(marketSource);
+            if (!updated.ObservedSources.Contains(marketSource, StringComparer.Ordinal))
+                updated.ObservedSources.Add(marketSource);
 
             var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [observation.RetainerId] = updated };
             store.Save(candidate);

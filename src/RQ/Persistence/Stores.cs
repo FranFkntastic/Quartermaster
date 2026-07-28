@@ -44,6 +44,19 @@ public sealed class RetainerCacheStore
     }
 }
 
+public sealed class PlayerInventoryCacheStore
+{
+    private readonly AtomicDocumentStore<Dictionary<ulong, CachedPlayerInventory>> store;
+
+    public PlayerInventoryCacheStore(string path) => store = new(path);
+
+    public string Path => store.Path;
+    public bool Exists => store.Exists;
+    public Dictionary<ulong, CachedPlayerInventory> Load() => store.Load();
+    public void Save(IReadOnlyDictionary<ulong, CachedPlayerInventory> cache) =>
+        store.Save(cache.ToDictionary(entry => entry.Key, entry => entry.Value));
+}
+
 public sealed class QuartermasterStateStore
 {
     private readonly AtomicDocumentStore<QuartermasterState> store;

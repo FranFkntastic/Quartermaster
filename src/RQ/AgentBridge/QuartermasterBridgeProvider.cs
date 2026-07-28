@@ -10,6 +10,8 @@ public sealed record QuartermasterBridgeTruth(
     string PluginVersion,
     bool MainWindowOpen,
     string CurrentWorkspace,
+    string StockFilter,
+    int VisibleStockCount,
     string TransferDirection,
     bool PlanEditorOpen,
     bool PlanEditorHasUnsavedChanges,

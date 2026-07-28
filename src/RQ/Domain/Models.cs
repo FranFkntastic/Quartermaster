@@ -97,6 +97,23 @@ public sealed class InventoryItem
     public bool? Equipped { get; set; }
 }
 
+public sealed class CachedPlayerInventory
+{
+    public OwnerScope Owner { get; set; } = new();
+    public DateTime UpdatedAtUtc { get; set; }
+    public List<string> RequestedSources { get; set; } = [];
+    public List<string> ObservedSources { get; set; } = [];
+    public List<CachedPlayerBag> Bags { get; set; } = [];
+}
+
+public sealed class CachedPlayerBag
+{
+    public string BagName { get; set; } = string.Empty;
+    public string? Location { get; set; }
+    public DateTime ObservedAtUtc { get; set; }
+    public List<InventoryItem> Items { get; set; } = [];
+}
+
 public sealed class TargetPlanItem
 {
     public Guid Id { get; set; } = Guid.NewGuid();

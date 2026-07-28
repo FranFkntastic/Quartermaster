@@ -31,4 +31,25 @@ public sealed class CaptureTests
         Assert.Equal(1, diagnosticAttempts);
         Assert.Equal(1, received);
     }
+
+    [Fact]
+    public void ListingFingerprint_ChangesWhenPriceOrContentsChange()
+    {
+        var baseline = new[]
+        {
+            new RQ.Domain.CachedMarketListing { SlotIndex = 0, ItemId = 100, Quantity = 2, UnitPrice = 40 },
+        };
+
+        Assert.Equal(
+            RetainerCaptureService.ListingFingerprint(baseline),
+            RetainerCaptureService.ListingFingerprint(
+                [new RQ.Domain.CachedMarketListing { SlotIndex = 0, ItemId = 100, Quantity = 2, UnitPrice = 40 }]));
+        Assert.NotEqual(
+            RetainerCaptureService.ListingFingerprint(baseline),
+            RetainerCaptureService.ListingFingerprint(
+                [new RQ.Domain.CachedMarketListing { SlotIndex = 0, ItemId = 100, Quantity = 2, UnitPrice = 41 }]));
+        Assert.NotEqual(
+            RetainerCaptureService.ListingFingerprint(baseline),
+            RetainerCaptureService.ListingFingerprint([]));
+    }
 }

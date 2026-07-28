@@ -255,9 +255,7 @@ public static class StowageEvaluator
         TargetPlanItem rule,
         StockGroup? stock)
     {
-        var player = stock?.Stacks
-            .Where(stack => stack.ScopeKind == BrowserScopeKind.Player && Matches(rule.Quality, stack.Quality))
-            .Sum(stack => stack.Quantity) ?? 0;
+        var player = PlayerQuantity(rule, stock);
         var target = Math.Max(0, rule.TargetQuantity);
         var retrieve = Math.Max(0, target - player);
         var deposit = Math.Max(0, player - target);
@@ -274,6 +272,11 @@ public static class StowageEvaluator
             retrieve > 0 ? StowageAction.Retrieve : deposit > 0 ? StowageAction.Deposit : StowageAction.None,
             Copy(rule.Routing));
     }
+
+    public static int PlayerQuantity(TargetPlanItem rule, StockGroup? stock) =>
+        stock?.Stacks
+            .Where(stack => stack.ScopeKind == BrowserScopeKind.Player && Matches(rule.Quality, stack.Quality))
+            .Sum(stack => stack.Quantity) ?? 0;
 
     private static bool Matches(ItemQualityPolicy policy, FfxivItemQuality quality) => policy switch
     {

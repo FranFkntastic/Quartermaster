@@ -62,6 +62,8 @@ public sealed class BrowserProjection
     public required IReadOnlyList<StockGroup> Items { get; init; }
     public required IReadOnlyList<ListingRow> Listings { get; init; }
     public required OwnerScope Owner { get; init; }
+    public IReadOnlyDictionary<string, bool> RetainerInventoryCompleteByScope { get; init; } =
+        new Dictionary<string, bool>(StringComparer.Ordinal);
 
     public IReadOnlyList<StockGroup> GetItems(string? scopeKey) => string.IsNullOrWhiteSpace(scopeKey) || scopeKey == BrowserScope.AllKey
         ? Items
@@ -70,6 +72,17 @@ public sealed class BrowserProjection
     public IReadOnlyList<ListingRow> GetListings(string? scopeKey) => string.IsNullOrWhiteSpace(scopeKey) || scopeKey == BrowserScope.AllKey
         ? Listings
         : Listings.Where(listing => listing.ScopeKey == scopeKey).ToArray();
+
+    public FieldEvidence<int> GetUnlistedRetainerQuantity(uint itemId, string? scopeKey)
+    {
+        var normalizedScope = string.IsNullOrWhiteSpace(scopeKey) ? BrowserScope.AllKey : scopeKey;
+        if (!RetainerInventoryCompleteByScope.GetValueOrDefault(normalizedScope))
+            return Evidence.Unknown<int>("Retainer inventory has not been observed for every retainer in this scope.");
+        var quantity = GetItems(normalizedScope)
+            .FirstOrDefault(item => item.ItemId == itemId)?
+            .RetainerQuantity ?? 0;
+        return Evidence.Known(quantity);
+    }
 
     internal static IReadOnlyList<StockGroup> Aggregate(IEnumerable<StockStack> stacks, IReadOnlyDictionary<uint, ItemMetadata?>? definitions = null) => stacks
         .GroupBy(stack => stack.ItemId)
@@ -102,11 +115,22 @@ public static class BrowserProjectionBuilder
             foreach (var item in bag.Items.Where(item => item.ItemId > 0 && item.Quantity > 0))
                 stacks.Add(new(BrowserScope.PlayerKey, BrowserScopeKind.Player, null, "Player", item.ContainerKey ?? bag.Location ?? bag.BagName, item.SlotIndex, item.ItemId, DisplayName(item.ItemId, item.ItemName), checked((int)item.Quantity), item.IsHq ? FfxivItemQuality.HQ : FfxivItemQuality.NQ, null, item.ItemType, item.ConditionPercent is { } condition ? (decimal)condition : null, item.Equipped));
 
-        foreach (var retainer in cache.Values.Where(retainer => retainer.Owner.Matches(owner)).OrderBy(retainer => retainer.RetainerName).ThenBy(retainer => retainer.RetainerId))
+        var retainers = cache.Values
+            .Where(retainer => retainer.Owner.Matches(owner))
+            .OrderBy(retainer => retainer.RetainerName)
+            .ThenBy(retainer => retainer.RetainerId)
+            .ToArray();
+        var retainerInventoryCompleteByScope = new Dictionary<string, bool>(StringComparer.Ordinal)
+        {
+            [BrowserScope.AllKey] = retainers.All(HasCompleteRetainerInventory),
+            [BrowserScope.PlayerKey] = true,
+        };
+        foreach (var retainer in retainers)
         {
             var key = BrowserScope.RetainerKey(retainer.RetainerId);
             var name = string.IsNullOrWhiteSpace(retainer.RetainerName) ? $"Retainer {retainer.RetainerId}" : retainer.RetainerName;
             scopes.Add(new(key, name, BrowserScopeKind.Retainer, retainer.RetainerId));
+            retainerInventoryCompleteByScope[key] = HasCompleteRetainerInventory(retainer);
             foreach (var bag in retainer.Bags.Where(bag => bag.BagName is not "RetainerGil" and not "RetainerMarket"))
                 foreach (var item in bag.Items.Where(item => item.ItemId > 0 && item.Quantity > 0))
                     stacks.Add(new(key, BrowserScopeKind.Retainer, retainer.RetainerId, name, item.ContainerKey ?? bag.Location ?? bag.BagName, item.SlotIndex, item.ItemId, DisplayName(item.ItemId, item.ItemName), checked((int)item.Quantity), item.IsHq ? FfxivItemQuality.HQ : FfxivItemQuality.NQ, bag.ObservedAtUtc, item.ItemType, item.ConditionPercent is { } condition ? (decimal)condition : null, item.Equipped));
@@ -131,8 +155,14 @@ public static class BrowserProjectionBuilder
             Items = items,
             Listings = sortedListings,
             Owner = owner,
+            RetainerInventoryCompleteByScope = retainerInventoryCompleteByScope,
         };
     }
+
+    private static bool HasCompleteRetainerInventory(CachedRetainer retainer) =>
+        InventoryScanner.RequiredRetainerContainers
+            .Select(container => container.ToString())
+            .All(required => retainer.ObservedSources.Contains(required, StringComparer.Ordinal));
 
     private static string DisplayName(uint id, string? name) => string.IsNullOrWhiteSpace(name) ? $"Item {id}" : name;
 }
@@ -211,7 +241,7 @@ public sealed class BrowserQueryController
             .UseDefaultText(catalog.ItemName, item => Evidence.Known(item.ItemName));
         if (owner.LocalContentId is > 0)
             builder.BindSet(catalog.OwnershipCharacters, _ => Evidence.Known<IReadOnlyCollection<FfxivCharacterKey>>([new(owner.LocalContentId.Value)]));
-        return builder.Build("quartermaster-items", "1");
+        return builder.Build("quartermaster-items", "2");
     }
 
     public static FilterContext<ListingRow> CreateListingContext(IReadOnlyList<ListingRow> source, OwnerScope owner)
@@ -238,7 +268,7 @@ public sealed class BrowserQueryController
             .UseDefaultText(catalog.ItemName, item => Evidence.Known(item.ItemName));
         if (owner.LocalContentId is > 0)
             builder.BindSet(catalog.OwnershipCharacters, _ => Evidence.Known<IReadOnlyCollection<FfxivCharacterKey>>([new(owner.LocalContentId.Value)]));
-        return builder.Build("quartermaster-listings", "1");
+        return builder.Build("quartermaster-listings", "2");
     }
 
     private static FfxivFilterCatalog CreateCatalog(
@@ -336,19 +366,11 @@ public sealed class BrowserQueryController
 
             if (currentCompilation.IsValid)
             {
-                var applyCurrentCompilation = evaluatedCompilation is null || !isEditing;
-                var compilationToEvaluate = applyCurrentCompilation
-                    ? currentCompilation
-                    : evaluatedCompilation!;
-                var rows = Evaluate(source, dataIdentity, compilationToEvaluate);
-
-                if (applyCurrentCompilation || ReferenceEquals(compilationToEvaluate, lastValidCompilation))
-                {
-                    lastValidCompilation = compilationToEvaluate;
-                    lastValidRows = rows;
-                    lastValidDataIdentity = dataIdentity;
-                    hasLastValidResults = true;
-                }
+                var rows = Evaluate(source, dataIdentity, currentCompilation);
+                lastValidCompilation = currentCompilation;
+                lastValidRows = rows;
+                lastValidDataIdentity = dataIdentity;
+                hasLastValidResults = true;
 
                 return (rows, new(true, false, currentCompilation.Diagnostics));
             }

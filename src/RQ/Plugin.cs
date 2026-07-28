@@ -20,6 +20,8 @@ namespace RQ;
 public sealed class Plugin : IDalamudPlugin
 {
     private static readonly TimeSpan SnapshotRefreshInterval = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan PlayerObservationInterval = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan PlayerInventoryFlushInterval = TimeSpan.FromSeconds(2);
 
     private const string Command = "/rq";
     private readonly IDalamudPluginInterface pluginInterface;
@@ -30,6 +32,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly string providerInstanceId = Guid.NewGuid().ToString("N");
     private readonly FrameworkWorkQueue workQueue;
     private readonly InventoryScanner scanner;
+    private readonly PlayerInventoryCacheRepository playerInventory;
     private readonly RetainerCacheRepository cache;
     private readonly StateRepository state;
     private readonly RetainerCaptureService captures;
@@ -49,6 +52,8 @@ public sealed class Plugin : IDalamudPlugin
     private readonly QuartermasterWindow window;
     private readonly System.Collections.Concurrent.ConcurrentQueue<(string Kind, string? OperationId)> pendingChanges = new();
     private DateTime nextSnapshotAt;
+    private DateTime nextPlayerObservationAt;
+    private DateTime nextPlayerInventoryFlushAt;
     private int snapshotDirty;
 
     public Plugin(
@@ -80,6 +85,7 @@ public sealed class Plugin : IDalamudPlugin
         ImportLegacyStorageSettings(configuration, legacyConfigurationPath);
         pluginInterface.SavePluginConfig(configuration);
         var cachePath = Path.Combine(configDirectory, "retainer-cache.json");
+        var playerInventoryCachePath = Path.Combine(configDirectory, "player-inventory-cache.json");
         var statePath = Path.Combine(configDirectory, "quartermaster-state.json");
         new LegacyMigrationService(new LegacyMigrationPaths(
             Path.Combine(pluginConfigs, "MarketMafioso", "retainer-cache.json"),
@@ -93,6 +99,7 @@ public sealed class Plugin : IDalamudPlugin
             configuration.IncludeCrystals,
             configuration.IncludeEquipped,
             configuration.IncludeSaddlebag));
+        playerInventory = new(new PlayerInventoryCacheStore(playerInventoryCachePath));
         cache = new(new RetainerCacheStore(cachePath));
         state = new(new QuartermasterStateStore(statePath));
         StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
@@ -111,19 +118,31 @@ public sealed class Plugin : IDalamudPlugin
             driver,
             cache,
             CurrentOwner,
-            scanner.CountPlayerItems,
+            CountCachedPlayerItems,
             automation);
         automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerIpc);
         workQueue = new();
-        runtimeSnapshots = new(scanner, cache, state, CurrentOwner);
+        runtimeSnapshots = new(scanner, playerInventory, cache, state, CurrentOwner);
+        ObservePlayerInventory();
         var initialSnapshot = runtimeSnapshots.Refresh();
+        nextPlayerObservationAt = DateTime.UtcNow.Add(PlayerObservationInterval);
+        nextPlayerInventoryFlushAt = DateTime.UtcNow.Add(PlayerInventoryFlushInterval);
         snapshots = new(providerInstanceId, state, cache.Snapshot);
         snapshots.Refresh(initialSnapshot);
         nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
         submissions = new ShortageSubmissionService(providerInstanceId, state, workQueue, CurrentOwner);
         deposits = new ElementalDepositSubmissionService(providerInstanceId, state, workQueue, journal, cache.Snapshot, CurrentOwner);
         ipc = new(new DalamudIpcRegistrar(pluginInterface), snapshots, submissions, deposits);
-        window = new(state, runtimeSnapshots, journal, transfers, autoRetainer, dataManager, configuration, SaveConfiguration, agentReviewRegistry);
+        window = new(
+            state,
+            runtimeSnapshots,
+            journal,
+            transfers,
+            autoRetainer,
+            dataManager,
+            configuration,
+            SaveConfiguration,
+            agentReviewRegistry);
         agentBridgeViewportCapture = new(
             configDirectory,
             configuration.PluginInstanceId,
@@ -150,6 +169,7 @@ public sealed class Plugin : IDalamudPlugin
             captures.Register();
             autoRetainer.Register();
             state.Changed += OnStateChanged;
+            playerInventory.Changed += OnPlayerInventoryChanged;
             cache.Changed += OnCacheChanged;
             journal.OperationChanged += OnOperationChanged;
             submissions.OperationChanged += OnSubmittedOperationChanged;
@@ -177,6 +197,12 @@ public sealed class Plugin : IDalamudPlugin
         CharacterName = playerState.CharacterName ?? string.Empty,
         HomeWorldName = playerState.HomeWorld.IsValid ? playerState.HomeWorld.Value.Name.ToString() : string.Empty,
     };
+
+    private IReadOnlyDictionary<uint, int> CountCachedPlayerItems() =>
+        playerInventory.Snapshot(CurrentOwner(), scanner.RequestedPlayerStorageSources()).Bags
+            .SelectMany(bag => bag.Items)
+            .GroupBy(item => item.ItemId)
+            .ToDictionary(group => group.Key, group => group.Sum(item => checked((int)item.Quantity)));
 
     private static void ImportLegacyStorageSettings(PluginConfiguration target, string legacyPath)
     {
@@ -206,9 +232,12 @@ public sealed class Plugin : IDalamudPlugin
         StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
         TransferPlanMigration.EnsureOwnerPlans(state, CurrentOwner());
         workQueue.Drain();
+        captures.TickPassive();
         automaticRetrievals.Tick();
         autoRetainer.TickAutomatic(window.StockBrowserVisible);
         agentBridge.Tick();
+        ObservePlayerInventory();
+        FlushPlayerInventoryIfDue();
         if (Interlocked.Exchange(ref snapshotDirty, 0) != 0 || DateTime.UtcNow >= nextSnapshotAt)
             RefreshSnapshot();
         while (pendingChanges.TryDequeue(out var change))
@@ -218,7 +247,26 @@ public sealed class Plugin : IDalamudPlugin
     private void RefreshSnapshot()
     {
         snapshots.Refresh(runtimeSnapshots.Refresh());
+        nextPlayerObservationAt = DateTime.UtcNow.Add(PlayerObservationInterval);
         nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
+    }
+
+    private void ObservePlayerInventory()
+    {
+        var now = DateTime.UtcNow;
+        if (now < nextPlayerObservationAt)
+            return;
+        nextPlayerObservationAt = now.Add(PlayerObservationInterval);
+        playerInventory.Observe(CurrentOwner(), scanner.CapturePlayerStorage(), now);
+    }
+
+    private void FlushPlayerInventoryIfDue()
+    {
+        var now = DateTime.UtcNow;
+        if (now < nextPlayerInventoryFlushAt)
+            return;
+        nextPlayerInventoryFlushAt = now.Add(PlayerInventoryFlushInterval);
+        playerInventory.Flush();
     }
 
     private void OnStateChanged()
@@ -230,6 +278,8 @@ public sealed class Plugin : IDalamudPlugin
     {
         MarkChanged("cache", null);
     }
+
+    private void OnPlayerInventoryChanged() => MarkChanged("player_inventory", null);
 
     private void OnOperationChanged(OperationRecord operation)
     {
@@ -299,13 +349,19 @@ public sealed class Plugin : IDalamudPlugin
             .Where(candidate => candidate.Owner.Matches(runtime.Owner))
             .OrderByDescending(candidate => candidate.UpdatedAtUtc)
             .FirstOrDefault();
+        var selectedPlanId = window.SelectedStowagePlanId;
+        var selectedPlanRules = selectedPlanId is { } planId
+            ? runtime.State.PlanItems.Where(item => item.StowagePlanId == planId).ToArray()
+            : [];
         return new QuartermasterBridgeTruth(
-            6,
+            7,
             configuration.PluginInstanceId,
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
             window.IsOpen,
             window.CurrentWorkspace,
+            window.StockFilter,
+            window.VisibleStockCount,
             window.CurrentTransferDirection,
             window.RestockEditorOpen || window.StowageEditorOpen,
             window.PlanEditorHasUnsavedChanges,
@@ -318,8 +374,8 @@ public sealed class Plugin : IDalamudPlugin
             runtime.Owner.HasStableIdentity,
             retainers.Length,
             retainers.Length == 0 ? null : retainers.Min(retainer => new DateTimeOffset(DateTime.SpecifyKind(retainer.ObservedAtUtc, DateTimeKind.Utc))),
-            StowagePlanMigration.OwnerRules(runtime.State, runtime.Owner, enabledPlansOnly: false).Count,
-            StowagePlanMigration.OwnerRules(runtime.State, runtime.Owner).Count(item => item.Enabled),
+            selectedPlanRules.Length,
+            selectedPlanRules.Count(item => item.Enabled),
             StowagePlanCatalog.OwnerPlans(runtime.State, runtime.Owner).Count,
             window.SelectedStowagePlanId,
             window.SelectedStowagePlanName,
@@ -336,6 +392,7 @@ public sealed class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
+        playerInventory.Flush();
         automaticRetrievals.Dispose();
         window.CancelAndWaitForActiveTransfer(TimeSpan.FromSeconds(2));
         agentBridge.Dispose();
@@ -346,6 +403,7 @@ public sealed class Plugin : IDalamudPlugin
         submissions.OperationChanged -= OnSubmittedOperationChanged;
         deposits.OperationChanged -= OnSubmittedOperationChanged;
         state.Changed -= OnStateChanged;
+        playerInventory.Changed -= OnPlayerInventoryChanged;
         cache.Changed -= OnCacheChanged;
         journal.OperationChanged -= OnOperationChanged;
         ipc.Dispose();

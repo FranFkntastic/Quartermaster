@@ -152,7 +152,7 @@ public sealed class PlanWorkspaceTests
         var addedRule = draft.Rules.Single(rule => rule.ItemId == 9);
         Assert.Equal("Ice Crystal", addedRule.ItemName);
         Assert.Equal(0, addedRule.TargetQuantity);
-        Assert.False(addedRule.Enabled);
+        Assert.True(addedRule.Enabled);
         Assert.Equal("@Crystals", $"@{group.Name}");
         Assert.Equal("crystals 2", duplicateName.Name);
     }
@@ -197,7 +197,7 @@ public sealed class PlanWorkspaceTests
         Assert.Equal(1, added);
         var item = Assert.Single(draft.Items);
         Assert.Equal((uint)100, item.ItemId);
-        Assert.False(item.Enabled);
+        Assert.True(item.Enabled);
         Assert.Equal([item.Id], selected);
     }
 

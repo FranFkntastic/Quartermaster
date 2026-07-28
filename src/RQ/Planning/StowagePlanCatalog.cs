@@ -439,7 +439,6 @@ public static class ItemGroupCatalog
                 ItemName = item.ItemName,
                 Quality = item.Quality,
                 TargetQuantity = 0,
-                Enabled = false,
             });
             added++;
         }
@@ -469,7 +468,6 @@ public static class ItemGroupCatalog
                 ItemName = item.ItemName,
                 Quality = item.Quality,
                 TargetQuantity = 1,
-                Enabled = false,
             });
             added++;
         }

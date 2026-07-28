@@ -13,8 +13,6 @@ public sealed class WorkbenchState
     public Guid? SelectedRestockPlanId { get; set; }
     public Guid? SelectedStowagePlanId { get; set; }
     public string ScopeKey { get; set; } = BrowserScope.AllKey;
-    public string ItemFilter { get; set; } = string.Empty;
-    public string ListingFilter { get; set; } = string.Empty;
     public DalamudFilterAutocompleteState ItemFilterState { get; } = new();
     public DalamudFilterAutocompleteState ListingFilterState { get; } = new();
     public string ItemSort { get; set; } = "Name";

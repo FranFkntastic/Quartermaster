@@ -148,6 +148,8 @@ public sealed class QuartermasterWindow : Window
     public string CurrentWorkspace => workbench.View is WorkbenchView.Listings or WorkbenchView.Activity
         ? workbench.View.ToString().ToLowerInvariant()
         : "transfer";
+    public string StockFilter => workbench.ItemFilterState.Expression;
+    public int VisibleStockCount { get; private set; }
     public string CurrentTransferDirection => "mixed";
     public bool StowageEditorOpen => stowageDraft is not null && (requestStowageEditorOpen || stowageEditorVisible);
     public bool RestockEditorOpen => restockDraft is not null && (requestRestockEditorOpen || restockEditorVisible);
@@ -456,10 +458,11 @@ public sealed class QuartermasterWindow : Window
         DrawStockToolbar(projection);
         var result = queries.QueryItems(
             projection,
-            workbench.ItemFilter,
+            workbench.ItemFilterState.Expression,
             workbench.ScopeKey,
             workbench.ItemFilterState.IsInputActive,
             runtime.Revision);
+        VisibleStockCount = result.Items.Count;
         if (!result.Filter.IsValid)
             ImGui.TextColored(
                 new Vector4(1f, .65f, .25f, 1f),
@@ -559,13 +562,30 @@ public sealed class QuartermasterWindow : Window
         var sourceItems = projection.GetItems(workbench.ScopeKey);
         var context = BrowserQueryController.CreateItemContext(sourceItems, projection.Owner);
         var trailingWidth = 204f;
-        if (DalamudFilterAutocompleteRenderer.Draw(
-                "RQStockWorkbench",
-                "Search accessible stock by item name",
-                context,
-                workbench.ItemFilterState,
-                Math.Max(220, ImGui.GetContentRegionAvail().X - trailingWidth)))
-            workbench.ItemFilter = workbench.ItemFilterState.Expression;
+        DalamudFilterAutocompleteRenderer.Draw(
+            "RQStockWorkbench",
+            "Search accessible stock by item name",
+            context,
+            workbench.ItemFilterState,
+            Math.Max(220, ImGui.GetContentRegionAvail().X - trailingWidth));
+        reviewRegistry.RegisterLastAction(
+            "quartermaster.stock.search",
+            "Search accessible stock",
+            AgentBridgeUiControlKind.Input,
+            true,
+            false,
+            workbench.ItemFilterState.Expression,
+            new AgentBridgeActionArgumentSchema(
+                [new("query", AgentBridgeActionArgumentKind.String, Required: false)]),
+            arguments =>
+            {
+                var query = arguments is { ValueKind: System.Text.Json.JsonValueKind.Object } value &&
+                            value.TryGetProperty("query", out var queryValue)
+                    ? queryValue.GetString()
+                    : string.Empty;
+                workbench.ItemFilterState.SetExpression(query);
+                return AgentBridgeUiActionResult.Ok("Stock search updated.");
+            });
 
         ImGui.SameLine();
         ImGui.SetNextItemWidth(150);
@@ -2269,12 +2289,12 @@ public sealed class QuartermasterWindow : Window
         var movements = evaluated.Values.Count(line =>
             line.Action is StowageAction.Retrieve or StowageAction.Deposit);
         var hasMovement = retrieval.NeededQuantity > 0 || surplusBatch.PlannedQuantity > 0;
-        var canExecute = selected.Enabled &&
-                         hasMovement &&
-                         owner.HasStableIdentity &&
-                         transfers.CanStart &&
-                         !autoRetainer.IsRefreshing &&
-                         !autoRetainer.IsQueued;
+        var availability = TransferExecutionPolicy.ForExplicitRun(
+            hasMovement,
+            owner.HasStableIdentity,
+            transfers.CanStart,
+            autoRetainer.IsRefreshing || autoRetainer.IsQueued);
+        var canExecute = availability.CanExecute;
 
         ImGui.SameLine();
         if (!canExecute)
@@ -2300,7 +2320,7 @@ public sealed class QuartermasterWindow : Window
                     requestTransferReviewOpen = true;
                 }
             },
-            canExecute ? $"{movements:N0} movements" : hasMovement ? "Transfer unavailable" : "Already at target");
+            canExecute ? $"{movements:N0} movements" : availability.BlockReason);
 
         ImGui.Separator();
         ImGui.TextUnformatted($"{ownerRules.Length:N0} items");
@@ -2340,10 +2360,16 @@ public sealed class QuartermasterWindow : Window
             {
                 evaluated.TryGetValue(rule.Id, out var line);
                 retrievalLines.TryGetValue(rule.Id, out var retrievalLine);
-                var playerQuantity = line?.PlayerQuantity ?? 0;
+                var playerQuantity = StowageEvaluator.PlayerQuantity(
+                    rule,
+                    runtime.Browser.Items.FirstOrDefault(item => item.ItemId == rule.ItemId));
                 var difference = rule.TargetQuantity - playerQuantity;
 
                 ImGui.TableNextRow();
+                if (!rule.Enabled)
+                    ImGui.TableSetBgColor(
+                        ImGuiTableBgTarget.RowBg0,
+                        ImGui.GetColorU32(new Vector4(.38f, .12f, .14f, .42f)));
                 ImGui.TableNextColumn();
                 ImGui.TextUnformatted(rule.ItemName);
                 ImGui.SameLine();
@@ -2390,9 +2416,8 @@ public sealed class QuartermasterWindow : Window
         }
 
         ImGui.TextDisabled(
-            hasMovement
-                ? "Balanced items stay visible and are skipped during execution."
-                : "This plan is already satisfied.");
+            availability.BlockReason ??
+            "Balanced items stay visible and are skipped during execution.");
     }
 
     private void RequestSelectedTransferReview()
@@ -2564,10 +2589,6 @@ public sealed class QuartermasterWindow : Window
         if (ImGui.InputText("##stowagedraftname", ref planName, 80))
             draft.Name = planName;
         ImGui.SameLine();
-        var planEnabled = draft.Enabled;
-        if (ImGui.Checkbox("Enabled##stowagedraft", ref planEnabled))
-            draft.Enabled = planEnabled;
-        ImGui.SameLine();
         ImGui.TextDisabled($"{selectedStowageRuleIds.Count:N0} selected of {draft.Rules.Count:N0} rules");
 
         DrawStowageEditorToolbar(draft);
@@ -2711,7 +2732,6 @@ public sealed class QuartermasterWindow : Window
                     ItemId = choice.ItemId,
                     ItemName = choice.Name,
                     TargetQuantity = 0,
-                    Enabled = false,
                 };
                 draft.Rules.Add(existing);
             }
@@ -2990,13 +3010,12 @@ public sealed class QuartermasterWindow : Window
     {
         var sourceListings = projection.GetListings(workbench.ScopeKey);
         var context = BrowserQueryController.CreateListingContext(sourceListings, projection.Owner);
-        if (DalamudFilterAutocompleteRenderer.Draw(
-                "RQListingsWorkbench",
-                "Search listed items",
-                context,
-                workbench.ListingFilterState,
-                Math.Max(240, ImGui.GetContentRegionAvail().X - 200)))
-            workbench.ListingFilter = workbench.ListingFilterState.Expression;
+        DalamudFilterAutocompleteRenderer.Draw(
+            "RQListingsWorkbench",
+            "Search listed items",
+            context,
+            workbench.ListingFilterState,
+            Math.Max(240, ImGui.GetContentRegionAvail().X - 200));
         ImGui.SameLine();
         ImGui.SetNextItemWidth(170);
         var selectedScope = projection.Scopes.First(scope => scope.Key == workbench.ScopeKey);
@@ -3012,7 +3031,7 @@ public sealed class QuartermasterWindow : Window
 
         var result = queries.QueryListings(
             projection,
-            workbench.ListingFilter,
+            workbench.ListingFilterState.Expression,
             workbench.ScopeKey,
             workbench.ListingFilterState.IsInputActive,
             revision);
@@ -3028,6 +3047,7 @@ public sealed class QuartermasterWindow : Window
                 group.Key.ItemName,
                 group.Sum(listing => listing.Quantity),
                 group.Select(listing => listing.RetainerId).Distinct().Count(),
+                projection.GetUnlistedRetainerQuantity(group.Key.ItemId, workbench.ScopeKey),
                 group.OrderBy(listing => listing.RetainerName, StringComparer.OrdinalIgnoreCase).ToArray()))
             .OrderBy(group => group.ItemName, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -3057,13 +3077,15 @@ public sealed class QuartermasterWindow : Window
         {
             if (ImGui.BeginTable(
                     "RQListingGroupRows",
-                    4,
+                    5,
                     ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
-                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp,
+                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp |
+                    ImGuiTableFlags.Hideable,
                     new Vector2(0, ImGui.GetContentRegionAvail().Y)))
             {
                 ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.4f);
                 ImGui.TableSetupColumn("Qty", ImGuiTableColumnFlags.WidthFixed, 58);
+                ImGui.TableSetupColumn("Unlisted", ImGuiTableColumnFlags.WidthFixed, 68);
                 ImGui.TableSetupColumn("Retainers", ImGuiTableColumnFlags.WidthFixed, 72);
                 ImGui.TableSetupColumn("Price state", ImGuiTableColumnFlags.WidthFixed, 82);
                 ImGui.TableHeadersRow();
@@ -3078,6 +3100,13 @@ public sealed class QuartermasterWindow : Window
                         workbench.SelectedListingItemId = group.ItemId;
                     ImGui.TableNextColumn();
                     ImGui.TextUnformatted(group.Quantity.ToString("N0"));
+                    ImGui.TableNextColumn();
+                    ImGui.TextUnformatted(
+                        group.UnlistedQuantity.IsKnown
+                            ? group.UnlistedQuantity.Value.ToString("N0")
+                            : "—");
+                    if (!group.UnlistedQuantity.IsKnown && ImGui.IsItemHovered())
+                        ImGui.SetTooltip(group.UnlistedQuantity.UnknownReason);
                     ImGui.TableNextColumn();
                     ImGui.TextUnformatted(group.RetainerCount.ToString("N0"));
                     ImGui.TableNextColumn();
@@ -3351,6 +3380,7 @@ public sealed class QuartermasterWindow : Window
         var evaluated = stowage?.Lines.ToDictionary(line => line.RuleId) ?? [];
         var movements = evaluated.Values.Count(line =>
             line.Action is StowageAction.Retrieve or StowageAction.Deposit);
+        var hasMovement = retrieval.NeededQuantity > 0 || deposit.PlannedQuantity > 0;
 
         ImGui.TextUnformatted($"{movements:N0} movements");
         ImGui.SameLine();
@@ -3413,14 +3443,16 @@ public sealed class QuartermasterWindow : Window
             true,
             () => transferReview = null,
             "No inventory movement");
+        var availability = TransferExecutionPolicy.ForExplicitRun(
+            hasMovement,
+            runtime.Owner.HasStableIdentity,
+            transfers.CanStart,
+            autoRetainer.IsRefreshing || autoRetainer.IsQueued);
         ImGui.SameLine();
-        ImGui.TextDisabled("Balanced items remain in the plan but require no movement.");
-        var canExecute = movements > 0 &&
-                         plan.Enabled &&
-                         runtime.Owner.HasStableIdentity &&
-                         transfers.CanStart &&
-                         !autoRetainer.IsRefreshing &&
-                         !autoRetainer.IsQueued;
+        ImGui.TextDisabled(
+            availability.BlockReason ??
+            "Balanced items remain in the plan but require no movement.");
+        var canExecute = availability.CanExecute;
         ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - 110));
         if (!canExecute)
             ImGui.BeginDisabled();
@@ -3432,6 +3464,16 @@ public sealed class QuartermasterWindow : Window
         }
         if (!canExecute)
             ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.transfer.review.execute",
+            "Execute the reviewed Transfer Plan",
+            canExecute,
+            () =>
+            {
+                ExecuteTransferPlan(plan.Id);
+                transferReview = null;
+            },
+            canExecute ? $"{movements:N0} movements" : availability.BlockReason);
 
         ImGui.EndPopup();
         if (!open)
@@ -3443,7 +3485,7 @@ public sealed class QuartermasterWindow : Window
         var current = runtimeSnapshots.Current;
         var plan = current.State.StowagePlans.FirstOrDefault(candidate =>
             candidate.Id == planId && candidate.Owner.Matches(current.Owner));
-        if (plan is null || !plan.Enabled)
+        if (plan is null)
             return;
         var rules = current.State.PlanItems
             .Where(rule => rule.StowagePlanId == plan.Id)
@@ -3637,6 +3679,7 @@ public sealed class QuartermasterWindow : Window
         string ItemName,
         int Quantity,
         int RetainerCount,
+        Franthropy.Filtering.Evaluation.FieldEvidence<int> UnlistedQuantity,
         IReadOnlyList<ListingRow> Listings)
     {
         public bool HasKnownPrice => Listings.Any(listing => listing.UnitPrice.IsKnown);
