@@ -528,4 +528,5 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     stack.IsHighQuality == isHighQuality)
                 .ToArray());
     }
+
 }
