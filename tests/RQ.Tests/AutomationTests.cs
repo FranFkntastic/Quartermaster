@@ -272,26 +272,17 @@ public sealed class AutomationTests
     }
 
     [Fact]
-    public async Task RetainerLiveDriver_PropagatesCancellationIntoFrameworkWork()
+    public async Task RetainerLiveDriver_PropagatesCancellationIntoSharedSession()
     {
         using var cancellation = new CancellationTokenSource();
         CancellationToken observed = default;
-        var framework = CreateProxy<IFramework>((method, arguments) =>
+        var session = CreateProxy<IRetainerAutomationSession>((method, arguments) =>
         {
-            Assert.Equal(nameof(IFramework.RunOnTick), method.Name);
+            Assert.Equal(nameof(IRetainerAutomationSession.OpenInventoryAsync), method.Name);
             observed = arguments!.OfType<CancellationToken>().Single();
             return CreateCancellableTask(method.ReturnType, observed);
         });
-        var unused = new Func<MethodInfo, object?[]?, object?>((method, _) =>
-            throw new InvalidOperationException($"Unexpected dependency call: {method.Name}."));
-        var driver = new RetainerLiveDriver(
-            framework,
-            CreateProxy<IGameGui>(unused),
-            CreateProxy<IDataManager>(unused),
-            CreateProxy<IPluginLog>(unused),
-            CreateProxy<IObjectTable>(unused),
-            CreateProxy<ITargetManager>(unused),
-            CreateProxy<ISigScanner>(unused));
+        var driver = new RetainerLiveDriver(session);
 
         var open = driver.OpenInventoryAsync(cancellation.Token);
 
