@@ -40,6 +40,15 @@ public sealed class QuartermasterWindow : Window
     private readonly TableSelectionModel<ListingRowKey> physicalListingSelection = new();
     private readonly DalamudTableProjection<ListingGroupView> listingGroupTable;
     private readonly DalamudTableProjection<ListingRow> physicalListingTable;
+    private readonly DalamudTableProjection<StockWorkbenchRow> stockTable;
+    private readonly DalamudTableProjection<RestockPlanRow> restockPlanTable;
+    private readonly DalamudTableProjection<ItemGroupItem> itemGroupWorkspaceTable;
+    private readonly DalamudTableProjection<ItemGroupItem> itemGroupEditorTable;
+    private readonly DalamudTableProjection<RestockPlanItem> restockDraftTable;
+    private readonly DalamudTableProjection<TransferWorkbenchRow> transferWorkbenchTable;
+    private readonly DalamudTableProjection<StowageDraftRow> stowageDraftTable;
+    private readonly DalamudTableProjection<TransferReviewRow> transferReviewTable;
+    private readonly DalamudTableProjection<OperationLine> operationLineTable;
     private readonly BrowserQueryController queries = new();
     private readonly RootConfirmationDialog confirmationDialog = new();
     private string transferStatus = "No transfer has run.";
@@ -49,7 +58,7 @@ public sealed class QuartermasterWindow : Window
     private int captureCollapseRestoreFramesRemaining;
     private bool requestCaptureFocus;
     private StowagePlanDraft? stowageDraft;
-    private readonly HashSet<Guid> selectedStowageRuleIds = [];
+    private readonly TableSelectionModel<Guid> selectedStowageRuleIds = new();
     private Guid? activeStowageRuleId;
     private Guid? selectedItemGroupId;
     private string stowageItemSearch = string.Empty;
@@ -63,7 +72,7 @@ public sealed class QuartermasterWindow : Window
     private bool requestStowageEditorOpen;
     private bool stowageEditorVisible;
     private RestockPlanDraft? restockDraft;
-    private readonly HashSet<Guid> selectedRestockItemIds = [];
+    private readonly TableSelectionModel<Guid> selectedRestockItemIds = new();
     private Guid? activeRestockItemId;
     private Guid? selectedRestockItemGroupId;
     private string restockItemSearch = string.Empty;
@@ -77,7 +86,7 @@ public sealed class QuartermasterWindow : Window
     private bool restockEditorVisible;
     private ItemGroupDraft? itemGroupDraft;
     private WorkbenchView? itemGroupEditorOrigin;
-    private readonly HashSet<ItemGroupItem> selectedItemGroupItems = [];
+    private readonly TableSelectionModel<ItemGroupItem> selectedItemGroupItems = new();
     private string itemGroupFilter = string.Empty;
     private string itemGroupItemSearch = string.Empty;
     private ItemChoice? selectedItemGroupChoice;
@@ -179,6 +188,15 @@ public sealed class QuartermasterWindow : Window
                 row => row.UnitPrice.IsKnown ? row.UnitPrice.Value : decimal.MinValue,
                 Alignment: DalamudTableCellAlignment.Right),
         ]);
+        stockTable = CreateStockTable();
+        restockPlanTable = CreateRestockPlanTable();
+        itemGroupWorkspaceTable = CreateItemGroupWorkspaceTable();
+        itemGroupEditorTable = CreateItemGroupEditorTable();
+        restockDraftTable = CreateRestockDraftTable();
+        transferWorkbenchTable = CreateTransferWorkbenchTable();
+        stowageDraftTable = CreateStowageDraftTable();
+        transferReviewTable = CreateTransferReviewTable();
+        operationLineTable = CreateOperationLineTable();
         captureTransactions = new(
             () => IsOpen,
             value => IsOpen = value,
@@ -197,6 +215,251 @@ public sealed class QuartermasterWindow : Window
         SizeCondition = ImGuiCond.FirstUseEver;
         SizeConstraints = new WindowSizeConstraints { MinimumSize = new Vector2(980, 520), MaximumSize = new Vector2(float.MaxValue, float.MaxValue) };
     }
+
+    private DalamudTableProjection<StockWorkbenchRow> CreateStockTable() => new(
+    [
+        new(
+            "Item",
+            1.8f,
+            row => row.Item.ItemName,
+            row => row.Item.ItemName,
+            ImGuiTableColumnFlags.WidthStretch),
+        new(
+            "Player",
+            58,
+            row => row.Item.PlayerQuantity.ToString("N0"),
+            row => row.Item.PlayerQuantity,
+            Alignment: DalamudTableCellAlignment.Right),
+        new(
+            "Stored",
+            66,
+            row => row.Item.RetainerQuantity.ToString("N0"),
+            row => row.Item.RetainerQuantity,
+            Alignment: DalamudTableCellAlignment.Right),
+        new(
+            "Target",
+            68,
+            row => row.Rule?.TargetQuantity.ToString("N0") ?? "—",
+            row => row.Rule?.TargetQuantity ?? -1,
+            TextColor: row => row.Rule is null
+                ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
+                : null,
+            Alignment: DalamudTableCellAlignment.Right),
+        new(
+            "Plan state",
+            1f,
+            StockPlanState,
+            row => StockPlanState(row),
+            ImGuiTableColumnFlags.WidthStretch,
+            TextColor: row => row.Rule is null
+                ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
+                : TransferActionColor(row.Line?.Action)),
+    ]);
+
+    private DalamudTableProjection<RestockPlanRow> CreateRestockPlanTable() => new(
+    [
+        new(
+            "State",
+            44,
+            row => row.Item.Enabled ? "On" : "Off",
+            TextColor: _ => ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]),
+        new(
+            "Item",
+            1.8f,
+            row => row.Item.ItemName,
+            row => row.Item.ItemName,
+            ImGuiTableColumnFlags.WidthStretch,
+            Draw: DrawRestockPlanItemLink),
+        new(
+            "Have / goal",
+            112,
+            row => $"{row.Line?.PlayerQuantity ?? 0:N0} / {row.Item.TargetQuantity:N0}"),
+        new(
+            "Need / stored",
+            104,
+            row => $"{row.Line?.NeededQuantity ?? 0:N0} / {row.Line?.CachedRetainerQuantity ?? 0:N0}"),
+        new(
+            "Notes",
+            1.2f,
+            row => row.Item.Notes,
+            row => row.Item.Notes,
+            ImGuiTableColumnFlags.WidthStretch),
+    ]);
+
+    private DalamudTableProjection<ItemGroupItem> CreateItemGroupWorkspaceTable() => new(
+    [
+        new(
+            "Item",
+            1.4f,
+            item => item.ItemName,
+            item => item.ItemName,
+            ImGuiTableColumnFlags.WidthStretch),
+        new(
+            "Quality",
+            145,
+            item => QualityChoiceLabel(item.Quality),
+            Draw: DrawItemGroupQuality),
+        new(
+            "##remove",
+            62,
+            _ => string.Empty,
+            Draw: DrawItemGroupWorkspaceRemove),
+    ]);
+
+    private DalamudTableProjection<ItemGroupItem> CreateItemGroupEditorTable() => new(
+    [
+        new(
+            "Item",
+            1.7f,
+            item => item.ItemName,
+            item => item.ItemName,
+            ImGuiTableColumnFlags.WidthStretch),
+        new(
+            "Quality identity",
+            180,
+            item => QualityChoiceLabel(item.Quality),
+            Draw: DrawItemGroupQuality),
+        new("", 28, _ => string.Empty, Draw: DrawItemGroupEditorRemove),
+    ]);
+
+    private DalamudTableProjection<RestockPlanItem> CreateRestockDraftTable() => new(
+    [
+        new(
+            "Item",
+            1.5f,
+            item => item.ItemName,
+            item => item.ItemName,
+            ImGuiTableColumnFlags.WidthStretch),
+        new("Rule", 52, item => item.Enabled ? "On" : "Off", Draw: item =>
+            item.Enabled = DrawRuleToggle($"restock{item.Id}", item.Enabled)),
+        new("Target", 80, item => item.TargetQuantity.ToString("N0"), Draw: DrawRestockTarget),
+        new("Quality", 112, item => QualityLabel(item.Quality), Draw: DrawRestockDraftQuality),
+        new(
+            "Note",
+            1f,
+            item => item.Notes,
+            item => item.Notes,
+            ImGuiTableColumnFlags.WidthStretch,
+            Draw: DrawRestockNote),
+        new(
+            "Item group",
+            .8f,
+            RestockItemGroups,
+            item => RestockItemGroups(item),
+            ImGuiTableColumnFlags.WidthStretch,
+            TextColor: _ => ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]),
+        new("", 28, _ => string.Empty, Draw: DrawRestockDraftRemove),
+    ]);
+
+    private DalamudTableProjection<TransferWorkbenchRow> CreateTransferWorkbenchTable() => new(
+    [
+        new(
+            "Item",
+            1.5f,
+            row => $"{row.Rule.ItemName} {QualityLabel(row.Rule.Quality)}",
+            row => row.Rule.ItemName,
+            ImGuiTableColumnFlags.WidthStretch,
+            Draw: row =>
+            {
+                ImGui.TextUnformatted(row.Rule.ItemName);
+                ImGui.SameLine();
+                ImGui.TextDisabled(QualityLabel(row.Rule.Quality));
+            }),
+        new(
+            "Player",
+            64,
+            row => row.PlayerQuantity.ToString("N0"),
+            row => row.PlayerQuantity,
+            Alignment: DalamudTableCellAlignment.Right),
+        new("Target", 82, row => row.Rule.TargetQuantity.ToString("N0"), Draw: DrawTransferTarget),
+        new(
+            "Diff",
+            68,
+            row => SignedQuantity(row.Difference),
+            row => row.Difference,
+            TextColor: row => TransferActionColor(row.Line?.Action),
+            Alignment: DalamudTableCellAlignment.Right),
+        new(
+            "Outcome",
+            112,
+            TransferOutcome,
+            row => TransferOutcome(row),
+            TextColor: row => TransferActionColor(row.Line?.Action)),
+        new(
+            "Route",
+            1.1f,
+            row => RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Owner),
+            row => RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Owner),
+            ImGuiTableColumnFlags.WidthStretch,
+            Draw: row => DrawInlineTransferRoute(row.Owner, row.PlanId, row.Rule, row.Runtime)),
+        new("##remove", 28, _ => string.Empty, Draw: row =>
+        {
+            if (ImGui.SmallButton($"X##remove-transfer:{row.Rule.Id}"))
+                RemoveTransferRule(row.Owner, row.PlanId, row.Rule.Id);
+        }),
+    ]);
+
+    private DalamudTableProjection<StowageDraftRow> CreateStowageDraftTable() => new(
+    [
+        new(
+            "Item",
+            1.5f,
+            row => row.Rule.ItemName,
+            row => row.Rule.ItemName,
+            ImGuiTableColumnFlags.WidthStretch),
+        new("Rule", 52, row => row.Rule.Enabled ? "On" : "Off", Draw: row =>
+            row.Rule.Enabled = DrawRuleToggle($"stowage{row.Rule.Id}", row.Rule.Enabled)),
+        new("Player target", 92, row => row.Rule.TargetQuantity.ToString("N0"), Draw: DrawStowageTarget),
+        new("Quality", 112, row => QualityLabel(row.Rule.Quality), Draw: row => DrawDraftQuality(row.Rule)),
+        new(
+            "Now",
+            92,
+            StowageDraftOutcome,
+            TextColor: _ => ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]),
+        new(
+            "Destination",
+            1.1f,
+            row => RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner),
+            row => RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner),
+            ImGuiTableColumnFlags.WidthStretch,
+            Draw: row => DrawStowageRouteCombo(row.Rule, row.Runtime)),
+        new("Overflow", 112, row => OverflowLabel(row.Rule.Routing.Overflow), Draw: row => DrawStowageOverflowCombo(row.Rule)),
+        new("", 28, _ => string.Empty, Draw: DrawStowageDraftRemove),
+    ]);
+
+    private DalamudTableProjection<TransferReviewRow> CreateTransferReviewTable() => new(
+    [
+        new(
+            "Item",
+            1.3f,
+            row => row.Rule.ItemName,
+            row => row.Rule.ItemName,
+            ImGuiTableColumnFlags.WidthStretch),
+        new("Player / target", 120, row => $"{row.PlayerQuantity:N0} / {row.Rule.TargetQuantity:N0}"),
+        new(
+            "Diff",
+            72,
+            row => SignedQuantity(row.Difference),
+            row => row.Difference,
+            TextColor: row => TransferActionColor(row.Line?.Action),
+            Alignment: DalamudTableCellAlignment.Right),
+        new(
+            "Planned movement",
+            1.2f,
+            TransferReviewOutcome,
+            row => TransferReviewOutcome(row),
+            ImGuiTableColumnFlags.WidthStretch,
+            TextColor: row => TransferActionColor(row.Line?.Action)),
+    ]);
+
+    private static DalamudTableProjection<OperationLine> CreateOperationLineTable() => new(
+    [
+        new("Item", 1f, line => line.ItemName, line => line.ItemName, ImGuiTableColumnFlags.WidthStretch),
+        new("Target", 80, line => line.TargetQuantity.ToString("N0"), line => line.TargetQuantity, Alignment: DalamudTableCellAlignment.Right),
+        new("Submitted shortage", 120, line => line.ShortageQuantity.ToString("N0"), line => line.ShortageQuantity, Alignment: DalamudTableCellAlignment.Right),
+        new("Transferred", 90, line => line.TransferredQuantity.ToString("N0"), line => line.TransferredQuantity, Alignment: DalamudTableCellAlignment.Right),
+        new("Remaining", 90, line => Math.Max(0, line.ShortageQuantity - line.TransferredQuantity).ToString("N0"), line => Math.Max(0, line.ShortageQuantity - line.TransferredQuantity), Alignment: DalamudTableCellAlignment.Right),
+    ]);
 
     public Guid? SelectedRestockPlanId =>
         SelectedStowagePlanId;
@@ -586,8 +849,15 @@ public sealed class QuartermasterWindow : Window
                   .Lines.ToDictionary(line => line.RuleId) ?? [];
 
         stockSelection.Retain(projection.Items.Select(item => item.ItemId));
-        var rows = SortItems(result.Items);
-        var rowKeys = rows.Select(item => item.ItemId).ToArray();
+        var rows = SortItems(result.Items)
+            .Select(item =>
+            {
+                rules.TryGetValue(item.ItemId, out var rule);
+                evaluated.TryGetValue(rule?.Id ?? Guid.Empty, out var line);
+                return new StockWorkbenchRow(item, rule, line);
+            })
+            .ToArray();
+        var rowKeys = rows.Select(row => row.Item.ItemId).ToArray();
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
                     ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
                     ImGuiTableFlags.SizingStretchProp;
@@ -595,69 +865,36 @@ public sealed class QuartermasterWindow : Window
             ? ImGui.GetFrameHeightWithSpacing() + 4
             : 0;
         var tableHeight = Math.Max(180, ImGui.GetContentRegionAvail().Y - actionBarHeight);
-        if (ImGui.BeginTable("RQStockWorkbench", 5, flags, new Vector2(0, tableHeight)))
+        if (stockTable.Begin(
+                "RQStockWorkbench",
+                new DalamudTableLayout(new Vector2(0, tableHeight), flags)))
         {
-            ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.8f);
-            ImGui.TableSetupColumn("Player", ImGuiTableColumnFlags.WidthFixed, 58);
-            ImGui.TableSetupColumn("Stored", ImGuiTableColumnFlags.WidthFixed, 66);
-            ImGui.TableSetupColumn("Target", ImGuiTableColumnFlags.WidthFixed, 68);
-            ImGui.TableSetupColumn("Plan state", ImGuiTableColumnFlags.WidthStretch, 1f);
-            ImGui.TableHeadersRow();
-            for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+            for (var rowIndex = 0; rowIndex < rows.Length; rowIndex++)
             {
-                var item = rows[rowIndex];
-                ImGui.TableNextRow();
-                ImGui.TableNextColumn();
-                var itemCursor = ImGui.GetCursorPos();
-                var itemWidth = Math.Max(1, ImGui.GetContentRegionAvail().X);
+                var row = rows[rowIndex];
+                var itemWidth = Math.Max(1, ImGui.GetContentRegionAvail().X * .35f);
                 var itemHeight = Math.Max(
                     ImGui.GetTextLineHeightWithSpacing(),
-                    ImGui.CalcTextSize(item.ItemName, false, itemWidth).Y);
-                DalamudTableSelectionRenderer.DrawRow(
+                    ImGui.CalcTextSize(row.Item.ItemName, false, itemWidth).Y);
+                stockTable.DrawSelectableRow(
+                    row,
                     stockSelection,
                     rowKeys,
                     rowIndex,
-                    $"##stock-row:{item.ItemId}",
-                    new Vector2(0, itemHeight));
-                var stockSelected = stockSelection.IsSelected(item.ItemId);
+                    $"##stock-row:{row.Item.ItemId}",
+                    minimumHeight: itemHeight);
+                var stockSelected = stockSelection.IsSelected(row.Item.ItemId);
                 reviewRegistry.RegisterLastButton(
-                    $"quartermaster.stock.select.{item.ItemId}",
-                    $"Select {item.ItemName} for stock actions",
+                    $"quartermaster.stock.select.{row.Item.ItemId}",
+                    $"Select {row.Item.ItemName} for stock actions",
                     true,
                     () => stockSelection.SetSelected(
-                        item.ItemId,
-                        !stockSelection.IsSelected(item.ItemId)),
+                        row.Item.ItemId,
+                        !stockSelection.IsSelected(row.Item.ItemId)),
                     stockSelected ? "Selected" : "Available");
-                ImGui.SetCursorPos(itemCursor);
-                ImGui.TextUnformatted(item.ItemName);
-                ImGui.TableNextColumn();
-                ImGui.TextUnformatted(item.PlayerQuantity.ToString("N0"));
-                ImGui.TableNextColumn();
-                ImGui.TextUnformatted(item.RetainerQuantity.ToString("N0"));
-                ImGui.TableNextColumn();
-                if (rules.TryGetValue(item.ItemId, out var rule))
-                {
-                    ImGui.TextUnformatted(rule.TargetQuantity.ToString("N0"));
-                    ImGui.TableNextColumn();
-                    evaluated.TryGetValue(rule.Id, out var line);
-                    ImGui.TextColored(
-                        TransferActionColor(line?.Action),
-                        !rule.Enabled ? "Off" : line?.Action switch
-                        {
-                            StowageAction.Retrieve => $"Retrieve {line.RetrieveQuantity:N0}",
-                            StowageAction.Deposit => $"Stow {line.DepositQuantity:N0}",
-                            _ => "On target",
-                        });
-                }
-                else
-                {
-                    ImGui.TextDisabled("—");
-                    ImGui.TableNextColumn();
-                    ImGui.TextDisabled("Not in plan");
-                }
             }
             DalamudTableSelectionRenderer.EndRows(stockSelection);
-            ImGui.EndTable();
+            stockTable.End();
         }
         DrawStockSelectionBar(runtime);
     }
@@ -1030,38 +1267,23 @@ public sealed class QuartermasterWindow : Window
         ImGui.TextDisabled(transferStatus);
 
         var lines = evaluation.Lines.ToDictionary(line => line.PlanItemId);
-        var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
-        if (ImGui.BeginTable("RQRestockPlanTable", 5, flags, new Vector2(0, Math.Max(220, ImGui.GetContentRegionAvail().Y))))
-        {
-            ImGui.TableSetupColumn("State", ImGuiTableColumnFlags.WidthFixed, 44);
-            ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.8f);
-            ImGui.TableSetupColumn("Have / goal", ImGuiTableColumnFlags.WidthFixed, 112);
-            ImGui.TableSetupColumn("Need / stored", ImGuiTableColumnFlags.WidthFixed, 104);
-            ImGui.TableSetupColumn("Notes", ImGuiTableColumnFlags.WidthStretch, 1.2f);
-            ImGui.TableHeadersRow();
-            foreach (var item in selected.Items)
+        var rows = selected.Items
+            .Select(item =>
             {
                 lines.TryGetValue(item.Id, out var line);
-                ImGui.TableNextRow();
-                ImGui.TableNextColumn();
-                ImGui.TextDisabled(item.Enabled ? "On" : "Off");
-                ImGui.TableNextColumn();
-                if (ImGui.Selectable($"{item.ItemName}##restockrow{item.Id}"))
-                {
-                    OpenRestockEditor(RestockPlanCatalog.Draft(state.Snapshot(), owner, selected.Id));
-                    activeRestockItemId = item.Id;
-                    selectedRestockItemIds.Clear();
-                    selectedRestockItemIds.Add(item.Id);
-                }
-                ImGui.TextDisabled(QualityLabel(item.Quality));
-                ImGui.TableNextColumn();
-                ImGui.TextUnformatted($"{line?.PlayerQuantity ?? 0:N0} / {item.TargetQuantity:N0}");
-                ImGui.TableNextColumn();
-                ImGui.TextUnformatted($"{line?.NeededQuantity ?? 0:N0} / {line?.CachedRetainerQuantity ?? 0:N0}");
-                ImGui.TableNextColumn();
-                ImGui.TextUnformatted(item.Notes);
-            }
-            ImGui.EndTable();
+                return new RestockPlanRow(item, line, selected.Id, owner);
+            })
+            .ToArray();
+        var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
+        if (restockPlanTable.Begin(
+                "RQRestockPlanTable",
+                new DalamudTableLayout(
+                    new Vector2(0, Math.Max(220, ImGui.GetContentRegionAvail().Y)),
+                    flags)))
+        {
+            foreach (var row in rows)
+                restockPlanTable.DrawRow(row, id: $"restock-plan:{row.Item.Id}");
+            restockPlanTable.End();
         }
     }
 
@@ -1224,7 +1446,7 @@ public sealed class QuartermasterWindow : Window
         if (ImGui.SmallButton("Select visible##restock"))
         {
             foreach (var item in FilteredRestockDraftItems(draft))
-                selectedRestockItemIds.Add(item.Id);
+                selectedRestockItemIds.SetSelected(item.Id, true);
         }
         ImGui.SameLine();
         if (ImGui.SmallButton("Clear selection##restock"))
@@ -1275,7 +1497,7 @@ public sealed class QuartermasterWindow : Window
             }
             activeRestockItemId = existing.Id;
             selectedRestockItemIds.Clear();
-            selectedRestockItemIds.Add(existing.Id);
+            selectedRestockItemIds.SetSelected(existing.Id, true);
             selectedRestockChoice = null;
             restockItemSearch = string.Empty;
         }
@@ -1494,40 +1716,18 @@ public sealed class QuartermasterWindow : Window
 
         ImGui.Separator();
         var footerHeight = (ImGui.GetFrameHeightWithSpacing() * 2) + 8;
-        if (ImGui.BeginTable(
+        if (itemGroupWorkspaceTable.Begin(
                 "RQItemGroupMembersWorkbench",
-                3,
-                ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
-                ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp,
-                new Vector2(0, Math.Max(130, ImGui.GetContentRegionAvail().Y - footerHeight))))
+                new DalamudTableLayout(
+                    new Vector2(0, Math.Max(130, ImGui.GetContentRegionAvail().Y - footerHeight)),
+                    ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
+                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp)))
         {
-            ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.4f);
-            ImGui.TableSetupColumn("Quality", ImGuiTableColumnFlags.WidthFixed, 145);
-            ImGui.TableSetupColumn("##remove", ImGuiTableColumnFlags.WidthFixed, 62);
-            ImGui.TableHeadersRow();
             foreach (var member in draft.Items.ToArray())
-            {
-                ImGui.TableNextRow();
-                ImGui.TableNextColumn();
-                ImGui.TextUnformatted(member.ItemName);
-                ImGui.TableNextColumn();
-                ImGui.SetNextItemWidth(-1);
-                if (ImGui.BeginCombo(
-                        $"##group-quality:{member.ItemId}:{member.Quality}",
-                        QualityChoiceLabel(member.Quality)))
-                {
-                    foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
-                    {
-                        if (ImGui.Selectable(QualityChoiceLabel(quality), member.Quality == quality))
-                            member.Quality = quality;
-                    }
-                    ImGui.EndCombo();
-                }
-                ImGui.TableNextColumn();
-                if (ImGui.SmallButton($"Remove##group-member:{member.ItemId}:{member.Quality}"))
-                    draft.Items.Remove(member);
-            }
-            ImGui.EndTable();
+                itemGroupWorkspaceTable.DrawRow(
+                    member,
+                    id: $"item-group-workspace:{member.ItemId}:{member.GetHashCode()}");
+            itemGroupWorkspaceTable.End();
         }
 
         if (!string.IsNullOrWhiteSpace(itemGroupEditorError))
@@ -1630,7 +1830,7 @@ public sealed class QuartermasterWindow : Window
         if (restockDraft is null)
             return;
         var selected = restockDraft.Items
-            .Where(item => selectedRestockItemIds.Contains(item.Id))
+            .Where(item => selectedRestockItemIds.IsSelected(item.Id))
             .ToArray();
         itemGroupEditorOrigin = WorkbenchView.Restock;
         itemGroupDraft = ItemGroupCatalog.NewDraft(state.Snapshot(), "Item group", selected);
@@ -1642,7 +1842,7 @@ public sealed class QuartermasterWindow : Window
         if (stowageDraft is null)
             return;
         var selected = stowageDraft.Rules
-            .Where(rule => selectedStowageRuleIds.Contains(rule.Id))
+            .Where(rule => selectedStowageRuleIds.IsSelected(rule.Id))
             .ToArray();
         itemGroupEditorOrigin = WorkbenchView.Stowage;
         itemGroupDraft = ItemGroupCatalog.NewDraft(state.Snapshot(), "Item group", selected);
@@ -1919,7 +2119,7 @@ public sealed class QuartermasterWindow : Window
             ImGui.BeginDisabled();
         if (ImGui.Button($"Remove selected ({selectedItemGroupItems.Count:N0})##itemgroup"))
         {
-            draft.Items.RemoveAll(selectedItemGroupItems.Contains);
+            draft.Items.RemoveAll(selectedItemGroupItems.IsSelected);
             selectedItemGroupItems.Clear();
         }
         if (!hasSelectedMembers)
@@ -1927,53 +2127,35 @@ public sealed class QuartermasterWindow : Window
 
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY |
                     ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
-        if (!ImGui.BeginTable("RQItemGroupMembersTable", 4, flags, new Vector2(0, Math.Max(180, ImGui.GetContentRegionAvail().Y))))
+        if (!itemGroupEditorTable.Begin(
+                "RQItemGroupMembersTable",
+                new DalamudTableLayout(
+                    new Vector2(0, Math.Max(180, ImGui.GetContentRegionAvail().Y)),
+                    flags)))
             return;
-        ImGui.TableSetupColumn("Select", ImGuiTableColumnFlags.WidthFixed, 48);
-        ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.7f);
-        ImGui.TableSetupColumn("Quality identity", ImGuiTableColumnFlags.WidthFixed, 180);
-        ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 28);
-        ImGui.TableHeadersRow();
-        foreach (var item in draft.Items.ToArray())
+        var items = draft.Items.ToArray();
+        selectedItemGroupItems.Retain(items);
+        for (var index = 0; index < items.Length; index++)
         {
-            ImGui.TableNextRow();
-            ImGui.TableNextColumn();
-            var selected = selectedItemGroupItems.Contains(item);
-            if (ImGui.Checkbox($"##selectgroupitem{item.ItemId}:{(int)item.Quality}:{item.GetHashCode()}", ref selected))
-            {
-                if (selected)
-                    selectedItemGroupItems.Add(item);
-                else
-                    selectedItemGroupItems.Remove(item);
-            }
-            ImGui.TableNextColumn();
-            ImGui.TextUnformatted(item.ItemName);
-            ImGui.TableNextColumn();
-            ImGui.SetNextItemWidth(-1);
-            if (ImGui.BeginCombo($"##groupitemquality{item.GetHashCode()}", QualityChoiceLabel(item.Quality)))
-            {
-                foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
-                    if (ImGui.Selectable(QualityChoiceLabel(quality), item.Quality == quality))
-                        item.Quality = quality;
-                ImGui.EndCombo();
-            }
-            ImGui.TableNextColumn();
-            if (ImGui.SmallButton($"X##removegroupitem{item.GetHashCode()}"))
-            {
-                draft.Items.Remove(item);
-                selectedItemGroupItems.Remove(item);
-            }
+            var item = items[index];
+            itemGroupEditorTable.DrawSelectableRow(
+                item,
+                selectedItemGroupItems,
+                items,
+                index,
+                $"##selectgroupitem:{item.ItemId}:{item.GetHashCode()}");
         }
-        ImGui.EndTable();
+        DalamudTableSelectionRenderer.EndRows(selectedItemGroupItems);
+        itemGroupEditorTable.End();
     }
 
     private int ItemGroupPlanSelectionCount() =>
         itemGroupEditorOrigin switch
         {
             WorkbenchView.Restock when restockDraft is not null =>
-                restockDraft.Items.Count(item => selectedRestockItemIds.Contains(item.Id)),
+                restockDraft.Items.Count(item => selectedRestockItemIds.IsSelected(item.Id)),
             WorkbenchView.Stowage when stowageDraft is not null =>
-                stowageDraft.Rules.Count(rule => selectedStowageRuleIds.Contains(rule.Id)),
+                stowageDraft.Rules.Count(rule => selectedStowageRuleIds.IsSelected(rule.Id)),
             _ => 0,
         };
 
@@ -1982,11 +2164,11 @@ public sealed class QuartermasterWindow : Window
         if (itemGroupEditorOrigin == WorkbenchView.Restock && restockDraft is not null)
             ItemGroupCatalog.AddMissing(
                 draft,
-                restockDraft.Items.Where(item => selectedRestockItemIds.Contains(item.Id)));
+                restockDraft.Items.Where(item => selectedRestockItemIds.IsSelected(item.Id)));
         else if (itemGroupEditorOrigin == WorkbenchView.Stowage && stowageDraft is not null)
             ItemGroupCatalog.AddMissing(
                 draft,
-                stowageDraft.Rules.Where(rule => selectedStowageRuleIds.Contains(rule.Id)));
+                stowageDraft.Rules.Where(rule => selectedStowageRuleIds.IsSelected(rule.Id)));
     }
 
     private void DrawDeleteItemGroupPopup()
@@ -2067,7 +2249,7 @@ public sealed class QuartermasterWindow : Window
             ImGui.BeginDisabled();
         if (ImGui.Button("Apply to selected##restockbulk"))
         {
-            foreach (var item in draft.Items.Where(item => selectedRestockItemIds.Contains(item.Id)))
+            foreach (var item in draft.Items.Where(item => selectedRestockItemIds.IsSelected(item.Id)))
             {
                 if (bulkRestockQuality >= 0)
                     item.Quality = (ItemQualityPolicy)bulkRestockQuality;
@@ -2086,7 +2268,7 @@ public sealed class QuartermasterWindow : Window
             ImGui.BeginDisabled();
         if (ImGui.Button("Remove selected##restockbulk"))
         {
-            draft.Items.RemoveAll(item => selectedRestockItemIds.Contains(item.Id));
+            draft.Items.RemoveAll(item => selectedRestockItemIds.IsSelected(item.Id));
             selectedRestockItemIds.Clear();
         }
         if (!hasSelection)
@@ -2097,76 +2279,182 @@ public sealed class QuartermasterWindow : Window
     {
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY |
                     ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
-        if (!ImGui.BeginTable("RQRestockDraftItems", 8, flags, new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y))))
+        if (!restockDraftTable.Begin(
+                "RQRestockDraftItems",
+                new DalamudTableLayout(
+                    new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y)),
+                    flags)))
             return;
-        ImGui.TableSetupColumn("Select", ImGuiTableColumnFlags.WidthFixed, 46);
-        ImGui.TableSetupColumn("Rule", ImGuiTableColumnFlags.WidthFixed, 52);
-        ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.5f);
-        ImGui.TableSetupColumn("Target", ImGuiTableColumnFlags.WidthFixed, 80);
-        ImGui.TableSetupColumn("Quality", ImGuiTableColumnFlags.WidthFixed, 112);
-        ImGui.TableSetupColumn("Note", ImGuiTableColumnFlags.WidthStretch, 1f);
-        ImGui.TableSetupColumn("Item group", ImGuiTableColumnFlags.WidthStretch, .8f);
-        ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 28);
-        ImGui.TableHeadersRow();
         var filtered = FilteredRestockDraftItems(draft);
-        var groups = ItemGroupCatalog.All(state.Snapshot());
+        selectedRestockItemIds.Retain(draft.Items.Select(item => item.Id));
         if (filtered.Count == 0)
-        {
-            ImGui.TableNextRow();
-            ImGui.TableNextColumn();
-            ImGui.TableNextColumn();
-            ImGui.TableNextColumn();
-            ImGui.TextDisabled(draft.Items.Count == 0
+            restockDraftTable.DrawMessageRow(draft.Items.Count == 0
                 ? "No items yet. Search by name above or add a selected Stock item."
                 : "No items match this filter.");
-        }
-        foreach (var item in filtered.ToArray())
+        var rowKeys = filtered.Select(item => item.Id).ToArray();
+        for (var index = 0; index < filtered.Count; index++)
         {
-            ImGui.TableNextRow();
-            ImGui.TableNextColumn();
-            var selected = selectedRestockItemIds.Contains(item.Id);
-            if (ImGui.Checkbox($"##selectrestock{item.Id}", ref selected))
-            {
-                if (selected)
-                    selectedRestockItemIds.Add(item.Id);
-                else
-                    selectedRestockItemIds.Remove(item.Id);
-            }
-            ImGui.TableNextColumn();
-            item.Enabled = DrawRuleToggle($"restock{item.Id}", item.Enabled);
-            ImGui.TableNextColumn();
-            ImGui.TextUnformatted(item.ItemName);
-            ImGui.TableNextColumn();
-            var target = item.TargetQuantity;
-            ImGui.SetNextItemWidth(-1);
-            if (ImGui.InputInt($"##draftrestocktarget{item.Id}", ref target))
-                item.TargetQuantity = Math.Max(0, target);
-            ImGui.TableNextColumn();
-            DrawRestockDraftQuality(item);
-            ImGui.TableNextColumn();
-            var note = item.Notes;
-            ImGui.SetNextItemWidth(-1);
-            if (ImGui.InputText($"##draftrestocknote{item.Id}", ref note, 160))
-                item.Notes = note;
-            ImGui.TableNextColumn();
-            var matchingGroups = groups
-                .Where(group => group.Items.Any(member =>
-                    member.ItemId == item.ItemId && member.Quality == item.Quality))
-                .Select(group => $"@{group.Name}")
-                .Take(2)
-                .ToArray();
-            ImGui.TextDisabled(matchingGroups.Length == 0 ? "Ungrouped" : string.Join(", ", matchingGroups));
-            ImGui.TableNextColumn();
-            if (ImGui.SmallButton($"X##draftrestockremove{item.Id}"))
-            {
-                draft.Items.Remove(item);
-                selectedRestockItemIds.Remove(item.Id);
-                if (activeRestockItemId == item.Id)
-                    activeRestockItemId = draft.Items.FirstOrDefault()?.Id;
-            }
+            var item = filtered[index];
+            restockDraftTable.DrawSelectableRow(
+                item,
+                selectedRestockItemIds,
+                rowKeys,
+                index,
+                $"##selectrestock:{item.Id}");
         }
-        ImGui.EndTable();
+        DalamudTableSelectionRenderer.EndRows(selectedRestockItemIds);
+        restockDraftTable.End();
     }
+
+    private static string StockPlanState(StockWorkbenchRow row) =>
+        row.Rule is null
+            ? "Not in plan"
+            : !row.Rule.Enabled
+                ? "Off"
+                : row.Line?.Action switch
+                {
+                    StowageAction.Retrieve => $"Retrieve {row.Line.RetrieveQuantity:N0}",
+                    StowageAction.Deposit => $"Stow {row.Line.DepositQuantity:N0}",
+                    _ => "On target",
+                };
+
+    private void DrawRestockPlanItemLink(RestockPlanRow row)
+    {
+        if (ImGui.Selectable($"{row.Item.ItemName}##restockrow{row.Item.Id}"))
+        {
+            OpenRestockEditor(RestockPlanCatalog.Draft(state.Snapshot(), row.Owner, row.PlanId));
+            activeRestockItemId = row.Item.Id;
+            selectedRestockItemIds.Clear();
+            selectedRestockItemIds.SetSelected(row.Item.Id, true);
+        }
+        ImGui.TextDisabled(QualityLabel(row.Item.Quality));
+    }
+
+    private static void DrawItemGroupQuality(ItemGroupItem item)
+    {
+        ImGui.SetNextItemWidth(-1);
+        if (!ImGui.BeginCombo(
+                $"##group-quality:{item.ItemId}:{item.GetHashCode()}",
+                QualityChoiceLabel(item.Quality)))
+            return;
+        foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
+            if (ImGui.Selectable(QualityChoiceLabel(quality), item.Quality == quality))
+                item.Quality = quality;
+        ImGui.EndCombo();
+    }
+
+    private void DrawItemGroupWorkspaceRemove(ItemGroupItem item)
+    {
+        if (ImGui.SmallButton($"Remove##group-member:{item.ItemId}:{item.GetHashCode()}"))
+            itemGroupDraft?.Items.Remove(item);
+    }
+
+    private void DrawItemGroupEditorRemove(ItemGroupItem item)
+    {
+        if (!ImGui.SmallButton($"X##removegroupitem{item.GetHashCode()}"))
+            return;
+        itemGroupDraft?.Items.Remove(item);
+        selectedItemGroupItems.SetSelected(item, false);
+    }
+
+    private static void DrawRestockTarget(RestockPlanItem item)
+    {
+        var target = item.TargetQuantity;
+        ImGui.SetNextItemWidth(-1);
+        if (ImGui.InputInt($"##draftrestocktarget{item.Id}", ref target))
+            item.TargetQuantity = Math.Max(0, target);
+    }
+
+    private static void DrawRestockNote(RestockPlanItem item)
+    {
+        var note = item.Notes;
+        ImGui.SetNextItemWidth(-1);
+        if (ImGui.InputText($"##draftrestocknote{item.Id}", ref note, 160))
+            item.Notes = note;
+    }
+
+    private string RestockItemGroups(RestockPlanItem item)
+    {
+        var matchingGroups = ItemGroupCatalog.All(state.Snapshot())
+            .Where(group => group.Items.Any(member =>
+                member.ItemId == item.ItemId && member.Quality == item.Quality))
+            .Select(group => $"@{group.Name}")
+            .Take(2)
+            .ToArray();
+        return matchingGroups.Length == 0 ? "Ungrouped" : string.Join(", ", matchingGroups);
+    }
+
+    private void DrawRestockDraftRemove(RestockPlanItem item)
+    {
+        if (!ImGui.SmallButton($"X##draftrestockremove{item.Id}"))
+            return;
+        restockDraft?.Items.Remove(item);
+        selectedRestockItemIds.SetSelected(item.Id, false);
+        if (activeRestockItemId == item.Id)
+            activeRestockItemId = restockDraft?.Items.FirstOrDefault()?.Id;
+    }
+
+    private static string SignedQuantity(int quantity) =>
+        quantity > 0
+            ? $"+{quantity:N0}"
+            : quantity.ToString("N0", CultureInfo.CurrentCulture);
+
+    private void DrawTransferTarget(TransferWorkbenchRow row)
+    {
+        ImGui.SetNextItemWidth(-1);
+        var target = row.Rule.TargetQuantity;
+        if (ImGui.InputInt($"##target:{row.Rule.Id}", ref target, 0))
+            UpdateTransferRule(row.Owner, row.PlanId, row.Rule.Id, draftRule =>
+                draftRule.TargetQuantity = Math.Max(0, target));
+    }
+
+    private static string TransferOutcome(TransferWorkbenchRow row) =>
+        !row.Rule.Enabled
+            ? "Off"
+            : row.Line?.Action switch
+            {
+                StowageAction.Retrieve => $"Retrieve {row.Line.RetrieveQuantity:N0}",
+                StowageAction.Deposit => $"Stow {row.Line.DepositQuantity:N0}",
+                _ => "On target",
+            };
+
+    private static void DrawStowageTarget(StowageDraftRow row)
+    {
+        var target = row.Rule.TargetQuantity;
+        ImGui.SetNextItemWidth(-1);
+        if (ImGui.InputInt($"##drafttarget{row.Rule.Id}", ref target))
+            row.Rule.TargetQuantity = Math.Max(0, target);
+    }
+
+    private static string StowageDraftOutcome(StowageDraftRow row)
+    {
+        var player = PlayerQuantity(row.Runtime.Browser, row.Rule);
+        return !row.Rule.Enabled
+            ? "Off"
+            : player < row.Rule.TargetQuantity
+                ? $"Retrieve {row.Rule.TargetQuantity - player:N0}"
+                : player > row.Rule.TargetQuantity
+                    ? $"Stow {player - row.Rule.TargetQuantity:N0}"
+                    : "Balanced";
+    }
+
+    private void DrawStowageDraftRemove(StowageDraftRow row)
+    {
+        if (!ImGui.SmallButton($"X##draftremove{row.Rule.Id}"))
+            return;
+        stowageDraft?.Rules.Remove(row.Rule);
+        selectedStowageRuleIds.SetSelected(row.Rule.Id, false);
+        if (activeStowageRuleId == row.Rule.Id)
+            activeStowageRuleId = stowageDraft?.Rules.FirstOrDefault()?.Id;
+    }
+
+    private static string TransferReviewOutcome(TransferReviewRow row) =>
+        row.Line?.Action switch
+        {
+            StowageAction.Retrieve => $"Retrieve {row.Line.RetrieveQuantity:N0}",
+            StowageAction.Deposit => $"Stow {row.Line.DepositQuantity:N0} · {RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner)}",
+            _ => "On target · skip",
+        };
 
     private static void DrawRestockDraftQuality(RestockPlanItem item)
     {
@@ -2257,7 +2545,7 @@ public sealed class QuartermasterWindow : Window
         workbench.SelectedRestockPlanId = selectedPlan?.Id;
         OpenRestockEditor(draft);
         activeRestockItemId = item.Id;
-        selectedRestockItemIds.Add(item.Id);
+        selectedRestockItemIds.SetSelected(item.Id, true);
         workbench.ClearSelection();
     }
 
@@ -2293,7 +2581,7 @@ public sealed class QuartermasterWindow : Window
         workbench.SelectedStowagePlanId = selectedPlan?.Id;
         OpenStowageEditor(draft);
         activeStowageRuleId = rule.Id;
-        selectedStowageRuleIds.Add(rule.Id);
+        selectedStowageRuleIds.SetSelected(rule.Id, true);
         workbench.ClearSelection();
     }
 
@@ -2459,77 +2747,41 @@ public sealed class QuartermasterWindow : Window
                     ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
                     ImGuiTableFlags.SizingStretchProp;
         var footerHeight = ImGui.GetTextLineHeightWithSpacing() + 4;
-        if (ImGui.BeginTable(
-                "RQTransferWorkbench",
-                7,
-                flags,
-                new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y - footerHeight))))
-        {
-            ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.5f);
-            ImGui.TableSetupColumn("Player", ImGuiTableColumnFlags.WidthFixed, 64);
-            ImGui.TableSetupColumn("Target", ImGuiTableColumnFlags.WidthFixed, 82);
-            ImGui.TableSetupColumn("Diff", ImGuiTableColumnFlags.WidthFixed, 68);
-            ImGui.TableSetupColumn("Outcome", ImGuiTableColumnFlags.WidthFixed, 112);
-            ImGui.TableSetupColumn("Route", ImGuiTableColumnFlags.WidthStretch, 1.1f);
-            ImGui.TableSetupColumn("##remove", ImGuiTableColumnFlags.WidthFixed, 28);
-            ImGui.TableHeadersRow();
-            foreach (var rule in ownerRules)
+        var transferRows = ownerRules
+            .Select(rule =>
             {
                 evaluated.TryGetValue(rule.Id, out var line);
                 retrievalLines.TryGetValue(rule.Id, out var retrievalLine);
                 var playerQuantity = StowageEvaluator.PlayerQuantity(
                     rule,
                     runtime.Browser.Items.FirstOrDefault(item => item.ItemId == rule.ItemId));
-                var difference = rule.TargetQuantity - playerQuantity;
-
-                ImGui.TableNextRow();
-                if (!rule.Enabled)
-                    ImGui.TableSetBgColor(
-                        ImGuiTableBgTarget.RowBg0,
-                        ImGui.GetColorU32(new Vector4(.38f, .12f, .14f, .42f)));
-                ImGui.TableNextColumn();
-                ImGui.TextUnformatted(rule.ItemName);
-                ImGui.SameLine();
-                ImGui.TextDisabled(QualityLabel(rule.Quality));
-
-                ImGui.TableNextColumn();
-                ImGui.TextUnformatted(playerQuantity.ToString("N0"));
-
-                ImGui.TableNextColumn();
-                ImGui.SetNextItemWidth(-1);
-                var target = rule.TargetQuantity;
-                if (ImGui.InputInt($"##target:{rule.Id}", ref target, 0))
-                    UpdateTransferRule(owner, selected.Id, rule.Id, draftRule =>
-                        draftRule.TargetQuantity = Math.Max(0, target));
-
-                ImGui.TableNextColumn();
-                ImGui.TextColored(
-                    TransferActionColor(line?.Action),
-                    difference > 0
-                        ? $"+{difference:N0}"
-                        : difference.ToString("N0", CultureInfo.CurrentCulture));
-
-                ImGui.TableNextColumn();
-                ImGui.TextColored(
-                    TransferActionColor(line?.Action),
-                    !rule.Enabled ? "Off" : line?.Action switch
-                    {
-                        StowageAction.Retrieve => $"Retrieve {line.RetrieveQuantity:N0}",
-                        StowageAction.Deposit => $"Stow {line.DepositQuantity:N0}",
-                        _ => "On target",
-                    });
-
-                ImGui.TableNextColumn();
-                DrawInlineTransferRoute(owner, selected.Id, rule, runtime);
-
-                ImGui.TableNextColumn();
-                if (ImGui.SmallButton($"×##remove-transfer:{rule.Id}"))
-                    RemoveTransferRule(owner, selected.Id, rule.Id);
-
-                if (line?.Action == StowageAction.Retrieve && retrievalLine?.MissingQuantity > 0)
-                    inlineTransferError = $"{rule.ItemName}: {retrievalLine.MissingQuantity:N0} missing from known retainer stock.";
+                return new TransferWorkbenchRow(
+                    rule,
+                    line,
+                    retrievalLine,
+                    playerQuantity,
+                    rule.TargetQuantity - playerQuantity,
+                    owner,
+                    selected.Id,
+                    runtime);
+            })
+            .ToArray();
+        if (transferWorkbenchTable.Begin(
+                "RQTransferWorkbench",
+                new DalamudTableLayout(
+                    new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y - footerHeight)),
+                    flags)))
+        {
+            foreach (var row in transferRows)
+            {
+                transferWorkbenchTable.DrawRow(
+                    row,
+                    row.Rule.Enabled ? null : new Vector4(.38f, .12f, .14f, .42f),
+                    id: $"transfer:{row.Rule.Id}");
+                if (row.Line?.Action == StowageAction.Retrieve && row.RetrievalLine?.MissingQuantity > 0)
+                    inlineTransferError = $"{row.Rule.ItemName}: {row.RetrievalLine.MissingQuantity:N0} missing from known retainer stock.";
             }
-            ImGui.EndTable();
+            transferWorkbenchTable.End();
         }
 
         ImGui.TextDisabled(
@@ -2802,7 +3054,7 @@ public sealed class QuartermasterWindow : Window
         if (ImGui.SmallButton("Select visible"))
         {
             foreach (var rule in FilteredDraftRules(draft))
-                selectedStowageRuleIds.Add(rule.Id);
+                selectedStowageRuleIds.SetSelected(rule.Id, true);
         }
         ImGui.SameLine();
         if (ImGui.SmallButton("Clear selection"))
@@ -2854,7 +3106,7 @@ public sealed class QuartermasterWindow : Window
             }
             activeStowageRuleId = existing.Id;
             selectedStowageRuleIds.Clear();
-            selectedStowageRuleIds.Add(existing.Id);
+            selectedStowageRuleIds.SetSelected(existing.Id, true);
             selectedStowageChoice = null;
             stowageItemSearch = string.Empty;
         }
@@ -2888,7 +3140,7 @@ public sealed class QuartermasterWindow : Window
             ImGui.BeginDisabled();
         if (ImGui.Button("Apply to selected##stowagebulk"))
         {
-            foreach (var rule in draft.Rules.Where(rule => selectedStowageRuleIds.Contains(rule.Id)))
+            foreach (var rule in draft.Rules.Where(rule => selectedStowageRuleIds.IsSelected(rule.Id)))
             {
                 if (bulkStowageTarget >= 0)
                     rule.TargetQuantity = bulkStowageTarget;
@@ -2909,7 +3161,7 @@ public sealed class QuartermasterWindow : Window
             ImGui.BeginDisabled();
         if (ImGui.Button("Remove selected##stowagebulk"))
         {
-            draft.Rules.RemoveAll(rule => selectedStowageRuleIds.Contains(rule.Id));
+            draft.Rules.RemoveAll(rule => selectedStowageRuleIds.IsSelected(rule.Id));
             selectedStowageRuleIds.Clear();
         }
         if (!hasSelection)
@@ -2942,75 +3194,32 @@ public sealed class QuartermasterWindow : Window
     {
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY |
                     ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
-        if (!ImGui.BeginTable("RQStowageDraftRules", 9, flags, new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y))))
+        if (!stowageDraftTable.Begin(
+                "RQStowageDraftRules",
+                new DalamudTableLayout(
+                    new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y)),
+                    flags)))
             return;
-        ImGui.TableSetupColumn("Select", ImGuiTableColumnFlags.WidthFixed, 46);
-        ImGui.TableSetupColumn("Rule", ImGuiTableColumnFlags.WidthFixed, 52);
-        ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.5f);
-        ImGui.TableSetupColumn("Player target", ImGuiTableColumnFlags.WidthFixed, 92);
-        ImGui.TableSetupColumn("Quality", ImGuiTableColumnFlags.WidthFixed, 112);
-        ImGui.TableSetupColumn("Now", ImGuiTableColumnFlags.WidthFixed, 92);
-        ImGui.TableSetupColumn("Destination", ImGuiTableColumnFlags.WidthStretch, 1.1f);
-        ImGui.TableSetupColumn("Overflow", ImGuiTableColumnFlags.WidthFixed, 112);
-        ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 28);
-        ImGui.TableHeadersRow();
         var filtered = FilteredDraftRules(draft);
+        selectedStowageRuleIds.Retain(draft.Rules.Select(rule => rule.Id));
         if (filtered.Count == 0)
-        {
-            ImGui.TableNextRow();
-            ImGui.TableNextColumn();
-            ImGui.TableNextColumn();
-            ImGui.TableNextColumn();
-            ImGui.TextDisabled(draft.Rules.Count == 0
+            stowageDraftTable.DrawMessageRow(draft.Rules.Count == 0
                 ? "No rules yet. Search by name above or add a selected Stock item."
                 : "No rules match this filter.");
-        }
-        foreach (var rule in filtered.ToArray())
+        var rows = filtered.Select(rule => new StowageDraftRow(rule, runtime)).ToArray();
+        var rowKeys = rows.Select(row => row.Rule.Id).ToArray();
+        for (var index = 0; index < rows.Length; index++)
         {
-            ImGui.TableNextRow();
-            ImGui.TableNextColumn();
-            var selected = selectedStowageRuleIds.Contains(rule.Id);
-            if (ImGui.Checkbox($"##selectstowage{rule.Id}", ref selected))
-            {
-                if (selected)
-                    selectedStowageRuleIds.Add(rule.Id);
-                else
-                    selectedStowageRuleIds.Remove(rule.Id);
-            }
-            ImGui.TableNextColumn();
-            rule.Enabled = DrawRuleToggle($"stowage{rule.Id}", rule.Enabled);
-            ImGui.TableNextColumn();
-            ImGui.TextUnformatted(rule.ItemName);
-            ImGui.TableNextColumn();
-            var target = rule.TargetQuantity;
-            ImGui.SetNextItemWidth(-1);
-            if (ImGui.InputInt($"##drafttarget{rule.Id}", ref target))
-                rule.TargetQuantity = Math.Max(0, target);
-            ImGui.TableNextColumn();
-            DrawDraftQuality(rule);
-            ImGui.TableNextColumn();
-            var player = PlayerQuantity(runtime.Browser, rule);
-            ImGui.TextDisabled(!rule.Enabled
-                ? "Off"
-                : player < rule.TargetQuantity
-                    ? $"Retrieve {rule.TargetQuantity - player:N0}"
-                    : player > rule.TargetQuantity
-                        ? $"Stow {player - rule.TargetQuantity:N0}"
-                        : "Balanced");
-            ImGui.TableNextColumn();
-            DrawStowageRouteCombo(rule, runtime);
-            ImGui.TableNextColumn();
-            DrawStowageOverflowCombo(rule);
-            ImGui.TableNextColumn();
-            if (ImGui.SmallButton($"X##draftremove{rule.Id}"))
-            {
-                draft.Rules.Remove(rule);
-                selectedStowageRuleIds.Remove(rule.Id);
-                if (activeStowageRuleId == rule.Id)
-                    activeStowageRuleId = draft.Rules.FirstOrDefault()?.Id;
-            }
+            var row = rows[index];
+            stowageDraftTable.DrawSelectableRow(
+                row,
+                selectedStowageRuleIds,
+                rowKeys,
+                index,
+                $"##selectstowage:{row.Rule.Id}");
         }
-        ImGui.EndTable();
+        DalamudTableSelectionRenderer.EndRows(selectedStowageRuleIds);
+        stowageDraftTable.End();
     }
 
     private void DrawDraftQuality(TargetPlanItem rule)
@@ -3626,45 +3835,29 @@ public sealed class QuartermasterWindow : Window
         ImGui.TextColored(new Vector4(.53f, .83f, .64f, 1f), $"Stow {deposit.PlannedQuantity:N0}");
         ImGui.Separator();
 
-        if (ImGui.BeginTable(
-                "RQTransferReviewRows",
-                4,
-                ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
-                ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp,
-                new Vector2(0, Math.Max(260, ImGui.GetContentRegionAvail().Y - 48))))
-        {
-            ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.3f);
-            ImGui.TableSetupColumn("Player / target", ImGuiTableColumnFlags.WidthFixed, 120);
-            ImGui.TableSetupColumn("Diff", ImGuiTableColumnFlags.WidthFixed, 72);
-            ImGui.TableSetupColumn("Planned movement", ImGuiTableColumnFlags.WidthStretch, 1.2f);
-            ImGui.TableHeadersRow();
-            foreach (var rule in rules)
+        var reviewRows = rules
+            .Select(rule =>
             {
                 evaluated.TryGetValue(rule.Id, out var line);
                 var player = line?.PlayerQuantity ?? 0;
-                var difference = rule.TargetQuantity - player;
-                ImGui.TableNextRow();
-                ImGui.TableNextColumn();
-                ImGui.TextUnformatted(rule.ItemName);
-                ImGui.TableNextColumn();
-                ImGui.TextUnformatted($"{player:N0} / {rule.TargetQuantity:N0}");
-                ImGui.TableNextColumn();
-                ImGui.TextColored(
-                    TransferActionColor(line?.Action),
-                    difference > 0
-                        ? $"+{difference:N0}"
-                        : difference.ToString("N0", CultureInfo.CurrentCulture));
-                ImGui.TableNextColumn();
-                ImGui.TextColored(
-                    TransferActionColor(line?.Action),
-                    line?.Action switch
-                    {
-                        StowageAction.Retrieve => $"Retrieve {line.RetrieveQuantity:N0}",
-                        StowageAction.Deposit => $"Stow {line.DepositQuantity:N0} · {RouteSummary(rule.Routing, runtime.Retainers, runtime.Owner)}",
-                        _ => "On target · skip",
-                    });
-            }
-            ImGui.EndTable();
+                return new TransferReviewRow(
+                    rule,
+                    line,
+                    player,
+                    rule.TargetQuantity - player,
+                    runtime);
+            })
+            .ToArray();
+        if (transferReviewTable.Begin(
+                "RQTransferReviewRows",
+                new DalamudTableLayout(
+                    new Vector2(0, Math.Max(260, ImGui.GetContentRegionAvail().Y - 48)),
+                    ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
+                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp)))
+        {
+            foreach (var row in reviewRows)
+                transferReviewTable.DrawRow(row, id: $"transfer-review:{row.Rule.Id}");
+            transferReviewTable.End();
         }
 
         if (ImGui.Button("Back"))
@@ -3765,19 +3958,14 @@ public sealed class QuartermasterWindow : Window
             if (!canExecute)
                 ImGui.EndDisabled();
         }
-        if (ImGui.BeginTable("RQOperationLines", 5, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH))
+        if (operationLineTable.Begin(
+                "RQOperationLines",
+                DalamudTableLayout.FitContent(
+                    ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH)))
         {
-            ImGui.TableSetupColumn("Item"); ImGui.TableSetupColumn("Target"); ImGui.TableSetupColumn("Submitted shortage"); ImGui.TableSetupColumn("Transferred"); ImGui.TableSetupColumn("Remaining"); ImGui.TableHeadersRow();
             foreach (var line in operation.Lines)
-            {
-                ImGui.TableNextRow();
-                ImGui.TableNextColumn(); ImGui.TextUnformatted(line.ItemName);
-                ImGui.TableNextColumn(); ImGui.TextUnformatted(line.TargetQuantity.ToString("N0"));
-                ImGui.TableNextColumn(); ImGui.TextUnformatted(line.ShortageQuantity.ToString("N0"));
-                ImGui.TableNextColumn(); ImGui.TextUnformatted(line.TransferredQuantity.ToString("N0"));
-                ImGui.TableNextColumn(); ImGui.TextUnformatted(Math.Max(0, line.ShortageQuantity - line.TransferredQuantity).ToString("N0"));
-            }
-            ImGui.EndTable();
+                operationLineTable.DrawRow(line, id: $"operation-line:{line.ItemId}:{line.SourceRuleId}");
+            operationLineTable.End();
         }
     }
 
@@ -3906,6 +4094,38 @@ public sealed class QuartermasterWindow : Window
         try { return task.Wait(timeout); }
         catch (AggregateException exception) when (exception.InnerExceptions.All(inner => inner is OperationCanceledException)) { return true; }
     }
+
+    private sealed record StockWorkbenchRow(
+        StockGroup Item,
+        TargetPlanItem? Rule,
+        StowageEvaluationLine? Line);
+
+    private sealed record RestockPlanRow(
+        RestockPlanItem Item,
+        PlanLine? Line,
+        Guid PlanId,
+        OwnerScope Owner);
+
+    private sealed record TransferWorkbenchRow(
+        TargetPlanItem Rule,
+        StowageEvaluationLine? Line,
+        PlanLine? RetrievalLine,
+        int PlayerQuantity,
+        int Difference,
+        OwnerScope Owner,
+        Guid PlanId,
+        QuartermasterRuntimeSnapshot Runtime);
+
+    private sealed record StowageDraftRow(
+        TargetPlanItem Rule,
+        QuartermasterRuntimeSnapshot Runtime);
+
+    private sealed record TransferReviewRow(
+        TargetPlanItem Rule,
+        StowageEvaluationLine? Line,
+        int PlayerQuantity,
+        int Difference,
+        QuartermasterRuntimeSnapshot Runtime);
 
     private sealed record TransferReviewRequest(Guid PlanId, string PlanName);
 
