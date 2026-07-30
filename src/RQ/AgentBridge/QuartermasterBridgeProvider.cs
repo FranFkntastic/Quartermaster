@@ -37,7 +37,9 @@ public sealed record QuartermasterBridgeTruth(
     bool RefreshAvailable,
     bool RefreshActive,
     string RefreshStatus,
-    bool TransferActive);
+    bool TransferActive,
+    bool ListingNavigationActive,
+    string ListingNavigationStatus);
 
 public sealed class QuartermasterBridgeProvider
 {
