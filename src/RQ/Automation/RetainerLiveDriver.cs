@@ -99,6 +99,9 @@ public sealed class RetainerLiveDriver : IRetainerTransferDriver
     public async Task CloseRetainerAsync(CancellationToken cancellationToken) =>
         RequireSuccess(await session.CloseRetainerAsync(cancellationToken).ConfigureAwait(false));
 
+    public async Task CloseRetainerListAsync(CancellationToken cancellationToken) =>
+        RequireSuccess(await session.CloseRetainerListAsync(cancellationToken).ConfigureAwait(false));
+
     public void CancelActive() => session.CancelActive();
 
     private static void RequireSuccess(RetainerAutomationResult result)
