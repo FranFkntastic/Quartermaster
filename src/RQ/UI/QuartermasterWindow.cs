@@ -872,17 +872,12 @@ public sealed class QuartermasterWindow : Window
             for (var rowIndex = 0; rowIndex < rows.Length; rowIndex++)
             {
                 var row = rows[rowIndex];
-                var itemWidth = Math.Max(1, ImGui.GetContentRegionAvail().X * .35f);
-                var itemHeight = Math.Max(
-                    ImGui.GetTextLineHeightWithSpacing(),
-                    ImGui.CalcTextSize(row.Item.ItemName, false, itemWidth).Y);
                 stockTable.DrawSelectableRow(
                     row,
                     stockSelection,
                     rowKeys,
                     rowIndex,
-                    $"##stock-row:{row.Item.ItemId}",
-                    minimumHeight: itemHeight);
+                    $"##stock-row:{row.Item.ItemId}");
                 var stockSelected = stockSelection.IsSelected(row.Item.ItemId);
                 reviewRegistry.RegisterLastButton(
                     $"quartermaster.stock.select.{row.Item.ItemId}",
