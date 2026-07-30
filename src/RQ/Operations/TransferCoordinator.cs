@@ -31,6 +31,7 @@ public interface IRetainerTransferDriver
     Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerCrystalsAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken);
     Task<RetainerCrystalTransferResult> DepositCrystalAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken);
     Task CloseRetainerAsync(CancellationToken cancellationToken);
+    Task CloseRetainerListAsync(CancellationToken cancellationToken) => Task.CompletedTask;
     void CancelActive();
 }
 
@@ -114,6 +115,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         SetActive(linkedCancellation);
         var token = linkedCancellation.Token;
         var retainerOpen = false;
+        var retainerSessionOpen = false;
         var movementAttempted = false;
         try
         {
@@ -174,6 +176,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
 
             var transferred = 0;
             await driver.RequireRetainerListAsync(token).ConfigureAwait(false);
+            retainerSessionOpen = true;
             token.ThrowIfCancellationRequested();
             foreach (var candidate in candidates)
             {
@@ -244,6 +247,8 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                 if (remaining.Values.All(quantity => quantity <= 0))
                     break;
             }
+            await driver.CloseRetainerListAsync(token).ConfigureAwait(false);
+            retainerSessionOpen = false;
             var missing = remaining.Values.Where(quantity => quantity > 0).Sum();
             journal.Transition(
                 operationId,
@@ -256,16 +261,40 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         }
         catch (OperationCanceledException)
         {
-            MarkCancelled(operationId);
-            return new(true, "Transfer cancelled; any operation that began live movement is indeterminate.");
-        }
-        catch (Exception exception)
-        {
+            Exception? releaseFailure = null;
             if (retainerOpen)
             {
                 try { await driver.CloseRetainerAsync(CancellationToken.None).ConfigureAwait(false); }
-                catch { }
+                catch (Exception closeException) { releaseFailure = closeException; }
             }
+            if (retainerSessionOpen)
+            {
+                try { await driver.CloseRetainerListAsync(CancellationToken.None).ConfigureAwait(false); }
+                catch (Exception closeException) { releaseFailure ??= closeException; }
+            }
+            MarkCancelled(operationId);
+            return new(
+                true,
+                releaseFailure is null
+                    ? "Transfer cancelled; any operation that began live movement is indeterminate."
+                    : $"Transfer cancelled and retainer session release failed: {releaseFailure.Message}");
+        }
+        catch (Exception exception)
+        {
+            Exception? releaseFailure = null;
+            if (retainerOpen)
+            {
+                try { await driver.CloseRetainerAsync(CancellationToken.None).ConfigureAwait(false); }
+                catch (Exception closeException) { releaseFailure = closeException; }
+            }
+            if (retainerSessionOpen)
+            {
+                try { await driver.CloseRetainerListAsync(CancellationToken.None).ConfigureAwait(false); }
+                catch (Exception closeException) { releaseFailure ??= closeException; }
+            }
+            var failure = releaseFailure is null
+                ? exception.Message
+                : $"{exception.Message} Retainer session release also failed: {releaseFailure.Message}";
             var operation = journal.Get(operationId);
             if (operation is { Status: not OperationStatuses.Failed } && !OperationStatuses.IsTerminal(operation.Status))
             {
@@ -273,9 +302,9 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     operationId,
                     movementAttempted ? OperationStatuses.Indeterminate : OperationStatuses.Failed,
                     movementAttempted ? "BookkeepingIndeterminate" : "ExecutionFailed",
-                    movementAttempted ? $"Live movement may have occurred, but durable bookkeeping failed: {exception.Message}" : exception.Message);
+                    movementAttempted ? $"Live movement may have occurred, but execution did not finish cleanly: {failure}" : failure);
             }
-            return new(true, exception.Message);
+            return new(true, failure);
         }
         finally
         {
@@ -297,6 +326,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         SetActive(linkedCancellation);
         var token = linkedCancellation.Token;
         var retainerOpen = false;
+        var retainerSessionOpen = false;
         var movementAttempted = false;
         try
         {
@@ -318,6 +348,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                 line => line.TargetQuantity);
             var transferred = 0;
             await driver.RequireRetainerListAsync(token).ConfigureAwait(false);
+            retainerSessionOpen = true;
             token.ThrowIfCancellationRequested();
             foreach (var source in operation.DepositCandidates)
             {
@@ -412,6 +443,8 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                 if (remaining.Values.All(quantity => quantity <= 0))
                     break;
             }
+            await driver.CloseRetainerListAsync(token).ConfigureAwait(false);
+            retainerSessionOpen = false;
             var missing = remaining.Values.Where(quantity => quantity > 0).Sum();
             journal.Transition(operationId,
                 missing == 0 ? OperationStatuses.Succeeded : transferred > 0 ? OperationStatuses.PartiallySucceeded : OperationStatuses.Failed,
@@ -421,16 +454,40 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         }
         catch (OperationCanceledException)
         {
-            MarkCancelled(operationId);
-            return new(true, "Transfer cancelled; any operation that began live movement is indeterminate.");
-        }
-        catch (Exception exception)
-        {
+            Exception? releaseFailure = null;
             if (retainerOpen)
             {
                 try { await driver.CloseRetainerAsync(CancellationToken.None).ConfigureAwait(false); }
-                catch { }
+                catch (Exception closeException) { releaseFailure = closeException; }
             }
+            if (retainerSessionOpen)
+            {
+                try { await driver.CloseRetainerListAsync(CancellationToken.None).ConfigureAwait(false); }
+                catch (Exception closeException) { releaseFailure ??= closeException; }
+            }
+            MarkCancelled(operationId);
+            return new(
+                true,
+                releaseFailure is null
+                    ? "Transfer cancelled; any operation that began live movement is indeterminate."
+                    : $"Transfer cancelled and retainer session release failed: {releaseFailure.Message}");
+        }
+        catch (Exception exception)
+        {
+            Exception? releaseFailure = null;
+            if (retainerOpen)
+            {
+                try { await driver.CloseRetainerAsync(CancellationToken.None).ConfigureAwait(false); }
+                catch (Exception closeException) { releaseFailure = closeException; }
+            }
+            if (retainerSessionOpen)
+            {
+                try { await driver.CloseRetainerListAsync(CancellationToken.None).ConfigureAwait(false); }
+                catch (Exception closeException) { releaseFailure ??= closeException; }
+            }
+            var failure = releaseFailure is null
+                ? exception.Message
+                : $"{exception.Message} Retainer session release also failed: {releaseFailure.Message}";
             var operation = journal.Get(operationId);
             if (operation is not null && !OperationStatuses.IsTerminal(operation.Status))
             {
@@ -438,9 +495,9 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     operationId,
                     movementAttempted ? OperationStatuses.Indeterminate : OperationStatuses.Failed,
                     movementAttempted ? "BookkeepingIndeterminate" : "DepositFailed",
-                    movementAttempted ? $"Live movement may have occurred, but durable bookkeeping failed: {exception.Message}" : exception.Message);
+                    movementAttempted ? $"Live movement may have occurred, but execution did not finish cleanly: {failure}" : failure);
             }
-            return new(true, exception.Message);
+            return new(true, failure);
         }
         finally
         {
