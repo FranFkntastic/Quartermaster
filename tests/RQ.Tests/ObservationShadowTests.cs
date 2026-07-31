@@ -113,6 +113,7 @@ public sealed class ObservationShadowTests
             var retainer = Retainer();
             host.ObserveRetainerListings(retainer, retainer.ObservedAtUtc);
             host.Dispose();
+            var shadowDiagnostics = host.Diagnostics;
 
             var paths = SharedObservationPaths.FromPluginConfigDirectory(pluginConfig);
             var open = await SqliteObservationStore.OpenAsync(new ObservationStoreOptions { DatabasePath = paths.DatabasePath });
@@ -128,6 +129,10 @@ public sealed class ObservationShadowTests
                 ObservationPayloadContracts.RetainerMarketListings,
                 1).Listings);
             Assert.Empty(diagnostics);
+            Assert.Equal(1, shadowDiagnostics.Enqueued);
+            Assert.Equal(1, shadowDiagnostics.AcceptedChanged);
+            Assert.Equal(0, shadowDiagnostics.QueueFull);
+            Assert.Equal(0, shadowDiagnostics.WriterFaults);
             await open.Store.DisposeAsync();
         }
         finally

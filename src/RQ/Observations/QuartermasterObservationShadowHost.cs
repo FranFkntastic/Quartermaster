@@ -17,6 +17,17 @@ internal sealed class QuartermasterObservationShadowHost : IDisposable
     private readonly ObservationProvenance provenance;
     private WriterSession? writer;
     private long sourceRevision;
+    private long enqueued;
+    private long queueFull;
+    private long acceptedChanged;
+    private long acceptedConfirmed;
+    private long preservedStale;
+    private long rejected;
+    private long ignored;
+    private long writerFaults;
+    private long divergenceFaults;
+    private string? lastOutcome;
+    private long lastOutcomeUtcTicks;
     private bool started;
     private bool disposed;
 
@@ -33,6 +44,7 @@ internal sealed class QuartermasterObservationShadowHost : IDisposable
         var version = typeof(ObservationContract).Assembly.GetName().Version ?? new Version(0, 0);
         provenance = new ObservationProvenance("Quartermaster", pluginInstanceId, version.ToString(), gameBuild);
         paths = SharedObservationPaths.FromPluginConfigDirectory(pluginConfigDirectory);
+        var storeOptions = CreateStoreOptions();
         coordinator = new ObservationCollectorCoordinator(new ObservationCollectorCoordinatorOptions
         {
             ProfileId = paths.ProfileId,
@@ -41,6 +53,7 @@ internal sealed class QuartermasterObservationShadowHost : IDisposable
             PluginInstanceId = pluginInstanceId,
             FranthropyVersion = version,
             WriterCapability = 1,
+            DatabaseProbe = () => ObservationDatabaseProbe.ReadAsync(storeOptions).AsTask().GetAwaiter().GetResult(),
             StartCollector = StartWriter,
             StopCollector = StopWriter,
         });
@@ -49,6 +62,21 @@ internal sealed class QuartermasterObservationShadowHost : IDisposable
 
     public event Action? CollectorActivated;
     public ObservationLeadershipSnapshot Leadership => coordinator.State;
+    public QuartermasterObservationShadowDiagnostics Diagnostics => new(
+        Leadership,
+        Interlocked.Read(ref enqueued),
+        Interlocked.Read(ref queueFull),
+        Interlocked.Read(ref acceptedChanged),
+        Interlocked.Read(ref acceptedConfirmed),
+        Interlocked.Read(ref preservedStale),
+        Interlocked.Read(ref rejected),
+        Interlocked.Read(ref ignored),
+        Interlocked.Read(ref writerFaults),
+        Interlocked.Read(ref divergenceFaults),
+        lastOutcome,
+        Interlocked.Read(ref lastOutcomeUtcTicks) == 0
+            ? null
+            : new DateTimeOffset(Interlocked.Read(ref lastOutcomeUtcTicks), TimeSpan.Zero));
 
     public void Start()
     {
@@ -92,20 +120,27 @@ internal sealed class QuartermasterObservationShadowHost : IDisposable
         }
         catch (Exception ex)
         {
+            RecordOutcome("Rejected invalid shadow input.");
+            Interlocked.Increment(ref rejected);
             diagnostic("Quartermaster rejected an invalid shared-observation shadow input.", ex);
             return;
         }
 
         if (!current.Channel.Writer.TryWrite(observation))
+        {
+            Interlocked.Increment(ref queueFull);
+            RecordOutcome("Shadow queue full.");
             diagnostic("Quartermaster shared-observation shadow queue is full; the observation was not written.", null);
+        }
+        else
+        {
+            Interlocked.Increment(ref enqueued);
+        }
     }
 
     private void StartWriter()
     {
-        var result = SqliteObservationStore.OpenAsync(new ObservationStoreOptions
-        {
-            DatabasePath = paths.DatabasePath,
-        }).AsTask().GetAwaiter().GetResult();
+        var result = SqliteObservationStore.OpenAsync(CreateStoreOptions()).AsTask().GetAwaiter().GetResult();
         if (!result.IsReady)
             throw new InvalidOperationException(result.Message);
 
@@ -142,8 +177,10 @@ internal sealed class QuartermasterObservationShadowHost : IDisposable
         await foreach (var observation in session.Channel.Reader.ReadAllAsync())
         {
             var result = await session.Store.WriteAsync(observation).ConfigureAwait(false);
+            RecordWriteResult(result);
             if (result.Status is ObservationWriteStatus.Busy or ObservationWriteStatus.Unavailable or ObservationWriteStatus.UnsupportedDatabaseVersion)
             {
+                Interlocked.Increment(ref writerFaults);
                 diagnostic($"Quartermaster shared-observation shadow write failed: {result.Message}", null);
                 coordinator.ReportCollectorFault(result.Message);
                 return;
@@ -161,12 +198,53 @@ internal sealed class QuartermasterObservationShadowHost : IDisposable
                     read.Observation.Payload.Json != observation.Payload.Json)
                 {
                     const string message = "Quartermaster shared-observation shadow projection diverged from the legacy capture.";
+                    Interlocked.Increment(ref divergenceFaults);
+                    RecordOutcome(message);
                     diagnostic(message, null);
                     coordinator.ReportCollectorFault(message);
                     return;
                 }
             }
         }
+    }
+
+    private ObservationStoreOptions CreateStoreOptions() => new()
+    {
+        DatabasePath = paths.DatabasePath,
+        BackupDirectory = paths.BackupsDirectory,
+        MigrationLockPath = paths.MigrationLockPath,
+        ChangeSignalPath = paths.ChangeSignalPath,
+        WriterCapability = 1,
+    };
+
+    private void RecordWriteResult(ObservationWriteResult result)
+    {
+        switch (result.Status)
+        {
+            case ObservationWriteStatus.AcceptedChanged:
+                Interlocked.Increment(ref acceptedChanged);
+                break;
+            case ObservationWriteStatus.AcceptedConfirmed:
+                Interlocked.Increment(ref acceptedConfirmed);
+                break;
+            case ObservationWriteStatus.PreservedAsStale:
+                Interlocked.Increment(ref preservedStale);
+                break;
+            case ObservationWriteStatus.Rejected:
+                Interlocked.Increment(ref rejected);
+                break;
+            case ObservationWriteStatus.IgnoredOlderRevision:
+            case ObservationWriteStatus.IgnoredRepeatedRevision:
+                Interlocked.Increment(ref ignored);
+                break;
+        }
+        RecordOutcome($"{result.Status}: {result.Message}");
+    }
+
+    private void RecordOutcome(string outcome)
+    {
+        lastOutcome = outcome.Length <= 512 ? outcome : outcome[..512];
+        Interlocked.Exchange(ref lastOutcomeUtcTicks, DateTimeOffset.UtcNow.UtcTicks);
     }
 
     private void PublishCollectorActivated()
@@ -202,3 +280,17 @@ internal sealed class QuartermasterObservationShadowHost : IDisposable
         public Task Worker { get; set; } = Task.CompletedTask;
     }
 }
+
+internal sealed record QuartermasterObservationShadowDiagnostics(
+    ObservationLeadershipSnapshot Leadership,
+    long Enqueued,
+    long QueueFull,
+    long AcceptedChanged,
+    long AcceptedConfirmed,
+    long PreservedStale,
+    long Rejected,
+    long Ignored,
+    long WriterFaults,
+    long DivergenceFaults,
+    string? LastOutcome,
+    DateTimeOffset? LastOutcomeAtUtc);
