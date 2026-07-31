@@ -1,4 +1,5 @@
 using System.Threading.Channels;
+using Franthropy.Dalamud.Diagnostics;
 using Franthropy.Dalamud.Observations;
 using Franthropy.Observations.Hosting;
 using Franthropy.Observations.Storage;
@@ -40,6 +41,10 @@ internal sealed class QuartermasterObservationShadowHost : IDisposable
         ArgumentException.ThrowIfNullOrWhiteSpace(gameBuild);
         if (string.Equals(gameBuild, "unknown", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("The exact game build is unavailable; shared observation shadowing is blocked.");
+        GamePatchCompatibilityGate.Require(
+            "Quartermaster.SharedObservationShadow.V1",
+            DalamudSharedObservationHost.ApprovedGameBuild,
+            gameBuild);
         this.diagnostic = diagnostic ?? throw new ArgumentNullException(nameof(diagnostic));
         var version = typeof(ObservationContract).Assembly.GetName().Version ?? new Version(0, 0);
         provenance = new ObservationProvenance("Quartermaster", pluginInstanceId, version.ToString(), gameBuild);
@@ -129,8 +134,10 @@ internal sealed class QuartermasterObservationShadowHost : IDisposable
         if (!current.Channel.Writer.TryWrite(observation))
         {
             Interlocked.Increment(ref queueFull);
-            RecordOutcome("Shadow queue full.");
-            diagnostic("Quartermaster shared-observation shadow queue is full; the observation was not written.", null);
+            const string message = "Quartermaster shared-observation shadow queue is full; collection stopped before evidence could be dropped silently.";
+            RecordOutcome(message);
+            diagnostic(message, null);
+            coordinator.ReportCollectorFault(message);
         }
         else
         {
@@ -174,37 +181,48 @@ internal sealed class QuartermasterObservationShadowHost : IDisposable
 
     private async Task ProcessAsync(WriterSession session)
     {
-        await foreach (var observation in session.Channel.Reader.ReadAllAsync())
+        try
         {
-            var result = await session.Store.WriteAsync(observation).ConfigureAwait(false);
-            RecordWriteResult(result);
-            if (result.Status is ObservationWriteStatus.Busy or ObservationWriteStatus.Unavailable or ObservationWriteStatus.UnsupportedDatabaseVersion)
+            await foreach (var observation in session.Channel.Reader.ReadAllAsync())
             {
-                Interlocked.Increment(ref writerFaults);
-                diagnostic($"Quartermaster shared-observation shadow write failed: {result.Message}", null);
-                coordinator.ReportCollectorFault(result.Message);
-                return;
-            }
-            if (result.Status == ObservationWriteStatus.Rejected)
-                diagnostic($"Quartermaster shared-observation shadow evidence was rejected: {result.Message}", null);
-            if (result.Status is ObservationWriteStatus.AcceptedChanged or ObservationWriteStatus.AcceptedConfirmed)
-            {
-                var read = await session.Store.ReadCurrentAsync(observation.Scope).ConfigureAwait(false);
-                if (read.Status != ObservationReadStatus.Found ||
-                    read.Observation is null ||
-                    observation.Payload is null ||
-                    read.Observation.Payload.Contract != observation.Payload.Contract ||
-                    read.Observation.Payload.Version != observation.Payload.Version ||
-                    read.Observation.Payload.Json != observation.Payload.Json)
+                var result = await session.Store.WriteAsync(observation).ConfigureAwait(false);
+                RecordWriteResult(result);
+                if (result.Status is ObservationWriteStatus.Busy or ObservationWriteStatus.Unavailable or ObservationWriteStatus.UnsupportedDatabaseVersion)
                 {
-                    const string message = "Quartermaster shared-observation shadow projection diverged from the legacy capture.";
-                    Interlocked.Increment(ref divergenceFaults);
-                    RecordOutcome(message);
-                    diagnostic(message, null);
-                    coordinator.ReportCollectorFault(message);
+                    Interlocked.Increment(ref writerFaults);
+                    diagnostic($"Quartermaster shared-observation shadow write failed: {result.Message}", null);
+                    coordinator.ReportCollectorFault(result.Message);
                     return;
                 }
+                if (result.Status == ObservationWriteStatus.Rejected)
+                    diagnostic($"Quartermaster shared-observation shadow evidence was rejected: {result.Message}", null);
+                if (result.Status is ObservationWriteStatus.AcceptedChanged or ObservationWriteStatus.AcceptedConfirmed)
+                {
+                    var read = await session.Store.ReadCurrentAsync(observation.Scope).ConfigureAwait(false);
+                    if (read.Status != ObservationReadStatus.Found ||
+                        read.Observation is null ||
+                        observation.Payload is null ||
+                        read.Observation.Payload.Contract != observation.Payload.Contract ||
+                        read.Observation.Payload.Version != observation.Payload.Version ||
+                        read.Observation.Payload.Json != observation.Payload.Json)
+                    {
+                        const string message = "Quartermaster shared-observation shadow projection diverged from the legacy capture.";
+                        Interlocked.Increment(ref divergenceFaults);
+                        RecordOutcome(message);
+                        diagnostic(message, null);
+                        coordinator.ReportCollectorFault(message);
+                        return;
+                    }
+                }
             }
+        }
+        catch (Exception ex)
+        {
+            var message = $"Quartermaster shared-observation shadow writer stopped unexpectedly: {ex.Message}";
+            Interlocked.Increment(ref writerFaults);
+            RecordOutcome(message);
+            diagnostic(message, ex);
+            coordinator.ReportCollectorFault(message);
         }
     }
 

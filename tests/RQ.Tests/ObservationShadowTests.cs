@@ -1,4 +1,5 @@
 using FFXIVClientStructs.FFXIV.Client.Game;
+using Franthropy.Dalamud.Diagnostics;
 using Franthropy.Dalamud.Observations;
 using Franthropy.Observations.Storage;
 using Franthropy.Observations.V1;
@@ -103,7 +104,7 @@ public sealed class ObservationShadowTests
         var host = new QuartermasterObservationShadowHost(
             pluginConfig,
             $"test-{Guid.NewGuid():N}",
-            "2026.07.31.0000.0000",
+            DalamudSharedObservationHost.ApprovedGameBuild,
             (message, _) => diagnostics.Add(message));
         host.CollectorActivated += () => activated.TrySetResult();
         try
@@ -141,6 +142,19 @@ public sealed class ObservationShadowTests
             SqliteConnection.ClearAllPools();
             Directory.Delete(root, recursive: true);
         }
+    }
+
+    [Fact]
+    public void Shadow_host_rejects_an_unapproved_game_build_before_opening_storage()
+    {
+        var exception = Assert.Throws<GamePatchCompatibilityException>(() =>
+            new QuartermasterObservationShadowHost(
+                "unused",
+                "instance",
+                "2099.01.01.0000.0000",
+                (_, _) => { }));
+
+        Assert.Equal(DalamudSharedObservationHost.ApprovedGameBuild, exception.Compatibility.ApprovedGameVersion);
     }
 
     private static OwnerScope Owner() => new()
