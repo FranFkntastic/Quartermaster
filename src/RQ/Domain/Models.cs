@@ -313,6 +313,10 @@ public sealed class OperationReceipt
 
 public sealed class RetainerListingCaptureReceipt
 {
+    public const string ChangedListingsV1 = "changed-listings/v1";
+
+    public string Semantics { get; set; } = ChangedListingsV1;
+    public bool ComparisonAvailable { get; set; }
     public string CaptureId { get; set; } = string.Empty;
     public ulong RetainerId { get; set; }
     public OwnerScope Owner { get; set; } = new();
