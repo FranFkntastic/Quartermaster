@@ -32,6 +32,7 @@ public sealed class RetainerCacheRepository
     }
 
     public event Action? Changed;
+    public event Action<RetainerListingCaptureReceipt>? ListingCaptured;
     public long Revision { get; private set; }
 
     public IReadOnlyDictionary<ulong, CachedRetainer> Snapshot()
@@ -120,6 +121,7 @@ public sealed class RetainerCacheRepository
         if (!observation.Owner.HasStableIdentity)
             throw new InvalidOperationException("A stable owner identity is required.");
 
+        RetainerListingCaptureReceipt receipt;
         lock (gate)
         {
             var updated = cache.TryGetValue(observation.RetainerId, out var current)
@@ -145,8 +147,29 @@ public sealed class RetainerCacheRepository
             store.Save(candidate);
             cache = candidate;
             Revision++;
+            receipt = new RetainerListingCaptureReceipt
+            {
+                CaptureId = Guid.NewGuid().ToString("N"),
+                RetainerId = observation.RetainerId,
+                Owner = observation.Owner with { },
+                CapturedAtUtc = observation.ObservedAtUtc,
+                Items = cache.Values
+                    .Where(retainer => observation.Owner.Matches(retainer.Owner))
+                    .SelectMany(retainer => retainer.Listings)
+                    .Where(listing => listing.ItemId != 0)
+                    .GroupBy(listing => listing.ItemId)
+                    .Select(group => new RetainerListingCaptureItem
+                    {
+                        ItemId = group.Key,
+                        ItemName = group.Select(listing => listing.ItemName)
+                            .FirstOrDefault(name => !string.IsNullOrWhiteSpace(name)),
+                    })
+                    .OrderBy(item => item.ItemId)
+                    .ToList(),
+            };
         }
         Changed?.Invoke();
+        ListingCaptured?.Invoke(receipt);
     }
 
     public CacheInvalidationResult Invalidate(ulong retainerId)

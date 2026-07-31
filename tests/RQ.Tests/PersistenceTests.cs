@@ -105,6 +105,41 @@ public sealed class PersistenceTests
     }
 
     [Fact]
+    public void ReplaceListings_PublishesOneExplicitCaptureReceipt()
+    {
+        using var directory = new TemporaryDirectory();
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "retainer-cache.json"));
+        var existing = TestData.Retainer(20, "Iris");
+        existing.Listings.Add(new CachedMarketListing { ItemId = 200, ItemName = "Cobalt Ore" });
+        var otherOwner = TestData.Retainer(30, "Other");
+        otherOwner.Owner = TestData.Owner with { LocalContentId = 9002, CharacterName = "Other Character" };
+        otherOwner.Listings.Add(new CachedMarketListing { ItemId = 300, ItemName = "Mythril Ore" });
+        store.Save(new Dictionary<ulong, CachedRetainer>
+        {
+            [existing.RetainerId] = existing,
+            [otherOwner.RetainerId] = otherOwner,
+        });
+        var repository = new RetainerCacheRepository(store);
+        var receipts = new List<RetainerListingCaptureReceipt>();
+        repository.ListingCaptured += receipts.Add;
+        var observedAt = new DateTime(2026, 7, 31, 17, 30, 0, DateTimeKind.Utc);
+
+        repository.ReplaceListings(new RetainerListingsObservation(
+            10,
+            "Eris",
+            TestData.Owner,
+            observedAt,
+            [new CachedMarketListing { ItemId = 100, Quantity = 1, UnitPrice = 44 }]));
+
+        var receipt = Assert.Single(receipts);
+        Assert.False(string.IsNullOrWhiteSpace(receipt.CaptureId));
+        Assert.Equal((ulong)10, receipt.RetainerId);
+        Assert.Equal(TestData.Owner, receipt.Owner);
+        Assert.Equal(observedAt, receipt.CapturedAtUtc);
+        Assert.Equal([100u, 200u], receipt.Items.Select(item => item.ItemId));
+    }
+
+    [Fact]
     public void SaveAfterInvalidation_WhenReplacementFails_DoesNotResurrectStaleEvidence()
     {
         using var directory = new TemporaryDirectory();

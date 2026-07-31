@@ -168,6 +168,30 @@ public sealed class IpcTests
     }
 
     [Fact]
+    public void Snapshot_PublishesLatestOwnerScopedListingCapture()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        repository.Mutate(state => state.LatestRetainerListingCapture = new RetainerListingCaptureReceipt
+        {
+            CaptureId = "capture-1",
+            RetainerId = 10,
+            Owner = TestData.Owner,
+            CapturedAtUtc = new DateTime(2026, 7, 31, 17, 30, 0, DateTimeKind.Utc),
+            Items = [new RetainerListingCaptureItem { ItemId = 100, ItemName = "Darksteel Ore" }],
+        });
+        var snapshots = new SnapshotPublisher("provider", repository, () => new Dictionary<ulong, CachedRetainer>());
+
+        snapshots.Refresh(TestData.Owner, []);
+        using var document = JsonDocument.Parse(snapshots.GetSnapshot());
+
+        var capture = document.RootElement.GetProperty("latestRetainerListingCapture");
+        Assert.Equal("capture-1", capture.GetProperty("captureId").GetString());
+        Assert.Equal((ulong)10, capture.GetProperty("retainerId").GetUInt64());
+        Assert.Equal((uint)100, Assert.Single(capture.GetProperty("items").EnumerateArray()).GetProperty("itemId").GetUInt32());
+    }
+
+    [Fact]
     public void Snapshot_PublishesOwnerScopedStowageRulesWithoutInternalConfidenceFields()
     {
         using var directory = new TemporaryDirectory();

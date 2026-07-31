@@ -68,6 +68,10 @@ public sealed class SnapshotPublisher
             .ToArray();
         var scopedOperations = stateSnapshot.Operations.Where(operation => operation.Owner.Matches(owner)).ToArray();
         var current = scopedOperations.OrderByDescending(operation => operation.UpdatedAtUtc).FirstOrDefault();
+        var latestListingCapture = stateSnapshot.LatestRetainerListingCapture is { } capture &&
+                                   owner.Matches(capture.Owner)
+            ? capture
+            : null;
         var snapshot = new
         {
             schema = "gooseworks-quartermaster-snapshot/v1",
@@ -78,6 +82,7 @@ public sealed class SnapshotPublisher
             playerBags = playerStorage.Bags,
             playerStorage = new { requestedSources = playerStorage.RequestedSources, observedSources = playerStorage.ObservedSources },
             retainers,
+            latestRetainerListingCapture = latestListingCapture,
             planItems = stateSnapshot.PlanItems,
             transferPlans = TransferPlanContract(stateSnapshot, owner, stowage ?? []),
             stowagePlans = StowageContract(stateSnapshot, owner, stowage ?? []),

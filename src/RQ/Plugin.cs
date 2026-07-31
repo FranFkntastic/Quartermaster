@@ -174,6 +174,7 @@ public sealed class Plugin : IDalamudPlugin
             state.Changed += OnStateChanged;
             playerInventory.Changed += OnPlayerInventoryChanged;
             cache.Changed += OnCacheChanged;
+            cache.ListingCaptured += OnListingCaptured;
             journal.OperationChanged += OnOperationChanged;
             submissions.OperationChanged += OnSubmittedOperationChanged;
             deposits.OperationChanged += OnSubmittedOperationChanged;
@@ -280,6 +281,12 @@ public sealed class Plugin : IDalamudPlugin
     private void OnCacheChanged()
     {
         MarkChanged("cache", null);
+    }
+
+    private void OnListingCaptured(RetainerListingCaptureReceipt receipt)
+    {
+        state.Mutate(document => document.LatestRetainerListingCapture = receipt);
+        MarkChanged("retainer_listings", null);
     }
 
     private void OnPlayerInventoryChanged() => MarkChanged("player_inventory", null);
@@ -411,6 +418,7 @@ public sealed class Plugin : IDalamudPlugin
         state.Changed -= OnStateChanged;
         playerInventory.Changed -= OnPlayerInventoryChanged;
         cache.Changed -= OnCacheChanged;
+        cache.ListingCaptured -= OnListingCaptured;
         journal.OperationChanged -= OnOperationChanged;
         ipc.Dispose();
         autoRetainer.Dispose();
