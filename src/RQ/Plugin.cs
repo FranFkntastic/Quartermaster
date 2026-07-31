@@ -5,6 +5,7 @@ using Dalamud.Plugin.Services;
 using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.Automation.Retainers;
 using Franthropy.Dalamud.Diagnostics;
+using Franthropy.Dalamud.Observations;
 using RQ.AgentBridge;
 using RQ.Automation;
 using RQ.Domain;
@@ -52,6 +53,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly AgentBridgeViewportCaptureService agentBridgeViewportCapture;
     private readonly AgentBridgeUiReviewRegistry agentReviewRegistry = new();
     private readonly QuartermasterObservationShadowHost? observationShadow;
+    private readonly DalamudSharedObservationHost? observationHost;
     private readonly WindowSystem windows = new("RQ");
     private readonly QuartermasterWindow window;
     private readonly System.Collections.Concurrent.ConcurrentQueue<(string Kind, string? OperationId)> pendingChanges = new();
@@ -67,6 +69,7 @@ public sealed class Plugin : IDalamudPlugin
         IFramework framework,
         IPlayerState playerState,
         IAddonLifecycle addonLifecycle,
+        IGameInventory gameInventory,
         IGameGui gameGui,
         IDataManager dataManager,
         ITextureProvider textureProvider,
@@ -126,6 +129,33 @@ public sealed class Plugin : IDalamudPlugin
             catch (Exception exception)
             {
                 log.Error(exception, "Quartermaster shared-observation shadow host is unavailable; legacy product reads remain active.");
+            }
+        }
+        else
+        {
+            try
+            {
+                observationHost = new DalamudSharedObservationHost(new DalamudSharedObservationHostOptions
+                {
+                    PluginConfigDirectory = configDirectory,
+                    PluginName = "Quartermaster",
+                    PluginInstanceId = providerInstanceId,
+                    GameBuild = GamePatchCompatibilityGate.ReadCurrentGameVersion(),
+                    GameInventory = gameInventory,
+                    PlayerState = playerState,
+                    AddonLifecycle = addonLifecycle,
+                    Diagnostic = (message, exception) =>
+                    {
+                        if (exception is null)
+                            log.Warning(message);
+                        else
+                            log.Error(exception, message);
+                    },
+                });
+            }
+            catch (Exception exception)
+            {
+                log.Error(exception, "Quartermaster shared-observation host is unavailable.");
             }
         }
         StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
@@ -206,6 +236,7 @@ public sealed class Plugin : IDalamudPlugin
                 observationShadow.CollectorActivated += OnObservationCollectorActivated;
                 observationShadow.Start();
             }
+            observationHost?.Start();
             journal.OperationChanged += OnOperationChanged;
             submissions.OperationChanged += OnSubmittedOperationChanged;
             deposits.OperationChanged += OnSubmittedOperationChanged;
@@ -477,6 +508,7 @@ public sealed class Plugin : IDalamudPlugin
         autoRetainer.Dispose();
         captures.Dispose();
         observationShadow?.Dispose();
+        observationHost?.Dispose();
         windows.RemoveAllWindows();
     }
 }
