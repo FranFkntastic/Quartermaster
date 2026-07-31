@@ -4,12 +4,14 @@ using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.Automation.Retainers;
+using Franthropy.Dalamud.Diagnostics;
 using RQ.AgentBridge;
 using RQ.Automation;
 using RQ.Domain;
 using RQ.Interop;
 using RQ.Inventory;
 using RQ.Operations;
+using RQ.Observations;
 using RQ.Persistence;
 using RQ.Planning;
 using RQ.Runtime;
@@ -49,6 +51,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly RQ.AgentBridge.AgentBridgeHost agentBridge;
     private readonly AgentBridgeViewportCaptureService agentBridgeViewportCapture;
     private readonly AgentBridgeUiReviewRegistry agentReviewRegistry = new();
+    private readonly QuartermasterObservationShadowHost? observationShadow;
     private readonly WindowSystem windows = new("RQ");
     private readonly QuartermasterWindow window;
     private readonly System.Collections.Concurrent.ConcurrentQueue<(string Kind, string? OperationId)> pendingChanges = new();
@@ -56,6 +59,7 @@ public sealed class Plugin : IDalamudPlugin
     private DateTime nextPlayerObservationAt;
     private DateTime nextPlayerInventoryFlushAt;
     private int snapshotDirty;
+    private int observationReconcileRequested;
 
     public Plugin(
         IDalamudPluginInterface pluginInterface,
@@ -103,6 +107,27 @@ public sealed class Plugin : IDalamudPlugin
         playerInventory = new(new PlayerInventoryCacheStore(playerInventoryCachePath));
         cache = new(new RetainerCacheStore(cachePath));
         state = new(new QuartermasterStateStore(statePath));
+        if (configuration.EnableSharedObservationShadow)
+        {
+            try
+            {
+                observationShadow = new QuartermasterObservationShadowHost(
+                    configDirectory,
+                    providerInstanceId,
+                    GamePatchCompatibilityGate.ReadCurrentGameVersion(),
+                    (message, exception) =>
+                    {
+                        if (exception is null)
+                            log.Warning(message);
+                        else
+                            log.Error(exception, message);
+                    });
+            }
+            catch (Exception exception)
+            {
+                log.Error(exception, "Quartermaster shared-observation shadow host is unavailable; legacy product reads remain active.");
+            }
+        }
         StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
         TransferPlanMigration.EnsureOwnerPlans(state, CurrentOwner());
         captures = new(addonLifecycle, log, scanner, cache, CurrentOwner);
@@ -175,6 +200,12 @@ public sealed class Plugin : IDalamudPlugin
             playerInventory.Changed += OnPlayerInventoryChanged;
             cache.Changed += OnCacheChanged;
             cache.ListingCaptured += OnListingCaptured;
+            captures.CaptureCompleted += OnRetainerCaptureCompleted;
+            if (observationShadow is not null)
+            {
+                observationShadow.CollectorActivated += OnObservationCollectorActivated;
+                observationShadow.Start();
+            }
             journal.OperationChanged += OnOperationChanged;
             submissions.OperationChanged += OnSubmittedOperationChanged;
             deposits.OperationChanged += OnSubmittedOperationChanged;
@@ -240,7 +271,7 @@ public sealed class Plugin : IDalamudPlugin
         automaticRetrievals.Tick();
         autoRetainer.TickAutomatic(window.StockBrowserVisible);
         agentBridge.Tick();
-        ObservePlayerInventory();
+        ObservePlayerInventory(Interlocked.Exchange(ref observationReconcileRequested, 0) != 0);
         FlushPlayerInventoryIfDue();
         if (Interlocked.Exchange(ref snapshotDirty, 0) != 0 || DateTime.UtcNow >= nextSnapshotAt)
             RefreshSnapshot();
@@ -255,13 +286,17 @@ public sealed class Plugin : IDalamudPlugin
         nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
     }
 
-    private void ObservePlayerInventory()
+    private void ObservePlayerInventory(bool forceShadow = false)
     {
         var now = DateTime.UtcNow;
         if (now < nextPlayerObservationAt)
             return;
         nextPlayerObservationAt = now.Add(PlayerObservationInterval);
-        playerInventory.Observe(CurrentOwner(), scanner.CapturePlayerStorage(), now);
+        var owner = CurrentOwner();
+        var capture = scanner.CapturePlayerStorage();
+        var changed = playerInventory.Observe(owner, capture, now);
+        if (changed || forceShadow)
+            observationShadow?.ObservePlayerInventory(owner, capture, now);
     }
 
     private void FlushPlayerInventoryIfDue()
@@ -286,8 +321,23 @@ public sealed class Plugin : IDalamudPlugin
     private void OnListingCaptured(RetainerListingCaptureReceipt receipt)
     {
         state.Mutate(document => document.LatestRetainerListingCapture = receipt);
+        if (cache.Snapshot().GetValueOrDefault(receipt.RetainerId) is { } retainer && receipt.Owner.Matches(retainer.Owner))
+            observationShadow?.ObserveRetainerListings(retainer, receipt.CapturedAtUtc);
         MarkChanged("retainer_listings", null);
     }
+
+    private void OnRetainerCaptureCompleted(CaptureReceipt receipt)
+    {
+        if (receipt.Outcome != CaptureOutcome.Persisted ||
+            cache.Snapshot().GetValueOrDefault(receipt.RetainerId) is not { } retainer)
+            return;
+        observationShadow?.ObserveRetainerInventory(retainer);
+        if (retainer.ListingsObservedAtUtc == retainer.ObservedAtUtc)
+            observationShadow?.ObserveRetainerListings(retainer, retainer.ObservedAtUtc);
+    }
+
+    private void OnObservationCollectorActivated() =>
+        Interlocked.Exchange(ref observationReconcileRequested, 1);
 
     private void OnPlayerInventoryChanged() => MarkChanged("player_inventory", null);
 
@@ -419,10 +469,14 @@ public sealed class Plugin : IDalamudPlugin
         playerInventory.Changed -= OnPlayerInventoryChanged;
         cache.Changed -= OnCacheChanged;
         cache.ListingCaptured -= OnListingCaptured;
+        captures.CaptureCompleted -= OnRetainerCaptureCompleted;
+        if (observationShadow is not null)
+            observationShadow.CollectorActivated -= OnObservationCollectorActivated;
         journal.OperationChanged -= OnOperationChanged;
         ipc.Dispose();
         autoRetainer.Dispose();
         captures.Dispose();
+        observationShadow?.Dispose();
         windows.RemoveAllWindows();
     }
 }

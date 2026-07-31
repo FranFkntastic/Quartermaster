@@ -17,11 +17,13 @@
     <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
     <FranthropyDalamudProject Condition="'$(FranthropyDalamudProject)' == ''">..\..\..\Franthropy\src\Franthropy.Dalamud\Franthropy.Dalamud.csproj</FranthropyDalamudProject>
     <FranthropyFfxivProject Condition="'$(FranthropyFfxivProject)' == ''">..\..\..\Franthropy\src\Franthropy.FFXIV\Franthropy.FFXIV.csproj</FranthropyFfxivProject>
+    <FranthropyObservationsProject Condition="'$(FranthropyObservationsProject)' == ''">..\..\..\Franthropy\src\Franthropy.Observations\Franthropy.Observations.csproj</FranthropyObservationsProject>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="$(FranthropyDalamudProject)" SetConfiguration="Configuration=$(Configuration)" />
     <ProjectReference Include="$(FranthropyFfxivProject)" SetConfiguration="Configuration=$(Configuration)" />
+    <ProjectReference Include="$(FranthropyObservationsProject)" SetConfiguration="Configuration=$(Configuration)" />
   </ItemGroup>
 
   <ItemGroup>
@@ -31,6 +33,7 @@
   <Target Name="ValidateFranthropyProjects" BeforeTargets="PrepareForBuild">
     <Error Condition="!Exists('$(FranthropyDalamudProject)')" Text="Franthropy.Dalamud was not found at '$(FranthropyDalamudProject)'. Clone Franthropy beside Quartermaster or set FranthropyDalamudProject." />
     <Error Condition="!Exists('$(FranthropyFfxivProject)')" Text="Franthropy.FFXIV was not found at '$(FranthropyFfxivProject)'. Clone Franthropy beside Quartermaster or set FranthropyFfxivProject." />
+    <Error Condition="!Exists('$(FranthropyObservationsProject)')" Text="Franthropy.Observations was not found at '$(FranthropyObservationsProject)'. Clone Franthropy beside Quartermaster or set FranthropyObservationsProject." />
   </Target>
 
   <Target Name="RejectDebugProjectReferencesInRelease" AfterTargets="ResolveProjectReferences" Condition="'$(Configuration)' == 'Release'">

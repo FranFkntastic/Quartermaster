@@ -15,4 +15,5 @@ public sealed class PluginConfiguration : IPluginConfiguration
     public bool IncludeEquipped { get; set; }
     public bool IncludeSaddlebag { get; set; }
     public bool LegacyStorageSettingsImported { get; set; }
+    public bool EnableSharedObservationShadow { get; set; }
 }
