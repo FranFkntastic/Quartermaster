@@ -311,6 +311,21 @@ public sealed class OperationReceipt
     public int? Quantity { get; set; }
 }
 
+public sealed class RetainerListingCaptureReceipt
+{
+    public string CaptureId { get; set; } = string.Empty;
+    public ulong RetainerId { get; set; }
+    public OwnerScope Owner { get; set; } = new();
+    public DateTime CapturedAtUtc { get; set; }
+    public List<RetainerListingCaptureItem> Items { get; set; } = [];
+}
+
+public sealed class RetainerListingCaptureItem
+{
+    public uint ItemId { get; set; }
+    public string? ItemName { get; set; }
+}
+
 public sealed class QuartermasterState
 {
     public string Schema { get; set; } = "gooseworks-quartermaster-state/v5";
@@ -325,4 +340,5 @@ public sealed class QuartermasterState
     public List<OperationRecord> Operations { get; set; } = [];
     public List<OperationReceipt> Receipts { get; set; } = [];
     public List<PendingCacheInvalidation> PendingCacheInvalidations { get; set; } = [];
+    public RetainerListingCaptureReceipt? LatestRetainerListingCapture { get; set; }
 }
