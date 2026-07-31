@@ -105,12 +105,19 @@ public sealed class PersistenceTests
     }
 
     [Fact]
-    public void ReplaceListings_PublishesOneExplicitCaptureReceipt()
+    public void ReplaceListings_PublishesOnlySemanticallyChangedItems()
     {
         using var directory = new TemporaryDirectory();
         var store = new RetainerCacheStore(Path.Combine(directory.Path, "retainer-cache.json"));
-        var existing = TestData.Retainer(20, "Iris");
-        existing.Listings.Add(new CachedMarketListing { ItemId = 200, ItemName = "Cobalt Ore" });
+        var existing = TestData.Retainer(10, "Eris");
+        existing.ListingsObservedAtUtc = new DateTime(2026, 7, 31, 17, 0, 0, DateTimeKind.Utc);
+        existing.ObservedSources.Add("RetainerMarket");
+        existing.Listings.AddRange(
+        [
+            new CachedMarketListing { ItemId = 100, ItemName = "Darksteel Ore", Quantity = 1, UnitPrice = 44 },
+            new CachedMarketListing { ItemId = 200, ItemName = "Cobalt Ore", Quantity = 1, UnitPrice = 55 },
+            new CachedMarketListing { ItemId = 400, ItemName = "Removed Ore", Quantity = 1, UnitPrice = 66 },
+        ]);
         var otherOwner = TestData.Retainer(30, "Other");
         otherOwner.Owner = TestData.Owner with { LocalContentId = 9002, CharacterName = "Other Character" };
         otherOwner.Listings.Add(new CachedMarketListing { ItemId = 300, ItemName = "Mythril Ore" });
@@ -129,14 +136,76 @@ public sealed class PersistenceTests
             "Eris",
             TestData.Owner,
             observedAt,
-            [new CachedMarketListing { ItemId = 100, Quantity = 1, UnitPrice = 44 }]));
+            [
+                new CachedMarketListing { ItemId = 100, ItemName = "Darksteel Ore", Quantity = 1, UnitPrice = 45 },
+                new CachedMarketListing { ItemId = 200, ItemName = "Cobalt Ore", Quantity = 1, UnitPrice = 55 },
+                new CachedMarketListing { ItemId = 300, ItemName = "Mythril Ore", Quantity = 1, UnitPrice = 77 },
+            ]));
 
         var receipt = Assert.Single(receipts);
         Assert.False(string.IsNullOrWhiteSpace(receipt.CaptureId));
         Assert.Equal((ulong)10, receipt.RetainerId);
         Assert.Equal(TestData.Owner, receipt.Owner);
         Assert.Equal(observedAt, receipt.CapturedAtUtc);
-        Assert.Equal([100u, 200u], receipt.Items.Select(item => item.ItemId));
+        Assert.Equal(RetainerListingCaptureReceipt.ChangedListingsV1, receipt.Semantics);
+        Assert.True(receipt.ComparisonAvailable);
+        Assert.Equal([100u, 300u, 400u], receipt.Items.Select(item => item.ItemId));
+        Assert.Equal("Removed Ore", receipt.Items.Single(item => item.ItemId == 400).ItemName);
+    }
+
+    [Fact]
+    public void ReplaceListings_UsesMultisetStateSoUnchangedDuplicateListingsStayQuiet()
+    {
+        using var directory = new TemporaryDirectory();
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "retainer-cache.json"));
+        var existing = TestData.Retainer(10, "Eris");
+        existing.ListingsObservedAtUtc = new DateTime(2026, 7, 31, 17, 0, 0, DateTimeKind.Utc);
+        existing.ObservedSources.Add("RetainerMarket");
+        existing.Listings.AddRange(
+        [
+            new CachedMarketListing { ItemId = 100, Quantity = 1, IsHq = false, UnitPrice = 44, SlotIndex = 1 },
+            new CachedMarketListing { ItemId = 100, Quantity = 1, IsHq = false, UnitPrice = 44, SlotIndex = 2 },
+        ]);
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = existing });
+        var repository = new RetainerCacheRepository(store);
+        RetainerListingCaptureReceipt? receipt = null;
+        repository.ListingCaptured += value => receipt = value;
+
+        repository.ReplaceListings(new RetainerListingsObservation(
+            10,
+            "Eris",
+            TestData.Owner,
+            new DateTime(2026, 7, 31, 17, 30, 0, DateTimeKind.Utc),
+            [
+                new CachedMarketListing { ItemId = 100, Quantity = 1, IsHq = false, UnitPrice = 44, SlotIndex = 8 },
+                new CachedMarketListing { ItemId = 100, Quantity = 1, IsHq = false, UnitPrice = 44, SlotIndex = 9 },
+            ]));
+
+        Assert.NotNull(receipt);
+        Assert.True(receipt.ComparisonAvailable);
+        Assert.Empty(receipt.Items);
+    }
+
+    [Fact]
+    public void ReplaceListings_WithoutPreviousMarketEvidenceEstablishesBaselineWithoutChanges()
+    {
+        using var directory = new TemporaryDirectory();
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "retainer-cache.json"));
+        var repository = new RetainerCacheRepository(store);
+        RetainerListingCaptureReceipt? receipt = null;
+        repository.ListingCaptured += value => receipt = value;
+
+        repository.ReplaceListings(new RetainerListingsObservation(
+            10,
+            "Eris",
+            TestData.Owner,
+            new DateTime(2026, 7, 31, 17, 30, 0, DateTimeKind.Utc),
+            [new CachedMarketListing { ItemId = 100, Quantity = 1, UnitPrice = 44 }]));
+
+        Assert.NotNull(receipt);
+        Assert.Equal(RetainerListingCaptureReceipt.ChangedListingsV1, receipt.Semantics);
+        Assert.False(receipt.ComparisonAvailable);
+        Assert.Empty(receipt.Items);
     }
 
     [Fact]

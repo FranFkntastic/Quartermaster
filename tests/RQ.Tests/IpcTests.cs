@@ -174,6 +174,7 @@ public sealed class IpcTests
         var repository = TestData.Repository(directory.Path);
         repository.Mutate(state => state.LatestRetainerListingCapture = new RetainerListingCaptureReceipt
         {
+            ComparisonAvailable = true,
             CaptureId = "capture-1",
             RetainerId = 10,
             Owner = TestData.Owner,
@@ -186,6 +187,10 @@ public sealed class IpcTests
         using var document = JsonDocument.Parse(snapshots.GetSnapshot());
 
         var capture = document.RootElement.GetProperty("latestRetainerListingCapture");
+        Assert.Equal(
+            RetainerListingCaptureReceipt.ChangedListingsV1,
+            capture.GetProperty("semantics").GetString());
+        Assert.True(capture.GetProperty("comparisonAvailable").GetBoolean());
         Assert.Equal("capture-1", capture.GetProperty("captureId").GetString());
         Assert.Equal((ulong)10, capture.GetProperty("retainerId").GetUInt64());
         Assert.Equal((uint)100, Assert.Single(capture.GetProperty("items").EnumerateArray()).GetProperty("itemId").GetUInt32());

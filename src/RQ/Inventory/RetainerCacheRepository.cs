@@ -124,7 +124,15 @@ public sealed class RetainerCacheRepository
         RetainerListingCaptureReceipt receipt;
         lock (gate)
         {
-            var updated = cache.TryGetValue(observation.RetainerId, out var current)
+            var marketSource = FFXIVClientStructs.FFXIV.Client.Game.InventoryType.RetainerMarket.ToString();
+            var comparisonAvailable = cache.TryGetValue(observation.RetainerId, out var current) &&
+                                      observation.Owner.Matches(current.Owner) &&
+                                      current.ListingsObservedAtUtc.HasValue &&
+                                      current.ObservedSources.Contains(marketSource, StringComparer.Ordinal);
+            var previousListings = comparisonAvailable
+                ? current!.Listings.Select(Copy).ToArray()
+                : [];
+            var updated = current is not null
                 ? Copy(current)
                 : new CachedRetainer
                 {
@@ -137,7 +145,6 @@ public sealed class RetainerCacheRepository
             updated.Owner = observation.Owner with { };
             updated.ListingsObservedAtUtc = observation.ObservedAtUtc;
             updated.Listings = observation.Listings.Select(Copy).ToList();
-            var marketSource = FFXIVClientStructs.FFXIV.Client.Game.InventoryType.RetainerMarket.ToString();
             if (!updated.RequestedSources.Contains(marketSource, StringComparer.Ordinal))
                 updated.RequestedSources.Add(marketSource);
             if (!updated.ObservedSources.Contains(marketSource, StringComparer.Ordinal))
@@ -149,27 +156,75 @@ public sealed class RetainerCacheRepository
             Revision++;
             receipt = new RetainerListingCaptureReceipt
             {
+                Semantics = RetainerListingCaptureReceipt.ChangedListingsV1,
+                ComparisonAvailable = comparisonAvailable,
                 CaptureId = Guid.NewGuid().ToString("N"),
                 RetainerId = observation.RetainerId,
                 Owner = observation.Owner with { },
                 CapturedAtUtc = observation.ObservedAtUtc,
-                Items = cache.Values
-                    .Where(retainer => observation.Owner.Matches(retainer.Owner))
-                    .SelectMany(retainer => retainer.Listings)
-                    .Where(listing => listing.ItemId != 0)
-                    .GroupBy(listing => listing.ItemId)
-                    .Select(group => new RetainerListingCaptureItem
-                    {
-                        ItemId = group.Key,
-                        ItemName = group.Select(listing => listing.ItemName)
-                            .FirstOrDefault(name => !string.IsNullOrWhiteSpace(name)),
-                    })
-                    .OrderBy(item => item.ItemId)
-                    .ToList(),
+                Items = comparisonAvailable
+                    ? ChangedListingItems(previousListings, updated.Listings)
+                    : [],
             };
         }
         Changed?.Invoke();
         ListingCaptured?.Invoke(receipt);
+    }
+
+    private static List<RetainerListingCaptureItem> ChangedListingItems(
+        IReadOnlyList<CachedMarketListing> previous,
+        IReadOnlyList<CachedMarketListing> current)
+    {
+        var previousByItem = previous
+            .Where(listing => listing.ItemId != 0)
+            .GroupBy(listing => listing.ItemId)
+            .ToDictionary(group => group.Key, group => group.ToArray());
+        var currentByItem = current
+            .Where(listing => listing.ItemId != 0)
+            .GroupBy(listing => listing.ItemId)
+            .ToDictionary(group => group.Key, group => group.ToArray());
+
+        return previousByItem.Keys
+            .Concat(currentByItem.Keys)
+            .Distinct()
+            .Where(itemId => !SameMarketState(
+                previousByItem.GetValueOrDefault(itemId) ?? [],
+                currentByItem.GetValueOrDefault(itemId) ?? []))
+            .Select(itemId => new RetainerListingCaptureItem
+            {
+                ItemId = itemId,
+                ItemName = (currentByItem.GetValueOrDefault(itemId) ?? [])
+                    .Concat(previousByItem.GetValueOrDefault(itemId) ?? [])
+                    .Select(listing => listing.ItemName)
+                    .FirstOrDefault(name => !string.IsNullOrWhiteSpace(name)),
+            })
+            .OrderBy(item => item.ItemId)
+            .ToList();
+    }
+
+    private static bool SameMarketState(
+        IReadOnlyList<CachedMarketListing> previous,
+        IReadOnlyList<CachedMarketListing> current)
+    {
+        if (previous.Count != current.Count)
+            return false;
+
+        var previousCounts = previous
+            .Select(ListingSignature.From)
+            .GroupBy(signature => signature)
+            .ToDictionary(group => group.Key, group => group.Count());
+        var currentCounts = current
+            .Select(ListingSignature.From)
+            .GroupBy(signature => signature)
+            .ToDictionary(group => group.Key, group => group.Count());
+        return previousCounts.Count == currentCounts.Count &&
+               previousCounts.All(pair => currentCounts.GetValueOrDefault(pair.Key) == pair.Value);
+    }
+
+    private readonly record struct ListingSignature(uint Quantity, bool IsHq, uint? UnitPrice)
+    {
+        public static ListingSignature From(CachedMarketListing listing) =>
+            new(listing.Quantity, listing.IsHq, listing.UnitPrice);
     }
 
     public CacheInvalidationResult Invalidate(ulong retainerId)
