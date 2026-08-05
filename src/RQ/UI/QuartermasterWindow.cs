@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
@@ -492,6 +493,9 @@ public sealed class QuartermasterWindow : Window
         : "transfer";
     public string StockFilter => workbench.ItemFilterState.Expression;
     public int VisibleStockCount { get; private set; }
+    public int RenderedStockRowCount { get; private set; }
+    public double WindowDrawMilliseconds { get; private set; }
+    public double StockDrawMilliseconds { get; private set; }
     public string CurrentTransferDirection => "mixed";
     public bool StowageEditorOpen => stowageDraft is not null && (requestStowageEditorOpen || stowageEditorVisible);
     public bool RestockEditorOpen => restockDraft is not null && (requestRestockEditorOpen || restockEditorVisible);
@@ -533,6 +537,7 @@ public sealed class QuartermasterWindow : Window
 
     public override void Draw()
     {
+        var drawStarted = Stopwatch.GetTimestamp();
         ClearAgentReviewWindowOverride();
         reviewRegistry.BeginFrame();
         try
@@ -556,6 +561,7 @@ public sealed class QuartermasterWindow : Window
             var frame = reviewRegistry.EndFrame();
             if (ActiveCapturePresentationTarget() is { } target)
                 captureTransactions.MarkRendered(target, frame.FrameId);
+            WindowDrawMilliseconds = Stopwatch.GetElapsedTime(drawStarted).TotalMilliseconds;
         }
     }
 
@@ -827,6 +833,7 @@ public sealed class QuartermasterWindow : Window
 
     private void DrawStock(QuartermasterRuntimeSnapshot runtime)
     {
+        var drawStarted = Stopwatch.GetTimestamp();
         var projection = runtime.Browser;
         DrawStockToolbar(projection);
         var result = queries.QueryItems(
@@ -867,6 +874,7 @@ public sealed class QuartermasterWindow : Window
                     ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
                     ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.Sortable;
         var tableHeight = Math.Max(180, ImGui.GetContentRegionAvail().Y);
+        RenderedStockRowCount = 0;
         if (stockTable.Begin(
                 "RQStockWorkbenchV3",
                 new DalamudTableLayout(
@@ -880,28 +888,30 @@ public sealed class QuartermasterWindow : Window
                 rows = stockTable.Apply(sourceRows, ImGui.TableGetSortSpecs());
             }
             var rowKeys = rows.Select(row => row.Item.ItemId).ToArray();
-            for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
-            {
-                var row = rows[rowIndex];
-                stockTable.DrawSelectableRow(
-                    row,
-                    stockSelection,
-                    rowKeys,
-                    rowIndex,
-                    $"##stock-row:{row.Item.ItemId}");
-                var stockSelected = stockSelection.IsSelected(row.Item.ItemId);
-                reviewRegistry.RegisterLastButton(
-                    $"quartermaster.stock.select.{row.Item.ItemId}",
-                    $"Select {row.Item.ItemName} for stock actions",
-                    true,
-                    () => stockSelection.SetSelected(
-                        row.Item.ItemId,
-                        !stockSelection.IsSelected(row.Item.ItemId)),
-                    stockSelected ? "Selected" : "Available");
-            }
+            RenderedStockRowCount = stockTable.DrawClippedRows(
+                rows,
+                (row, rowIndex) =>
+                {
+                    stockTable.DrawSelectableRow(
+                        row,
+                        stockSelection,
+                        rowKeys,
+                        rowIndex,
+                        $"##stock-row:{row.Item.ItemId}");
+                    var stockSelected = stockSelection.IsSelected(row.Item.ItemId);
+                    reviewRegistry.RegisterLastButton(
+                        $"quartermaster.stock.select.{row.Item.ItemId}",
+                        $"Select {row.Item.ItemName} for stock actions",
+                        true,
+                        () => stockSelection.SetSelected(
+                            row.Item.ItemId,
+                            !stockSelection.IsSelected(row.Item.ItemId)),
+                        stockSelected ? "Selected" : "Available");
+                });
             DalamudTableSelectionRenderer.EndRows(stockSelection);
             stockTable.End();
         }
+        StockDrawMilliseconds = Stopwatch.GetElapsedTime(drawStarted).TotalMilliseconds;
     }
 
     private void DrawStockToolbar(BrowserProjection projection)
