@@ -24,6 +24,17 @@ public interface IRetainerTransferDriver
     Task OpenInventoryAsync(CancellationToken cancellationToken);
     Task<IReadOnlyList<DalamudInventoryStack>> ScanRetainerAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken);
     Task<RetrievalResult> RetrieveAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken);
+    /// <summary>
+    /// Supplies the affected variant's total from the route scan that selected this
+    /// stack. Drivers can use it to reconcile a reordered source without rescanning
+    /// the retainer before every transfer.
+    /// </summary>
+    Task<RetrievalResult> RetrieveAsync(
+        DalamudInventoryStack stack,
+        int quantity,
+        int retainerVariantQuantityBefore,
+        CancellationToken cancellationToken) =>
+        RetrieveAsync(stack, quantity, cancellationToken);
     Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerInventoryAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken) =>
         Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([]);
     Task<RetainerDepositResult> DepositAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken) =>
@@ -103,6 +114,10 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             : deposit;
     }
 
+    /// <summary>
+    /// Executes a persisted, reviewed retrieval operation retainer by retainer.
+    /// Every successful movement is durably reconciled before the next stack begins.
+    /// </summary>
     public async Task<TransferExecutionResult> ExecuteRetrievalAsync(string operationId, CancellationToken cancellationToken = default)
     {
         if (!automation.TryAcquire("retainer transfer", out var lease))
@@ -188,7 +203,14 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     operation.Lines.Any(line =>
                         line.ItemId == itemId &&
                         remaining.GetValueOrDefault(RetrievalKey(line.ItemId, line.Quality)) > 0)).ToHashSet();
-                foreach (var stack in await driver.ScanRetainerAsync(wanted, token).ConfigureAwait(false))
+                var liveStacks = await driver.ScanRetainerAsync(wanted, token).ConfigureAwait(false);
+                // The route scan is already required to choose physical source stacks.
+                // Reuse its per-variant totals as verification baselines instead of
+                // adding another retainer-wide scan to every retrieval command.
+                var liveVariantQuantities = liveStacks
+                    .GroupBy(stack => OperationJournal.VariantKey(stack.ItemId, stack.IsHighQuality))
+                    .ToDictionary(group => group.Key, group => group.Sum(stack => stack.Quantity));
+                foreach (var stack in liveStacks)
                 {
                     token.ThrowIfCancellationRequested();
                     var exactQuality = stack.IsHighQuality ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly;
@@ -199,6 +221,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     if (quantity <= 0)
                         continue;
                     var itemName = operation.Lines.First(line => line.ItemId == stack.ItemId).ItemName;
+                    var variantKey = OperationJournal.VariantKey(stack.ItemId, stack.IsHighQuality);
                     var previousMovementAttempted = movementAttempted;
                     var attempt = await VerifiedMutationTransaction.ExecuteAsync(
                         new RetainerStockMutationIntent(operationId, candidate.Route.RetainerId, operation.Owner),
@@ -206,7 +229,11 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         async mutationToken =>
                         {
                             movementAttempted = true;
-                            var result = await driver.RetrieveAsync(stack, quantity, mutationToken).ConfigureAwait(false);
+                            var result = await driver.RetrieveAsync(
+                                stack,
+                                quantity,
+                                liveVariantQuantities.GetValueOrDefault(variantKey),
+                                mutationToken).ConfigureAwait(false);
                             if (!result.Success)
                             {
                                 return result.MovementMayHaveOccurred
@@ -232,6 +259,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         throw new InvalidOperationException(result.Message);
                     }
                     remaining[key] -= result.Transferred;
+                    liveVariantQuantities[variantKey] -= result.Transferred;
                     transferred += result.Transferred;
                     journal.RecordRetrievalTransfer(
                         operationId,
