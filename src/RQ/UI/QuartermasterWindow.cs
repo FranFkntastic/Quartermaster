@@ -495,7 +495,10 @@ public sealed class QuartermasterWindow : Window
     public int VisibleStockCount { get; private set; }
     public int RenderedStockRowCount { get; private set; }
     public double WindowDrawMilliseconds { get; private set; }
+    public double ContentDrawMilliseconds { get; private set; }
     public double StockDrawMilliseconds { get; private set; }
+    public double PlanDrawMilliseconds { get; private set; }
+    public double ReviewFinalizeMilliseconds { get; private set; }
     public string CurrentTransferDirection => "mixed";
     public bool StowageEditorOpen => stowageDraft is not null && (requestStowageEditorOpen || stowageEditorVisible);
     public bool RestockEditorOpen => restockDraft is not null && (requestRestockEditorOpen || restockEditorVisible);
@@ -554,13 +557,17 @@ public sealed class QuartermasterWindow : Window
                     viewport.Size,
                     DateTimeOffset.UtcNow);
             }
+            var contentStarted = Stopwatch.GetTimestamp();
             DrawContent();
+            ContentDrawMilliseconds = Stopwatch.GetElapsedTime(contentStarted).TotalMilliseconds;
         }
         finally
         {
+            var reviewStarted = Stopwatch.GetTimestamp();
             var frame = reviewRegistry.EndFrame();
             if (ActiveCapturePresentationTarget() is { } target)
                 captureTransactions.MarkRendered(target, frame.FrameId);
+            ReviewFinalizeMilliseconds = Stopwatch.GetElapsedTime(reviewStarted).TotalMilliseconds;
             WindowDrawMilliseconds = Stopwatch.GetElapsedTime(drawStarted).TotalMilliseconds;
         }
     }
@@ -766,6 +773,7 @@ public sealed class QuartermasterWindow : Window
             ImGui.SameLine();
             ImGui.TextDisabled("Stock stays available while you plan.");
             ImGui.Separator();
+            var planStarted = Stopwatch.GetTimestamp();
             if (workbench.View == WorkbenchView.ItemGroups)
                 DrawItemGroupWorkspace(runtime);
             else
@@ -773,6 +781,7 @@ public sealed class QuartermasterWindow : Window
                 workbench.View = WorkbenchView.Stowage;
                 DrawStowageWorkspace(runtime);
             }
+            PlanDrawMilliseconds = Stopwatch.GetElapsedTime(planStarted).TotalMilliseconds;
         }
         ImGui.EndChild();
         ImGui.EndTable();

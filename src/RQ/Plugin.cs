@@ -445,7 +445,7 @@ public sealed class Plugin : IDalamudPlugin
             ? runtime.State.PlanItems.Where(item => item.StowagePlanId == planId).ToArray()
             : [];
         return new QuartermasterBridgeTruth(
-            9,
+            10,
             configuration.PluginInstanceId,
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
@@ -455,7 +455,10 @@ public sealed class Plugin : IDalamudPlugin
             window.VisibleStockCount,
             window.RenderedStockRowCount,
             window.WindowDrawMilliseconds,
+            window.ContentDrawMilliseconds,
             window.StockDrawMilliseconds,
+            window.PlanDrawMilliseconds,
+            window.ReviewFinalizeMilliseconds,
             window.CurrentTransferDirection,
             window.RestockEditorOpen || window.StowageEditorOpen,
             window.PlanEditorHasUnsavedChanges,
