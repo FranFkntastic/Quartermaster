@@ -25,6 +25,7 @@ public sealed class Plugin : IDalamudPlugin
 {
     private static readonly TimeSpan SnapshotRefreshInterval = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan PlayerInventoryFlushInterval = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan PlayerInventoryReconciliationInterval = TimeSpan.FromSeconds(1);
 
     private const string Command = "/rq";
     private readonly IDalamudPluginInterface pluginInterface;
@@ -36,6 +37,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly FrameworkWorkQueue workQueue;
     private readonly InventoryScanner scanner;
     private readonly PlayerInventoryCacheRepository playerInventory;
+    private readonly PlayerInventoryReconciler playerInventoryReconciler;
     private readonly RetainerCacheRepository cache;
     private readonly StateRepository state;
     private readonly RetainerCaptureService captures;
@@ -106,6 +108,11 @@ public sealed class Plugin : IDalamudPlugin
             configuration.IncludeEquipped,
             configuration.IncludeSaddlebag));
         playerInventory = new(new PlayerInventoryCacheStore(playerInventoryCachePath));
+        playerInventoryReconciler = new(
+            playerInventory,
+            CurrentOwner,
+            scanner.CapturePlayerStorage,
+            PlayerInventoryReconciliationInterval);
         cache = new(new RetainerCacheStore(cachePath));
         state = new(new QuartermasterStateStore(statePath));
         workQueue = new();
@@ -166,6 +173,7 @@ public sealed class Plugin : IDalamudPlugin
             automation);
         automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerIpc);
         runtimeSnapshots = new(scanner, playerInventory, cache, state, CurrentOwner);
+        playerInventoryReconciler.ReconcileIfDue(DateTime.UtcNow, force: true);
         var initialSnapshot = runtimeSnapshots.Refresh();
         nextPlayerInventoryFlushAt = DateTime.UtcNow.Add(PlayerInventoryFlushInterval);
         snapshots = new(providerInstanceId, state, cache.Snapshot);
@@ -278,6 +286,7 @@ public sealed class Plugin : IDalamudPlugin
         StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
         TransferPlanMigration.EnsureOwnerPlans(state, CurrentOwner());
         workQueue.Drain();
+        playerInventoryReconciler.ReconcileIfDue(DateTime.UtcNow);
         captures.TickPassive();
         automaticRetrievals.Tick();
         autoRetainer.TickAutomatic(window.StockBrowserVisible);
