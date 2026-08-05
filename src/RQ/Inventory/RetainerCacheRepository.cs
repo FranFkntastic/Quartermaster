@@ -4,6 +4,13 @@ using Franthropy.Dalamud.Automation.Inventory;
 
 namespace RQ.Inventory;
 
+public enum RetainerCacheChangeKind
+{
+    Stock,
+    Listings,
+    All,
+}
+
 public sealed record CacheInvalidationResult(bool Removed, bool Persisted, string? Error);
 public sealed record RetainerVariantObservation(
     ulong RetainerId,
@@ -31,7 +38,7 @@ public sealed class RetainerCacheRepository
         cache = store.Load();
     }
 
-    public event Action? Changed;
+    public event Action<RetainerCacheChangeKind>? Changed;
     public event Action<RetainerListingCaptureReceipt>? ListingCaptured;
     public long Revision { get; private set; }
 
@@ -50,7 +57,7 @@ public sealed class RetainerCacheRepository
             cache = candidate;
             Revision++;
         }
-        Changed?.Invoke();
+        Changed?.Invoke(RetainerCacheChangeKind.All);
     }
 
     public void ReplaceObservedVariant(RetainerVariantObservation observation)
@@ -111,7 +118,7 @@ public sealed class RetainerCacheRepository
             cache = candidate;
             Revision++;
         }
-        Changed?.Invoke();
+        Changed?.Invoke(RetainerCacheChangeKind.Stock);
     }
 
     public void ReplaceListings(RetainerListingsObservation observation)
@@ -167,7 +174,7 @@ public sealed class RetainerCacheRepository
                     : [],
             };
         }
-        Changed?.Invoke();
+        Changed?.Invoke(RetainerCacheChangeKind.Listings);
         ListingCaptured?.Invoke(receipt);
     }
 
@@ -250,7 +257,7 @@ public sealed class RetainerCacheRepository
             }
         }
         if (removed)
-            Changed?.Invoke();
+            Changed?.Invoke(RetainerCacheChangeKind.All);
         return persistenceError is null
             ? new(removed, true, null)
             : new(removed, false, persistenceError.Message);

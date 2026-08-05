@@ -642,6 +642,34 @@ public sealed class IpcTests
         Assert.False(document.RootElement.TryGetProperty("operation", out _));
     }
 
+    [Fact]
+    public void OperationRefresh_UpdatesExactEnvelopeAndLazilyRepairsBroadSnapshot()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var publisher = new SnapshotPublisher("provider", repository, () => new Dictionary<ulong, CachedRetainer>());
+        publisher.Refresh(TestData.Owner, []);
+        var operation = new OperationRecord
+        {
+            OperationId = "op-1",
+            RequestId = "request-1",
+            Owner = TestData.Owner,
+            Status = OperationStatuses.Running,
+            CreatedAtUtc = new DateTime(2026, 8, 5, 12, 0, 0, DateTimeKind.Utc),
+            UpdatedAtUtc = new DateTime(2026, 8, 5, 12, 0, 1, DateTimeKind.Utc),
+        };
+        repository.Mutate(StateChangeKind.Operations, state => state.Operations.Add(operation));
+
+        publisher.RefreshOperations(TestData.Owner, [operation.OperationId]);
+
+        using var operationDocument = JsonDocument.Parse(publisher.GetOperation(operation.OperationId));
+        using var snapshotDocument = JsonDocument.Parse(publisher.GetSnapshot());
+        Assert.Equal(OperationStatuses.Running, operationDocument.RootElement.GetProperty("status").GetString());
+        Assert.Equal(
+            OperationStatuses.Running,
+            snapshotDocument.RootElement.GetProperty("currentOperation").GetProperty("status").GetString());
+    }
+
     private static JsonElement Parse(string json) => JsonDocument.Parse(json).RootElement.Clone();
 
     private static string LegacyCanonicalHash(ShortageRequest request)

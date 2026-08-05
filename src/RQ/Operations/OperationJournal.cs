@@ -55,7 +55,7 @@ public sealed class OperationJournal
         if (!repository.Read(state => state.Operations.Any(operation => operation.Status == OperationStatuses.Running)))
             return [];
         var reconciled = new List<OperationRecord>();
-        repository.Mutate(state =>
+        repository.Mutate(StateChangeKind.Operations, state =>
         {
             foreach (var operation in state.Operations.Where(operation => operation.Status == OperationStatuses.Running))
             {
@@ -139,7 +139,7 @@ public sealed class OperationJournal
                 })
                 .ToList(),
         };
-        repository.Mutate(state =>
+        repository.Mutate(StateChangeKind.Operations, state =>
         {
             state.Operations.Add(operation);
             AddReceipt(state, operation, "PlanAccepted", operation.Message);
@@ -193,7 +193,7 @@ public sealed class OperationJournal
             operation.RequestId = operation.OperationId;
         if (operation.Lines.Count == 0 || operation.DepositCandidates.Count == 0)
             throw new InvalidOperationException("Deposit plan has no executable reviewed authorization.");
-        repository.Mutate(state =>
+        repository.Mutate(StateChangeKind.Operations, state =>
         {
             if (state.Operations.Any(candidate => candidate.OperationId == operation.OperationId))
                 throw new InvalidOperationException($"Operation ID '{operation.OperationId}' is already in use.");
@@ -297,7 +297,7 @@ public sealed class OperationJournal
         if (operation.Lines.Count == 0 || operation.DepositCandidates.Count == 0)
             throw new InvalidOperationException("Stowage batch has no executable reviewed authorization.");
 
-        repository.Mutate(state =>
+        repository.Mutate(StateChangeKind.Operations, state =>
         {
             state.Operations.Add(operation);
             AddReceipt(state, operation, "StowageAuthorizationPersisted", operation.Message);
@@ -307,13 +307,13 @@ public sealed class OperationJournal
         return copy;
     }
 
-    public void ArmCacheInvalidation(string operationId, ulong retainerId, OwnerScope owner) => repository.Mutate(state =>
+    public void ArmCacheInvalidation(string operationId, ulong retainerId, OwnerScope owner) => repository.Mutate(StateChangeKind.Operations, state =>
     {
         if (!state.PendingCacheInvalidations.Any(entry => entry.OperationId == operationId && entry.RetainerId == retainerId))
             state.PendingCacheInvalidations.Add(new PendingCacheInvalidation { OperationId = operationId, RetainerId = retainerId, Owner = owner with { } });
     });
 
-    public void ResolveCacheInvalidation(string operationId, ulong retainerId) => repository.Mutate(state =>
+    public void ResolveCacheInvalidation(string operationId, ulong retainerId) => repository.Mutate(StateChangeKind.Operations, state =>
         state.PendingCacheInvalidations.RemoveAll(entry => entry.OperationId == operationId && entry.RetainerId == retainerId));
 
     public IReadOnlyList<PendingCacheInvalidation> PendingCacheInvalidations() => repository.Read(state =>
@@ -327,7 +327,7 @@ public sealed class OperationJournal
     public OperationRecord Transition(string operationId, string status, string code, string message)
     {
         OperationRecord changed = null!;
-        repository.Mutate(state =>
+        repository.Mutate(StateChangeKind.Operations, state =>
         {
             var operation = state.Operations.SingleOrDefault(candidate => candidate.OperationId == operationId)
                 ?? throw new KeyNotFoundException($"Operation '{operationId}' was not found.");
@@ -348,7 +348,7 @@ public sealed class OperationJournal
         if (quantity <= 0)
             throw new ArgumentOutOfRangeException(nameof(quantity));
         OperationRecord changed = null!;
-        repository.Mutate(state =>
+        repository.Mutate(StateChangeKind.Operations, state =>
         {
             var operation = state.Operations.Single(candidate => candidate.OperationId == operationId);
             if (operation.Status != OperationStatuses.Running)
@@ -388,7 +388,7 @@ public sealed class OperationJournal
         if (quantity <= 0)
             throw new ArgumentOutOfRangeException(nameof(quantity));
         OperationRecord changed = null!;
-        repository.Mutate(state =>
+        repository.Mutate(StateChangeKind.Operations, state =>
         {
             var operation = state.Operations.Single(candidate => candidate.OperationId == operationId);
             if (operation.Status != OperationStatuses.Running)
@@ -429,7 +429,7 @@ public sealed class OperationJournal
         if (quantity <= 0)
             throw new ArgumentOutOfRangeException(nameof(quantity));
         OperationRecord changed = null!;
-        repository.Mutate(state =>
+        repository.Mutate(StateChangeKind.Operations, state =>
         {
             var operation = state.Operations.Single(candidate => candidate.OperationId == operationId);
             if (operation.Status != OperationStatuses.Running)
@@ -464,7 +464,7 @@ public sealed class OperationJournal
     public void RecordWarning(string operationId, string code, string message)
     {
         OperationRecord changed = null!;
-        repository.Mutate(state =>
+        repository.Mutate(StateChangeKind.Operations, state =>
         {
             var operation = state.Operations.Single(candidate => candidate.OperationId == operationId);
             if (OperationStatuses.IsTerminal(operation.Status))

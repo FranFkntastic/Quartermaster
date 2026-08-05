@@ -332,6 +332,40 @@ public sealed class BrowserTests
         Assert.True(item.Enabled);
     }
 
+    [Fact]
+    public void ListingRefresh_PreservesStockProjectionIdentity()
+    {
+        var retainer = TestData.Retainer(10, "Eris", (100, "Darksteel Ore", 3));
+        retainer.Listings.Add(new CachedMarketListing { ItemId = 100, ItemName = "Darksteel Ore", Quantity = 1, UnitPrice = 40 });
+        var cache = new Dictionary<ulong, CachedRetainer> { [10] = retainer };
+        var current = BrowserProjectionBuilder.Build([], cache, TestData.Owner);
+        retainer.Listings[0].UnitPrice = 55;
+
+        var refreshed = BrowserProjectionBuilder.RefreshListings(current, cache, TestData.Owner);
+
+        Assert.Same(current.Items, refreshed.Items);
+        Assert.Equal(55m, Assert.Single(refreshed.Listings).UnitPrice.Value);
+    }
+
+    [Fact]
+    public void StockRefresh_PreservesListingProjectionIdentity()
+    {
+        var retainer = TestData.Retainer(10, "Eris", (100, "Darksteel Ore", 3));
+        retainer.Listings.Add(new CachedMarketListing { ItemId = 200, ItemName = "Spruce Log", Quantity = 1, UnitPrice = 40 });
+        var current = BrowserProjectionBuilder.Build([], new Dictionary<ulong, CachedRetainer> { [10] = retainer }, TestData.Owner);
+        var changed = TestData.Retainer(10, "Eris", (100, "Darksteel Ore", 1));
+        changed.Listings.AddRange(retainer.Listings);
+
+        var refreshed = BrowserProjectionBuilder.RefreshRetainerStock(
+            current,
+            [],
+            new Dictionary<ulong, CachedRetainer> { [10] = changed },
+            TestData.Owner);
+
+        Assert.Same(current.Listings, refreshed.Listings);
+        Assert.Equal(1, Assert.Single(refreshed.Items).RetainerQuantity);
+    }
+
     private static InventoryBag Bag(params (uint Id, string Name, uint Quantity)[] items) => new()
     {
         BagName = "Inventory1",

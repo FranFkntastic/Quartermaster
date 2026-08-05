@@ -3,6 +3,13 @@ using RQ.Domain;
 
 namespace RQ.Persistence;
 
+public enum StateChangeKind
+{
+    Plans,
+    Listings,
+    Operations,
+}
+
 public sealed class StateRepository
 {
     private readonly object gate = new();
@@ -15,7 +22,7 @@ public sealed class StateRepository
         state = store.Load();
     }
 
-    public event Action? Changed;
+    public event Action<StateChangeKind>? Changed;
 
     public QuartermasterState Snapshot()
     {
@@ -29,7 +36,9 @@ public sealed class StateRepository
             return read(state);
     }
 
-    public T Mutate<T>(Func<QuartermasterState, T> mutate)
+    public T Mutate<T>(Func<QuartermasterState, T> mutate) => Mutate(StateChangeKind.Plans, mutate);
+
+    public T Mutate<T>(StateChangeKind changeKind, Func<QuartermasterState, T> mutate)
     {
         T result;
         lock (gate)
@@ -40,11 +49,17 @@ public sealed class StateRepository
             store.Save(candidate);
             state = candidate;
         }
-        Changed?.Invoke();
+        Changed?.Invoke(changeKind);
         return result;
     }
 
     public void Mutate(Action<QuartermasterState> mutate) => Mutate(state =>
+    {
+        mutate(state);
+        return true;
+    });
+
+    public void Mutate(StateChangeKind changeKind, Action<QuartermasterState> mutate) => Mutate(changeKind, state =>
     {
         mutate(state);
         return true;

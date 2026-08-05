@@ -141,7 +141,7 @@ public sealed class ShortageSubmissionService
     {
         try
         {
-            repository.Mutate(state =>
+            repository.Mutate(StateChangeKind.Operations, state =>
             {
                 if (state.Requests.Any(record => record.RequestId == request.RequestId))
                     return;

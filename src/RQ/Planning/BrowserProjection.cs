@@ -99,6 +99,95 @@ public sealed class BrowserProjection
 
 public static class BrowserProjectionBuilder
 {
+    public static BrowserProjection RefreshRetainerStock(
+        BrowserProjection current,
+        IReadOnlyList<InventoryBag> playerBags,
+        IReadOnlyDictionary<ulong, CachedRetainer> cache,
+        OwnerScope owner,
+        Func<uint, ItemMetadata>? resolveMetadata = null)
+    {
+        // Stock and listings share one browser object for the workbench, but a
+        // retainer inventory mutation must not invalidate listing rows.
+        var rebuilt = Build(playerBags, cache, owner, resolveMetadata);
+        return new BrowserProjection
+        {
+            Scopes = rebuilt.Scopes,
+            Items = rebuilt.Items,
+            Listings = current.Listings,
+            Owner = rebuilt.Owner,
+            RetainerInventoryCompleteByScope = rebuilt.RetainerInventoryCompleteByScope,
+        };
+    }
+
+    public static BrowserProjection RefreshListings(
+        BrowserProjection current,
+        IReadOnlyDictionary<ulong, CachedRetainer> cache,
+        OwnerScope owner,
+        Func<uint, ItemMetadata>? resolveMetadata = null)
+    {
+        var retainers = cache.Values
+            .Where(retainer => retainer.Owner.Matches(owner))
+            .OrderBy(retainer => retainer.RetainerName)
+            .ThenBy(retainer => retainer.RetainerId)
+            .ToArray();
+        var scopes = new List<BrowserScope>
+        {
+            new(BrowserScope.AllKey, "All accessible stock", BrowserScopeKind.All, null),
+            new(BrowserScope.PlayerKey, "Player", BrowserScopeKind.Player, null),
+        };
+        var completeness = new Dictionary<string, bool>(StringComparer.Ordinal)
+        {
+            [BrowserScope.AllKey] = retainers.All(HasCompleteRetainerInventory),
+            [BrowserScope.PlayerKey] = true,
+        };
+        var listings = new List<ListingRow>();
+        foreach (var retainer in retainers)
+        {
+            var key = BrowserScope.RetainerKey(retainer.RetainerId);
+            var name = string.IsNullOrWhiteSpace(retainer.RetainerName)
+                ? $"Retainer {retainer.RetainerId}"
+                : retainer.RetainerName;
+            scopes.Add(new(key, name, BrowserScopeKind.Retainer, retainer.RetainerId));
+            completeness[key] = HasCompleteRetainerInventory(retainer);
+            foreach (var listing in retainer.Listings.Where(listing => listing.ItemId > 0 && listing.Quantity > 0))
+            {
+                var price = listing.UnitPrice is { } known
+                    ? Evidence.Known((decimal)known)
+                    : Evidence.Unknown<decimal>("Unit price was not observed.");
+                listings.Add(new(
+                    key,
+                    retainer.RetainerId,
+                    name,
+                    listing.SlotIndex,
+                    listing.ItemId,
+                    DisplayName(listing.ItemId, listing.ItemName),
+                    checked((int)listing.Quantity),
+                    listing.IsHq ? FfxivItemQuality.HQ : FfxivItemQuality.NQ,
+                    listing.ConditionPercent is >= 0 and <= 100
+                        ? Evidence.Known((decimal)listing.ConditionPercent.Value)
+                        : Evidence.Unknown<decimal>("Condition was not observed."),
+                    price,
+                    price.IsKnown
+                        ? Evidence.Known(price.Value * listing.Quantity)
+                        : Evidence.Unknown<decimal>("Total price requires a unit price."),
+                    listing.ListedAtUtc,
+                    resolveMetadata?.Invoke(listing.ItemId)));
+            }
+        }
+
+        return new BrowserProjection
+        {
+            Scopes = scopes,
+            Items = current.Items,
+            Listings = listings
+                .OrderBy(listing => listing.ItemName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(listing => listing.RetainerName, StringComparer.OrdinalIgnoreCase)
+                .ToArray(),
+            Owner = owner,
+            RetainerInventoryCompleteByScope = completeness,
+        };
+    }
+
     public static BrowserProjection ApplyPlayerChanges(
         BrowserProjection current,
         PlayerInventoryCacheChange change,

@@ -58,10 +58,9 @@ public sealed class Plugin : IDalamudPlugin
     private readonly PlayerInventoryObservationConsumer observationConsumer;
     private readonly WindowSystem windows = new("RQ");
     private readonly QuartermasterWindow window;
-    private readonly System.Collections.Concurrent.ConcurrentQueue<(string Kind, string? OperationId)> pendingChanges = new();
+    private readonly RuntimeReconciliationQueue reconciliation = new();
     private DateTime nextSnapshotAt;
     private DateTime nextPlayerInventoryFlushAt;
-    private int snapshotDirty;
 
     public Plugin(
         IDalamudPluginInterface pluginInterface,
@@ -295,17 +294,39 @@ public sealed class Plugin : IDalamudPlugin
         autoRetainer.TickAutomatic(window.StockBrowserVisible);
         agentBridge.Tick();
         FlushPlayerInventoryIfDue();
-        if (Interlocked.Exchange(ref snapshotDirty, 0) != 0 || DateTime.UtcNow >= nextSnapshotAt)
-            RefreshSnapshot();
+        if (DateTime.UtcNow >= nextSnapshotAt)
+            reconciliation.Request(RuntimeDomain.All, "periodic");
+
+        // A running transfer already maintains exact per-command evidence and
+        // route-local quantities. Hold expensive stock/planner projection work
+        // until that workflow releases inventory ownership; operation progress
+        // and listings can still advance independently.
+        var allowedDomains = transfers.IsRunning
+            ? RuntimeDomain.Listings | RuntimeDomain.Operations
+            : RuntimeDomain.All;
+        var reconciliationBatch = reconciliation.Drain(allowedDomains);
+        if (reconciliationBatch.HasWork)
+            ReconcileRuntime(reconciliationBatch);
         window.Tick();
-        while (pendingChanges.TryDequeue(out var change))
-            ipc.PublishChanged(snapshots.CreateChanged(change.Kind, change.OperationId, CurrentOwner()));
     }
 
-    private void RefreshSnapshot()
+    private void ReconcileRuntime(RuntimeReconciliationBatch batch)
     {
-        snapshots.Refresh(runtimeSnapshots.Refresh());
+        var runtime = runtimeSnapshots.Refresh(batch.Domains, batch.PlayerInventoryChange);
+        if (batch.Domains == RuntimeDomain.Operations)
+            snapshots.RefreshOperations(
+                runtime.Owner,
+                batch.Notices
+                    .Select(notice => notice.OperationId)
+                    .Where(operationId => !string.IsNullOrWhiteSpace(operationId))
+                    .Select(operationId => operationId!)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToArray());
+        else
+            snapshots.Refresh(runtime);
         nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
+        foreach (var notice in batch.Notices)
+            ipc.PublishChanged(snapshots.CreateChanged(notice.Kind, notice.OperationId, CurrentOwner()));
     }
 
     private void FlushPlayerInventoryIfDue()
@@ -317,20 +338,32 @@ public sealed class Plugin : IDalamudPlugin
         playerInventory.Flush();
     }
 
-    private void OnStateChanged()
+    private void OnStateChanged(StateChangeKind changeKind)
     {
-        MarkChanged("state", null);
+        var domain = changeKind switch
+        {
+            StateChangeKind.Listings => RuntimeDomain.Listings,
+            StateChangeKind.Operations => RuntimeDomain.Operations,
+            _ => RuntimeDomain.Plans,
+        };
+        reconciliation.Request(domain, "state");
     }
 
-    private void OnCacheChanged()
+    private void OnCacheChanged(RetainerCacheChangeKind changeKind)
     {
-        MarkChanged("cache", null);
+        var domain = changeKind switch
+        {
+            RetainerCacheChangeKind.Stock => RuntimeDomain.RetainerStock,
+            RetainerCacheChangeKind.Listings => RuntimeDomain.Listings,
+            _ => RuntimeDomain.RetainerStock | RuntimeDomain.Listings,
+        };
+        reconciliation.Request(domain, "cache");
     }
 
     private void OnListingCaptured(RetainerListingCaptureReceipt receipt)
     {
-        state.Mutate(document => document.LatestRetainerListingCapture = receipt);
-        MarkChanged("retainer_listings", null);
+        state.Mutate(StateChangeKind.Listings, document => document.LatestRetainerListingCapture = receipt);
+        reconciliation.Request(RuntimeDomain.Listings, "retainer_listings");
     }
 
     private void OnRetainerCaptureCompleted(CaptureReceipt receipt)
@@ -342,27 +375,20 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnPlayerInventoryChanged(PlayerInventoryCacheChange change)
     {
-        snapshots.Refresh(runtimeSnapshots.ApplyPlayerInventoryChange(change));
-        nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
-        pendingChanges.Enqueue(("player_inventory", null));
+        reconciliation.Request(change);
     }
 
     private void OnOperationChanged(OperationRecord operation)
     {
-        MarkChanged("operation", operation.OperationId);
+        reconciliation.Request(RuntimeDomain.Operations, "operation", operation.OperationId);
     }
 
-    private void OnSubmittedOperationChanged(string operationId) => MarkChanged("operation", operationId);
-
-    private void MarkChanged(string kind, string? operationId)
-    {
-        pendingChanges.Enqueue((kind, operationId));
-        Interlocked.Exchange(ref snapshotDirty, 1);
-    }
+    private void OnSubmittedOperationChanged(string operationId) =>
+        reconciliation.Request(RuntimeDomain.Operations, "operation", operationId);
 
     private void OpenMainUi()
     {
-        RefreshSnapshot();
+        reconciliation.Request(RuntimeDomain.All, "opened");
         window.IsOpen = true;
     }
 
@@ -378,7 +404,7 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 #endif
-        RefreshSnapshot();
+        reconciliation.Request(RuntimeDomain.All, "opened");
         window.IsOpen = true;
     }
 
@@ -411,10 +437,9 @@ public sealed class Plugin : IDalamudPlugin
     {
         var runtime = runtimeSnapshots.Current;
         var retainers = runtime.Retainers.Values.Where(retainer => runtime.Owner.Matches(retainer.Owner)).ToArray();
-        var operation = runtime.State.Operations
-            .Where(candidate => candidate.Owner.Matches(runtime.Owner))
-            .OrderByDescending(candidate => candidate.UpdatedAtUtc)
-            .FirstOrDefault();
+        // Operation history advances independently from the heavier runtime
+        // projection, so bridge truth reads it from the journal authority.
+        var operation = journal.Current(runtime.Owner);
         var selectedPlanId = window.SelectedStowagePlanId;
         var selectedPlanRules = selectedPlanId is { } planId
             ? runtime.State.PlanItems.Where(item => item.StowagePlanId == planId).ToArray()
