@@ -53,8 +53,10 @@ public sealed class QuartermasterWindow : Window
     private readonly BrowserQueryController queries = new();
     private readonly RootConfirmationDialog confirmationDialog = new();
     private StockWorkbenchProjection? stockWorkbenchProjection;
+    private TransferWorkbenchProjection? transferWorkbenchProjection;
     private long stockSelectionRevision = -1;
     private int stockProjectionBuildCount;
+    private int transferProjectionBuildCount;
     private string transferStatus = "No transfer has run.";
     private WorkbenchView? requestedView;
     private Task? activeTransferTask;
@@ -499,6 +501,8 @@ public sealed class QuartermasterWindow : Window
     public int RenderedStockRowCount { get; private set; }
     public int StockProjectionBuildCount => stockProjectionBuildCount;
     public int StockTableApplyCount => stockTable.ApplyCount;
+    public int TransferProjectionBuildCount => transferProjectionBuildCount;
+    public int RenderedTransferRowCount { get; private set; }
     public double WindowDrawMilliseconds { get; private set; }
     public double ContentDrawMilliseconds { get; private set; }
     public double StockDrawMilliseconds { get; private set; }
@@ -2753,7 +2757,7 @@ public sealed class QuartermasterWindow : Window
             ImGui.EndPopup();
         }
 
-        selected = ResolveSelectedStowagePlan(state.Snapshot(), owner);
+        selected = ResolveSelectedStowagePlan(runtime.State, owner);
         if (selected is null)
         {
             ImGui.Spacing();
@@ -2762,18 +2766,12 @@ public sealed class QuartermasterWindow : Window
             return;
         }
 
-        var ownerRules = runtime.State.PlanItems
-            .Where(rule => rule.StowagePlanId == selected.Id)
-            .OrderBy(rule => rule.ItemName, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        var stowage = StowageEvaluator.BuildPlan(runtime.State, runtime.Browser, owner, selected.Id);
-        var retrieval = BuildTransferRetrievalEvaluation(runtime, ownerRules);
-        var surplusBatch = BuildSurplusBatch(runtime, stowage);
-        var evaluated = stowage?.Lines.ToDictionary(line => line.RuleId) ?? [];
-        var retrievalLines = retrieval.Lines.ToDictionary(line => line.PlanItemId);
-        var movements = evaluated.Values.Count(line =>
-            line.Action is StowageAction.Retrieve or StowageAction.Deposit);
-        var hasMovement = retrieval.NeededQuantity > 0 || surplusBatch.PlannedQuantity > 0;
+        var projection = ResolveTransferWorkbenchProjection(runtime, selected);
+        var ownerRules = projection.Rules;
+        var retrieval = projection.Retrieval;
+        var surplusBatch = projection.Deposit;
+        var movements = projection.Movements;
+        var hasMovement = projection.HasMovement;
         var availability = TransferExecutionPolicy.ForExplicitRun(
             hasMovement,
             owner.HasStableIdentity,
@@ -2808,7 +2806,7 @@ public sealed class QuartermasterWindow : Window
             canExecute ? $"{movements:N0} movements" : availability.BlockReason);
 
         ImGui.Separator();
-        ImGui.TextUnformatted($"{ownerRules.Length:N0} items");
+        ImGui.TextUnformatted($"{ownerRules.Count:N0} items");
         ImGui.SameLine();
         ImGui.TextDisabled("·");
         ImGui.SameLine();
@@ -2827,7 +2825,54 @@ public sealed class QuartermasterWindow : Window
                     ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
                     ImGuiTableFlags.SizingStretchProp;
         var footerHeight = ImGui.GetTextLineHeightWithSpacing() + 4;
-        var transferRows = ownerRules
+        var transferRows = projection.Rows;
+        RenderedTransferRowCount = 0;
+        if (transferWorkbenchTable.Begin(
+                "RQTransferWorkbench",
+                new DalamudTableLayout(
+                    new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y - footerHeight)),
+                    flags)))
+        {
+            RenderedTransferRowCount = transferWorkbenchTable.DrawClippedRows(
+                transferRows,
+                (row, _) =>
+                {
+                    transferWorkbenchTable.DrawRow(
+                        row,
+                        row.Rule.Enabled ? null : new Vector4(.38f, .12f, .14f, .42f),
+                        id: $"transfer:{row.Rule.Id}");
+                    if (row.Line?.Action == StowageAction.Retrieve && row.RetrievalLine?.MissingQuantity > 0)
+                        inlineTransferError = $"{row.Rule.ItemName}: {row.RetrievalLine.MissingQuantity:N0} missing from known retainer stock.";
+                });
+            transferWorkbenchTable.End();
+        }
+
+        ImGui.TextDisabled(
+            availability.BlockReason ??
+            "Balanced items stay visible and are skipped during execution.");
+    }
+
+    private TransferWorkbenchProjection ResolveTransferWorkbenchProjection(
+        QuartermasterRuntimeSnapshot runtime,
+        StowagePlan plan)
+    {
+        if (transferWorkbenchProjection is { } cached &&
+            cached.RuntimeRevision == runtime.Revision &&
+            cached.PlanId == plan.Id)
+            return cached;
+
+        var rules = runtime.State.PlanItems
+            .Where(rule => rule.StowagePlanId == plan.Id)
+            .OrderBy(rule => rule.ItemName, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var stowage = runtime.Stowage.FirstOrDefault(candidate => candidate.PlanId == plan.Id);
+        var retrieval = BuildTransferRetrievalEvaluation(runtime, rules);
+        var deposit = BuildSurplusBatch(runtime, stowage);
+        var evaluated = stowage?.Lines.ToDictionary(line => line.RuleId) ?? [];
+        var retrievalLines = retrieval.Lines.ToDictionary(line => line.PlanItemId);
+        var movements = evaluated.Values.Count(line =>
+            line.Action is StowageAction.Retrieve or StowageAction.Deposit);
+        var rows = rules
             .Select(rule =>
             {
                 evaluated.TryGetValue(rule.Id, out var line);
@@ -2841,32 +2886,23 @@ public sealed class QuartermasterWindow : Window
                     retrievalLine,
                     playerQuantity,
                     rule.TargetQuantity - playerQuantity,
-                    owner,
-                    selected.Id,
+                    runtime.Owner,
+                    plan.Id,
                     runtime);
             })
             .ToArray();
-        if (transferWorkbenchTable.Begin(
-                "RQTransferWorkbench",
-                new DalamudTableLayout(
-                    new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y - footerHeight)),
-                    flags)))
-        {
-            foreach (var row in transferRows)
-            {
-                transferWorkbenchTable.DrawRow(
-                    row,
-                    row.Rule.Enabled ? null : new Vector4(.38f, .12f, .14f, .42f),
-                    id: $"transfer:{row.Rule.Id}");
-                if (row.Line?.Action == StowageAction.Retrieve && row.RetrievalLine?.MissingQuantity > 0)
-                    inlineTransferError = $"{row.Rule.ItemName}: {row.RetrievalLine.MissingQuantity:N0} missing from known retainer stock.";
-            }
-            transferWorkbenchTable.End();
-        }
-
-        ImGui.TextDisabled(
-            availability.BlockReason ??
-            "Balanced items stay visible and are skipped during execution.");
+        transferWorkbenchProjection = new(
+            runtime.Revision,
+            plan.Id,
+            rules,
+            stowage,
+            retrieval,
+            deposit,
+            movements,
+            retrieval.NeededQuantity > 0 || deposit.PlannedQuantity > 0,
+            rows);
+        transferProjectionBuildCount++;
+        return transferWorkbenchProjection;
     }
 
     private void RequestSelectedTransferReview()
@@ -3719,7 +3755,7 @@ public sealed class QuartermasterWindow : Window
         StowageEvaluation? evaluation)
     {
         if (evaluation is null)
-            return new(DateTime.UtcNow, []);
+            return new(runtime.CapturedAtUtc, []);
         var requests = new List<StowageDepositRequest>();
         foreach (var line in evaluation.Lines.Where(line => line.DepositQuantity > 0))
         {
@@ -3752,7 +3788,7 @@ public sealed class QuartermasterWindow : Window
             runtime.Retainers,
             runtime.Owner,
             itemId => ResolveMaxStack(runtime.Browser, itemId),
-            DateTime.UtcNow);
+            runtime.CapturedAtUtc);
     }
 
     private static int ResolveMaxStack(BrowserProjection browser, uint itemId) =>
@@ -3882,17 +3918,12 @@ public sealed class QuartermasterWindow : Window
             return;
         }
 
-        var rules = runtime.State.PlanItems
-            .Where(rule => rule.StowagePlanId == plan.Id)
-            .OrderBy(rule => rule.ItemName, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        var stowage = StowageEvaluator.BuildPlan(runtime.State, runtime.Browser, runtime.Owner, plan.Id);
-        var retrieval = BuildTransferRetrievalEvaluation(runtime, rules);
-        var deposit = BuildSurplusBatch(runtime, stowage);
-        var evaluated = stowage?.Lines.ToDictionary(line => line.RuleId) ?? [];
-        var movements = evaluated.Values.Count(line =>
-            line.Action is StowageAction.Retrieve or StowageAction.Deposit);
-        var hasMovement = retrieval.NeededQuantity > 0 || deposit.PlannedQuantity > 0;
+        var projection = ResolveTransferWorkbenchProjection(runtime, plan);
+        var rules = projection.Rules;
+        var retrieval = projection.Retrieval;
+        var deposit = projection.Deposit;
+        var movements = projection.Movements;
+        var hasMovement = projection.HasMovement;
 
         ImGui.TextUnformatted($"{movements:N0} movements");
         ImGui.SameLine();
@@ -3903,18 +3934,13 @@ public sealed class QuartermasterWindow : Window
         ImGui.TextColored(new Vector4(.53f, .83f, .64f, 1f), $"Stow {deposit.PlannedQuantity:N0}");
         ImGui.Separator();
 
-        var reviewRows = rules
-            .Select(rule =>
-            {
-                evaluated.TryGetValue(rule.Id, out var line);
-                var player = line?.PlayerQuantity ?? 0;
-                return new TransferReviewRow(
-                    rule,
-                    line,
-                    player,
-                    rule.TargetQuantity - player,
-                    runtime);
-            })
+        var reviewRows = projection.Rows
+            .Select(row => new TransferReviewRow(
+                row.Rule,
+                row.Line,
+                row.PlayerQuantity,
+                row.Difference,
+                runtime))
             .ToArray();
         if (transferReviewTable.Begin(
                 "RQTransferReviewRows",
@@ -3923,8 +3949,9 @@ public sealed class QuartermasterWindow : Window
                     ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
                     ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp)))
         {
-            foreach (var row in reviewRows)
-                transferReviewTable.DrawRow(row, id: $"transfer-review:{row.Rule.Id}");
+            transferReviewTable.DrawClippedRows(
+                reviewRows,
+                (row, _) => transferReviewTable.DrawRow(row, id: $"transfer-review:{row.Rule.Id}"));
             transferReviewTable.End();
         }
 
@@ -4086,7 +4113,7 @@ public sealed class QuartermasterWindow : Window
             playerCounts,
             runtime.Retainers,
             runtime.Owner,
-            DateTime.UtcNow,
+            runtime.CapturedAtUtc,
             runtime.Browser);
     }
 
@@ -4173,6 +4200,17 @@ public sealed class QuartermasterWindow : Window
         Guid? PlanId,
         IReadOnlyList<StockGroup> QueryItems,
         IReadOnlyList<StockWorkbenchRow> Rows);
+
+    private sealed record TransferWorkbenchProjection(
+        long RuntimeRevision,
+        Guid PlanId,
+        IReadOnlyList<TargetPlanItem> Rules,
+        StowageEvaluation? Stowage,
+        RetrievalPlan Retrieval,
+        StowageDepositBatch Deposit,
+        int Movements,
+        bool HasMovement,
+        IReadOnlyList<TransferWorkbenchRow> Rows);
 
     private sealed record RestockPlanRow(
         RestockPlanItem Item,

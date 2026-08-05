@@ -15,6 +15,8 @@ public sealed record QuartermasterBridgeTruth(
     int RenderedStockRowCount,
     int StockProjectionBuildCount,
     int StockTableApplyCount,
+    int TransferProjectionBuildCount,
+    int RenderedTransferRowCount,
     double WindowDrawMilliseconds,
     double ContentDrawMilliseconds,
     double StockDrawMilliseconds,

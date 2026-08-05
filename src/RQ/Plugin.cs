@@ -445,7 +445,7 @@ public sealed class Plugin : IDalamudPlugin
             ? runtime.State.PlanItems.Where(item => item.StowagePlanId == planId).ToArray()
             : [];
         return new QuartermasterBridgeTruth(
-            11,
+            12,
             configuration.PluginInstanceId,
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
@@ -456,6 +456,8 @@ public sealed class Plugin : IDalamudPlugin
             window.RenderedStockRowCount,
             window.StockProjectionBuildCount,
             window.StockTableApplyCount,
+            window.TransferProjectionBuildCount,
+            window.RenderedTransferRowCount,
             window.WindowDrawMilliseconds,
             window.ContentDrawMilliseconds,
             window.StockDrawMilliseconds,
