@@ -227,21 +227,21 @@ public sealed class QuartermasterWindow : Window
             DrawContextMenu: DrawStockRowContextMenu),
         new(
             "Player",
-            74,
+            80,
             row => row.Item.PlayerQuantity.ToString("N0"),
             row => row.Item.PlayerQuantity,
             Alignment: DalamudTableCellAlignment.Right,
             DrawContextMenu: DrawStockRowContextMenu),
         new(
             "Stored",
-            78,
+            84,
             row => row.Item.RetainerQuantity.ToString("N0"),
             row => row.Item.RetainerQuantity,
             Alignment: DalamudTableCellAlignment.Right,
             DrawContextMenu: DrawStockRowContextMenu),
         new(
             "Target",
-            76,
+            80,
             row => row.Rule?.TargetQuantity.ToString("N0") ?? "—",
             row => row.Rule?.TargetQuantity ?? -1,
             TextColor: row => row.Rule is null
@@ -868,7 +868,7 @@ public sealed class QuartermasterWindow : Window
                     ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.Sortable;
         var tableHeight = Math.Max(180, ImGui.GetContentRegionAvail().Y);
         if (stockTable.Begin(
-                "RQStockWorkbench",
+                "RQStockWorkbenchV3",
                 new DalamudTableLayout(
                     new Vector2(0, tableHeight),
                     flags,
