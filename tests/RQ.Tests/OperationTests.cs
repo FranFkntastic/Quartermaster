@@ -91,6 +91,38 @@ public sealed class OperationTests
     }
 
     [Fact]
+    public async Task Retrieval_ReusesRouteScanTotalAndDecrementsItBetweenStacks()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateManual(
+            TestData.Owner,
+            [new TargetPlanItem { ItemId = 100, ItemName = "Spruce Log", TargetQuantity = 1998 }]);
+        var cacheStore = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        cacheStore.Save(new Dictionary<ulong, CachedRetainer>
+        {
+            [10] = TestData.Retainer(
+                10,
+                "Eris",
+                (100, "Spruce Log", 999),
+                (100, "Spruce Log", 999)),
+        });
+        var driver = new BaselineRecordingDriver();
+        var coordinator = new TransferCoordinator(
+            journal,
+            driver,
+            new RetainerCacheRepository(cacheStore),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>());
+
+        await coordinator.ExecuteRetrievalAsync(operation.OperationId);
+
+        Assert.Equal([1998, 999], driver.RetainerBaselines);
+        Assert.Equal(OperationStatuses.Succeeded, journal.Get(operation.OperationId)!.Status);
+    }
+
+    [Fact]
     public async Task MixedPlan_DoesNotStartStowageWhenRetrievalFails()
     {
         using var directory = new TemporaryDirectory();
@@ -482,6 +514,58 @@ public sealed class OperationTests
         public Task<RetainerCrystalTransferResult> DepositCrystalAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken) { Calls++; return Task.FromResult(new RetainerCrystalTransferResult(true, quantity, "TransferVerified", "Verified.")); }
         public Task CloseRetainerAsync(CancellationToken cancellationToken) { Calls++; return Task.CompletedTask; }
         public void CancelActive() { Calls++; }
+    }
+
+    private sealed class BaselineRecordingDriver : IRetainerTransferDriver
+    {
+        private int remaining = 1998;
+        public List<int> RetainerBaselines { get; } = [];
+
+        public Task RequireRetainerListAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task OpenInventoryAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<IReadOnlyList<DalamudInventoryStack>> ScanRetainerAsync(
+            IReadOnlySet<uint> itemIds,
+            CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<DalamudInventoryStack>>(remaining switch
+            {
+                >= 1998 =>
+                [
+                    new(InventoryType.RetainerPage1, 0, 100, 999),
+                    new(InventoryType.RetainerPage1, 1, 100, 999),
+                ],
+                >= 999 => [new(InventoryType.RetainerPage1, 1, 100, 999)],
+                _ => [],
+            });
+
+        public Task<RetrievalResult> RetrieveAsync(
+            DalamudInventoryStack stack,
+            int quantity,
+            CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("Coordinator did not supply its route-scan baseline.");
+
+        public Task<RetrievalResult> RetrieveAsync(
+            DalamudInventoryStack stack,
+            int quantity,
+            int retainerVariantQuantityBefore,
+            CancellationToken cancellationToken)
+        {
+            RetainerBaselines.Add(retainerVariantQuantityBefore);
+            remaining -= quantity;
+            return Task.FromResult(new RetrievalResult(true, quantity, "TransferVerified", "Verified."));
+        }
+
+        public Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerCrystalsAsync(
+            IReadOnlySet<uint> itemIds,
+            CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([]);
+        public Task<RetainerCrystalTransferResult> DepositCrystalAsync(
+            DalamudInventoryStack stack,
+            int quantity,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+        public Task CloseRetainerAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public void CancelActive() { }
     }
 
     private sealed class BlockingDriver : IRetainerTransferDriver

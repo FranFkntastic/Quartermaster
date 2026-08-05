@@ -64,8 +64,28 @@ public sealed class RetainerLiveDriver : IRetainerTransferDriver
         DalamudInventoryStack stack,
         int quantity,
         CancellationToken cancellationToken)
+        => await RetrieveAsync(stack, quantity, null, cancellationToken).ConfigureAwait(false);
+
+    /// <summary>
+    /// Passes Quartermaster's existing route-scan total into Franthropy so its rare
+    /// timeout reconciliation needs only one after-state scan.
+    /// </summary>
+    public async Task<RetrievalResult> RetrieveAsync(
+        DalamudInventoryStack stack,
+        int quantity,
+        int retainerVariantQuantityBefore,
+        CancellationToken cancellationToken)
+        => await RetrieveAsync(stack, quantity, (int?)retainerVariantQuantityBefore, cancellationToken).ConfigureAwait(false);
+
+    private async Task<RetrievalResult> RetrieveAsync(
+        DalamudInventoryStack stack,
+        int quantity,
+        int? retainerVariantQuantityBefore,
+        CancellationToken cancellationToken)
     {
-        var result = await session.RetrieveAsync(stack, quantity, cancellationToken).ConfigureAwait(false);
+        var result = retainerVariantQuantityBefore is { } knownQuantity
+            ? await session.RetrieveAsync(stack, quantity, knownQuantity, cancellationToken).ConfigureAwait(false)
+            : await session.RetrieveAsync(stack, quantity, cancellationToken).ConfigureAwait(false);
         return new(
             result.Success,
             result.Transferred,
