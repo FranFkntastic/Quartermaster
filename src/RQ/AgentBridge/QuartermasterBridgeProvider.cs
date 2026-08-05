@@ -13,6 +13,8 @@ public sealed record QuartermasterBridgeTruth(
     string StockFilter,
     int VisibleStockCount,
     int RenderedStockRowCount,
+    int StockProjectionBuildCount,
+    int StockTableApplyCount,
     double WindowDrawMilliseconds,
     double ContentDrawMilliseconds,
     double StockDrawMilliseconds,

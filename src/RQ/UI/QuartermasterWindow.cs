@@ -52,6 +52,9 @@ public sealed class QuartermasterWindow : Window
     private readonly DalamudTableProjection<OperationLine> operationLineTable;
     private readonly BrowserQueryController queries = new();
     private readonly RootConfirmationDialog confirmationDialog = new();
+    private StockWorkbenchProjection? stockWorkbenchProjection;
+    private long stockSelectionRevision = -1;
+    private int stockProjectionBuildCount;
     private string transferStatus = "No transfer has run.";
     private WorkbenchView? requestedView;
     private Task? activeTransferTask;
@@ -494,6 +497,8 @@ public sealed class QuartermasterWindow : Window
     public string StockFilter => workbench.ItemFilterState.Expression;
     public int VisibleStockCount { get; private set; }
     public int RenderedStockRowCount { get; private set; }
+    public int StockProjectionBuildCount => stockProjectionBuildCount;
+    public int StockTableApplyCount => stockTable.ApplyCount;
     public double WindowDrawMilliseconds { get; private set; }
     public double ContentDrawMilliseconds { get; private set; }
     public double StockDrawMilliseconds { get; private set; }
@@ -857,27 +862,13 @@ public sealed class QuartermasterWindow : Window
                 new Vector4(1f, .65f, .25f, 1f),
                 result.Filter.Diagnostics.FirstOrDefault()?.Message ?? "Invalid filter");
 
+        if (stockSelectionRevision != runtime.Revision)
+        {
+            stockSelection.Retain(projection.Items.Select(item => item.ItemId));
+            stockSelectionRevision = runtime.Revision;
+        }
         var selectedPlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
-        var rules = selectedPlan is null
-            ? new Dictionary<uint, TargetPlanItem>()
-            : runtime.State.PlanItems
-                .Where(rule => rule.StowagePlanId == selectedPlan.Id)
-                .GroupBy(rule => rule.ItemId)
-                .ToDictionary(group => group.Key, group => group.First());
-        var evaluated = selectedPlan is null
-            ? new Dictionary<Guid, StowageEvaluationLine>()
-            : StowageEvaluator.BuildPlan(runtime.State, runtime.Browser, runtime.Owner, selectedPlan.Id)?
-                  .Lines.ToDictionary(line => line.RuleId) ?? [];
-
-        stockSelection.Retain(projection.Items.Select(item => item.ItemId));
-        var sourceRows = result.Items
-            .Select(item =>
-            {
-                rules.TryGetValue(item.ItemId, out var rule);
-                evaluated.TryGetValue(rule?.Id ?? Guid.Empty, out var line);
-                return new StockWorkbenchRow(item, rule, line);
-            })
-            .ToArray();
+        var sourceRows = ResolveStockWorkbenchProjection(runtime, result.Items, selectedPlan);
         DrawStockSelectionBar(runtime);
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
                     ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
@@ -921,6 +912,41 @@ public sealed class QuartermasterWindow : Window
             stockTable.End();
         }
         StockDrawMilliseconds = Stopwatch.GetElapsedTime(drawStarted).TotalMilliseconds;
+    }
+
+    private IReadOnlyList<StockWorkbenchRow> ResolveStockWorkbenchProjection(
+        QuartermasterRuntimeSnapshot runtime,
+        IReadOnlyList<StockGroup> queryItems,
+        StowagePlan? selectedPlan)
+    {
+        if (stockWorkbenchProjection is { } cached &&
+            cached.RuntimeRevision == runtime.Revision &&
+            cached.PlanId == selectedPlan?.Id &&
+            ReferenceEquals(cached.QueryItems, queryItems))
+            return cached.Rows;
+
+        var rules = selectedPlan is null
+            ? new Dictionary<uint, TargetPlanItem>()
+            : runtime.State.PlanItems
+                .Where(rule => rule.StowagePlanId == selectedPlan.Id)
+                .GroupBy(rule => rule.ItemId)
+                .ToDictionary(group => group.Key, group => group.First());
+        var evaluated = selectedPlan is null
+            ? new Dictionary<Guid, StowageEvaluationLine>()
+            : runtime.Stowage
+                .FirstOrDefault(plan => plan.PlanId == selectedPlan.Id)?
+                .Lines.ToDictionary(line => line.RuleId) ?? [];
+        var rows = queryItems
+            .Select(item =>
+            {
+                rules.TryGetValue(item.ItemId, out var rule);
+                evaluated.TryGetValue(rule?.Id ?? Guid.Empty, out var line);
+                return new StockWorkbenchRow(item, rule, line);
+            })
+            .ToArray();
+        stockWorkbenchProjection = new(runtime.Revision, selectedPlan?.Id, queryItems, rows);
+        stockProjectionBuildCount++;
+        return rows;
     }
 
     private void DrawStockToolbar(BrowserProjection projection)
@@ -4141,6 +4167,12 @@ public sealed class QuartermasterWindow : Window
         StockGroup Item,
         TargetPlanItem? Rule,
         StowageEvaluationLine? Line);
+
+    private sealed record StockWorkbenchProjection(
+        long RuntimeRevision,
+        Guid? PlanId,
+        IReadOnlyList<StockGroup> QueryItems,
+        IReadOnlyList<StockWorkbenchRow> Rows);
 
     private sealed record RestockPlanRow(
         RestockPlanItem Item,
