@@ -2866,7 +2866,11 @@ public sealed class QuartermasterWindow : Window
             .Where(rule => rule.StowagePlanId == plan.Id)
             .OrderBy(rule => rule.ItemName, StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        var stowage = runtime.Stowage.FirstOrDefault(candidate => candidate.PlanId == plan.Id);
+        var stowage = StowageEvaluator.BuildPlan(
+            runtime.State,
+            runtime.Browser,
+            runtime.Owner,
+            plan.Id);
         var retrieval = BuildTransferRetrievalEvaluation(runtime, rules);
         var deposit = BuildSurplusBatch(runtime, stowage);
         var evaluated = stowage?.Lines.ToDictionary(line => line.RuleId) ?? [];

@@ -146,6 +146,39 @@ public sealed class StowageTests
     }
 
     [Fact]
+    public void ExplicitPlanEvaluation_DoesNotDependOnDefaultPlanFlag()
+    {
+        var plan = new StowagePlan
+        {
+            Owner = TestData.Owner,
+            Enabled = false,
+        };
+        var state = new QuartermasterState
+        {
+            StowagePlans = [plan],
+            PlanItems =
+            [
+                new TargetPlanItem
+                {
+                    StowagePlanId = plan.Id,
+                    ItemId = 100,
+                    ItemName = "Spruce Log",
+                    TargetQuantity = 4000,
+                },
+            ],
+        };
+
+        var line = Assert.Single(StowageEvaluator.BuildPlan(
+            state,
+            Browser(5000, false),
+            TestData.Owner,
+            plan.Id)!.Lines);
+
+        Assert.Equal(StowageAction.Deposit, line.Action);
+        Assert.Equal(1000, line.DepositQuantity);
+    }
+
+    [Fact]
     public void Router_ConsolidatesPartialStackBeforePreferredEmptySlots()
     {
         var home = Retainer(10, "Home");
