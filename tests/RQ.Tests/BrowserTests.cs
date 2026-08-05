@@ -9,6 +9,39 @@ namespace RQ.Tests;
 public sealed class BrowserTests
 {
     [Fact]
+    public void PlayerDelta_RebuildsOnlyAffectedStockGroups()
+    {
+        var current = BrowserProjectionBuilder.Build(
+            [new InventoryBag
+            {
+                BagName = "Inventory1",
+                Items =
+                [
+                    new InventoryItem { ItemId = 100, ItemName = "Ore", Quantity = 10, ContainerKey = "Inventory1", SlotIndex = 0 },
+                    new InventoryItem { ItemId = 200, ItemName = "Log", Quantity = 7, ContainerKey = "Inventory1", SlotIndex = 1 },
+                ],
+            }],
+            new Dictionary<ulong, CachedRetainer>(),
+            TestData.Owner,
+            itemId => TestData.Metadata(itemId, itemId == 100 ? "Ore" : "Log"));
+        var unaffected = current.Items.Single(item => item.ItemId == 200);
+        var change = new PlayerInventoryCacheChange(
+            TestData.Owner,
+            new DateTime(2026, 8, 5, 10, 0, 1, DateTimeKind.Utc),
+            false,
+            [new PlayerInventorySlotMutation(
+                "Inventory1",
+                0,
+                new InventoryItem { ItemId = 100, ItemName = "Ore", Quantity = 10, ContainerKey = "Inventory1", SlotIndex = 0 },
+                new InventoryItem { ItemId = 100, ItemName = "Ore", Quantity = 4, ContainerKey = "Inventory1", SlotIndex = 0 })]);
+
+        var updated = BrowserProjectionBuilder.ApplyPlayerChanges(current, change, itemId => TestData.Metadata(itemId));
+
+        Assert.Equal(4, updated.Items.Single(item => item.ItemId == 100).PlayerQuantity);
+        Assert.Same(unaffected, updated.Items.Single(item => item.ItemId == 200));
+    }
+
+    [Fact]
     public void Projection_KeepsPhysicalStacksStableScopesAndOwnerListings()
     {
         var first = TestData.Retainer(10, "Eris", (100, "Darksteel Ore", 3));

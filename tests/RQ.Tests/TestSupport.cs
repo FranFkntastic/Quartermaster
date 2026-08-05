@@ -1,6 +1,7 @@
 using System.Text.Json;
 using RQ.Domain;
 using RQ.Interop;
+using RQ.Inventory;
 using RQ.Operations;
 using RQ.Persistence;
 
@@ -46,6 +47,24 @@ internal static class TestData
     };
 
     public static StateRepository Repository(string directory) => new(new QuartermasterStateStore(System.IO.Path.Combine(directory, "state.json")));
+
+    public static ItemMetadata Metadata(uint itemId, string? name = null) => new(
+        itemId,
+        name ?? $"Item {itemId}",
+        null,
+        false,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        999);
 
     public static ShortageRequest Request(string requestId = "request-1", string operationId = "operation-1", OwnerScope? owner = null) => new()
     {

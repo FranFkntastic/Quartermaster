@@ -1,3 +1,4 @@
+using Franthropy.Observations.V1;
 using RQ;
 using RQ.Domain;
 using RQ.Inventory;
@@ -53,6 +54,51 @@ public sealed class PersistenceTests
         var other = TestData.Owner with { LocalContentId = TestData.Owner.LocalContentId + 1, CharacterName = "Other" };
 
         Assert.Empty(repository.Snapshot(other, ["Inventory1"]).Bags);
+    }
+
+    [Fact]
+    public void PlayerInventoryCache_AppliesOnlyNamedSlotChanges()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = new PlayerInventoryCacheRepository(
+            new PlayerInventoryCacheStore(Path.Combine(directory.Path, "player-inventory-cache.json")));
+        repository.Observe(
+            TestData.Owner,
+            new PlayerStorageCapture(
+                [PlayerBag("Inventory1", (100, 10), (200, 7)), PlayerBag("Crystals", (2, 99))],
+                ["Inventory1", "Crystals"],
+                ["Inventory1", "Crystals"]),
+            new DateTime(2026, 8, 5, 10, 0, 0, DateTimeKind.Utc));
+        PlayerInventoryCacheChange? observed = null;
+        repository.Changed += change => observed = change;
+        var owner = new ObservationOwner(TestData.Owner.LocalContentId!.Value, TestData.Owner.HomeWorldId!.Value);
+        var scope = new ObservationScope(owner, ObservationSubject.Character(owner), ObservationContainerKind.PlayerInventory);
+        var capture = new ObservationCapture(
+            2,
+            new DateTimeOffset(2026, 8, 5, 10, 0, 1, TimeSpan.Zero),
+            new ObservationProvenance("test", "test", "1.0", "test"),
+            ObservationEvidence.CompleteAvailable);
+
+        Assert.True(repository.ApplyChanges(
+            TestData.Owner,
+            [new InventoryChangeBatch(2, scope, capture,
+            [
+                new InventorySlotChange(0, 0, new InventorySlotValue(100, 10, false), new InventorySlotValue(100, 4, false)),
+                new InventorySlotChange(0, 1, new InventorySlotValue(200, 7, false), null),
+                new InventorySlotChange(0, 2, null, new InventorySlotValue(300, 5, true)),
+            ])],
+            itemId => TestData.Metadata(itemId)));
+
+        Assert.NotNull(observed);
+        Assert.False(observed!.IsBaseline);
+        Assert.Equal([100u, 200u, 300u], observed.AffectedItemIds.Order().ToArray());
+        var snapshot = repository.Snapshot(TestData.Owner, ["Inventory1", "Crystals"]);
+        var inventory = Assert.Single(snapshot.Bags, bag => bag.BagName == "Inventory1");
+        Assert.Collection(
+            inventory.Items,
+            item => { Assert.Equal(100u, item.ItemId); Assert.Equal(4u, item.Quantity); },
+            item => { Assert.Equal(300u, item.ItemId); Assert.Equal(5u, item.Quantity); Assert.True(item.IsHq); });
+        Assert.Equal(99u, Assert.Single(Assert.Single(snapshot.Bags, bag => bag.BagName == "Crystals").Items).Quantity);
     }
 
     [Fact]

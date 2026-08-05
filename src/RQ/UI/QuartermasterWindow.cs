@@ -110,6 +110,7 @@ public sealed class QuartermasterWindow : Window
     private TransferReviewRequest? capturePreviousTransferReview;
     private bool capturePreviousTransferReviewOpenRequest;
     private ListingRowKey? focusedListing;
+    private PendingTransferPlanRecovery? pendingTransferPlanRecovery;
 
     public QuartermasterWindow(
         StateRepository state,
@@ -2814,7 +2815,7 @@ public sealed class QuartermasterWindow : Window
         ImGui.SameLine();
         ImGui.TextColored(new Vector4(.52f, .79f, .94f, 1f), $"Retrieve {retrieval.NeededQuantity:N0}");
         ImGui.SameLine();
-        ImGui.TextColored(new Vector4(.53f, .83f, .64f, 1f), $"Stow {surplusBatch.PlannedQuantity:N0}");
+        ImGui.TextColored(new Vector4(.53f, .83f, .64f, 1f), $"Stow {surplusBatch.RequestedQuantity:N0}");
         if (!string.IsNullOrWhiteSpace(inlineTransferError))
         {
             ImGui.SameLine();
@@ -2899,7 +2900,7 @@ public sealed class QuartermasterWindow : Window
             retrieval,
             deposit,
             movements,
-            retrieval.NeededQuantity > 0 || deposit.PlannedQuantity > 0,
+            TransferExecutionPolicy.HasMovement(retrieval.NeededQuantity, deposit),
             rows);
         transferProjectionBuildCount++;
         return transferWorkbenchProjection;
@@ -3931,7 +3932,7 @@ public sealed class QuartermasterWindow : Window
         ImGui.SameLine();
         ImGui.TextColored(new Vector4(.52f, .79f, .94f, 1f), $"Retrieve {retrieval.NeededQuantity:N0}");
         ImGui.SameLine();
-        ImGui.TextColored(new Vector4(.53f, .83f, .64f, 1f), $"Stow {deposit.PlannedQuantity:N0}");
+        ImGui.TextColored(new Vector4(.53f, .83f, .64f, 1f), $"Stow {deposit.RequestedQuantity:N0}");
         ImGui.Separator();
 
         var reviewRows = projection.Rows
@@ -4003,7 +4004,7 @@ public sealed class QuartermasterWindow : Window
             transferReview = null;
     }
 
-    private void ExecuteTransferPlan(Guid planId)
+    private void ExecuteTransferPlan(Guid planId, bool allowCapacityRecovery = true)
     {
         var current = runtimeSnapshots.Current;
         var plan = current.State.StowagePlans.FirstOrDefault(candidate =>
@@ -4020,6 +4021,24 @@ public sealed class QuartermasterWindow : Window
             plan.Id);
         var currentRetrieval = BuildTransferRetrievalEvaluation(current, rules);
         var currentBatch = BuildSurplusBatch(current, currentStowage);
+        if (allowCapacityRecovery && TransferExecutionPolicy.RequiresCapacityRecovery(currentBatch))
+        {
+            var completionSequence = autoRetainer.CompletedRunSequence;
+            if (autoRetainer.Start())
+            {
+                pendingTransferPlanRecovery = new(planId, completionSequence);
+                transferStatus = "Refreshing retainer capacity before executing the plan.";
+                return;
+            }
+            inlineTransferError = autoRetainer.Status;
+            return;
+        }
+        if (!allowCapacityRecovery && currentBatch.RequestedQuantity > 0 && currentBatch.PlannedQuantity == 0)
+        {
+            inlineTransferError = "No owner retainer has capacity for the items to stow.";
+            transferStatus = inlineTransferError;
+            return;
+        }
         var retrievalOperationId = currentRetrieval.NeededQuantity > 0
             ? journal.CreateTransferRetrieval(current.Owner, plan, rules).OperationId
             : null;
@@ -4027,6 +4046,21 @@ public sealed class QuartermasterWindow : Window
             ? journal.CreateTransferDeposit(current.Owner, plan, currentBatch).OperationId
             : null;
         StartTransfer(transfers.ExecutePlanAsync(retrievalOperationId, depositOperationId));
+    }
+
+    public void Tick()
+    {
+        if (pendingTransferPlanRecovery is not { } pending ||
+            autoRetainer.CompletedRunSequence <= pending.CompletionSequence)
+            return;
+        pendingTransferPlanRecovery = null;
+        if (autoRetainer.LastRunSucceeded != true)
+        {
+            inlineTransferError = autoRetainer.Status;
+            transferStatus = autoRetainer.Status;
+            return;
+        }
+        ExecuteTransferPlan(pending.PlanId, false);
     }
 
     private void DrawOperation(OwnerScope owner)
@@ -4211,6 +4245,8 @@ public sealed class QuartermasterWindow : Window
         int Movements,
         bool HasMovement,
         IReadOnlyList<TransferWorkbenchRow> Rows);
+
+    private sealed record PendingTransferPlanRecovery(Guid PlanId, long CompletionSequence);
 
     private sealed record RestockPlanRow(
         RestockPlanItem Item,

@@ -6,6 +6,7 @@ using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.Automation.Retainers;
 using Franthropy.Dalamud.Diagnostics;
 using Franthropy.Dalamud.Observations;
+using Franthropy.Observations.V1;
 using RQ.AgentBridge;
 using RQ.Automation;
 using RQ.Domain;
@@ -23,7 +24,6 @@ namespace RQ;
 public sealed class Plugin : IDalamudPlugin
 {
     private static readonly TimeSpan SnapshotRefreshInterval = TimeSpan.FromMinutes(1);
-    private static readonly TimeSpan PlayerObservationInterval = TimeSpan.FromMilliseconds(100);
     private static readonly TimeSpan PlayerInventoryFlushInterval = TimeSpan.FromSeconds(2);
 
     private const string Command = "/rq";
@@ -52,16 +52,14 @@ public sealed class Plugin : IDalamudPlugin
     private readonly RQ.AgentBridge.AgentBridgeHost agentBridge;
     private readonly AgentBridgeViewportCaptureService agentBridgeViewportCapture;
     private readonly AgentBridgeUiReviewRegistry agentReviewRegistry = new();
-    private readonly QuartermasterObservationShadowHost? observationShadow;
-    private readonly DalamudSharedObservationHost? observationHost;
+    private readonly DalamudSharedObservationHost observationHost;
+    private readonly PlayerInventoryObservationConsumer observationConsumer;
     private readonly WindowSystem windows = new("RQ");
     private readonly QuartermasterWindow window;
     private readonly System.Collections.Concurrent.ConcurrentQueue<(string Kind, string? OperationId)> pendingChanges = new();
     private DateTime nextSnapshotAt;
-    private DateTime nextPlayerObservationAt;
     private DateTime nextPlayerInventoryFlushAt;
     private int snapshotDirty;
-    private int observationReconcileRequested;
 
     public Plugin(
         IDalamudPluginInterface pluginInterface,
@@ -110,53 +108,42 @@ public sealed class Plugin : IDalamudPlugin
         playerInventory = new(new PlayerInventoryCacheStore(playerInventoryCachePath));
         cache = new(new RetainerCacheStore(cachePath));
         state = new(new QuartermasterStateStore(statePath));
-        if (configuration.EnableSharedObservationShadow)
+        workQueue = new();
+        try
         {
-            try
+            observationHost = new DalamudSharedObservationHost(new DalamudSharedObservationHostOptions
             {
-                observationShadow = new QuartermasterObservationShadowHost(
-                    configDirectory,
-                    providerInstanceId,
-                    GamePatchCompatibilityGate.ReadCurrentGameVersion(),
-                    (message, exception) =>
-                    {
-                        if (exception is null)
-                            log.Warning(message);
-                        else
-                            log.Error(exception, message);
-                    });
-            }
-            catch (Exception exception)
-            {
-                log.Error(exception, "Quartermaster shared-observation shadow host is unavailable; legacy product reads remain active.");
-            }
-        }
-        else
-        {
-            try
-            {
-                observationHost = new DalamudSharedObservationHost(new DalamudSharedObservationHostOptions
+                PluginConfigDirectory = configDirectory,
+                PluginName = "Quartermaster",
+                PluginInstanceId = providerInstanceId,
+                GameBuild = GamePatchCompatibilityGate.ReadCurrentGameVersion(),
+                GameInventory = gameInventory,
+                PlayerState = playerState,
+                AddonLifecycle = addonLifecycle,
+                Diagnostic = (message, exception) =>
                 {
-                    PluginConfigDirectory = configDirectory,
-                    PluginName = "Quartermaster",
-                    PluginInstanceId = providerInstanceId,
-                    GameBuild = GamePatchCompatibilityGate.ReadCurrentGameVersion(),
-                    GameInventory = gameInventory,
-                    PlayerState = playerState,
-                    AddonLifecycle = addonLifecycle,
-                    Diagnostic = (message, exception) =>
-                    {
-                        if (exception is null)
-                            log.Warning(message);
-                        else
-                            log.Error(exception, message);
-                    },
+                    if (exception is null)
+                        log.Warning(message);
+                    else
+                        log.Error(exception, message);
+                },
+            });
+            observationConsumer = new(
+                configDirectory,
+                CurrentOwner,
+                DeliverInventoryObservationAsync,
+                (message, exception) =>
+                {
+                    if (exception is null)
+                        log.Warning(message);
+                    else
+                        log.Error(exception, message);
                 });
-            }
-            catch (Exception exception)
-            {
-                log.Error(exception, "Quartermaster shared-observation host is unavailable.");
-            }
+        }
+        catch (Exception exception)
+        {
+            log.Error(exception, "Quartermaster shared inventory observations are unavailable.");
+            throw;
         }
         StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
         TransferPlanMigration.EnsureOwnerPlans(state, CurrentOwner());
@@ -178,11 +165,8 @@ public sealed class Plugin : IDalamudPlugin
             CountCachedPlayerItems,
             automation);
         automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerIpc);
-        workQueue = new();
         runtimeSnapshots = new(scanner, playerInventory, cache, state, CurrentOwner);
-        ObservePlayerInventory();
         var initialSnapshot = runtimeSnapshots.Refresh();
-        nextPlayerObservationAt = DateTime.UtcNow.Add(PlayerObservationInterval);
         nextPlayerInventoryFlushAt = DateTime.UtcNow.Add(PlayerInventoryFlushInterval);
         snapshots = new(providerInstanceId, state, cache.Snapshot);
         snapshots.Refresh(initialSnapshot);
@@ -231,12 +215,8 @@ public sealed class Plugin : IDalamudPlugin
             cache.Changed += OnCacheChanged;
             cache.ListingCaptured += OnListingCaptured;
             captures.CaptureCompleted += OnRetainerCaptureCompleted;
-            if (observationShadow is not null)
-            {
-                observationShadow.CollectorActivated += OnObservationCollectorActivated;
-                observationShadow.Start();
-            }
-            observationHost?.Start();
+            observationHost.Start();
+            observationConsumer.Start();
             journal.OperationChanged += OnOperationChanged;
             submissions.OperationChanged += OnSubmittedOperationChanged;
             deposits.OperationChanged += OnSubmittedOperationChanged;
@@ -302,10 +282,10 @@ public sealed class Plugin : IDalamudPlugin
         automaticRetrievals.Tick();
         autoRetainer.TickAutomatic(window.StockBrowserVisible);
         agentBridge.Tick();
-        ObservePlayerInventory(Interlocked.Exchange(ref observationReconcileRequested, 0) != 0);
         FlushPlayerInventoryIfDue();
         if (Interlocked.Exchange(ref snapshotDirty, 0) != 0 || DateTime.UtcNow >= nextSnapshotAt)
             RefreshSnapshot();
+        window.Tick();
         while (pendingChanges.TryDequeue(out var change))
             ipc.PublishChanged(snapshots.CreateChanged(change.Kind, change.OperationId, CurrentOwner()));
     }
@@ -313,21 +293,7 @@ public sealed class Plugin : IDalamudPlugin
     private void RefreshSnapshot()
     {
         snapshots.Refresh(runtimeSnapshots.Refresh());
-        nextPlayerObservationAt = DateTime.UtcNow.Add(PlayerObservationInterval);
         nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
-    }
-
-    private void ObservePlayerInventory(bool forceShadow = false)
-    {
-        var now = DateTime.UtcNow;
-        if (now < nextPlayerObservationAt)
-            return;
-        nextPlayerObservationAt = now.Add(PlayerObservationInterval);
-        var owner = CurrentOwner();
-        var capture = scanner.CapturePlayerStorage();
-        var changed = playerInventory.Observe(owner, capture, now);
-        if (changed || forceShadow)
-            observationShadow?.ObservePlayerInventory(owner, capture, now);
     }
 
     private void FlushPlayerInventoryIfDue()
@@ -352,8 +318,6 @@ public sealed class Plugin : IDalamudPlugin
     private void OnListingCaptured(RetainerListingCaptureReceipt receipt)
     {
         state.Mutate(document => document.LatestRetainerListingCapture = receipt);
-        if (cache.Snapshot().GetValueOrDefault(receipt.RetainerId) is { } retainer && receipt.Owner.Matches(retainer.Owner))
-            observationShadow?.ObserveRetainerListings(retainer, receipt.CapturedAtUtc);
         MarkChanged("retainer_listings", null);
     }
 
@@ -362,15 +326,14 @@ public sealed class Plugin : IDalamudPlugin
         if (receipt.Outcome != CaptureOutcome.Persisted ||
             cache.Snapshot().GetValueOrDefault(receipt.RetainerId) is not { } retainer)
             return;
-        observationShadow?.ObserveRetainerInventory(retainer);
-        if (retainer.ListingsObservedAtUtc == retainer.ObservedAtUtc)
-            observationShadow?.ObserveRetainerListings(retainer, retainer.ObservedAtUtc);
     }
 
-    private void OnObservationCollectorActivated() =>
-        Interlocked.Exchange(ref observationReconcileRequested, 1);
-
-    private void OnPlayerInventoryChanged() => MarkChanged("player_inventory", null);
+    private void OnPlayerInventoryChanged(PlayerInventoryCacheChange change)
+    {
+        snapshots.Refresh(runtimeSnapshots.ApplyPlayerInventoryChange(change));
+        nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
+        pendingChanges.Enqueue(("player_inventory", null));
+    }
 
     private void OnOperationChanged(OperationRecord operation)
     {
@@ -493,6 +456,95 @@ public sealed class Plugin : IDalamudPlugin
             listingNavigation.Status);
     }
 
+    private void ApplyInventoryObservation(PlayerInventoryObservationDelivery delivery)
+    {
+        var owner = CurrentOwner();
+        if (!owner.HasStableIdentity ||
+            owner.LocalContentId != delivery.Owner.LocalContentId ||
+            owner.HomeWorldId != delivery.Owner.HomeWorldId)
+            return;
+
+        if (delivery.Baselines.Count > 0)
+        {
+            var requested = new HashSet<string>(StringComparer.Ordinal);
+            var observed = new HashSet<string>(StringComparer.Ordinal);
+            var bags = new Dictionary<string, InventoryBag>(StringComparer.Ordinal);
+            var observedAtUtc = DateTime.MinValue;
+            foreach (var baseline in delivery.Baselines.Where(candidate =>
+                         candidate.Scope.Subject.Kind == ObservationSubjectKind.Character &&
+                         candidate.Scope.Container is ObservationContainerKind.PlayerInventory or ObservationContainerKind.Saddlebag))
+            {
+                var payload = baseline.Payload.Deserialize<InventoryObservationPayload>(
+                    baseline.Scope.Container == ObservationContainerKind.Saddlebag
+                        ? ObservationPayloadContracts.Saddlebag
+                        : ObservationPayloadContracts.PlayerInventory,
+                    ObservationPayloadContracts.Version);
+                foreach (var containerId in payload.RequestedContainerIds)
+                    requested.Add(((FFXIVClientStructs.FFXIV.Client.Game.InventoryType)containerId).ToString());
+                foreach (var containerId in payload.ObservedContainerIds)
+                {
+                    var key = ((FFXIVClientStructs.FFXIV.Client.Game.InventoryType)containerId).ToString();
+                    observed.Add(key);
+                    bags.TryAdd(key, new InventoryBag { BagName = key, Location = key });
+                }
+                foreach (var row in payload.Items)
+                {
+                    var key = ((FFXIVClientStructs.FFXIV.Client.Game.InventoryType)row.ContainerId).ToString();
+                    if (!bags.TryGetValue(key, out var bag))
+                        bags[key] = bag = new InventoryBag { BagName = key, Location = key };
+                    var metadata = scanner.ResolveItemMetadata(row.ItemId);
+                    bag.Items.Add(new Domain.InventoryItem
+                    {
+                        ItemId = row.ItemId,
+                        ItemName = metadata.Name,
+                        Quantity = checked((uint)row.Quantity),
+                        IsHq = row.IsHighQuality,
+                        ItemType = metadata.ItemType,
+                        ContainerKey = key,
+                        SlotIndex = row.SlotIndex,
+                        Equipped = (FFXIVClientStructs.FFXIV.Client.Game.InventoryType)row.ContainerId == FFXIVClientStructs.FFXIV.Client.Game.InventoryType.EquippedItems,
+                    });
+                }
+                var captured = baseline.Capture.ObservedAtUtc.UtcDateTime;
+                observedAtUtc = captured > observedAtUtc ? captured : observedAtUtc;
+            }
+            if (observed.Count > 0)
+                playerInventory.Observe(
+                    owner,
+                    new(
+                        bags.Values.OrderBy(bag => bag.BagName, StringComparer.Ordinal).ToArray(),
+                        requested.Order(StringComparer.Ordinal).ToArray(),
+                        observed.Order(StringComparer.Ordinal).ToArray()),
+                    observedAtUtc == DateTime.MinValue ? DateTime.UtcNow : observedAtUtc);
+            return;
+        }
+
+        playerInventory.ApplyChanges(owner, delivery.Changes, scanner.ResolveItemMetadata);
+    }
+
+    private async ValueTask DeliverInventoryObservationAsync(
+        PlayerInventoryObservationDelivery delivery,
+        CancellationToken cancellationToken)
+    {
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = cancellationToken.Register(() => completion.TrySetCanceled(cancellationToken));
+        workQueue.Enqueue(() =>
+        {
+            if (completion.Task.IsCompleted)
+                return;
+            try
+            {
+                ApplyInventoryObservation(delivery);
+                completion.TrySetResult();
+            }
+            catch (Exception exception)
+            {
+                completion.TrySetException(exception);
+            }
+        });
+        await completion.Task.ConfigureAwait(false);
+    }
+
     public void Dispose()
     {
         playerInventory.Flush();
@@ -511,14 +563,12 @@ public sealed class Plugin : IDalamudPlugin
         cache.Changed -= OnCacheChanged;
         cache.ListingCaptured -= OnListingCaptured;
         captures.CaptureCompleted -= OnRetainerCaptureCompleted;
-        if (observationShadow is not null)
-            observationShadow.CollectorActivated -= OnObservationCollectorActivated;
         journal.OperationChanged -= OnOperationChanged;
+        observationConsumer.DisposeAsync().AsTask().GetAwaiter().GetResult();
         ipc.Dispose();
         autoRetainer.Dispose();
         captures.Dispose();
-        observationShadow?.Dispose();
-        observationHost?.Dispose();
+        observationHost.Dispose();
         windows.RemoveAllWindows();
     }
 }

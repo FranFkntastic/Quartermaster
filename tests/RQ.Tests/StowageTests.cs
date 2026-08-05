@@ -237,6 +237,30 @@ public sealed class StowageTests
     }
 
     [Fact]
+    public void DepositBatch_PreservesRequestedMovementWhenCapacityIsUnknown()
+    {
+        var request = new StowageDepositRequest(
+            null,
+            null,
+            100,
+            "Ore",
+            false,
+            7,
+            new StowageRoutingPolicy());
+
+        var batch = StowageRouter.BuildBatch(
+            [request],
+            new Dictionary<ulong, CachedRetainer>(),
+            TestData.Owner,
+            _ => 99,
+            DateTime.UtcNow);
+
+        Assert.Equal(7, batch.RequestedQuantity);
+        Assert.Equal(0, batch.PlannedQuantity);
+        Assert.Equal(7, batch.RemainingQuantity);
+    }
+
+    [Fact]
     public void DepositBatch_PersistsExactVariantAndDestinationAuthorization()
     {
         using var directory = new TemporaryDirectory();
