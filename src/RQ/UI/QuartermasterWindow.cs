@@ -223,19 +223,22 @@ public sealed class QuartermasterWindow : Window
             1.8f,
             row => row.Item.ItemName,
             row => row.Item.ItemName,
-            ImGuiTableColumnFlags.WidthStretch),
+            ImGuiTableColumnFlags.WidthStretch | ImGuiTableColumnFlags.DefaultSort,
+            DrawContextMenu: DrawStockRowContextMenu),
         new(
             "Player",
             58,
             row => row.Item.PlayerQuantity.ToString("N0"),
             row => row.Item.PlayerQuantity,
-            Alignment: DalamudTableCellAlignment.Right),
+            Alignment: DalamudTableCellAlignment.Right,
+            DrawContextMenu: DrawStockRowContextMenu),
         new(
             "Stored",
             66,
             row => row.Item.RetainerQuantity.ToString("N0"),
             row => row.Item.RetainerQuantity,
-            Alignment: DalamudTableCellAlignment.Right),
+            Alignment: DalamudTableCellAlignment.Right,
+            DrawContextMenu: DrawStockRowContextMenu),
         new(
             "Target",
             68,
@@ -244,7 +247,8 @@ public sealed class QuartermasterWindow : Window
             TextColor: row => row.Rule is null
                 ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
                 : null,
-            Alignment: DalamudTableCellAlignment.Right),
+            Alignment: DalamudTableCellAlignment.Right,
+            DrawContextMenu: DrawStockRowContextMenu),
         new(
             "Plan state",
             1f,
@@ -253,7 +257,8 @@ public sealed class QuartermasterWindow : Window
             ImGuiTableColumnFlags.WidthStretch,
             TextColor: row => row.Rule is null
                 ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
-                : TransferActionColor(row.Line?.Action)),
+                : TransferActionColor(row.Line?.Action),
+            DrawContextMenu: DrawStockRowContextMenu),
     ]);
 
     private DalamudTableProjection<RestockPlanRow> CreateRestockPlanTable() => new(
@@ -849,7 +854,7 @@ public sealed class QuartermasterWindow : Window
                   .Lines.ToDictionary(line => line.RuleId) ?? [];
 
         stockSelection.Retain(projection.Items.Select(item => item.ItemId));
-        var rows = SortItems(result.Items)
+        var sourceRows = result.Items
             .Select(item =>
             {
                 rules.TryGetValue(item.ItemId, out var rule);
@@ -857,19 +862,25 @@ public sealed class QuartermasterWindow : Window
                 return new StockWorkbenchRow(item, rule, line);
             })
             .ToArray();
-        var rowKeys = rows.Select(row => row.Item.ItemId).ToArray();
+        DrawStockSelectionBar(runtime);
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
                     ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
-                    ImGuiTableFlags.SizingStretchProp;
-        var actionBarHeight = stockSelection.Count > 0
-            ? ImGui.GetFrameHeightWithSpacing() + 4
-            : 0;
-        var tableHeight = Math.Max(180, ImGui.GetContentRegionAvail().Y - actionBarHeight);
+                    ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.Sortable;
+        var tableHeight = Math.Max(180, ImGui.GetContentRegionAvail().Y);
         if (stockTable.Begin(
                 "RQStockWorkbench",
-                new DalamudTableLayout(new Vector2(0, tableHeight), flags)))
+                new DalamudTableLayout(
+                    new Vector2(0, tableHeight),
+                    flags,
+                    FreezeRows: 1)))
         {
-            for (var rowIndex = 0; rowIndex < rows.Length; rowIndex++)
+            IReadOnlyList<StockWorkbenchRow> rows;
+            unsafe
+            {
+                rows = stockTable.Apply(sourceRows, ImGui.TableGetSortSpecs());
+            }
+            var rowKeys = rows.Select(row => row.Item.ItemId).ToArray();
+            for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
             {
                 var row = rows[rowIndex];
                 stockTable.DrawSelectableRow(
@@ -891,14 +902,13 @@ public sealed class QuartermasterWindow : Window
             DalamudTableSelectionRenderer.EndRows(stockSelection);
             stockTable.End();
         }
-        DrawStockSelectionBar(runtime);
     }
 
     private void DrawStockToolbar(BrowserProjection projection)
     {
         var sourceItems = projection.GetItems(workbench.ScopeKey);
         var context = BrowserQueryController.CreateItemContext(sourceItems, projection.Owner);
-        var trailingWidth = 204f;
+        var trailingWidth = 180f;
         DalamudFilterAutocompleteRenderer.Draw(
             "RQStockWorkbench",
             "Search accessible stock by item name",
@@ -935,23 +945,6 @@ public sealed class QuartermasterWindow : Window
                     workbench.ScopeKey = scope.Key;
             }
             ImGui.EndCombo();
-        }
-
-        ImGui.SameLine();
-        var direction = workbench.ItemSortDescending ? "↓" : "↑";
-        if (ImGui.SmallButton($"{direction}##RQStockSort"))
-            ImGui.OpenPopup("RQStockSortMenu");
-        if (ImGui.BeginPopup("RQStockSortMenu"))
-        {
-            foreach (var option in new[] { "Name", "Total", "Player", "Retainers" })
-            {
-                if (ImGui.Selectable(option, workbench.ItemSort == option))
-                    workbench.ItemSort = option;
-            }
-            ImGui.Separator();
-            if (ImGui.Selectable(workbench.ItemSortDescending ? "Ascending" : "Descending"))
-                workbench.ItemSortDescending = !workbench.ItemSortDescending;
-            ImGui.EndPopup();
         }
 
         ImGui.SameLine();
@@ -995,21 +988,20 @@ public sealed class QuartermasterWindow : Window
 
     private void DrawStockSelectionBar(QuartermasterRuntimeSnapshot runtime)
     {
-        if (stockSelection.Count == 0)
-            return;
-
         var selected = runtime.Browser.Items
             .Where(item => stockSelection.IsSelected(item.ItemId))
             .ToArray();
-        if (selected.Length == 0)
+        if (selected.Length != stockSelection.Count)
         {
-            stockSelection.Clear();
-            return;
+            stockSelection.Retain(runtime.Browser.Items.Select(item => item.ItemId));
+            selected = runtime.Browser.Items
+                .Where(item => stockSelection.IsSelected(item.ItemId))
+                .ToArray();
         }
 
         ImGui.TextUnformatted($"{selected.Length:N0} selected");
         ImGui.SameLine();
-        var canPlan = runtime.Owner.HasStableIdentity;
+        var canPlan = selected.Length > 0 && runtime.Owner.HasStableIdentity;
         if (!canPlan)
             ImGui.BeginDisabled();
         if (ImGui.Button("Add to plan"))
@@ -1035,31 +1027,15 @@ public sealed class QuartermasterWindow : Window
             $"{selected.Length:N0} selected");
 
         ImGui.SameLine();
+        if (selected.Length == 0)
+            ImGui.BeginDisabled();
         if (ImGui.Button("Add to item group"))
         {
-            workbench.View = WorkbenchView.ItemGroups;
-            EnsureItemGroupDraft(runtime.State);
-            if (itemGroupDraft is null)
-            {
-                itemGroupDraft = ItemGroupCatalog.NewDraft(runtime.State);
-                itemGroupEditorOrigin = WorkbenchView.ItemGroups;
-            }
-            if (itemGroupDraft is not null)
-            {
-                var added = ItemGroupCatalog.AddMissing(
-                    itemGroupDraft,
-                    selected.Select(item => new ItemGroupItem
-                    {
-                        ItemId = item.ItemId,
-                        ItemName = item.ItemName,
-                        Quality = ItemQualityPolicy.Any,
-                    }));
-                itemGroupWorkspaceStatus = added == 0
-                    ? "Selected items are already in this group."
-                    : $"Added {added:N0} selected {(added == 1 ? "item" : "items")}.";
-            }
+            AddStockItemsToItemGroup(runtime, selected);
             stockSelection.Clear();
         }
+        if (selected.Length == 0)
+            ImGui.EndDisabled();
 
         ImGui.SameLine();
         var carried = selected.Where(item => item.PlayerQuantity > 0).ToArray();
@@ -1074,8 +1050,72 @@ public sealed class QuartermasterWindow : Window
             ImGui.EndDisabled();
 
         ImGui.SameLine();
+        if (selected.Length == 0)
+            ImGui.BeginDisabled();
         if (ImGui.SmallButton("Clear"))
             stockSelection.Clear();
+        if (selected.Length == 0)
+            ImGui.EndDisabled();
+    }
+
+    private void DrawStockRowContextMenu(StockWorkbenchRow row)
+    {
+        var runtime = runtimeSnapshots.Current;
+        var item = runtime.Browser.Items.FirstOrDefault(candidate => candidate.ItemId == row.Item.ItemId);
+        if (item is null)
+        {
+            ImGui.BeginDisabled();
+            ImGui.MenuItem("Item is no longer available");
+            ImGui.EndDisabled();
+            return;
+        }
+
+        if (!runtime.Owner.HasStableIdentity)
+            ImGui.BeginDisabled();
+        if (ImGui.MenuItem("Add to plan"))
+            UpsertSelectedStockRules(runtime, [item], stowCarried: false);
+        if (!runtime.Owner.HasStableIdentity)
+            ImGui.EndDisabled();
+
+        if (ImGui.MenuItem("Add to item group"))
+            AddStockItemsToItemGroup(runtime, [item]);
+
+        if (item.PlayerQuantity == 0 || !runtime.Owner.HasStableIdentity)
+            ImGui.BeginDisabled();
+        if (ImGui.MenuItem("Stow carried"))
+            UpsertSelectedStockRules(runtime, [item], stowCarried: true);
+        if (item.PlayerQuantity == 0 || !runtime.Owner.HasStableIdentity)
+            ImGui.EndDisabled();
+    }
+
+    private void AddStockItemsToItemGroup(
+        QuartermasterRuntimeSnapshot runtime,
+        IReadOnlyList<StockGroup> items)
+    {
+        if (items.Count == 0)
+            return;
+
+        workbench.View = WorkbenchView.ItemGroups;
+        EnsureItemGroupDraft(runtime.State);
+        if (itemGroupDraft is null)
+        {
+            itemGroupDraft = ItemGroupCatalog.NewDraft(runtime.State);
+            itemGroupEditorOrigin = WorkbenchView.ItemGroups;
+        }
+        if (itemGroupDraft is null)
+            return;
+
+        var added = ItemGroupCatalog.AddMissing(
+            itemGroupDraft,
+            items.Select(item => new ItemGroupItem
+            {
+                ItemId = item.ItemId,
+                ItemName = item.ItemName,
+                Quality = ItemQualityPolicy.Any,
+            }));
+        itemGroupWorkspaceStatus = added == 0
+            ? "Selected items are already in this group."
+            : $"Added {added:N0} selected {(added == 1 ? "item" : "items")}.";
     }
 
     private void UpsertSelectedStockRules(
@@ -3614,18 +3654,6 @@ public sealed class QuartermasterWindow : Window
             : group.LowestPrice == group.HighestPrice
                 ? $"{group.LowestPrice:N0} gil"
                 : $"{group.LowestPrice:N0}–{group.HighestPrice:N0}";
-
-    private IReadOnlyList<StockGroup> SortItems(IReadOnlyList<StockGroup> rows)
-    {
-        IEnumerable<StockGroup> sorted = workbench.ItemSort switch
-        {
-            "Total" => rows.OrderBy(row => row.TotalQuantity),
-            "Player" => rows.OrderBy(row => row.PlayerQuantity),
-            "Retainers" => rows.OrderBy(row => row.RetainerQuantity),
-            _ => rows.OrderBy(row => row.ItemName, StringComparer.OrdinalIgnoreCase),
-        };
-        return (workbench.ItemSortDescending ? sorted.Reverse() : sorted).ToArray();
-    }
 
     private static string QualityLabel(ItemQualityPolicy quality) => quality switch
     {
