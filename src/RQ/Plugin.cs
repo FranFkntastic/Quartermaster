@@ -156,7 +156,10 @@ public sealed class Plugin : IDalamudPlugin
         TransferPlanMigration.EnsureOwnerPlans(state, CurrentOwner());
         captures = new(addonLifecycle, log, scanner, cache, CurrentOwner);
         var automation = new AutomationLease();
-        var retainerSession = new DalamudRetainerAutomationSession(framework, gameGui, dataManager, log, objects, targets, sigScanner);
+        // Keep retrieval verification bound to the exact inventory changes emitted
+        // while its native command is in flight; this survives retainer slot compaction.
+        var retainerSession = new DalamudRetainerAutomationSession(
+            framework, gameGui, dataManager, log, objects, targets, sigScanner, gameInventory);
         var autoRetainerIpc = new DalamudAutoRetainerIpc(pluginInterface);
         autoRetainer = new(framework, log, captures, retainerSession, autoRetainerIpc, automation);
         journal = new OperationJournal(state);
