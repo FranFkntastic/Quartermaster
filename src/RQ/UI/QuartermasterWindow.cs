@@ -227,21 +227,21 @@ public sealed class QuartermasterWindow : Window
             DrawContextMenu: DrawStockRowContextMenu),
         new(
             "Player",
-            58,
+            74,
             row => row.Item.PlayerQuantity.ToString("N0"),
             row => row.Item.PlayerQuantity,
             Alignment: DalamudTableCellAlignment.Right,
             DrawContextMenu: DrawStockRowContextMenu),
         new(
             "Stored",
-            66,
+            78,
             row => row.Item.RetainerQuantity.ToString("N0"),
             row => row.Item.RetainerQuantity,
             Alignment: DalamudTableCellAlignment.Right,
             DrawContextMenu: DrawStockRowContextMenu),
         new(
             "Target",
-            68,
+            76,
             row => row.Rule?.TargetQuantity.ToString("N0") ?? "—",
             row => row.Rule?.TargetQuantity ?? -1,
             TextColor: row => row.Rule is null
