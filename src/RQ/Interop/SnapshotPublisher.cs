@@ -18,10 +18,13 @@ public sealed class SnapshotPublisher
     private readonly string providerInstanceId;
     private readonly StateRepository state;
     private readonly Func<IReadOnlyDictionary<ulong, CachedRetainer>> cache;
+    private readonly object snapshotGate = new();
     private long revision;
+    private int snapshotDirty;
     private string snapshotJson = "{}";
     private IReadOnlyDictionary<string, string> operationJson = new Dictionary<string, string>();
     private OwnerScope currentOwner = new();
+    private SnapshotInputs? latestInputs;
 
     public SnapshotPublisher(string providerInstanceId, StateRepository state, Func<IReadOnlyDictionary<ulong, CachedRetainer>> cache)
     {
@@ -31,7 +34,11 @@ public sealed class SnapshotPublisher
     }
 
     public long Revision => Interlocked.Read(ref revision);
-    public string GetSnapshot() => Volatile.Read(ref snapshotJson);
+    public string GetSnapshot()
+    {
+        EnsureSnapshotCurrent();
+        return Volatile.Read(ref snapshotJson);
+    }
     public string GetOperation(string operationId) => Volatile.Read(ref operationJson).TryGetValue(operationId, out var json)
         ? json
         : JsonSerializer.Serialize(new
@@ -49,27 +56,111 @@ public sealed class SnapshotPublisher
         Refresh(owner, playerStorage, state.Snapshot(), cache());
     }
 
-    public void Refresh(QuartermasterRuntimeSnapshot runtime) =>
-        Refresh(runtime.Owner, runtime.PlayerStorage, runtime.State, runtime.Retainers, runtime.Stowage);
+    public void Refresh(QuartermasterRuntimeSnapshot runtime, bool rebuildSnapshot = true)
+    {
+        // The repository remains authoritative for operations that may have
+        // advanced while expensive stock reconciliation was intentionally held.
+        Refresh(runtime.Owner, runtime.PlayerStorage, state.Snapshot(), runtime.Retainers, runtime.Stowage, rebuildSnapshot);
+    }
+
+    public void RefreshOperations(OwnerScope owner, IReadOnlyCollection<string> operationIds)
+    {
+        Volatile.Write(ref currentOwner, owner);
+        Interlocked.Increment(ref revision);
+        if (operationIds.Count > 0)
+        {
+            var updated = new Dictionary<string, string>(Volatile.Read(ref operationJson), StringComparer.Ordinal);
+            state.Read(document =>
+            {
+                foreach (var operationId in operationIds)
+                {
+                    var operation = document.Operations.FirstOrDefault(candidate =>
+                        candidate.OperationId == operationId && candidate.Owner.Matches(owner));
+                    if (operation is null)
+                    {
+                        updated.Remove(operationId);
+                        continue;
+                    }
+
+                    updated[operationId] = JsonSerializer.Serialize(OperationEnvelope(
+                        operation,
+                        document.Receipts
+                            .Where(receipt => receipt.OperationId == operationId)
+                            .OrderBy(receipt => receipt.Revision)), JsonOptions);
+                }
+                return true;
+            });
+            Volatile.Write(ref operationJson, updated);
+        }
+        Interlocked.Exchange(ref snapshotDirty, 1);
+    }
 
     private void Refresh(
         OwnerScope owner,
         PlayerStorageCapture playerStorage,
         QuartermasterState stateSnapshot,
         IReadOnlyDictionary<ulong, CachedRetainer> retainersById,
-        IReadOnlyList<StowageEvaluation>? stowage = null)
+        IReadOnlyList<StowageEvaluation>? stowage = null,
+        bool rebuildSnapshot = true)
     {
         Volatile.Write(ref currentOwner, owner);
+        Volatile.Write(ref latestInputs, new SnapshotInputs(owner, playerStorage, retainersById, stowage ?? []));
         var nextRevision = Interlocked.Increment(ref revision);
+        Volatile.Write(ref operationJson, BuildOperationJson(stateSnapshot, owner));
+        if (rebuildSnapshot)
+        {
+            lock (snapshotGate)
+            {
+                WriteSnapshot(owner, playerStorage, stateSnapshot, retainersById, stowage ?? [], nextRevision);
+                Interlocked.Exchange(ref snapshotDirty, 0);
+            }
+        }
+        else
+            Interlocked.Exchange(ref snapshotDirty, 1);
+    }
+
+    private void EnsureSnapshotCurrent()
+    {
+        if (Volatile.Read(ref snapshotDirty) == 0)
+            return;
+
+        lock (snapshotGate)
+        {
+            if (Interlocked.Exchange(ref snapshotDirty, 0) == 0)
+                return;
+            if (Volatile.Read(ref latestInputs) is not { } inputs)
+            {
+                Interlocked.Exchange(ref snapshotDirty, 1);
+                return;
+            }
+            WriteSnapshot(
+                inputs.Owner,
+                inputs.PlayerStorage,
+                state.Snapshot(),
+                inputs.Retainers,
+                inputs.Stowage,
+                Revision);
+        }
+    }
+
+    private void WriteSnapshot(
+        OwnerScope owner,
+        PlayerStorageCapture playerStorage,
+        QuartermasterState stateSnapshot,
+        IReadOnlyDictionary<ulong, CachedRetainer> retainersById,
+        IReadOnlyList<StowageEvaluation> stowage,
+        long snapshotRevision)
+    {
         var retainers = retainersById.Values
             .Where(retainer => owner.Matches(retainer.Owner))
             .OrderBy(retainer => retainer.RetainerName)
             .Select(RetainerContract)
             .ToArray();
-        var scopedOperations = stateSnapshot.Operations.Where(operation => operation.Owner.Matches(owner)).ToArray();
-        var current = scopedOperations.OrderByDescending(operation => operation.UpdatedAtUtc).FirstOrDefault();
-        var latestListingCapture = stateSnapshot.LatestRetainerListingCapture is { } capture &&
-                                   owner.Matches(capture.Owner)
+        var current = stateSnapshot.Operations
+            .Where(operation => operation.Owner.Matches(owner))
+            .OrderByDescending(operation => operation.UpdatedAtUtc)
+            .FirstOrDefault();
+        var latestListingCapture = stateSnapshot.LatestRetainerListingCapture is { } capture && owner.Matches(capture.Owner)
             ? capture
             : null;
         var snapshot = new
@@ -77,27 +168,32 @@ public sealed class SnapshotPublisher
             schema = "gooseworks-quartermaster-snapshot/v1",
             providerInstanceId,
             owner,
-            revision = nextRevision,
+            revision = snapshotRevision,
             generatedAtUtc = DateTime.UtcNow,
             playerBags = playerStorage.Bags,
             playerStorage = new { requestedSources = playerStorage.RequestedSources, observedSources = playerStorage.ObservedSources },
             retainers,
             latestRetainerListingCapture = latestListingCapture,
             planItems = stateSnapshot.PlanItems,
-            transferPlans = TransferPlanContract(stateSnapshot, owner, stowage ?? []),
-            stowagePlans = StowageContract(stateSnapshot, owner, stowage ?? []),
+            transferPlans = TransferPlanContract(stateSnapshot, owner, stowage),
+            stowagePlans = StowageContract(stateSnapshot, owner, stowage),
             restockPlans = RestockContract(stateSnapshot, owner),
             currentOperation = current is null ? null : OperationContract(current),
         };
-        var operations = scopedOperations.ToDictionary(
-            operation => operation.OperationId,
-            operation => JsonSerializer.Serialize(OperationEnvelope(
-                operation,
-                stateSnapshot.Receipts.Where(receipt => receipt.OperationId == operation.OperationId).OrderBy(receipt => receipt.Revision)), JsonOptions),
-            StringComparer.Ordinal);
-        Volatile.Write(ref operationJson, operations);
         Volatile.Write(ref snapshotJson, JsonSerializer.Serialize(snapshot, JsonOptions));
     }
+
+    private IReadOnlyDictionary<string, string> BuildOperationJson(QuartermasterState stateSnapshot, OwnerScope owner) =>
+        stateSnapshot.Operations
+            .Where(operation => operation.Owner.Matches(owner))
+            .ToDictionary(
+                operation => operation.OperationId,
+                operation => JsonSerializer.Serialize(OperationEnvelope(
+                    operation,
+                    stateSnapshot.Receipts
+                        .Where(receipt => receipt.OperationId == operation.OperationId)
+                        .OrderBy(receipt => receipt.Revision)), JsonOptions),
+                StringComparer.Ordinal);
 
     public void Refresh(OwnerScope owner, IReadOnlyList<InventoryBag> playerBags) => Refresh(
         owner,
@@ -294,4 +390,10 @@ public sealed class SnapshotPublisher
             listedAt = listing.ListedAtUtc,
         }),
     };
+
+    private sealed record SnapshotInputs(
+        OwnerScope Owner,
+        PlayerStorageCapture PlayerStorage,
+        IReadOnlyDictionary<ulong, CachedRetainer> Retainers,
+        IReadOnlyList<StowageEvaluation> Stowage);
 }

@@ -7,6 +7,10 @@ namespace RQ.Runtime;
 
 public sealed record QuartermasterRuntimeSnapshot(
     long Revision,
+    long StockRevision,
+    long PlanningRevision,
+    long ListingsRevision,
+    long OperationsRevision,
     DateTime CapturedAtUtc,
     OwnerScope Owner,
     PlayerStorageCapture PlayerStorage,
@@ -27,6 +31,10 @@ public sealed class QuartermasterRuntimeSnapshotSource
     private readonly Func<OwnerScope> currentOwner;
     private QuartermasterRuntimeSnapshot? current;
     private long revision;
+    private long stockRevision;
+    private long planningRevision;
+    private long listingsRevision;
+    private long operationsRevision;
 
     public QuartermasterRuntimeSnapshotSource(
         InventoryScanner scanner,
@@ -45,52 +53,129 @@ public sealed class QuartermasterRuntimeSnapshotSource
     public QuartermasterRuntimeSnapshot Current => Volatile.Read(ref current)
         ?? throw new InvalidOperationException("Quartermaster runtime snapshot has not been initialized.");
 
-    public QuartermasterRuntimeSnapshot Refresh()
-    {
-        lock (gate)
-            return RefreshCore();
-    }
+    public QuartermasterRuntimeSnapshot Refresh() => Refresh(RuntimeDomain.All);
 
-    public QuartermasterRuntimeSnapshot ApplyPlayerInventoryChange(PlayerInventoryCacheChange change)
+    public QuartermasterRuntimeSnapshot Refresh(
+        RuntimeDomain domains,
+        PlayerInventoryCacheChange? playerChange = null)
     {
-        ArgumentNullException.ThrowIfNull(change);
         lock (gate)
         {
             var existing = current;
-            if (existing is null || change.IsBaseline || !existing.Owner.Matches(change.Owner))
-                return RefreshCore();
+            var owner = currentOwner();
+            if (existing is null || domains == RuntimeDomain.All || !existing.Owner.Matches(owner))
+                return RefreshAll(owner);
+            if (domains == RuntimeDomain.None)
+                return existing;
 
-            var playerStorage = ApplyPlayerStorageChanges(existing.PlayerStorage, change);
-            var browser = BrowserProjectionBuilder.ApplyPlayerChanges(existing.Browser, change, scanner.ResolveItemMetadata);
-            var snapshot = BuildSnapshot(
-                change.ObservedAtUtc,
-                existing.Owner,
+            var capturedAtUtc = DateTime.UtcNow;
+            // Operation history is read directly by its owner. It receives its
+            // own revision without cloning the large plan document into every
+            // runtime snapshot during a transfer.
+            var stateChanged = (domains & (RuntimeDomain.Plans | RuntimeDomain.Listings)) != 0;
+            var retainersChanged = (domains & (RuntimeDomain.RetainerStock | RuntimeDomain.Listings)) != 0;
+            var stockChanged = (domains & (RuntimeDomain.PlayerInventory | RuntimeDomain.RetainerStock)) != 0;
+            var planningChanged = stockChanged || (domains & RuntimeDomain.Plans) != 0;
+            var listingsChanged = (domains & RuntimeDomain.Listings) != 0;
+            var operationsChanged = (domains & RuntimeDomain.Operations) != 0;
+
+            var stateSnapshot = stateChanged ? state.Snapshot() : existing.State;
+            var retainers = retainersChanged ? cache.Snapshot() : existing.Retainers;
+            var playerStorage = existing.PlayerStorage;
+            var browser = existing.Browser;
+
+            if ((domains & RuntimeDomain.PlayerInventory) != 0)
+            {
+                if (playerChange is { IsBaseline: false } change && existing.Owner.Matches(change.Owner))
+                {
+                    playerStorage = ApplyPlayerStorageChanges(existing.PlayerStorage, change);
+                    browser = BrowserProjectionBuilder.ApplyPlayerChanges(browser, change, scanner.ResolveItemMetadata);
+                    capturedAtUtc = change.ObservedAtUtc;
+                }
+                else
+                {
+                    playerStorage = playerInventory.Snapshot(owner, scanner.RequestedPlayerStorageSources());
+                    browser = BrowserProjectionBuilder.RefreshRetainerStock(
+                        browser,
+                        playerStorage.Bags,
+                        retainers,
+                        owner,
+                        scanner.ResolveItemMetadata);
+                }
+            }
+
+            if ((domains & RuntimeDomain.RetainerStock) != 0)
+            {
+                browser = BrowserProjectionBuilder.RefreshRetainerStock(
+                    browser,
+                    playerStorage.Bags,
+                    retainers,
+                    owner,
+                    scanner.ResolveItemMetadata);
+            }
+
+            if (listingsChanged)
+                browser = BrowserProjectionBuilder.RefreshListings(browser, retainers, owner, scanner.ResolveItemMetadata);
+
+            var retrieval = existing.Retrieval;
+            var deposit = existing.Deposit;
+            var stowage = existing.Stowage;
+            if (planningChanged)
+                (retrieval, deposit, stowage) = BuildPlanning(capturedAtUtc, owner, retainers, stateSnapshot, browser);
+
+            var snapshot = new QuartermasterRuntimeSnapshot(
+                Interlocked.Increment(ref revision),
+                stockChanged ? Interlocked.Increment(ref stockRevision) : existing.StockRevision,
+                planningChanged ? Interlocked.Increment(ref planningRevision) : existing.PlanningRevision,
+                listingsChanged ? Interlocked.Increment(ref listingsRevision) : existing.ListingsRevision,
+                operationsChanged ? Interlocked.Increment(ref operationsRevision) : existing.OperationsRevision,
+                capturedAtUtc,
+                owner,
                 playerStorage,
-                existing.Retainers,
-                existing.State,
-                browser);
+                retainers,
+                stateSnapshot,
+                browser,
+                retrieval,
+                deposit,
+                stowage);
             Volatile.Write(ref current, snapshot);
             return snapshot;
         }
     }
 
-    private QuartermasterRuntimeSnapshot RefreshCore()
+    public QuartermasterRuntimeSnapshot ApplyPlayerInventoryChange(PlayerInventoryCacheChange change) =>
+        Refresh(RuntimeDomain.PlayerInventory, change);
+
+    private QuartermasterRuntimeSnapshot RefreshAll(OwnerScope owner)
     {
         var capturedAtUtc = DateTime.UtcNow;
-        var owner = currentOwner();
         var playerStorage = playerInventory.Snapshot(owner, scanner.RequestedPlayerStorageSources());
         var retainers = cache.Snapshot();
         var stateSnapshot = state.Snapshot();
         var browser = BrowserProjectionBuilder.Build(playerStorage.Bags, retainers, owner, scanner.ResolveItemMetadata);
-        var snapshot = BuildSnapshot(capturedAtUtc, owner, playerStorage, retainers, stateSnapshot, browser);
+        var (retrieval, deposit, stowage) = BuildPlanning(capturedAtUtc, owner, retainers, stateSnapshot, browser);
+        var snapshot = new QuartermasterRuntimeSnapshot(
+            Interlocked.Increment(ref revision),
+            Interlocked.Increment(ref stockRevision),
+            Interlocked.Increment(ref planningRevision),
+            Interlocked.Increment(ref listingsRevision),
+            Interlocked.Increment(ref operationsRevision),
+            capturedAtUtc,
+            owner,
+            playerStorage,
+            retainers,
+            stateSnapshot,
+            browser,
+            retrieval,
+            deposit,
+            stowage);
         Volatile.Write(ref current, snapshot);
         return snapshot;
     }
 
-    private QuartermasterRuntimeSnapshot BuildSnapshot(
+    private (RetrievalPlan Retrieval, ElementalDepositPlan Deposit, IReadOnlyList<StowageEvaluation> Stowage) BuildPlanning(
         DateTime capturedAtUtc,
         OwnerScope owner,
-        PlayerStorageCapture playerStorage,
         IReadOnlyDictionary<ulong, CachedRetainer> retainers,
         QuartermasterState stateSnapshot,
         BrowserProjection browser)
@@ -111,20 +196,10 @@ public sealed class QuartermasterRuntimeSnapshotSource
             })
             .Where(item => item.Quantity > 0)
             .ToDictionary(item => item.ItemId, item => item.Quantity);
-        var deposit = ElementalDepositPlanner.Build(crystalCounts, retainers, owner, scanner.ResolveItemName, capturedAtUtc);
-        var stowage = StowageEvaluator.Build(stateSnapshot, browser, owner);
-        var snapshot = new QuartermasterRuntimeSnapshot(
-            Interlocked.Increment(ref revision),
-            capturedAtUtc,
-            owner,
-            playerStorage,
-            retainers,
-            stateSnapshot,
-            browser,
+        return (
             retrieval,
-            deposit,
-            stowage);
-        return snapshot;
+            ElementalDepositPlanner.Build(crystalCounts, retainers, owner, scanner.ResolveItemName, capturedAtUtc),
+            StowageEvaluator.Build(stateSnapshot, browser, owner));
     }
 
     private static PlayerStorageCapture ApplyPlayerStorageChanges(

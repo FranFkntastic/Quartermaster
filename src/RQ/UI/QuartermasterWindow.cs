@@ -735,7 +735,7 @@ public sealed class QuartermasterWindow : Window
             if (listingsOpen)
             {
                 workbench.View = WorkbenchView.Listings;
-                DrawListings(runtime.Browser, runtime.Revision);
+                DrawListings(runtime.Browser, runtime.ListingsRevision);
                 ImGui.EndTabItem();
             }
             ImGui.EndTabBar();
@@ -860,17 +860,17 @@ public sealed class QuartermasterWindow : Window
             workbench.ItemFilterState.Expression,
             workbench.ScopeKey,
             workbench.ItemFilterState.IsInputActive,
-            runtime.Revision);
+            runtime.StockRevision);
         VisibleStockCount = result.Items.Count;
         if (!result.Filter.IsValid)
             ImGui.TextColored(
                 new Vector4(1f, .65f, .25f, 1f),
                 result.Filter.Diagnostics.FirstOrDefault()?.Message ?? "Invalid filter");
 
-        if (stockSelectionRevision != runtime.Revision)
+        if (stockSelectionRevision != runtime.StockRevision)
         {
             stockSelection.Retain(projection.Items.Select(item => item.ItemId));
-            stockSelectionRevision = runtime.Revision;
+            stockSelectionRevision = runtime.StockRevision;
         }
         var selectedPlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
         var sourceRows = ResolveStockWorkbenchProjection(runtime, result.Items, selectedPlan);
@@ -925,7 +925,7 @@ public sealed class QuartermasterWindow : Window
         StowagePlan? selectedPlan)
     {
         if (stockWorkbenchProjection is { } cached &&
-            cached.RuntimeRevision == runtime.Revision &&
+            cached.RuntimeRevision == runtime.PlanningRevision &&
             cached.PlanId == selectedPlan?.Id &&
             ReferenceEquals(cached.QueryItems, queryItems))
             return cached.Rows;
@@ -949,7 +949,7 @@ public sealed class QuartermasterWindow : Window
                 return new StockWorkbenchRow(item, rule, line);
             })
             .ToArray();
-        stockWorkbenchProjection = new(runtime.Revision, selectedPlan?.Id, queryItems, rows);
+        stockWorkbenchProjection = new(runtime.PlanningRevision, selectedPlan?.Id, queryItems, rows);
         stockProjectionBuildCount++;
         return rows;
     }
@@ -2858,7 +2858,7 @@ public sealed class QuartermasterWindow : Window
         StowagePlan plan)
     {
         if (transferWorkbenchProjection is { } cached &&
-            cached.RuntimeRevision == runtime.Revision &&
+            cached.RuntimeRevision == runtime.PlanningRevision &&
             cached.PlanId == plan.Id)
             return cached;
 
@@ -2897,7 +2897,7 @@ public sealed class QuartermasterWindow : Window
             })
             .ToArray();
         transferWorkbenchProjection = new(
-            runtime.Revision,
+            runtime.PlanningRevision,
             plan.Id,
             rules,
             stowage,
