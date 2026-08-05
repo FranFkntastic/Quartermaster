@@ -1,4 +1,5 @@
 using RQ.Domain;
+using RQ.Planning;
 using RQ.UI;
 
 namespace RQ.Tests;
@@ -19,6 +20,23 @@ public sealed class TransferExecutionPolicyTests
         Assert.False(plan.Enabled);
         Assert.True(availability.CanExecute);
         Assert.Null(availability.BlockReason);
+    }
+
+    [Fact]
+    public void DepositOnlyPlan_RemainsExecutableWhileCapacityEvidenceIsMissing()
+    {
+        var request = new StowageDepositRequest(null, null, 100, "Ore", false, 7, new StowageRoutingPolicy());
+        var deposit = new StowageDepositBatch(
+            DateTime.UtcNow,
+            [new StowageRoute(request, [], 0, 7)]);
+
+        Assert.True(TransferExecutionPolicy.HasMovement(0, deposit));
+        Assert.True(TransferExecutionPolicy.RequiresCapacityRecovery(deposit));
+        Assert.True(TransferExecutionPolicy.ForExplicitRun(
+            TransferExecutionPolicy.HasMovement(0, deposit),
+            ownerScopeAvailable: true,
+            transferAvailable: true,
+            refreshActive: false).CanExecute);
     }
 
     [Theory]

@@ -68,6 +68,8 @@ public sealed class AutoRetainerRefreshService : IDisposable
     public string Status { get; private set; } = "Retainer refresh has not run.";
 
     public bool IsAvailable => autoRetainer.IsAvailable;
+    public long CompletedRunSequence { get; private set; }
+    public bool? LastRunSucceeded { get; private set; }
 
     public void TickAutomatic(bool stockBrowserVisible)
     {
@@ -192,6 +194,7 @@ public sealed class AutoRetainerRefreshService : IDisposable
                     phase = AutoRetainerRefreshPhase.Idle;
                     ReleaseAutomationLease();
                     Status = "No available retainers were found.";
+                    CompleteRun(false);
                     return;
                 }
                 phase = AutoRetainerRefreshPhase.Refreshing;
@@ -323,6 +326,7 @@ public sealed class AutoRetainerRefreshService : IDisposable
                     phase = AutoRetainerRefreshPhase.Idle;
                     ReleaseAutomationLease();
                     Status = $"Retainer refresh complete: {processed}/{expected}.";
+                    CompleteRun(true);
                 }
                 else if (!request.PartOfFullRefresh)
                 {
@@ -401,6 +405,7 @@ public sealed class AutoRetainerRefreshService : IDisposable
         phase = AutoRetainerRefreshPhase.Idle;
         ReleaseAutomationLease();
         Status = $"{message} {exception.Message}";
+        CompleteRun(false);
         if (readyRequest is not null)
         {
             try { session.CancelActive(); }
@@ -408,6 +413,12 @@ public sealed class AutoRetainerRefreshService : IDisposable
             try { autoRetainer.FinishPostprocess(); }
             catch { }
         }
+    }
+
+    private void CompleteRun(bool succeeded)
+    {
+        LastRunSucceeded = succeeded;
+        CompletedRunSequence++;
     }
 
     public void Dispose()

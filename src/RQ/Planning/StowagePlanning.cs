@@ -330,6 +330,7 @@ public sealed record StowageDepositBatch(
     DateTime BuiltAtUtc,
     IReadOnlyList<StowageRoute> Routes)
 {
+    public int RequestedQuantity => Routes.Sum(route => route.Request.Quantity);
     public int PlannedQuantity => Routes.Sum(route => route.RoutedQuantity);
     public int RemainingQuantity => Routes.Sum(route => route.RemainingQuantity);
 }

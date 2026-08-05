@@ -99,6 +99,77 @@ public sealed class BrowserProjection
 
 public static class BrowserProjectionBuilder
 {
+    public static BrowserProjection ApplyPlayerChanges(
+        BrowserProjection current,
+        PlayerInventoryCacheChange change,
+        Func<uint, ItemMetadata> resolveMetadata)
+    {
+        ArgumentNullException.ThrowIfNull(current);
+        ArgumentNullException.ThrowIfNull(change);
+        ArgumentNullException.ThrowIfNull(resolveMetadata);
+        var affected = change.AffectedItemIds;
+        if (affected.Count == 0)
+            return current;
+
+        var groups = current.Items.ToDictionary(group => group.ItemId);
+        var stacks = affected.ToDictionary(
+            itemId => itemId,
+            itemId => groups.GetValueOrDefault(itemId)?.Stacks.ToList() ?? []);
+        foreach (var slot in change.Slots)
+        {
+            foreach (var itemId in affected)
+                stacks[itemId].RemoveAll(stack =>
+                    stack.ScopeKind == BrowserScopeKind.Player &&
+                    stack.Storage == slot.ContainerKey &&
+                    stack.SlotIndex == slot.SlotIndex);
+
+            if (slot.Current is not { } item || item.ItemId == 0 || item.Quantity == 0)
+                continue;
+            stacks[item.ItemId].Add(new(
+                BrowserScope.PlayerKey,
+                BrowserScopeKind.Player,
+                null,
+                "Player",
+                item.ContainerKey ?? slot.ContainerKey,
+                item.SlotIndex,
+                item.ItemId,
+                DisplayName(item.ItemId, item.ItemName),
+                checked((int)item.Quantity),
+                item.IsHq ? FfxivItemQuality.HQ : FfxivItemQuality.NQ,
+                change.ObservedAtUtc,
+                item.ItemType,
+                item.ConditionPercent is { } condition ? (decimal)condition : null,
+                item.Equipped));
+        }
+
+        foreach (var itemId in affected)
+        {
+            if (stacks[itemId].Count == 0)
+            {
+                groups.Remove(itemId);
+                continue;
+            }
+            var definition = groups.GetValueOrDefault(itemId)?.Definition ?? resolveMetadata(itemId);
+            groups[itemId] = new(
+                itemId,
+                stacks[itemId].Select(stack => stack.ItemName).FirstOrDefault(name => !string.IsNullOrWhiteSpace(name)) ?? $"Item {itemId}",
+                stacks[itemId].OrderBy(stack => stack.ScopeKind).ThenBy(stack => stack.OwnerName).ToArray(),
+                definition);
+        }
+
+        return new BrowserProjection
+        {
+            Scopes = current.Scopes,
+            Items = groups.Values
+                .OrderBy(group => group.ItemName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(group => group.ItemId)
+                .ToArray(),
+            Listings = current.Listings,
+            Owner = current.Owner,
+            RetainerInventoryCompleteByScope = current.RetainerInventoryCompleteByScope,
+        };
+    }
+
     public static BrowserProjection Build(
         IReadOnlyList<InventoryBag> playerBags,
         IReadOnlyDictionary<ulong, CachedRetainer> cache,
