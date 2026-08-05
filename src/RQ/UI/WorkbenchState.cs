@@ -15,8 +15,6 @@ public sealed class WorkbenchState
     public string ScopeKey { get; set; } = BrowserScope.AllKey;
     public DalamudFilterAutocompleteState ItemFilterState { get; } = new();
     public DalamudFilterAutocompleteState ListingFilterState { get; } = new();
-    public string ItemSort { get; set; } = "Name";
-    public bool ItemSortDescending { get; set; }
     public string ListingSort { get; set; } = "Item";
     public bool ListingSortDescending { get; set; }
     public uint? SelectedListingItemId { get; set; }
