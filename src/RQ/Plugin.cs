@@ -172,7 +172,8 @@ public sealed class Plugin : IDalamudPlugin
             cache,
             CurrentOwner,
             CountCachedPlayerItems,
-            automation);
+            automation,
+            autoRetainer: autoRetainerIpc);
         automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerIpc);
         runtimeSnapshots = new(scanner, playerInventory, cache, state, CurrentOwner);
         playerInventoryReconciler.ReconcileIfDue(DateTime.UtcNow, force: true);

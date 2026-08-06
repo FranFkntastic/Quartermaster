@@ -56,6 +56,9 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
     private readonly AutomationLease automation;
     private readonly Func<DateTime> utcNow;
     private readonly RetainerStockMutationPersistence stockMutations;
+    private readonly IAutoRetainerIpc? autoRetainer;
+    private readonly TimeSpan autoRetainerWait;
+    private readonly TimeSpan autoRetainerPoll;
     private readonly object activeGate = new();
     private CancellationTokenSource? activeCancellation;
     private int running;
@@ -67,7 +70,10 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         Func<OwnerScope> currentOwner,
         Func<IReadOnlyDictionary<uint, int>> playerInventory,
         AutomationLease? automation = null,
-        Func<DateTime>? utcNow = null)
+        Func<DateTime>? utcNow = null,
+        IAutoRetainerIpc? autoRetainer = null,
+        TimeSpan? autoRetainerWait = null,
+        TimeSpan? autoRetainerPoll = null)
     {
         this.journal = journal;
         this.driver = driver;
@@ -76,16 +82,27 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         this.playerInventory = playerInventory;
         this.automation = automation ?? new AutomationLease();
         this.utcNow = utcNow ?? (() => DateTime.UtcNow);
+        this.autoRetainer = autoRetainer;
+        this.autoRetainerWait = autoRetainerWait ?? TimeSpan.FromSeconds(30);
+        this.autoRetainerPoll = autoRetainerPoll ?? TimeSpan.FromMilliseconds(250);
         stockMutations = new(journal, cache);
     }
 
     public bool IsRunning => Volatile.Read(ref running) != 0;
     public bool CanStart => !automation.IsHeld && !IsRunning;
 
-    public async Task<TransferExecutionResult> ExecutePlanAsync(
+    public Task<TransferExecutionResult> ExecutePlanAsync(
         string? retrievalOperationId,
         string? depositOperationId,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        WithAutoRetainerCoordinationAsync(
+            () => ExecutePlanCoreAsync(retrievalOperationId, depositOperationId, cancellationToken),
+            cancellationToken);
+
+    private async Task<TransferExecutionResult> ExecutePlanCoreAsync(
+        string? retrievalOperationId,
+        string? depositOperationId,
+        CancellationToken cancellationToken)
     {
         if (retrievalOperationId is null && depositOperationId is null)
             return new(false, "The transfer plan has no movement to execute.");
@@ -118,7 +135,12 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
     /// Executes a persisted, reviewed retrieval operation retainer by retainer.
     /// Every successful movement is durably reconciled before the next stack begins.
     /// </summary>
-    public async Task<TransferExecutionResult> ExecuteRetrievalAsync(string operationId, CancellationToken cancellationToken = default)
+    public Task<TransferExecutionResult> ExecuteRetrievalAsync(string operationId, CancellationToken cancellationToken = default) =>
+        WithAutoRetainerCoordinationAsync(
+            () => ExecuteRetrievalCoreAsync(operationId, cancellationToken),
+            cancellationToken);
+
+    private async Task<TransferExecutionResult> ExecuteRetrievalCoreAsync(string operationId, CancellationToken cancellationToken)
     {
         if (!automation.TryAcquire("retainer transfer", out var lease))
             return new(false, $"Automation is busy with {automation.Holder}.");
@@ -342,7 +364,12 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         }
     }
 
-    public async Task<TransferExecutionResult> ExecuteDepositAsync(string operationId, CancellationToken cancellationToken = default)
+    public Task<TransferExecutionResult> ExecuteDepositAsync(string operationId, CancellationToken cancellationToken = default) =>
+        WithAutoRetainerCoordinationAsync(
+            () => ExecuteDepositCoreAsync(operationId, cancellationToken),
+            cancellationToken);
+
+    private async Task<TransferExecutionResult> ExecuteDepositCoreAsync(string operationId, CancellationToken cancellationToken)
     {
         if (!automation.TryAcquire("retainer transfer", out var lease))
             return new(false, $"Automation is busy with {automation.Holder}.");
@@ -403,6 +430,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     : (await driver.ScanPlayerInventoryAsync(wanted, token).ConfigureAwait(false))
                         .Concat(await driver.ScanPlayerCrystalsAsync(wanted, token).ConfigureAwait(false))
                         .ToArray();
+                var depositedSinceScan = new Dictionary<string, int>(StringComparer.Ordinal);
                 foreach (var stack in stacks)
                 {
                     token.ThrowIfCancellationRequested();
@@ -434,9 +462,12 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                             }
                             if (!result.Success)
                             {
-                                return result.Code == "NoCapacity"
-                                    ? VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Unchanged(result)
-                                    : VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Indeterminate(result);
+                                if (result.Code == "NoCapacity")
+                                    return VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Unchanged(result);
+                                if (result.Code == "DepositNotObserved" &&
+                                    await PlayerVariantUnchangedAsync(stacks, depositedSinceScan, key, stack.ItemId, mutationToken).ConfigureAwait(false))
+                                    return VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Unchanged(result);
+                                return VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Indeterminate(result);
                             }
                             if (result.Transferred <= 0)
                                 return VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Unchanged(result);
@@ -452,14 +483,38 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     var result = attempt.Result;
                     movementAttempted = previousMovementAttempted ||
                                         attempt.Evidence != VerifiedMutationEvidence.Unchanged;
-                    if (!result.Success && result.Code == "NoCapacity")
+                    if (!result.Success &&
+                        attempt.Evidence == VerifiedMutationEvidence.Unchanged &&
+                        result.Code is "NoCapacity" or "DepositNotObserved")
+                    {
+                        candidateCapacity[key] = 0;
+                        journal.RecordWarning(
+                            operationId,
+                            result.Code == "NoCapacity" ? "DepositSkippedNoCapacity" : "DepositSkippedUnobserved",
+                            result.Code == "NoCapacity"
+                                ? $"{candidate.RetainerName} reported no live capacity for {itemName}; its remaining quantity will try other candidates."
+                                : $"Deposit of {itemName} at {candidate.RetainerName} could not be observed and the player stack is provably unchanged; its remaining quantity will try other candidates.");
                         continue;
+                    }
                     if (!result.Success)
                         throw new InvalidOperationException(result.Message);
                     if (result.Transferred == 0)
+                    {
+                        if (result.Code == "NoCapacity")
+                        {
+                            candidateCapacity[key] = 0;
+                            journal.RecordWarning(
+                                operationId,
+                                "DepositSkippedNoCapacity",
+                                $"{candidate.RetainerName} crystal storage is full for {itemName}; its remaining quantity will try other candidates.");
+                        }
                         continue;
+                    }
                     remaining[key] -= result.Transferred;
-                    candidateCapacity[key] -= result.Transferred;
+                    candidateCapacity[key] = result.Transferred < quantity
+                        ? 0
+                        : candidateCapacity[key] - result.Transferred;
+                    depositedSinceScan[key] = depositedSinceScan.GetValueOrDefault(key) + result.Transferred;
                     transferred += result.Transferred;
                     if (legacyCrystalDeposit)
                         journal.RecordTransfer(operationId, stack.ItemId, candidate.RetainerId, result.Transferred, result.Code, result.Message);
@@ -591,6 +646,119 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
 
     private static string RetrievalKey(uint itemId, ItemQualityPolicy quality) =>
         $"{itemId}:{quality}";
+
+    /// <summary>
+    /// Serializes live movement with AutoRetainer: waits a bounded time for it to
+    /// go idle, suppresses it for the movement unless someone else already holds
+    /// suppression, and restores only suppression this scope set. Nested scopes
+    /// (plan sequence around retrieval and deposit) reuse the outer acquisition.
+    /// </summary>
+    private async Task<TransferExecutionResult> WithAutoRetainerCoordinationAsync(
+        Func<Task<TransferExecutionResult>> body,
+        CancellationToken cancellationToken)
+    {
+        var ipc = autoRetainer;
+        if (ipc is null || !IsAutoRetainerAvailable(ipc))
+            return await body().ConfigureAwait(false);
+
+        var restoreSuppression = false;
+        try
+        {
+            var deadline = utcNow() + autoRetainerWait;
+            while (IsAutoRetainerBusy(ipc))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (utcNow() >= deadline)
+                    return new(false, "AutoRetainer remained busy beyond the coordination wait; the transfer was not started.");
+                await Task.Delay(autoRetainerPoll, cancellationToken).ConfigureAwait(false);
+            }
+            if (!ipc.IsSuppressed)
+            {
+                ipc.SetSuppressed(true);
+                restoreSuppression = true;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            return new(false, $"AutoRetainer coordination failed before the transfer started: {exception.Message}");
+        }
+
+        TransferExecutionResult result;
+        string? restoreFailure;
+        try
+        {
+            result = await body().ConfigureAwait(false);
+        }
+        finally
+        {
+            restoreFailure = RestoreAutoRetainerSuppression(ipc, restoreSuppression);
+        }
+        return restoreFailure is null
+            ? result
+            : result with { Message = $"{result.Message} AutoRetainer suppression could not be restored: {restoreFailure}" };
+    }
+
+    private static bool IsAutoRetainerAvailable(IAutoRetainerIpc ipc)
+    {
+        try
+        {
+            return ipc.IsAvailable;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsAutoRetainerBusy(IAutoRetainerIpc ipc)
+    {
+        try
+        {
+            return ipc.IsBusy;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string? RestoreAutoRetainerSuppression(IAutoRetainerIpc ipc, bool restoreSuppression)
+    {
+        if (!restoreSuppression)
+            return null;
+        try
+        {
+            ipc.SetSuppressed(false);
+            return null;
+        }
+        catch (Exception exception)
+        {
+            return exception.Message;
+        }
+    }
+
+    private async Task<bool> PlayerVariantUnchangedAsync(
+        IReadOnlyList<DalamudInventoryStack> scanStacks,
+        IReadOnlyDictionary<string, int> depositedSinceScan,
+        string variantKey,
+        uint itemId,
+        CancellationToken cancellationToken)
+    {
+        var scanned = scanStacks
+            .Where(stack => OperationJournal.VariantKey(stack.ItemId, stack.IsHighQuality) == variantKey)
+            .Sum(stack => stack.Quantity);
+        var expected = scanned - depositedSinceScan.GetValueOrDefault(variantKey);
+        var itemIds = new HashSet<uint> { itemId };
+        var current = (await driver.ScanPlayerInventoryAsync(itemIds, cancellationToken).ConfigureAwait(false))
+            .Concat(await driver.ScanPlayerCrystalsAsync(itemIds, cancellationToken).ConfigureAwait(false))
+            .Where(stack => OperationJournal.VariantKey(stack.ItemId, stack.IsHighQuality) == variantKey)
+            .Sum(stack => stack.Quantity);
+        return current == expected;
+    }
 
     private async Task<RetainerVariantObservation> ObserveVariantAsync(
         ulong retainerId,

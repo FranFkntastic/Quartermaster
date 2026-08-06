@@ -494,6 +494,463 @@ public sealed class OperationTests
         Assert.Empty(journal.PendingCacheInvalidations());
     }
 
+    [Fact]
+    public async Task Coordination_SuppressesAutoRetainerAndRestoresAfterRetrieval()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateManual(TestData.Owner, [new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }]);
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
+        var ipc = new FakeAutoRetainerIpc();
+        var coordinator = new TransferCoordinator(
+            journal,
+            new SuccessfulDriver(),
+            new RetainerCacheRepository(store),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>(),
+            autoRetainer: ipc);
+
+        await coordinator.ExecuteRetrievalAsync(operation.OperationId);
+
+        Assert.Equal(OperationStatuses.Succeeded, journal.Get(operation.OperationId)!.Status);
+        Assert.Equal([true, false], ipc.SuppressionCalls);
+        Assert.False(ipc.Suppressed);
+    }
+
+    [Fact]
+    public async Task Coordination_WaitsForBusyAutoRetainerBeforeSuppressing()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateManual(TestData.Owner, [new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }]);
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
+        var ipc = new FakeAutoRetainerIpc { BusyPollsBeforeIdle = 2 };
+        var coordinator = new TransferCoordinator(
+            journal,
+            new SuccessfulDriver(),
+            new RetainerCacheRepository(store),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>(),
+            autoRetainer: ipc,
+            autoRetainerWait: TimeSpan.FromSeconds(5),
+            autoRetainerPoll: TimeSpan.FromMilliseconds(10));
+
+        await coordinator.ExecuteRetrievalAsync(operation.OperationId);
+
+        Assert.Equal(OperationStatuses.Succeeded, journal.Get(operation.OperationId)!.Status);
+        Assert.True(ipc.BusyPolls >= 3);
+        Assert.Equal([true, false], ipc.SuppressionCalls);
+    }
+
+    [Fact]
+    public async Task Coordination_RefusesWhenAutoRetainerStaysBusy()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateManual(TestData.Owner, [new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }]);
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
+        var driver = new SuccessfulDriver();
+        var ipc = new FakeAutoRetainerIpc { AlwaysBusy = true };
+        var coordinator = new TransferCoordinator(
+            journal,
+            driver,
+            new RetainerCacheRepository(store),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>(),
+            autoRetainer: ipc,
+            autoRetainerWait: TimeSpan.FromMilliseconds(150),
+            autoRetainerPoll: TimeSpan.FromMilliseconds(20));
+
+        var result = await coordinator.ExecuteRetrievalAsync(operation.OperationId);
+
+        Assert.False(result.Started);
+        Assert.Contains("remained busy", result.Message);
+        Assert.Equal(OperationStatuses.Accepted, journal.Get(operation.OperationId)!.Status);
+        Assert.Empty(ipc.SuppressionCalls);
+        Assert.Equal(0, driver.Calls);
+    }
+
+    [Fact]
+    public async Task Coordination_PreservesSuppressionOwnedBySomeoneElse()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateManual(TestData.Owner, [new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }]);
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
+        var ipc = new FakeAutoRetainerIpc { Suppressed = true };
+        var coordinator = new TransferCoordinator(
+            journal,
+            new SuccessfulDriver(),
+            new RetainerCacheRepository(store),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>(),
+            autoRetainer: ipc);
+
+        await coordinator.ExecuteRetrievalAsync(operation.OperationId);
+
+        Assert.Equal(OperationStatuses.Succeeded, journal.Get(operation.OperationId)!.Status);
+        Assert.Empty(ipc.SuppressionCalls);
+        Assert.True(ipc.Suppressed);
+    }
+
+    [Fact]
+    public async Task Coordination_RestoreFailureSurfacesInResultMessage()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateManual(TestData.Owner, [new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }]);
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
+        var ipc = new FakeAutoRetainerIpc { ThrowOnUnsuppress = true };
+        var coordinator = new TransferCoordinator(
+            journal,
+            new SuccessfulDriver(),
+            new RetainerCacheRepository(store),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>(),
+            autoRetainer: ipc);
+
+        var result = await coordinator.ExecuteRetrievalAsync(operation.OperationId);
+
+        Assert.True(result.Started);
+        Assert.Contains("could not be restored", result.Message);
+        Assert.Equal(OperationStatuses.Succeeded, journal.Get(operation.OperationId)!.Status);
+        Assert.Equal([true], ipc.SuppressionCalls);
+    }
+
+    [Fact]
+    public async Task Coordination_PlanSequenceSuppressesOnceAcrossRetrievalAndDeposit()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var plan = new StowagePlan { Owner = TestData.Owner, Name = "Workshop supply" };
+        var retrieval = journal.CreateTransferRetrieval(
+            TestData.Owner,
+            plan,
+            [new TargetPlanItem { StowagePlanId = plan.Id, ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }]);
+        var deposit = journal.CreateTransferDeposit(
+            TestData.Owner,
+            plan,
+            new StowageDepositBatch(
+                DateTime.UtcNow,
+                [
+                    new StowageRoute(
+                        new StowageDepositRequest(plan.Id, Guid.NewGuid(), 200, "Ingot", false, 4, new StowageRoutingPolicy()),
+                        [new StowageAllocation(10, "Eris", 4, 20, DateTime.UtcNow)],
+                        4,
+                        0),
+                ]));
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
+        var ipc = new FakeAutoRetainerIpc();
+        var coordinator = new TransferCoordinator(
+            journal,
+            new SuccessfulDriver(),
+            new RetainerCacheRepository(store),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>(),
+            autoRetainer: ipc);
+
+        await coordinator.ExecutePlanAsync(retrieval.OperationId, deposit.OperationId);
+
+        Assert.Equal(OperationStatuses.Succeeded, journal.Get(retrieval.OperationId)!.Status);
+        Assert.Equal([true, false], ipc.SuppressionCalls);
+    }
+
+    [Fact]
+    public async Task DepositClamp_ZeroesLiveCandidateCapacityAndFinishesPartial()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateDeposit(
+            TestData.Owner,
+            new StowageDepositBatch(
+                DateTime.UtcNow,
+                [
+                    new StowageRoute(
+                        new StowageDepositRequest(null, null, 4, "Wind Shard", false, 9999, new StowageRoutingPolicy()),
+                        [new StowageAllocation(10, "Skor", 9999, 9999, DateTime.UtcNow)],
+                        9999,
+                        0),
+                ]));
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Skor") });
+        var driver = new CapacityDepositDriver
+        {
+            PlayerStacks =
+            [
+                new DalamudInventoryStack(InventoryType.Inventory1, 0, 4, 9999),
+                new DalamudInventoryStack(InventoryType.Inventory1, 1, 4, 9999),
+            ],
+            RetainerStacks = [new DalamudInventoryStack(InventoryType.RetainerPage1, 0, 4, 1)],
+        };
+        driver.DepositBehavior.Enqueue((_, _) => new RetainerDepositResult(true, 1, "TransferVerified", "Clamped to 1."));
+        var coordinator = new TransferCoordinator(
+            journal,
+            driver,
+            new RetainerCacheRepository(store),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>());
+
+        await coordinator.ExecuteDepositAsync(operation.OperationId);
+
+        var completed = journal.Get(operation.OperationId)!;
+        Assert.Equal(OperationStatuses.PartiallySucceeded, completed.Status);
+        Assert.Equal(1, Assert.Single(completed.Lines).TransferredQuantity);
+        Assert.Contains("9,998 remain", completed.Message);
+        Assert.Single(driver.DepositAttempts);
+    }
+
+    [Fact]
+    public async Task DepositNoCapacity_SkipsToNextCandidateWithReceipt()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateDeposit(
+            TestData.Owner,
+            new StowageDepositBatch(
+                DateTime.UtcNow,
+                [
+                    new StowageRoute(
+                        new StowageDepositRequest(null, null, 4, "Wind Shard", false, 9999, new StowageRoutingPolicy()),
+                        [
+                            new StowageAllocation(10, "Skor", 9999, 9999, DateTime.UtcNow),
+                            new StowageAllocation(20, "Nyx", 9999, 9999, DateTime.UtcNow),
+                        ],
+                        9999,
+                        0),
+                ]));
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer>
+        {
+            [10] = TestData.Retainer(10, "Skor"),
+            [20] = TestData.Retainer(20, "Nyx"),
+        });
+        var driver = new CapacityDepositDriver
+        {
+            PlayerStacks = [new DalamudInventoryStack(InventoryType.Inventory1, 0, 4, 9999)],
+            RetainerStacks = [new DalamudInventoryStack(InventoryType.RetainerPage1, 0, 4, 9999)],
+        };
+        driver.DepositBehavior.Enqueue((_, _) => new RetainerDepositResult(false, 0, "NoCapacity", "Retainer reported no deposit capacity for item 4."));
+        var coordinator = new TransferCoordinator(
+            journal,
+            driver,
+            new RetainerCacheRepository(store),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>());
+
+        await coordinator.ExecuteDepositAsync(operation.OperationId);
+
+        var completed = journal.Get(operation.OperationId)!;
+        Assert.Equal(OperationStatuses.Succeeded, completed.Status);
+        Assert.Equal(9999, Assert.Single(completed.Lines).TransferredQuantity);
+        Assert.Equal(2, driver.DepositAttempts.Count);
+        Assert.Contains(
+            repository.FullSnapshot().Receipts,
+            receipt => receipt.OperationId == operation.OperationId &&
+                       receipt.Code == "DepositSkippedNoCapacity" &&
+                       receipt.Message.Contains("Skor"));
+    }
+
+    [Fact]
+    public async Task DepositCrystalFull_SkipsWithReceiptInsteadOfSilentAbandonment()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateDeposit(
+            TestData.Owner,
+            new StowageDepositBatch(
+                DateTime.UtcNow,
+                [
+                    new StowageRoute(
+                        new StowageDepositRequest(null, null, 2, "Fire Shard", false, 9999, new StowageRoutingPolicy()),
+                        [new StowageAllocation(10, "Skor", 9999, 9999, DateTime.UtcNow)],
+                        9999,
+                        0),
+                ]));
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Skor") });
+        var driver = new CapacityDepositDriver
+        {
+            CrystalStacks = [new DalamudInventoryStack(InventoryType.Crystals, 0, 2, 9999)],
+            CrystalBehavior = (_, _) => new RetainerCrystalTransferResult(true, 0, "NoCapacity", "Retainer crystal storage is full for item 2."),
+        };
+        var coordinator = new TransferCoordinator(
+            journal,
+            driver,
+            new RetainerCacheRepository(store),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>());
+
+        await coordinator.ExecuteDepositAsync(operation.OperationId);
+
+        var completed = journal.Get(operation.OperationId)!;
+        Assert.Equal(OperationStatuses.Failed, completed.Status);
+        Assert.Contains(
+            repository.FullSnapshot().Receipts,
+            receipt => receipt.OperationId == operation.OperationId && receipt.Code == "DepositSkippedNoCapacity");
+    }
+
+    [Fact]
+    public async Task DepositNotObserved_ProvenPlayerStackUnchanged_SkipsInsteadOfAborting()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateDeposit(
+            TestData.Owner,
+            new StowageDepositBatch(
+                DateTime.UtcNow,
+                [
+                    new StowageRoute(
+                        new StowageDepositRequest(null, null, 5095, "Darksteel Rivets", false, 999, new StowageRoutingPolicy()),
+                        [new StowageAllocation(10, "Skor", 999, 999, DateTime.UtcNow)],
+                        999,
+                        0),
+                ]));
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Skor") });
+        var driver = new CapacityDepositDriver
+        {
+            PlayerStacks = [new DalamudInventoryStack(InventoryType.Inventory1, 0, 5095, 999)],
+        };
+        driver.DepositBehavior.Enqueue((_, _) => new RetainerDepositResult(false, 0, "DepositNotObserved", "Deposit neither completed nor opened a numeric quantity popup for item 5095."));
+        var coordinator = new TransferCoordinator(
+            journal,
+            driver,
+            new RetainerCacheRepository(store),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>());
+
+        await coordinator.ExecuteDepositAsync(operation.OperationId);
+
+        var completed = journal.Get(operation.OperationId)!;
+        Assert.Equal(OperationStatuses.Failed, completed.Status);
+        Assert.Contains(
+            repository.FullSnapshot().Receipts,
+            receipt => receipt.OperationId == operation.OperationId && receipt.Code == "DepositSkippedUnobserved");
+        Assert.Empty(journal.PendingCacheInvalidations());
+    }
+
+    [Fact]
+    public async Task DepositNotObserved_PlayerStackDecreased_RemainsIndeterminate()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateDeposit(
+            TestData.Owner,
+            new StowageDepositBatch(
+                DateTime.UtcNow,
+                [
+                    new StowageRoute(
+                        new StowageDepositRequest(null, null, 5095, "Darksteel Rivets", false, 999, new StowageRoutingPolicy()),
+                        [new StowageAllocation(10, "Skor", 999, 999, DateTime.UtcNow)],
+                        999,
+                        0),
+                ]));
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Skor") });
+        var playerStacks = new List<DalamudInventoryStack> { new(InventoryType.Inventory1, 0, 5095, 999) };
+        var driver = new CapacityDepositDriver();
+        driver.ScanPlayerInventory = _ => playerStacks;
+        driver.DepositBehavior.Enqueue((_, _) =>
+        {
+            playerStacks.Clear();
+            return new RetainerDepositResult(false, 0, "DepositNotObserved", "Deposit neither completed nor opened a numeric quantity popup for item 5095.");
+        });
+        var coordinator = new TransferCoordinator(
+            journal,
+            driver,
+            new RetainerCacheRepository(store),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>());
+
+        await coordinator.ExecuteDepositAsync(operation.OperationId);
+
+        Assert.Equal(OperationStatuses.Indeterminate, journal.Get(operation.OperationId)!.Status);
+        Assert.DoesNotContain(
+            repository.FullSnapshot().Receipts,
+            receipt => receipt.OperationId == operation.OperationId && receipt.Code == "DepositSkippedUnobserved");
+    }
+
+    private sealed class FakeAutoRetainerIpc : IAutoRetainerIpc
+    {
+        private int busyPolls;
+        public int BusyPollsBeforeIdle { get; set; }
+        public bool AlwaysBusy { get; set; }
+        public bool Suppressed { get; set; }
+        public bool ThrowOnUnsuppress { get; set; }
+        public int BusyPolls => busyPolls;
+        public List<bool> SuppressionCalls { get; } = [];
+        public bool IsAvailable { get; } = true;
+        public bool IsBusy => AlwaysBusy || busyPolls++ < BusyPollsBeforeIdle;
+        public bool IsSuppressed => Suppressed;
+        public void Register(AutoRetainerIpcCallbacks callbacks) { }
+        public void QueueRetainerListTask(string consumer) { }
+        public void RequestPostprocess(string consumer) { }
+        public void FinishPostprocess() { }
+        public void SetSuppressed(bool suppressed)
+        {
+            if (!suppressed && ThrowOnUnsuppress)
+                throw new InvalidOperationException("AutoRetainer IPC went away.");
+            Suppressed = suppressed;
+            SuppressionCalls.Add(suppressed);
+        }
+        public void Dispose() { }
+    }
+
+    private sealed class CapacityDepositDriver : IRetainerTransferDriver
+    {
+        public List<DalamudInventoryStack> PlayerStacks { get; set; } = [];
+        public List<DalamudInventoryStack> CrystalStacks { get; set; } = [];
+        public List<DalamudInventoryStack> RetainerStacks { get; set; } = [];
+        public Queue<Func<DalamudInventoryStack, int, RetainerDepositResult>> DepositBehavior { get; } = new();
+        public Func<DalamudInventoryStack, int, RetainerCrystalTransferResult>? CrystalBehavior { get; set; }
+        public Func<IReadOnlySet<uint>, IReadOnlyList<DalamudInventoryStack>>? ScanPlayerInventory { get; set; }
+        public List<(uint ItemId, int Quantity)> DepositAttempts { get; } = [];
+        public List<(uint ItemId, int Quantity)> CrystalAttempts { get; } = [];
+        public Task RequireRetainerListAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task OpenInventoryAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<IReadOnlyList<DalamudInventoryStack>> ScanRetainerAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<DalamudInventoryStack>>(RetainerStacks);
+        public Task<RetrievalResult> RetrieveAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+        public Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerInventoryAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken) =>
+            Task.FromResult(ScanPlayerInventory?.Invoke(itemIds) ?? PlayerStacks);
+        public Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerCrystalsAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<DalamudInventoryStack>>(CrystalStacks);
+        public Task<RetainerDepositResult> DepositAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken)
+        {
+            DepositAttempts.Add((stack.ItemId, quantity));
+            return Task.FromResult(DepositBehavior.Count > 0
+                ? DepositBehavior.Dequeue()(stack, quantity)
+                : new RetainerDepositResult(true, quantity, "TransferVerified", "Verified."));
+        }
+        public Task<RetainerCrystalTransferResult> DepositCrystalAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken)
+        {
+            CrystalAttempts.Add((stack.ItemId, quantity));
+            return Task.FromResult(CrystalBehavior?.Invoke(stack, quantity) ??
+                new RetainerCrystalTransferResult(true, quantity, "TransferVerified", "Verified."));
+        }
+        public Task CloseRetainerAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public void CancelActive() { }
+    }
+
     private sealed class SuccessfulDriver : IRetainerTransferDriver
     {
         private int retainerQuantity = 10;
