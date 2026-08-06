@@ -14,7 +14,7 @@ public sealed class AutoRetainerSuppression
     private readonly IAutoRetainerIpc ipc;
     private readonly object gate = new();
     private int holders;
-    private bool restoreOnLastRelease;
+    private bool weOwnSuppression;
 
     public AutoRetainerSuppression(IAutoRetainerIpc ipc) => this.ipc = ipc;
 
@@ -57,7 +57,7 @@ public sealed class AutoRetainerSuppression
                 if (!ipc.IsSuppressed)
                 {
                     ipc.SetSuppressed(true);
-                    restoreOnLastRelease = true;
+                    weOwnSuppression = true;
                 }
             }
             holders++;
@@ -70,15 +70,18 @@ public sealed class AutoRetainerSuppression
         lock (gate)
         {
             holders--;
-            if (holders != 0 || !restoreOnLastRelease)
+            if (holders != 0 || !weOwnSuppression)
                 return;
-            restoreOnLastRelease = false;
             try
             {
                 ipc.SetSuppressed(false);
+                weOwnSuppression = false;
             }
             catch (Exception exception)
             {
+                // Ownership is retained so the next scope lifecycle retries the
+                // restore instead of mistaking our own suppression for a
+                // foreign owner's and abandoning it.
                 scope.RestoreFailure = exception.Message;
             }
         }

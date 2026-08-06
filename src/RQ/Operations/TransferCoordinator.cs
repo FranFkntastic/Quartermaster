@@ -60,6 +60,8 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
     private readonly TimeSpan autoRetainerWait;
     private readonly TimeSpan autoRetainerPoll;
     private readonly object activeGate = new();
+    private readonly SemaphoreSlim coordinationGate = new(1, 1);
+    private readonly AsyncLocal<bool> coordinationAmbient = new();
     private CancellationTokenSource? activeCancellation;
     private int running;
 
@@ -668,9 +670,36 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         CancellationToken cancellationToken)
     {
         var suppression = autoRetainerSuppression;
-        if (suppression is null || !suppression.IsAvailable)
+        if (suppression is null || !suppression.IsAvailable || coordinationAmbient.Value)
             return await body().ConfigureAwait(false);
 
+        // One coordination scope at a time so CancelActive always targets the
+        // live wait or movement; nested plan/queue wrappers rejoin the ambient
+        // scope instead of deadlocking on this gate.
+        await coordinationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            coordinationAmbient.Value = true;
+            try
+            {
+                return await WithAutoRetainerCoordinationCoreAsync(suppression, body, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                coordinationAmbient.Value = false;
+            }
+        }
+        finally
+        {
+            coordinationGate.Release();
+        }
+    }
+
+    private async Task<TransferExecutionResult> WithAutoRetainerCoordinationCoreAsync(
+        AutoRetainerSuppression suppression,
+        Func<Task<TransferExecutionResult>> body,
+        CancellationToken cancellationToken)
+    {
         var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         SetActive(linkedCancellation);
         try

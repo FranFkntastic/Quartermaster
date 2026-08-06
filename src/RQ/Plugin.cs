@@ -165,8 +165,8 @@ public sealed class Plugin : IDalamudPlugin
         RetainerStockMutationPersistence.RecoverPending(journal, cache);
         journal.ReconcileInterruptedOperations();
         var driver = new RetainerLiveDriver(retainerSession);
-        listingNavigation = new(retainerSession, autoRetainerIpc, automation);
         var autoRetainerSuppression = new AutoRetainerSuppression(autoRetainerIpc);
+        listingNavigation = new(retainerSession, autoRetainerIpc, automation, autoRetainerSuppression);
         transfers = new TransferCoordinator(
             journal,
             driver,
