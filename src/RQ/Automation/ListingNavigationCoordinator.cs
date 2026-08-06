@@ -114,7 +114,7 @@ public sealed class ListingNavigationCoordinator : IDisposable
                 {
                     suppressionScope.Dispose();
                     if (suppressionScope.RestoreFailure is { } restoreFailure)
-                        Status = $"The listing opened, but AutoRetainer suppression could not be restored: {restoreFailure}";
+                        Status = $"{Status} AutoRetainer suppression could not be restored: {restoreFailure}";
                 }
                 Interlocked.Exchange(ref running, 0);
             }
@@ -182,7 +182,7 @@ public sealed class ListingNavigationCoordinator : IDisposable
                 {
                     suppressionScope.Dispose();
                     if (suppressionScope.RestoreFailure is { } restoreFailure)
-                        Status = $"The listings opened, but AutoRetainer suppression could not be restored: {restoreFailure}";
+                        Status = $"{Status} AutoRetainer suppression could not be restored: {restoreFailure}";
                 }
                 Interlocked.Exchange(ref running, 0);
             }
@@ -232,7 +232,7 @@ public sealed class ListingNavigationCoordinator : IDisposable
                 {
                     suppressionScope.Dispose();
                     if (suppressionScope.RestoreFailure is { } restoreFailure)
-                        Status = $"The retainer list was restored, but AutoRetainer suppression could not be restored: {restoreFailure}";
+                        Status = $"{Status} AutoRetainer suppression could not be restored: {restoreFailure}";
                 }
                 Interlocked.Exchange(ref running, 0);
             }
