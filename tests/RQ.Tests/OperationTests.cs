@@ -27,7 +27,7 @@ public sealed class OperationTests
         var complete = journal.Transition(operation.OperationId, OperationStatuses.Succeeded, "done", "done");
 
         Assert.Equal(4, complete.Revision);
-        var receipts = repository.Snapshot().Receipts.Where(receipt => receipt.OperationId == operation.OperationId).ToArray();
+        var receipts = repository.FullSnapshot().Receipts.Where(receipt => receipt.OperationId == operation.OperationId).ToArray();
         Assert.Equal([1L, 2L, 3L, 4L], receipts.Select(receipt => receipt.Revision));
         Assert.Throws<InvalidOperationException>(() => journal.Transition(operation.OperationId, OperationStatuses.Running, "again", "again"));
     }
@@ -45,7 +45,7 @@ public sealed class OperationTests
 
         Assert.Single(reconciled);
         Assert.Equal(OperationStatuses.Indeterminate, reconciled[0].Status);
-        Assert.Contains(repository.Snapshot().Receipts, receipt => receipt.OperationId == operation.OperationId && receipt.Code == "InterruptedByReload");
+        Assert.Contains(repository.FullSnapshot().Receipts, receipt => receipt.OperationId == operation.OperationId && receipt.Code == "InterruptedByReload");
     }
 
     [Fact]
@@ -213,7 +213,12 @@ public sealed class OperationTests
                 0));
             if (!operationStable)
             {
-                repository.Mutate(state => state.Operations.Single(candidate => candidate.OperationId == operation.OperationId).Owner = nameOnlyOwner);
+                repository.Mutate(StateChangeKind.Operations, state =>
+                {
+                    var persisted = state.Operations.Single(candidate => candidate.OperationId == operation.OperationId);
+                    persisted.Owner = nameOnlyOwner;
+                    persisted.Revision++;
+                });
                 operation = journal.Get(operation.OperationId)!;
             }
         }

@@ -53,14 +53,14 @@ public sealed class SnapshotPublisher
 
     public void Refresh(OwnerScope owner, PlayerStorageCapture playerStorage)
     {
-        Refresh(owner, playerStorage, state.Snapshot(), cache());
+        Refresh(owner, playerStorage, state.FullSnapshot(), cache());
     }
 
     public void Refresh(QuartermasterRuntimeSnapshot runtime, bool rebuildSnapshot = true)
     {
         // The repository remains authoritative for operations that may have
         // advanced while expensive stock reconciliation was intentionally held.
-        Refresh(runtime.Owner, runtime.PlayerStorage, state.Snapshot(), runtime.Retainers, runtime.Stowage, rebuildSnapshot);
+        Refresh(runtime.Owner, runtime.PlayerStorage, state.FullSnapshot(), runtime.Retainers, runtime.Stowage, rebuildSnapshot);
     }
 
     public void RefreshOperations(OwnerScope owner, IReadOnlyCollection<string> operationIds)
@@ -136,7 +136,7 @@ public sealed class SnapshotPublisher
             WriteSnapshot(
                 inputs.Owner,
                 inputs.PlayerStorage,
-                state.Snapshot(),
+                state.FullSnapshot(),
                 inputs.Retainers,
                 inputs.Stowage,
                 Revision);

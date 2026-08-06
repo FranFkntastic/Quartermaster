@@ -21,6 +21,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.10" />
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.5" />
     <ProjectReference Include="$(FranthropyDalamudProject)" SetConfiguration="Configuration=$(Configuration)" />
     <ProjectReference Include="$(FranthropyFfxivProject)" SetConfiguration="Configuration=$(Configuration)" />
     <ProjectReference Include="$(FranthropyObservationsProject)" SetConfiguration="Configuration=$(Configuration)" />
@@ -41,5 +43,17 @@
       <_DebugProjectReference Include="@(_ResolvedProjectReferencePaths)" Condition="$([System.String]::Copy('%(FullPath)').Contains('\bin\Debug\'))" />
     </ItemGroup>
     <Error Condition="'@(_DebugProjectReference)' != ''" Text="Release build resolved Debug project output: @(_DebugProjectReference)." />
+  </Target>
+
+  <!-- Dalamud loads development plugins from a flat watched directory. Keep
+       SQLite's x64 native provider beside RQ.dll so deployment does not depend
+       on NuGet's nested runtime layout or another plugin loading it first. -->
+  <Target Name="FlattenSqliteNativeRuntime" AfterTargets="Build">
+    <Copy SourceFiles="$(OutDir)runtimes\win-x64\native\e_sqlite3.dll"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(OutDir)runtimes\win-x64\native\e_sqlite3.dll')" />
+    <Error Condition="!Exists('$(OutDir)e_sqlite3.dll')"
+           Text="SQLite's x64 native runtime was not produced beside RQ.dll." />
   </Target>
 </Project>

@@ -57,12 +57,12 @@ public sealed class IpcTests
         queue.Drain();
         Assert.Equal(OperationStatuses.Accepted, Parse(service.Submit(TestData.Json(request))).GetProperty("status").GetString());
 
-        var operation = Assert.Single(repository.Snapshot().Operations);
+        var operation = Assert.Single(repository.FullSnapshot().Operations);
         Assert.True(operation.ExecuteImmediately);
         Assert.Equal(OperationKinds.Deposit, operation.Kind);
         Assert.Equal(500, Assert.Single(operation.Lines).TargetQuantity);
         Assert.Equal(999, Assert.Single(operation.DepositCandidates).CapacityByItem[2]);
-        Assert.Single(repository.Snapshot().Requests);
+        Assert.Single(repository.FullSnapshot().Requests);
     }
 
     [Fact]
@@ -284,10 +284,10 @@ public sealed class IpcTests
         var queued = Parse(service.Submit(TestData.Json(TestData.Request())));
 
         Assert.Equal(OperationStatuses.Queued, queued.GetProperty("status").GetString());
-        Assert.Empty(repository.Snapshot().Operations);
+        Assert.Empty(repository.FullSnapshot().Operations);
         Assert.Equal(1, queue.Count);
         queue.Drain();
-        var operation = Assert.Single(repository.Snapshot().Operations);
+        var operation = Assert.Single(repository.FullSnapshot().Operations);
         Assert.Equal(OperationStatuses.Accepted, operation.Status);
         Assert.False(operation.ExecuteImmediately);
         Assert.Contains("review", operation.Message, StringComparison.OrdinalIgnoreCase);
@@ -310,7 +310,7 @@ public sealed class IpcTests
             Assert.True(pending.RootElement.GetProperty("executeImmediately").GetBoolean());
         queue.Drain();
 
-        var persisted = Assert.Single(TestData.Repository(directory.Path).Snapshot().Operations);
+        var persisted = Assert.Single(TestData.Repository(directory.Path).FullSnapshot().Operations);
         Assert.True(persisted.ExecuteImmediately);
         Assert.Contains("automatic", persisted.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("ephemeral", persisted.Message, StringComparison.OrdinalIgnoreCase);
@@ -332,7 +332,7 @@ public sealed class IpcTests
         using var directory = new TemporaryDirectory();
         var repository = TestData.Repository(directory.Path);
         var request = TestData.Request();
-        repository.Mutate(state =>
+        repository.Mutate(StateChangeKind.Operations, state =>
         {
             state.Requests.Add(new SubmittedRequestRecord
             {
@@ -376,7 +376,7 @@ public sealed class IpcTests
         Assert.Equal(1, replay.GetProperty("revision").GetInt64());
         Assert.Equal(OperationStatuses.Rejected, conflict.GetProperty("status").GetString());
         Assert.Equal("request_conflict", conflict.GetProperty("errorCode").GetString());
-        Assert.Single(repository.Snapshot().Operations);
+        Assert.Single(repository.FullSnapshot().Operations);
     }
 
     [Fact]
@@ -413,7 +413,7 @@ public sealed class IpcTests
 
         Assert.Equal(OperationStatuses.Accepted, replay.GetProperty("status").GetString());
         Assert.Equal("provider-2", replay.GetProperty("providerInstanceId").GetString());
-        Assert.Single(repository.Snapshot().Operations);
+        Assert.Single(repository.FullSnapshot().Operations);
     }
 
     [Fact]
@@ -544,7 +544,9 @@ public sealed class IpcTests
         using var directory = new TemporaryDirectory();
         var blockedParent = Path.Combine(directory.Path, "blocked");
         var repository = new StateRepository(new QuartermasterStateStore(Path.Combine(blockedParent, "state.json")));
-        File.WriteAllText(blockedParent, "not a directory");
+        var blockedJournal = Path.Combine(blockedParent, "state-operations.db");
+        File.Move(blockedJournal, $"{blockedJournal}.saved");
+        Directory.CreateDirectory(blockedJournal);
         var queue = new TestWorkQueue();
         var service = new ShortageSubmissionService("provider-1", repository, queue, () => TestData.Owner);
         service.Submit(TestData.Json(TestData.Request()));
@@ -562,21 +564,24 @@ public sealed class IpcTests
         using var directory = new TemporaryDirectory();
         var blockedParent = Path.Combine(directory.Path, "blocked");
         var repository = new StateRepository(new QuartermasterStateStore(Path.Combine(blockedParent, "state.json")));
-        File.WriteAllText(blockedParent, "not a directory");
+        var blockedJournal = Path.Combine(blockedParent, "state-operations.db");
+        var savedJournal = $"{blockedJournal}.saved";
+        File.Move(blockedJournal, savedJournal);
+        Directory.CreateDirectory(blockedJournal);
         var queue = new TestWorkQueue();
         var service = new ShortageSubmissionService("provider-1", repository, queue, () => TestData.Owner);
         var request = TestData.Json(TestData.Request());
         service.Submit(request);
         queue.Drain();
         Assert.NotNull(service.GetPendingOperation("operation-1"));
-        File.Delete(blockedParent);
-        Directory.CreateDirectory(blockedParent);
+        Directory.Delete(blockedJournal);
+        File.Move(savedJournal, blockedJournal);
 
         service.Submit(request);
         queue.Drain();
 
         Assert.Null(service.GetPendingOperation("operation-1"));
-        Assert.Equal(OperationStatuses.Accepted, Assert.Single(repository.Snapshot().Operations).Status);
+        Assert.Equal(OperationStatuses.Accepted, Assert.Single(repository.FullSnapshot().Operations).Status);
     }
 
     [Fact]
