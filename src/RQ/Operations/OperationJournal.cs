@@ -28,6 +28,14 @@ public sealed class OperationJournal
         .Select(Copy)
         .FirstOrDefault());
 
+    public IReadOnlyList<OperationRecord> History(OwnerScope owner, int limit) => repository.Read(state => state.Operations
+        .Where(operation => operation.Owner.Matches(owner))
+        .OrderByDescending(operation => operation.UpdatedAtUtc)
+        .ThenByDescending(operation => operation.CreatedAtUtc)
+        .Take(Math.Max(0, limit))
+        .Select(Copy)
+        .ToArray());
+
     public OperationRecord? NextAutomaticRetrieval(OwnerScope owner)
         => NextAutomaticOperation(owner, OperationKinds.Retrieval);
 

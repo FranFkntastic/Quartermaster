@@ -393,7 +393,12 @@ public sealed class AutomationTests
         var journal = new OperationJournal(repository);
         var automatic = journal.CreateManual(TestData.Owner, [new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }]);
         var manual = journal.CreateManual(TestData.Owner, [new TargetPlanItem { ItemId = 200, ItemName = "Log", TargetQuantity = 10 }]);
-        repository.Mutate(state => state.Operations.Single(operation => operation.OperationId == automatic.OperationId).ExecuteImmediately = true);
+        repository.Mutate(StateChangeKind.Operations, state =>
+        {
+            var operation = state.Operations.Single(candidate => candidate.OperationId == automatic.OperationId);
+            operation.ExecuteImmediately = true;
+            operation.Revision++;
+        });
 
         var reloadedRepository = TestData.Repository(directory.Path);
         var reloadedJournal = new OperationJournal(reloadedRepository);
@@ -414,7 +419,12 @@ public sealed class AutomationTests
         Assert.Equal(1, executor.Starts);
         Assert.Equal(automatic.OperationId, queue.ActiveOperationId);
 
-        reloadedRepository.Mutate(state => state.Operations.Single(operation => operation.OperationId == automatic.OperationId).Status = OperationStatuses.Succeeded);
+        reloadedRepository.Mutate(StateChangeKind.Operations, state =>
+        {
+            var operation = state.Operations.Single(candidate => candidate.OperationId == automatic.OperationId);
+            operation.Status = OperationStatuses.Succeeded;
+            operation.Revision++;
+        });
         executor.Complete();
         queue.Tick();
         queue.Tick();
@@ -452,7 +462,12 @@ public sealed class AutomationTests
         var repository = TestData.Repository(directory.Path);
         var journal = new OperationJournal(repository);
         var operation = journal.CreateManual(TestData.Owner, [new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }]);
-        repository.Mutate(state => state.Operations.Single(candidate => candidate.OperationId == operation.OperationId).ExecuteImmediately = true);
+        repository.Mutate(StateChangeKind.Operations, state =>
+        {
+            var persisted = state.Operations.Single(candidate => candidate.OperationId == operation.OperationId);
+            persisted.ExecuteImmediately = true;
+            persisted.Revision++;
+        });
         var executor = new RecordingRetrievalExecutor { CanStart = true };
         var queue = new AutomaticRetrievalQueue(journal, executor, () => TestData.Owner);
         queue.Tick();
@@ -472,7 +487,12 @@ public sealed class AutomationTests
             TestData.Owner,
             [new TargetPlanItem { ItemId = 2, ItemName = "Fire Shard", TargetQuantity = 100 }],
             OperationKinds.Deposit);
-        repository.Mutate(state => state.Operations.Single(candidate => candidate.OperationId == operation.OperationId).ExecuteImmediately = true);
+        repository.Mutate(StateChangeKind.Operations, state =>
+        {
+            var persisted = state.Operations.Single(candidate => candidate.OperationId == operation.OperationId);
+            persisted.ExecuteImmediately = true;
+            persisted.Revision++;
+        });
         var executor = new RecordingRetrievalExecutor { CanStart = true };
         var autoRetainer = new FakeAutoRetainerIpc();
         using var queue = new AutomaticRetrievalQueue(journal, executor, () => TestData.Owner, autoRetainer);

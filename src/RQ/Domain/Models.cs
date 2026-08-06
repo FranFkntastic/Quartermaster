@@ -345,4 +345,19 @@ public sealed class QuartermasterState
     public List<OperationReceipt> Receipts { get; set; } = [];
     public List<PendingCacheInvalidation> PendingCacheInvalidations { get; set; } = [];
     public RetainerListingCaptureReceipt? LatestRetainerListingCapture { get; set; }
+    public OperationJournalMigrationRecord? OperationJournalMigration { get; set; }
+}
+
+public sealed class OperationJournalMigrationRecord
+{
+    public const int CurrentSchemaVersion = 1;
+
+    public int SchemaVersion { get; set; } = CurrentSchemaVersion;
+    public string JournalId { get; set; } = string.Empty;
+    public string SourceSha256 { get; set; } = string.Empty;
+    public int RequestCount { get; set; }
+    public int OperationCount { get; set; }
+    public int ReceiptCount { get; set; }
+    public int PendingInvalidationCount { get; set; }
+    public DateTime CompletedAtUtc { get; set; }
 }

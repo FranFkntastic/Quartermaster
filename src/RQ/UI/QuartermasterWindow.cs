@@ -3846,13 +3846,8 @@ public sealed class QuartermasterWindow : Window
 
         ImGui.TextUnformatted("Transfer history");
         ImGui.Separator();
-        var operations = state.Snapshot().Operations
-            .Where(operation => operation.Owner.Matches(owner))
-            .OrderByDescending(operation => operation.UpdatedAtUtc)
-            .ThenByDescending(operation => operation.CreatedAtUtc)
-            .Take(30)
-            .ToArray();
-        if (operations.Length == 0)
+        var operations = journal.History(owner, 30);
+        if (operations.Count == 0)
         {
             ImGui.TextDisabled("No Quartermaster operations yet.");
             ImGui.EndPopup();

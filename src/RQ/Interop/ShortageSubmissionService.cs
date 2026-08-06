@@ -141,19 +141,20 @@ public sealed class ShortageSubmissionService
     {
         try
         {
-            repository.Mutate(StateChangeKind.Operations, state =>
+            var operationPlanItems = request.Items.Select(source => new TargetPlanItem
             {
-                if (state.Requests.Any(record => record.RequestId == request.RequestId))
-                    return;
-                var now = utcNow();
-                var operationPlanItems = request.Items.Select(source => new TargetPlanItem
-                {
-                    ItemId = source.ItemId,
-                    ItemName = source.ItemName.Trim(),
-                    TargetQuantity = source.TargetQuantity,
-                    Enabled = true,
-                }).ToList();
-                if (!request.ExecuteImmediately)
+                ItemId = source.ItemId,
+                ItemName = source.ItemName.Trim(),
+                TargetQuantity = source.TargetQuantity,
+                Enabled = true,
+            }).ToList();
+            if (!request.ExecuteImmediately)
+            {
+                // The reviewed plan is configuration authority, while request and
+                // execution evidence belong to the operation journal. Persist the
+                // small plan document first; a retry is idempotent if journal
+                // creation fails or the process stops between the two stores.
+                operationPlanItems = repository.Mutate(StateChangeKind.Plans, state =>
                 {
                     foreach (var source in request.Items)
                     {
@@ -175,10 +176,17 @@ public sealed class ShortageSubmissionService
                             existing.TargetQuantity = source.TargetQuantity;
                         }
                     }
-                    operationPlanItems = request.Items
+                    return request.Items
                         .Select(source => Copy(state.PlanItems.First(item => item.ItemId == source.ItemId)))
                         .ToList();
-                }
+                });
+            }
+
+            repository.Mutate(StateChangeKind.Operations, state =>
+            {
+                if (state.Requests.Any(record => record.RequestId == request.RequestId))
+                    return;
+                var now = utcNow();
                 state.Requests.Add(new SubmittedRequestRecord
                 {
                     RequestId = request.RequestId,
