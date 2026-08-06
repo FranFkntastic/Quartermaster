@@ -166,6 +166,7 @@ public sealed class Plugin : IDalamudPlugin
         journal.ReconcileInterruptedOperations();
         var driver = new RetainerLiveDriver(retainerSession);
         listingNavigation = new(retainerSession, autoRetainerIpc, automation);
+        var autoRetainerSuppression = new AutoRetainerSuppression(autoRetainerIpc);
         transfers = new TransferCoordinator(
             journal,
             driver,
@@ -173,8 +174,8 @@ public sealed class Plugin : IDalamudPlugin
             CurrentOwner,
             CountCachedPlayerItems,
             automation,
-            autoRetainer: autoRetainerIpc);
-        automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerIpc);
+            autoRetainerSuppression: autoRetainerSuppression);
+        automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerSuppression);
         runtimeSnapshots = new(scanner, playerInventory, cache, state, CurrentOwner);
         playerInventoryReconciler.ReconcileIfDue(DateTime.UtcNow, force: true);
         var initialSnapshot = runtimeSnapshots.Refresh();

@@ -495,7 +495,7 @@ public sealed class AutomationTests
         });
         var executor = new RecordingRetrievalExecutor { CanStart = true };
         var autoRetainer = new FakeAutoRetainerIpc();
-        using var queue = new AutomaticRetrievalQueue(journal, executor, () => TestData.Owner, autoRetainer);
+        using var queue = new AutomaticRetrievalQueue(journal, executor, () => TestData.Owner, new AutoRetainerSuppression(autoRetainer));
 
         queue.Tick();
 
@@ -506,6 +506,91 @@ public sealed class AutomationTests
 
         Assert.False(autoRetainer.IsSuppressed);
         Assert.Equal([true, false], autoRetainer.SuppressionChanges);
+    }
+
+    [Fact]
+    public void AutoRetainerSuppression_NestedScopesRestoreOnceAfterLastRelease()
+    {
+        var ipc = new FakeAutoRetainerIpc();
+        var suppression = new AutoRetainerSuppression(ipc);
+        var outer = suppression.Acquire();
+        var inner = suppression.Acquire();
+
+        inner.Dispose();
+
+        Assert.True(ipc.IsSuppressed);
+        Assert.Equal([true], ipc.SuppressionChanges);
+
+        outer.Dispose();
+
+        Assert.False(ipc.IsSuppressed);
+        Assert.Equal([true, false], ipc.SuppressionChanges);
+    }
+
+    [Fact]
+    public void AutoRetainerSuppression_OutOfOrderReleaseRestoresOnlyAtZeroHolders()
+    {
+        var ipc = new FakeAutoRetainerIpc();
+        var suppression = new AutoRetainerSuppression(ipc);
+        var first = suppression.Acquire();
+        var second = suppression.Acquire();
+
+        first.Dispose();
+
+        Assert.True(ipc.IsSuppressed);
+
+        second.Dispose();
+
+        Assert.False(ipc.IsSuppressed);
+        Assert.Equal([true, false], ipc.SuppressionChanges);
+    }
+
+    [Fact]
+    public void AutoRetainerSuppression_ForeignSuppressionIsNeverCleared()
+    {
+        var ipc = new FakeAutoRetainerIpc { IsSuppressed = true };
+        var suppression = new AutoRetainerSuppression(ipc);
+
+        suppression.Acquire().Dispose();
+
+        Assert.True(ipc.IsSuppressed);
+        Assert.Empty(ipc.SuppressionChanges);
+    }
+
+    [Fact]
+    public void AutoRetainerSuppression_RestoreFailureSurfacesOnLastReleasingScope()
+    {
+        var ipc = new ThrowingAutoRetainerIpc();
+        var suppression = new AutoRetainerSuppression(ipc);
+        var outer = suppression.Acquire();
+        var inner = suppression.Acquire();
+
+        inner.Dispose();
+        Assert.Null(inner.RestoreFailure);
+
+        outer.Dispose();
+        Assert.Equal("AutoRetainer IPC went away.", outer.RestoreFailure);
+        Assert.Equal([true], ipc.SuppressionChanges);
+    }
+
+    private sealed class ThrowingAutoRetainerIpc : IAutoRetainerIpc
+    {
+        public bool IsAvailable => true;
+        public bool IsBusy => false;
+        public bool IsSuppressed { get; private set; }
+        public List<bool> SuppressionChanges { get; } = [];
+        public void Register(AutoRetainerIpcCallbacks callbacks) { }
+        public void QueueRetainerListTask(string consumer) { }
+        public void RequestPostprocess(string consumer) { }
+        public void FinishPostprocess() { }
+        public void SetSuppressed(bool suppressed)
+        {
+            if (!suppressed)
+                throw new InvalidOperationException("AutoRetainer IPC went away.");
+            IsSuppressed = suppressed;
+            SuppressionChanges.Add(suppressed);
+        }
+        public void Dispose() { }
     }
 
     private static T CreateProxy<T>(Func<MethodInfo, object?[]?, object?> handler) where T : class

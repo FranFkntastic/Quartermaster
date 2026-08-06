@@ -510,7 +510,7 @@ public sealed class OperationTests
             new RetainerCacheRepository(store),
             () => TestData.Owner,
             () => new Dictionary<uint, int>(),
-            autoRetainer: ipc);
+            autoRetainerSuppression: new AutoRetainerSuppression(ipc));
 
         await coordinator.ExecuteRetrievalAsync(operation.OperationId);
 
@@ -535,7 +535,7 @@ public sealed class OperationTests
             new RetainerCacheRepository(store),
             () => TestData.Owner,
             () => new Dictionary<uint, int>(),
-            autoRetainer: ipc,
+            autoRetainerSuppression: new AutoRetainerSuppression(ipc),
             autoRetainerWait: TimeSpan.FromSeconds(5),
             autoRetainerPoll: TimeSpan.FromMilliseconds(10));
 
@@ -563,7 +563,7 @@ public sealed class OperationTests
             new RetainerCacheRepository(store),
             () => TestData.Owner,
             () => new Dictionary<uint, int>(),
-            autoRetainer: ipc,
+            autoRetainerSuppression: new AutoRetainerSuppression(ipc),
             autoRetainerWait: TimeSpan.FromMilliseconds(150),
             autoRetainerPoll: TimeSpan.FromMilliseconds(20));
 
@@ -574,6 +574,35 @@ public sealed class OperationTests
         Assert.Equal(OperationStatuses.Accepted, journal.Get(operation.OperationId)!.Status);
         Assert.Empty(ipc.SuppressionCalls);
         Assert.Equal(0, driver.Calls);
+    }
+
+    [Fact]
+    public async Task Coordination_BusyWaitIsCancellableBeforeMovementStarts()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateManual(TestData.Owner, [new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 10 }]);
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
+        var ipc = new FakeAutoRetainerIpc { AlwaysBusy = true };
+        var coordinator = new TransferCoordinator(
+            journal,
+            new SuccessfulDriver(),
+            new RetainerCacheRepository(store),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>(),
+            autoRetainerSuppression: new AutoRetainerSuppression(ipc),
+            autoRetainerWait: TimeSpan.FromSeconds(30),
+            autoRetainerPoll: TimeSpan.FromMilliseconds(20));
+
+        var execution = coordinator.ExecuteRetrievalAsync(operation.OperationId);
+        await Task.Delay(150);
+        coordinator.CancelActive();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => execution);
+        Assert.Equal(OperationStatuses.Accepted, journal.Get(operation.OperationId)!.Status);
+        Assert.Empty(ipc.SuppressionCalls);
     }
 
     [Fact]
@@ -592,7 +621,7 @@ public sealed class OperationTests
             new RetainerCacheRepository(store),
             () => TestData.Owner,
             () => new Dictionary<uint, int>(),
-            autoRetainer: ipc);
+            autoRetainerSuppression: new AutoRetainerSuppression(ipc));
 
         await coordinator.ExecuteRetrievalAsync(operation.OperationId);
 
@@ -617,7 +646,7 @@ public sealed class OperationTests
             new RetainerCacheRepository(store),
             () => TestData.Owner,
             () => new Dictionary<uint, int>(),
-            autoRetainer: ipc);
+            autoRetainerSuppression: new AutoRetainerSuppression(ipc));
 
         var result = await coordinator.ExecuteRetrievalAsync(operation.OperationId);
 
@@ -659,7 +688,7 @@ public sealed class OperationTests
             new RetainerCacheRepository(store),
             () => TestData.Owner,
             () => new Dictionary<uint, int>(),
-            autoRetainer: ipc);
+            autoRetainerSuppression: new AutoRetainerSuppression(ipc));
 
         await coordinator.ExecutePlanAsync(retrieval.OperationId, deposit.OperationId);
 
@@ -710,6 +739,11 @@ public sealed class OperationTests
         Assert.Equal(1, Assert.Single(completed.Lines).TransferredQuantity);
         Assert.Contains("9,998 remain", completed.Message);
         Assert.Single(driver.DepositAttempts);
+        Assert.Contains(
+            repository.FullSnapshot().Receipts,
+            receipt => receipt.OperationId == operation.OperationId &&
+                       receipt.Code == "DepositCapacityClamped" &&
+                       receipt.Message.Contains("Skor"));
     }
 
     [Fact]

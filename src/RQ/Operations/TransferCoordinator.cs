@@ -56,7 +56,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
     private readonly AutomationLease automation;
     private readonly Func<DateTime> utcNow;
     private readonly RetainerStockMutationPersistence stockMutations;
-    private readonly IAutoRetainerIpc? autoRetainer;
+    private readonly AutoRetainerSuppression? autoRetainerSuppression;
     private readonly TimeSpan autoRetainerWait;
     private readonly TimeSpan autoRetainerPoll;
     private readonly object activeGate = new();
@@ -71,7 +71,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         Func<IReadOnlyDictionary<uint, int>> playerInventory,
         AutomationLease? automation = null,
         Func<DateTime>? utcNow = null,
-        IAutoRetainerIpc? autoRetainer = null,
+        AutoRetainerSuppression? autoRetainerSuppression = null,
         TimeSpan? autoRetainerWait = null,
         TimeSpan? autoRetainerPoll = null)
     {
@@ -82,7 +82,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         this.playerInventory = playerInventory;
         this.automation = automation ?? new AutomationLease();
         this.utcNow = utcNow ?? (() => DateTime.UtcNow);
-        this.autoRetainer = autoRetainer;
+        this.autoRetainerSuppression = autoRetainerSuppression;
         this.autoRetainerWait = autoRetainerWait ?? TimeSpan.FromSeconds(30);
         this.autoRetainerPoll = autoRetainerPoll ?? TimeSpan.FromMilliseconds(250);
         stockMutations = new(journal, cache);
@@ -511,9 +511,18 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         continue;
                     }
                     remaining[key] -= result.Transferred;
-                    candidateCapacity[key] = result.Transferred < quantity
-                        ? 0
-                        : candidateCapacity[key] - result.Transferred;
+                    if (result.Transferred < quantity)
+                    {
+                        candidateCapacity[key] = 0;
+                        journal.RecordWarning(
+                            operationId,
+                            "DepositCapacityClamped",
+                            $"{candidate.RetainerName} accepted only {result.Transferred:N0} of the requested {quantity:N0} {itemName}; its remaining live capacity is exhausted for this run.");
+                    }
+                    else
+                    {
+                        candidateCapacity[key] -= result.Transferred;
+                    }
                     depositedSinceScan[key] = depositedSinceScan.GetValueOrDefault(key) + result.Transferred;
                     transferred += result.Transferred;
                     if (legacyCrystalDeposit)
@@ -649,95 +658,58 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
 
     /// <summary>
     /// Serializes live movement with AutoRetainer: waits a bounded time for it to
-    /// go idle, suppresses it for the movement unless someone else already holds
-    /// suppression, and restores only suppression this scope set. Nested scopes
-    /// (plan sequence around retrieval and deposit) reuse the outer acquisition.
+    /// go idle, then holds the shared suppression scope for the movement. Nested
+    /// scopes (plan sequence around retrieval and deposit, automatic queue around
+    /// the coordinator) add references to the same acquisition, so suppression is
+    /// restored exactly once when the outermost owner finishes.
     /// </summary>
     private async Task<TransferExecutionResult> WithAutoRetainerCoordinationAsync(
         Func<Task<TransferExecutionResult>> body,
         CancellationToken cancellationToken)
     {
-        var ipc = autoRetainer;
-        if (ipc is null || !IsAutoRetainerAvailable(ipc))
+        var suppression = autoRetainerSuppression;
+        if (suppression is null || !suppression.IsAvailable)
             return await body().ConfigureAwait(false);
 
-        var restoreSuppression = false;
+        var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        SetActive(linkedCancellation);
         try
         {
             var deadline = utcNow() + autoRetainerWait;
-            while (IsAutoRetainerBusy(ipc))
+            while (suppression.IsBusy)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                linkedCancellation.Token.ThrowIfCancellationRequested();
                 if (utcNow() >= deadline)
                     return new(false, "AutoRetainer remained busy beyond the coordination wait; the transfer was not started.");
-                await Task.Delay(autoRetainerPoll, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(autoRetainerPoll, linkedCancellation.Token).ConfigureAwait(false);
             }
-            if (!ipc.IsSuppressed)
-            {
-                ipc.SetSuppressed(true);
-                restoreSuppression = true;
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception exception)
-        {
-            return new(false, $"AutoRetainer coordination failed before the transfer started: {exception.Message}");
-        }
 
-        TransferExecutionResult result;
-        string? restoreFailure;
-        try
-        {
-            result = await body().ConfigureAwait(false);
+            AutoRetainerSuppression.Scope scope;
+            try
+            {
+                scope = suppression.Acquire();
+            }
+            catch (Exception exception)
+            {
+                return new(false, $"AutoRetainer coordination failed before the transfer started: {exception.Message}");
+            }
+
+            TransferExecutionResult result;
+            try
+            {
+                result = await body().ConfigureAwait(false);
+            }
+            finally
+            {
+                scope.Dispose();
+            }
+            return scope.RestoreFailure is null
+                ? result
+                : result with { Message = $"{result.Message} AutoRetainer suppression could not be restored: {scope.RestoreFailure}" };
         }
         finally
         {
-            restoreFailure = RestoreAutoRetainerSuppression(ipc, restoreSuppression);
-        }
-        return restoreFailure is null
-            ? result
-            : result with { Message = $"{result.Message} AutoRetainer suppression could not be restored: {restoreFailure}" };
-    }
-
-    private static bool IsAutoRetainerAvailable(IAutoRetainerIpc ipc)
-    {
-        try
-        {
-            return ipc.IsAvailable;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static bool IsAutoRetainerBusy(IAutoRetainerIpc ipc)
-    {
-        try
-        {
-            return ipc.IsBusy;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static string? RestoreAutoRetainerSuppression(IAutoRetainerIpc ipc, bool restoreSuppression)
-    {
-        if (!restoreSuppression)
-            return null;
-        try
-        {
-            ipc.SetSuppressed(false);
-            return null;
-        }
-        catch (Exception exception)
-        {
-            return exception.Message;
+            ClearActive(linkedCancellation);
         }
     }
 

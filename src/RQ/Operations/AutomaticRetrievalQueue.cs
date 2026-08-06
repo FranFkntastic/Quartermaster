@@ -1,4 +1,4 @@
-using Franthropy.Dalamud.Automation.Retainers;
+using RQ.Automation;
 using RQ.Domain;
 
 namespace RQ.Operations;
@@ -16,18 +16,18 @@ public sealed class AutomaticRetrievalQueue : IDisposable
     private readonly OperationJournal journal;
     private readonly IRetrievalOperationExecutor executor;
     private readonly Func<OwnerScope> currentOwner;
-    private readonly IAutoRetainerIpc? autoRetainer;
+    private readonly AutoRetainerSuppression? autoRetainer;
     private readonly CancellationTokenSource lifetime = new();
     private Task<TransferExecutionResult>? activeTask;
+    private AutoRetainerSuppression.Scope? suppressionScope;
     private bool stopping;
     private bool disposed;
-    private bool restoreAutoRetainerSuppression;
 
     public AutomaticRetrievalQueue(
         OperationJournal journal,
         IRetrievalOperationExecutor executor,
         Func<OwnerScope> currentOwner,
-        IAutoRetainerIpc? autoRetainer = null)
+        AutoRetainerSuppression? autoRetainer = null)
     {
         this.journal = journal;
         this.executor = executor;
@@ -49,7 +49,7 @@ public sealed class AutomaticRetrievalQueue : IDisposable
             Observe(completed);
             activeTask = null;
             ActiveOperationId = null;
-            RestoreAutoRetainer();
+            ReleaseAutoRetainer();
             return;
         }
         if (!executor.CanStart)
@@ -69,7 +69,7 @@ public sealed class AutomaticRetrievalQueue : IDisposable
         catch
         {
             ActiveOperationId = null;
-            RestoreAutoRetainer();
+            ReleaseAutoRetainer();
             throw;
         }
     }
@@ -81,7 +81,7 @@ public sealed class AutomaticRetrievalQueue : IDisposable
         if (task is null)
         {
             lifetime.Cancel();
-            RestoreAutoRetainer();
+            ReleaseAutoRetainer();
             return true;
         }
         if (task.IsCompleted)
@@ -90,7 +90,7 @@ public sealed class AutomaticRetrievalQueue : IDisposable
             activeTask = null;
             ActiveOperationId = null;
             lifetime.Cancel();
-            RestoreAutoRetainer();
+            ReleaseAutoRetainer();
             return true;
         }
         lifetime.Cancel();
@@ -109,7 +109,10 @@ public sealed class AutomaticRetrievalQueue : IDisposable
         }
         finally
         {
-            RestoreAutoRetainer();
+            // The executor's own nested suppression scope keeps AutoRetainer held
+            // until any in-flight movement finishes, even when this release wins
+            // the race against a timed-out task.
+            ReleaseAutoRetainer();
         }
     }
 
@@ -137,10 +140,7 @@ public sealed class AutomaticRetrievalQueue : IDisposable
         {
             if (autoRetainer.IsBusy)
                 return false;
-            if (autoRetainer.IsSuppressed)
-                return true;
-            autoRetainer.SetSuppressed(true);
-            restoreAutoRetainerSuppression = true;
+            suppressionScope = autoRetainer.Acquire();
             return true;
         }
         catch (Exception exception)
@@ -150,12 +150,14 @@ public sealed class AutomaticRetrievalQueue : IDisposable
         }
     }
 
-    private void RestoreAutoRetainer()
+    private void ReleaseAutoRetainer()
     {
-        if (!restoreAutoRetainerSuppression || autoRetainer is null)
+        var scope = suppressionScope;
+        suppressionScope = null;
+        if (scope is null)
             return;
-        restoreAutoRetainerSuppression = false;
-        try { autoRetainer.SetSuppressed(false); }
-        catch (Exception exception) { LastMessage = $"Transfer ended, but AutoRetainer suppression could not be restored: {exception.Message}"; }
+        scope.Dispose();
+        if (scope.RestoreFailure is { } failure)
+            LastMessage = $"Transfer ended, but AutoRetainer suppression could not be restored: {failure}";
     }
 }
