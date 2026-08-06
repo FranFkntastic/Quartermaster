@@ -24,6 +24,7 @@ public sealed class ListingNavigationCoordinator : IDisposable
     private static readonly TimeSpan AutoRetainerWait = TimeSpan.FromSeconds(30);
     private readonly IRetainerAutomationSession session;
     private readonly IAutoRetainerIpc autoRetainer;
+    private readonly AutoRetainerSuppression autoRetainerSuppression;
     private readonly AutomationLease automation;
     private readonly CancellationTokenSource lifetime = new();
     private int running;
@@ -32,11 +33,13 @@ public sealed class ListingNavigationCoordinator : IDisposable
     public ListingNavigationCoordinator(
         IRetainerAutomationSession session,
         IAutoRetainerIpc autoRetainer,
-        AutomationLease automation)
+        AutomationLease automation,
+        AutoRetainerSuppression? autoRetainerSuppression = null)
     {
         this.session = session;
         this.autoRetainer = autoRetainer;
         this.automation = automation;
+        this.autoRetainerSuppression = autoRetainerSuppression ?? new AutoRetainerSuppression(autoRetainer);
     }
 
     public bool IsRunning => Volatile.Read(ref running) != 0;
@@ -60,17 +63,14 @@ public sealed class ListingNavigationCoordinator : IDisposable
 
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
             var token = linked.Token;
-            var restoreSuppression = false;
+            AutoRetainerSuppression.Scope? suppressionScope = null;
             try
             {
                 if (!await WaitForAutoRetainerAsync(token).ConfigureAwait(false))
                     return Complete(false, false, "AutoRetainer remained busy; the listing was not opened.");
 
-                if (autoRetainer.IsAvailable && !autoRetainer.IsSuppressed)
-                {
-                    autoRetainer.SetSuppressed(true);
-                    restoreSuppression = true;
-                }
+                if (autoRetainer.IsAvailable)
+                    suppressionScope = autoRetainerSuppression.Acquire();
 
                 Status = $"Opening {request.RetainerName}…";
                 var list = await session.EnsureRetainerListAsync(token).ConfigureAwait(false);
@@ -110,10 +110,11 @@ public sealed class ListingNavigationCoordinator : IDisposable
             }
             finally
             {
-                if (restoreSuppression)
+                if (suppressionScope is not null)
                 {
-                    try { autoRetainer.SetSuppressed(false); }
-                    catch (Exception exception) { Status = $"The listing opened, but AutoRetainer suppression could not be restored: {exception.Message}"; }
+                    suppressionScope.Dispose();
+                    if (suppressionScope.RestoreFailure is { } restoreFailure)
+                        Status = $"{Status} AutoRetainer suppression could not be restored: {restoreFailure}";
                 }
                 Interlocked.Exchange(ref running, 0);
             }
@@ -137,17 +138,14 @@ public sealed class ListingNavigationCoordinator : IDisposable
 
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
             var token = linked.Token;
-            var restoreSuppression = false;
+            AutoRetainerSuppression.Scope? suppressionScope = null;
             try
             {
                 if (!await WaitForAutoRetainerAsync(token).ConfigureAwait(false))
                     return Complete(false, false, "AutoRetainer remained busy; the listings were not opened.");
 
-                if (autoRetainer.IsAvailable && !autoRetainer.IsSuppressed)
-                {
-                    autoRetainer.SetSuppressed(true);
-                    restoreSuppression = true;
-                }
+                if (autoRetainer.IsAvailable)
+                    suppressionScope = autoRetainerSuppression.Acquire();
 
                 Status = $"Opening {request.RetainerName}'s listings…";
                 var list = await session.EnsureRetainerListAsync(token).ConfigureAwait(false);
@@ -180,10 +178,11 @@ public sealed class ListingNavigationCoordinator : IDisposable
             }
             finally
             {
-                if (restoreSuppression)
+                if (suppressionScope is not null)
                 {
-                    try { autoRetainer.SetSuppressed(false); }
-                    catch (Exception exception) { Status = $"The listings opened, but AutoRetainer suppression could not be restored: {exception.Message}"; }
+                    suppressionScope.Dispose();
+                    if (suppressionScope.RestoreFailure is { } restoreFailure)
+                        Status = $"{Status} AutoRetainer suppression could not be restored: {restoreFailure}";
                 }
                 Interlocked.Exchange(ref running, 0);
             }
@@ -204,17 +203,14 @@ public sealed class ListingNavigationCoordinator : IDisposable
 
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
             var token = linked.Token;
-            var restoreSuppression = false;
+            AutoRetainerSuppression.Scope? suppressionScope = null;
             try
             {
                 if (!await WaitForAutoRetainerAsync(token).ConfigureAwait(false))
                     return Complete(false, false, "AutoRetainer remained busy; the retainer list was not restored.");
 
-                if (autoRetainer.IsAvailable && !autoRetainer.IsSuppressed)
-                {
-                    autoRetainer.SetSuppressed(true);
-                    restoreSuppression = true;
-                }
+                if (autoRetainer.IsAvailable)
+                    suppressionScope = autoRetainerSuppression.Acquire();
 
                 Status = "Returning to the retainer list…";
                 var result = await session.ReturnToRetainerListAsync(token).ConfigureAwait(false);
@@ -232,10 +228,11 @@ public sealed class ListingNavigationCoordinator : IDisposable
             }
             finally
             {
-                if (restoreSuppression)
+                if (suppressionScope is not null)
                 {
-                    try { autoRetainer.SetSuppressed(false); }
-                    catch (Exception exception) { Status = $"The retainer list was restored, but AutoRetainer suppression could not be restored: {exception.Message}"; }
+                    suppressionScope.Dispose();
+                    if (suppressionScope.RestoreFailure is { } restoreFailure)
+                        Status = $"{Status} AutoRetainer suppression could not be restored: {restoreFailure}";
                 }
                 Interlocked.Exchange(ref running, 0);
             }

@@ -165,15 +165,17 @@ public sealed class Plugin : IDalamudPlugin
         RetainerStockMutationPersistence.RecoverPending(journal, cache);
         journal.ReconcileInterruptedOperations();
         var driver = new RetainerLiveDriver(retainerSession);
-        listingNavigation = new(retainerSession, autoRetainerIpc, automation);
+        var autoRetainerSuppression = new AutoRetainerSuppression(autoRetainerIpc);
+        listingNavigation = new(retainerSession, autoRetainerIpc, automation, autoRetainerSuppression);
         transfers = new TransferCoordinator(
             journal,
             driver,
             cache,
             CurrentOwner,
             CountCachedPlayerItems,
-            automation);
-        automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerIpc);
+            automation,
+            autoRetainerSuppression: autoRetainerSuppression);
+        automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerSuppression);
         runtimeSnapshots = new(scanner, playerInventory, cache, state, CurrentOwner);
         playerInventoryReconciler.ReconcileIfDue(DateTime.UtcNow, force: true);
         var initialSnapshot = runtimeSnapshots.Refresh();
