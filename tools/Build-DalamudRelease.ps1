@@ -54,9 +54,16 @@ $packageFiles = @(
     "RQ.deps.json",
     "RQ.json",
     "ECommons.dll",
+    "Franthropy.AgentBridge.dll",
     "Franthropy.Dalamud.dll",
     "Franthropy.FFXIV.dll",
     "Franthropy.Filtering.dll",
+    "Franthropy.Observations.dll",
+    "Microsoft.Data.Sqlite.dll",
+    "SQLitePCLRaw.batteries_v2.dll",
+    "SQLitePCLRaw.core.dll",
+    "SQLitePCLRaw.provider.e_sqlite3.dll",
+    "e_sqlite3.dll",
     "System.Security.Cryptography.ProtectedData.dll"
 )
 
