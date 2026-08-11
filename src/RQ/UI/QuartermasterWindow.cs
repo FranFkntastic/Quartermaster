@@ -159,20 +159,17 @@ public sealed class QuartermasterWindow : Window
                 "Desired",
                 62,
                 row => row.DesiredUnits.ToString("N0"),
-                row => row.DesiredUnits,
-                Alignment: DalamudTableCellAlignment.Right),
+                row => row.DesiredUnits),
             new(
                 "Listed",
                 72,
                 row => EvidenceText(row.ListedUnits),
-                row => row.ListedUnits.IsKnown ? row.ListedUnits.Value : -1,
-                Alignment: DalamudTableCellAlignment.Right),
+                row => row.ListedUnits.IsKnown ? row.ListedUnits.Value : -1),
             new(
                 "Need",
                 72,
                 row => EvidenceText(row.NeedUnits),
-                row => row.NeedUnits.IsKnown ? row.NeedUnits.Value : -1,
-                Alignment: DalamudTableCellAlignment.Right),
+                row => row.NeedUnits.IsKnown ? row.NeedUnits.Value : -1),
             new(
                 "Coverage",
                 132,
@@ -197,8 +194,7 @@ public sealed class QuartermasterWindow : Window
                 "Qty",
                 62,
                 row => row.Quantity.ToString("N0"),
-                row => row.Quantity,
-                Alignment: DalamudTableCellAlignment.Right),
+                row => row.Quantity),
             new(
                 "Quality",
                 78,
@@ -208,8 +204,7 @@ public sealed class QuartermasterWindow : Window
                 "Unit price",
                 104,
                 ListingUnitPrice,
-                row => row.UnitPrice.IsKnown ? row.UnitPrice.Value : decimal.MinValue,
-                Alignment: DalamudTableCellAlignment.Right),
+                row => row.UnitPrice.IsKnown ? row.UnitPrice.Value : decimal.MinValue),
         ]);
         stockTable = CreateStockTable();
         restockPlanTable = CreateRestockPlanTable();
@@ -254,7 +249,6 @@ public sealed class QuartermasterWindow : Window
             80,
             row => row.Item.PlayerQuantity.ToString("N0"),
             row => row.Item.PlayerQuantity,
-            Alignment: DalamudTableCellAlignment.Right,
             DrawContextMenu: DrawStockRowContextMenu,
             Id: "player"),
         new(
@@ -262,7 +256,6 @@ public sealed class QuartermasterWindow : Window
             84,
             row => row.AccessibleRetainerQuantity.ToString("N0"),
             row => row.AccessibleRetainerQuantity,
-            Alignment: DalamudTableCellAlignment.Right,
             DrawContextMenu: DrawStockRowContextMenu,
             Id: "retainers",
             HeaderTooltip: "Current matching quantity in accessible retainer storage."),
@@ -283,7 +276,6 @@ public sealed class QuartermasterWindow : Window
             TextColor: row => row.Rule is null
                 ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
                 : null,
-            Alignment: DalamudTableCellAlignment.Right,
             DrawContextMenu: DrawStockRowContextMenu,
             Id: "target"),
         new(
@@ -414,7 +406,6 @@ public sealed class QuartermasterWindow : Window
             64,
             row => row.PlayerQuantity.ToString("N0"),
             row => row.PlayerQuantity,
-            Alignment: DalamudTableCellAlignment.Right,
             Id: "player"),
         new(
             "Target",
@@ -429,7 +420,6 @@ public sealed class QuartermasterWindow : Window
             128,
             row => row.AccessibleStorageQuantity.ToString("N0"),
             row => row.AccessibleStorageQuantity,
-            Alignment: DalamudTableCellAlignment.Right,
             Id: "accessible-storage",
             HeaderTooltip: "Current matching quantity in accessible retainer storage."),
         new(
@@ -462,7 +452,6 @@ public sealed class QuartermasterWindow : Window
             TransferListingShortfall,
             row => row.ListingContribution.IsKnown ? row.ListingContribution.Value : -1,
             ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.DefaultHide,
-            Alignment: DalamudTableCellAlignment.Right,
             Id: "listing-shortfall",
             HeaderTooltip: "Units still needed by the linked Listing Plan."),
         new("##remove", 28, _ => string.Empty, Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoHide, Draw: row =>
@@ -514,8 +503,7 @@ public sealed class QuartermasterWindow : Window
             72,
             row => row.ListingContribution.IsKnown ? SignedQuantity(row.Difference) : "—",
             row => row.Difference,
-            TextColor: row => TransferActionColor(row.Line?.Action),
-            Alignment: DalamudTableCellAlignment.Right),
+            TextColor: row => TransferActionColor(row.Line?.Action)),
         new(
             "Planned movement",
             1.2f,
@@ -528,10 +516,10 @@ public sealed class QuartermasterWindow : Window
     private static DalamudTableProjection<OperationLine> CreateOperationLineTable() => new(
     [
         new("Item", 1f, line => line.ItemName, line => line.ItemName, ImGuiTableColumnFlags.WidthStretch),
-        new("Target", 80, line => line.TargetQuantity.ToString("N0"), line => line.TargetQuantity, Alignment: DalamudTableCellAlignment.Right),
-        new("Submitted shortage", 120, line => line.ShortageQuantity.ToString("N0"), line => line.ShortageQuantity, Alignment: DalamudTableCellAlignment.Right),
-        new("Transferred", 90, line => line.TransferredQuantity.ToString("N0"), line => line.TransferredQuantity, Alignment: DalamudTableCellAlignment.Right),
-        new("Remaining", 90, line => Math.Max(0, line.ShortageQuantity - line.TransferredQuantity).ToString("N0"), line => Math.Max(0, line.ShortageQuantity - line.TransferredQuantity), Alignment: DalamudTableCellAlignment.Right),
+        new("Target", 80, line => line.TargetQuantity.ToString("N0"), line => line.TargetQuantity),
+        new("Submitted shortage", 120, line => line.ShortageQuantity.ToString("N0"), line => line.ShortageQuantity),
+        new("Transferred", 90, line => line.TransferredQuantity.ToString("N0"), line => line.TransferredQuantity),
+        new("Remaining", 90, line => Math.Max(0, line.ShortageQuantity - line.TransferredQuantity).ToString("N0"), line => Math.Max(0, line.ShortageQuantity - line.TransferredQuantity)),
     ]);
 
     public Guid? SelectedRestockPlanId =>
