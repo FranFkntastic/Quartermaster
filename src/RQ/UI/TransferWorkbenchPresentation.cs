@@ -1,4 +1,5 @@
 using System.Globalization;
+using RQ.Domain;
 using RQ.Planning;
 
 namespace RQ.UI;
@@ -10,6 +11,32 @@ internal readonly record struct TransferOutcomePresentation(string Primary, stri
 
 internal static class TransferWorkbenchPresentation
 {
+    public static int AccessibleStorageQuantity(
+        StockGroup? stock,
+        ItemQualityPolicy quality,
+        IReadOnlyDictionary<ulong, CachedRetainer> retainers,
+        OwnerScope owner)
+    {
+        var accessibleRetainerIds = retainers.Values
+            .Where(retainer =>
+                retainer.Owner.Matches(owner) &&
+                retainer.IsCurrentlyAssigned is not false &&
+                retainer.IsUiAccessible is not false)
+            .Select(retainer => retainer.RetainerId)
+            .ToHashSet();
+        return stock?.Stacks
+            .Where(stack =>
+                stack.ScopeKind == BrowserScopeKind.Retainer &&
+                stack.RetainerId is { } retainerId &&
+                accessibleRetainerIds.Contains(retainerId) &&
+                (quality == ItemQualityPolicy.Any ||
+                 quality == ItemQualityPolicy.HqOnly &&
+                 stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ ||
+                 quality == ItemQualityPolicy.NqOnly &&
+                 stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.NQ))
+            .Sum(stack => stack.Quantity) ?? 0;
+    }
+
     public static string Target(int desiredPlayerQuantity, int playerQuantity, bool evidenceKnown = true) =>
         evidenceKnown
             ? $"{desiredPlayerQuantity.ToString("N0", CultureInfo.CurrentCulture)} ({Signed(desiredPlayerQuantity - playerQuantity)})"

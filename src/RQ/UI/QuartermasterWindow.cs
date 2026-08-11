@@ -3180,7 +3180,7 @@ public sealed class QuartermasterWindow : Window
                      ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.Sortable |
                      ImGuiTableFlags.Reorderable | ImGuiTableFlags.Hideable;
         var footerHeight = ImGui.GetTextLineHeightWithSpacing() + 4;
-        var transferRows = projection.Rows;
+        IReadOnlyList<TransferWorkbenchRow> transferRows = projection.Rows;
         RenderedTransferRowCount = 0;
         if (transferWorkbenchTable.Begin(
                 "RQTransferWorkbenchV2",
@@ -3188,6 +3188,10 @@ public sealed class QuartermasterWindow : Window
                     new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y - footerHeight)),
                     flags)))
         {
+            unsafe
+            {
+                transferRows = transferWorkbenchTable.Apply(transferRows, ImGui.TableGetSortSpecs());
+            }
             RenderedTransferRowCount = transferWorkbenchTable.DrawClippedRows(
                 transferRows,
                 (row, _) =>
@@ -3303,7 +3307,11 @@ public sealed class QuartermasterWindow : Window
                 var playerQuantity = StowageEvaluator.PlayerQuantity(
                     rule,
                     runtime.Browser.Items.FirstOrDefault(item => item.ItemId == rule.ItemId));
-                var accessibleStorageQuantity = AccessibleStorageQuantity(runtime.Browser, rule);
+                var accessibleStorageQuantity = TransferWorkbenchPresentation.AccessibleStorageQuantity(
+                    runtime.Browser.Items.FirstOrDefault(item => item.ItemId == rule.ItemId),
+                    rule.Quality,
+                    runtime.Retainers,
+                    runtime.Owner);
                 listingContributions.TryGetValue((rule.ItemId, rule.Quality), out var listingContribution);
                 return new TransferWorkbenchRow(
                     rule,
@@ -4669,17 +4677,6 @@ public sealed class QuartermasterWindow : Window
         browser.Items.FirstOrDefault(item => item.ItemId == rule.ItemId)?.Stacks
             .Where(stack =>
                 stack.ScopeKind == BrowserScopeKind.Player &&
-                (rule.Quality == ItemQualityPolicy.Any ||
-                 rule.Quality == ItemQualityPolicy.HqOnly &&
-                 stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ ||
-                 rule.Quality == ItemQualityPolicy.NqOnly &&
-                 stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.NQ))
-            .Sum(stack => stack.Quantity) ?? 0;
-
-    private static int AccessibleStorageQuantity(BrowserProjection browser, TargetPlanItem rule) =>
-        browser.Items.FirstOrDefault(item => item.ItemId == rule.ItemId)?.Stacks
-            .Where(stack =>
-                stack.ScopeKind == BrowserScopeKind.Retainer &&
                 (rule.Quality == ItemQualityPolicy.Any ||
                  rule.Quality == ItemQualityPolicy.HqOnly &&
                  stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ ||

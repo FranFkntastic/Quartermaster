@@ -5,6 +5,30 @@ namespace RQ.Tests;
 
 public sealed class TransferWorkbenchPresentationTests
 {
+    [Fact]
+    public void Accessible_storage_excludes_retainer_stock_known_to_be_inaccessible()
+    {
+        var accessible = TestData.Retainer(10, "Accessible", (100, "Bridge", 41));
+        accessible.IsUiAccessible = true;
+        var inaccessible = TestData.Retainer(20, "Inaccessible", (100, "Bridge", 9));
+        inaccessible.IsUiAccessible = false;
+        var retainers = new Dictionary<ulong, RQ.Domain.CachedRetainer>
+        {
+            [accessible.RetainerId] = accessible,
+            [inaccessible.RetainerId] = inaccessible,
+        };
+        var stock = BrowserProjectionBuilder.Build([], retainers, TestData.Owner)
+            .Items.Single(item => item.ItemId == 100);
+
+        var quantity = TransferWorkbenchPresentation.AccessibleStorageQuantity(
+            stock,
+            RQ.Domain.ItemQualityPolicy.Any,
+            retainers,
+            TestData.Owner);
+
+        Assert.Equal(41, quantity);
+    }
+
     [Theory]
     [InlineData(50, 0, "50 (+50)")]
     [InlineData(0, 25, "0 (-25)")]
