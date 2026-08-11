@@ -247,15 +247,14 @@ public sealed class RetainerRefreshCoordinator : IDisposable
             }
 
             phase = RetainerRefreshPhase.Refreshing;
-            var processed = 0;
+            var attempted = 0;
             foreach (var target in attempts)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                Status = $"Refreshing retainers: {processed}/{attempts.Length}.";
+                Status = $"Refreshing retainers: {attempted}/{attempts.Length}.";
                 try
                 {
                     await RefreshOneAsync(target, cancellationToken).ConfigureAwait(false);
-                    processed++;
                     results.Add(new(target.RetainerId, target.RetainerName, "Refreshed", "Complete inventory evidence was accepted."));
                     Results = results.ToArray();
                 }
@@ -284,6 +283,11 @@ public sealed class RetainerRefreshCoordinator : IDisposable
                     Results = results.ToArray();
                     await RecoverRetainerListAsync(cancellationToken).ConfigureAwait(false);
                 }
+                finally
+                {
+                    attempted++;
+                    Status = $"Refreshing retainers: {attempted}/{attempts.Length}.";
+                }
             }
 
             await CloseRetainerListAsync(cancellationToken).ConfigureAwait(false);
@@ -291,7 +295,7 @@ public sealed class RetainerRefreshCoordinator : IDisposable
             {
                 if (persistStandaloneRecovery)
                     PersistRecovery(runId, owner, pending, $"{pending.Count} retainer(s) need retry.");
-                Status = $"Retainer refresh finished with {pending.Count} retryable failure(s).";
+                Status = $"Retainer evidence refresh failed for {pending.Count} of {attempts.Length} retainers. Retry to try again.";
                 CompleteRun(runId, false);
                 return;
             }
@@ -299,8 +303,8 @@ public sealed class RetainerRefreshCoordinator : IDisposable
             if (persistStandaloneRecovery)
                 state.Mutate(StateChangeKind.Recovery, document => document.RetainerRefreshRecovery = null);
             Status = inaccessible == 0
-                ? $"Retainer refresh complete: {processed}/{attempts.Length}."
-                : $"Retainer refresh complete: {processed}/{attempts.Length}; {inaccessible} not accessible.";
+                ? $"Retainer refresh complete: {attempted}/{attempts.Length}."
+                : $"Retainer refresh complete: {attempted}/{attempts.Length}; {inaccessible} not accessible.";
             CompleteRun(runId, true);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
