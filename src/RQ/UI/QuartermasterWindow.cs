@@ -4659,7 +4659,7 @@ public sealed class QuartermasterWindow : Window
                 (!string.IsNullOrWhiteSpace(listingNavigation.Status)
                     ? ImGui.GetTextLineHeightWithSpacing()
                     : 0));
-            if (physicalListingTable.Begin("RQPhysicalListings", detailHeight))
+            if (physicalListingTable.Begin("RQPhysicalListingGroupsV1", detailHeight))
             {
                 physicalListingTable.DrawFilterRow();
                 var visibleGroups = physicalListingTable.Apply(
