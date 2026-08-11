@@ -40,8 +40,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly PlayerInventoryReconciler playerInventoryReconciler;
     private readonly RetainerCacheRepository cache;
     private readonly StateRepository state;
-    private readonly RetainerCaptureService captures;
-    private readonly AutoRetainerRefreshService autoRetainer;
+    private readonly RetainerRefreshCoordinator retainerRefresh;
     private readonly OperationJournal journal;
     private readonly TransferCoordinator transfers;
     private readonly ListingNavigationCoordinator listingNavigation;
@@ -55,7 +54,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly AgentBridgeViewportCaptureService agentBridgeViewportCapture;
     private readonly AgentBridgeUiReviewRegistry agentReviewRegistry = new();
     private readonly DalamudSharedObservationHost observationHost;
-    private readonly PlayerInventoryObservationConsumer observationConsumer;
+    private readonly QuartermasterObservationConsumer observationConsumer;
     private readonly WindowSystem windows = new("RQ");
     private readonly QuartermasterWindow window;
     private readonly RuntimeReconciliationQueue reconciliation = new();
@@ -153,14 +152,13 @@ public sealed class Plugin : IDalamudPlugin
         }
         StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
         TransferPlanMigration.EnsureOwnerPlans(state, CurrentOwner());
-        captures = new(addonLifecycle, log, scanner, cache, CurrentOwner);
         var automation = new AutomationLease();
         // Keep retrieval verification bound to the exact inventory changes emitted
         // while its native command is in flight; this survives retainer slot compaction.
         var retainerSession = new DalamudRetainerAutomationSession(
             framework, gameGui, dataManager, log, objects, targets, sigScanner, gameInventory);
         var autoRetainerIpc = new DalamudAutoRetainerIpc(pluginInterface);
-        autoRetainer = new(framework, log, captures, retainerSession, autoRetainerIpc, automation);
+        retainerRefresh = new(framework, log, cache, state, retainerSession, observationHost.CaptureSessions, autoRetainerIpc, automation, CurrentOwner);
         journal = new OperationJournal(state);
         RetainerStockMutationPersistence.RecoverPending(journal, cache);
         journal.ReconcileInterruptedOperations();
@@ -191,7 +189,7 @@ public sealed class Plugin : IDalamudPlugin
             runtimeSnapshots,
             journal,
             transfers,
-            autoRetainer,
+            retainerRefresh,
             listingNavigation,
             dataManager,
             configuration,
@@ -220,13 +218,11 @@ public sealed class Plugin : IDalamudPlugin
 
         try
         {
-            captures.Register();
-            autoRetainer.Register();
+            retainerRefresh.Register();
             state.Changed += OnStateChanged;
             playerInventory.Changed += OnPlayerInventoryChanged;
             cache.Changed += OnCacheChanged;
             cache.ListingCaptured += OnListingCaptured;
-            captures.CaptureCompleted += OnRetainerCaptureCompleted;
             observationHost.Start();
             observationConsumer.Start();
             journal.OperationChanged += OnOperationChanged;
@@ -291,9 +287,8 @@ public sealed class Plugin : IDalamudPlugin
         TransferPlanMigration.EnsureOwnerPlans(state, CurrentOwner());
         workQueue.Drain();
         playerInventoryReconciler.ReconcileIfDue(DateTime.UtcNow);
-        captures.TickPassive();
         automaticRetrievals.Tick();
-        autoRetainer.TickAutomatic(window.StockBrowserVisible);
+        retainerRefresh.TickRosterDiscovery(window.StockBrowserVisible);
         agentBridge.Tick();
         FlushPlayerInventoryIfDue();
         if (DateTime.UtcNow >= nextSnapshotAt)
@@ -346,6 +341,7 @@ public sealed class Plugin : IDalamudPlugin
         {
             StateChangeKind.Listings => RuntimeDomain.Listings,
             StateChangeKind.Operations => RuntimeDomain.Operations,
+            StateChangeKind.Recovery => RuntimeDomain.None,
             _ => RuntimeDomain.Plans,
         };
         reconciliation.Request(domain, "state");
@@ -366,13 +362,6 @@ public sealed class Plugin : IDalamudPlugin
     {
         state.Mutate(StateChangeKind.Listings, document => document.LatestRetainerListingCapture = receipt);
         reconciliation.Request(RuntimeDomain.Listings, "retainer_listings");
-    }
-
-    private void OnRetainerCaptureCompleted(CaptureReceipt receipt)
-    {
-        if (receipt.Outcome != CaptureOutcome.Persisted ||
-            cache.Snapshot().GetValueOrDefault(receipt.RetainerId) is not { } retainer)
-            return;
     }
 
     private void OnPlayerInventoryChanged(PlayerInventoryCacheChange change)
@@ -438,7 +427,9 @@ public sealed class Plugin : IDalamudPlugin
     private QuartermasterBridgeTruth CreateAgentBridgeTruth()
     {
         var runtime = runtimeSnapshots.Current;
-        var retainers = runtime.Retainers.Values.Where(retainer => runtime.Owner.Matches(retainer.Owner)).ToArray();
+        var retainers = runtime.Retainers.Values
+            .Where(retainer => runtime.Owner.Matches(retainer.Owner) && retainer.IsCurrentlyAssigned is not false)
+            .ToArray();
         // Operation history advances independently from the heavier runtime
         // projection, so bridge truth reads it from the journal authority.
         var operation = journal.Current(runtime.Owner);
@@ -487,15 +478,15 @@ public sealed class Plugin : IDalamudPlugin
             window.StowageEditorOpen,
             operation?.OperationId,
             operation?.Status,
-            autoRetainer.IsAvailable,
-            autoRetainer.IsRefreshing || autoRetainer.IsQueued,
-            autoRetainer.Status,
+            retainerRefresh.IsAvailable,
+            retainerRefresh.IsRefreshing || retainerRefresh.IsQueued,
+            retainerRefresh.Status,
             transfers.IsRunning,
             listingNavigation.IsRunning,
             listingNavigation.Status);
     }
 
-    private void ApplyInventoryObservation(PlayerInventoryObservationDelivery delivery)
+    private void ApplyInventoryObservation(QuartermasterObservationDelivery delivery)
     {
         var owner = CurrentOwner();
         if (!owner.HasStableIdentity ||
@@ -503,13 +494,13 @@ public sealed class Plugin : IDalamudPlugin
             owner.HomeWorldId != delivery.Owner.HomeWorldId)
             return;
 
-        if (delivery.Baselines.Count > 0)
+        if (delivery.PlayerBaselines.Count > 0)
         {
             var requested = new HashSet<string>(StringComparer.Ordinal);
             var observed = new HashSet<string>(StringComparer.Ordinal);
             var bags = new Dictionary<string, InventoryBag>(StringComparer.Ordinal);
             var observedAtUtc = DateTime.MinValue;
-            foreach (var baseline in delivery.Baselines.Where(candidate =>
+            foreach (var baseline in delivery.PlayerBaselines.Where(candidate =>
                          candidate.Scope.Subject.Kind == ObservationSubjectKind.Character &&
                          candidate.Scope.Container is ObservationContainerKind.PlayerInventory or ObservationContainerKind.Saddlebag))
             {
@@ -555,14 +546,135 @@ public sealed class Plugin : IDalamudPlugin
                         requested.Order(StringComparer.Ordinal).ToArray(),
                         observed.Order(StringComparer.Ordinal).ToArray()),
                     observedAtUtc == DateTime.MinValue ? DateTime.UtcNow : observedAtUtc);
-            return;
+        }
+        else if (delivery.PlayerChanges.Count > 0)
+        {
+            playerInventory.ApplyChanges(owner, delivery.PlayerChanges, scanner.ResolveItemMetadata);
         }
 
-        playerInventory.ApplyChanges(owner, delivery.Changes, scanner.ResolveItemMetadata);
+        foreach (var observation in delivery.RetainerObservations.OrderBy(observation => observation.Revision))
+            ApplyRetainerObservation(owner, observation);
+    }
+
+    private void ApplyRetainerObservation(OwnerScope owner, TrustedObservation observation)
+    {
+        var observedAtUtc = observation.Capture.ObservedAtUtc.UtcDateTime;
+        switch (observation.Scope.Container)
+        {
+            case ObservationContainerKind.RetainerRoster:
+            {
+                var payload = observation.Payload.Deserialize<RetainerRosterPayload>(
+                    ObservationPayloadContracts.RetainerRoster,
+                    ObservationPayloadContracts.Version);
+                cache.ReconcileRoster(
+                    owner,
+                    payload.Retainers
+                        .Where(retainer => retainer.WorldId == owner.HomeWorldId)
+                        .Select(retainer => new RetainerRosterProjectionEntry(
+                            retainer.RetainerId,
+                            retainer.Name,
+                            retainer.DisplayOrder,
+                            retainer.IsUiAccessible,
+                            retainer.ClassJobId,
+                            retainer.Level,
+                            retainer.MarketItemCount,
+                            retainer.IsGameAvailable))
+                        .ToArray(),
+                    observedAtUtc);
+                break;
+            }
+            case ObservationContainerKind.RetainerInventory:
+            {
+                var payload = observation.Payload.Deserialize<InventoryObservationPayload>(
+                    ObservationPayloadContracts.RetainerInventory,
+                    ObservationPayloadContracts.Version);
+                var bags = payload.ObservedContainerIds
+                    .Select(containerId => ((FFXIVClientStructs.FFXIV.Client.Game.InventoryType)containerId).ToString())
+                    .Distinct(StringComparer.Ordinal)
+                    .ToDictionary(
+                        key => key,
+                        key => new CachedBag { BagName = key, Location = key, ObservedAtUtc = observedAtUtc },
+                        StringComparer.Ordinal);
+                foreach (var item in payload.Items)
+                {
+                    var key = ((FFXIVClientStructs.FFXIV.Client.Game.InventoryType)item.ContainerId).ToString();
+                    if (!bags.TryGetValue(key, out var bag))
+                        bags[key] = bag = new CachedBag { BagName = key, Location = key, ObservedAtUtc = observedAtUtc };
+                    var metadata = scanner.ResolveItemMetadata(item.ItemId);
+                    bag.Items.Add(new CachedItem
+                    {
+                        ItemId = item.ItemId,
+                        ItemName = metadata.Name,
+                        ItemType = metadata.ItemType,
+                        Quantity = checked((uint)item.Quantity),
+                        IsHq = item.IsHighQuality,
+                        ContainerKey = key,
+                        SlotIndex = item.SlotIndex,
+                    });
+                }
+                cache.ReplaceInventoryObservation(
+                    observation.Scope.Subject.Id,
+                    owner,
+                    observedAtUtc,
+                    bags.Values.OrderBy(bag => bag.BagName, StringComparer.Ordinal).ToArray(),
+                    payload.RequestedContainerIds
+                        .Select(containerId => ((FFXIVClientStructs.FFXIV.Client.Game.InventoryType)containerId).ToString())
+                        .ToArray(),
+                    payload.ObservedContainerIds
+                        .Select(containerId => ((FFXIVClientStructs.FFXIV.Client.Game.InventoryType)containerId).ToString())
+                        .ToArray(),
+                    observation.Capture.SessionId);
+                break;
+            }
+            case ObservationContainerKind.RetainerGil:
+            {
+                var payload = observation.Payload.Deserialize<RetainerGilPayload>(
+                    ObservationPayloadContracts.RetainerGil,
+                    ObservationPayloadContracts.Version);
+                cache.ReplaceGilObservation(
+                    observation.Scope.Subject.Id,
+                    owner,
+                    observedAtUtc,
+                    payload.Gil,
+                    observation.Capture.SessionId);
+                break;
+            }
+            case ObservationContainerKind.RetainerMarketListings:
+            {
+                var payload = observation.Payload.Deserialize<RetainerMarketListingsPayload>(
+                    ObservationPayloadContracts.RetainerMarketListings,
+                    ObservationPayloadContracts.Version);
+                var retainerId = observation.Scope.Subject.Id;
+                var retainerName = cache.Snapshot().GetValueOrDefault(retainerId)?.RetainerName;
+                cache.ReplaceListings(new RetainerListingsObservation(
+                    retainerId,
+                    string.IsNullOrWhiteSpace(retainerName) ? $"Retainer {retainerId}" : retainerName,
+                    owner,
+                    observedAtUtc,
+                    payload.Listings.Select(listing =>
+                    {
+                        var metadata = scanner.ResolveItemMetadata(listing.ItemId);
+                        return new CachedMarketListing
+                        {
+                            ItemId = listing.ItemId,
+                            ItemName = metadata.Name,
+                            ItemType = metadata.ItemType,
+                            Quantity = checked((uint)listing.Quantity),
+                            IsHq = listing.IsHighQuality,
+                            ContainerKey = FFXIVClientStructs.FFXIV.Client.Game.InventoryType.RetainerMarket.ToString(),
+                            SlotIndex = listing.SlotIndex,
+                            UnitPrice = checked((uint)listing.UnitPrice),
+                            ListedAtUtc = observedAtUtc,
+                        };
+                    }).ToArray(),
+                    observation.Capture.SessionId));
+                break;
+            }
+        }
     }
 
     private async ValueTask DeliverInventoryObservationAsync(
-        PlayerInventoryObservationDelivery delivery,
+        QuartermasterObservationDelivery delivery,
         CancellationToken cancellationToken)
     {
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -601,12 +713,10 @@ public sealed class Plugin : IDalamudPlugin
         playerInventory.Changed -= OnPlayerInventoryChanged;
         cache.Changed -= OnCacheChanged;
         cache.ListingCaptured -= OnListingCaptured;
-        captures.CaptureCompleted -= OnRetainerCaptureCompleted;
         journal.OperationChanged -= OnOperationChanged;
         observationConsumer.DisposeAsync().AsTask().GetAwaiter().GetResult();
         ipc.Dispose();
-        autoRetainer.Dispose();
-        captures.Dispose();
+        retainerRefresh.Dispose();
         observationHost.Dispose();
         windows.RemoveAllWindows();
     }

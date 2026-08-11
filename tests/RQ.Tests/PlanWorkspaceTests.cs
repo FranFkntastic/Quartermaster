@@ -108,6 +108,30 @@ public sealed class PlanWorkspaceTests
     }
 
     [Fact]
+    public void Apply_AtomicallySupersedesRecoveryForTheEditedPlan()
+    {
+        var plan = new StowagePlan { Owner = TestData.Owner };
+        var state = new QuartermasterState
+        {
+            StowagePlans = [plan],
+            PlanItems = [Rule(plan.Id, 100, "Ore", 10)],
+            TransferPlanRecovery = new TransferPlanRecoveryState
+            {
+                Owner = TestData.Owner,
+                PlanId = plan.Id,
+                PlanRevision = plan.Revision,
+                RefreshRunId = "old-run",
+            },
+        };
+        var draft = StowagePlanCatalog.Draft(state, TestData.Owner, plan.Id);
+        draft.Rules[0].TargetQuantity++;
+
+        StowagePlanCatalog.Apply(state, TestData.Owner, draft);
+
+        Assert.Null(state.TransferPlanRecovery);
+    }
+
+    [Fact]
     public void Apply_RejectsAStaleDraftWithoutPartialChanges()
     {
         var plan = new StowagePlan { Owner = TestData.Owner };

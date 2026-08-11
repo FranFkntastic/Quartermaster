@@ -11,6 +11,36 @@ public enum RetainerCacheChangeKind
     All,
 }
 
+[Flags]
+public enum RetainerEvidenceDomain
+{
+    None = 0,
+    Inventory = 1,
+    Crystals = 2,
+    Gil = 4,
+    Listings = 8,
+}
+
+public sealed record RetainerRosterProjectionEntry(
+    ulong RetainerId,
+    string RetainerName,
+    int DisplayOrder,
+    bool? IsUiAccessible,
+    byte ClassJobId,
+    byte Level,
+    byte MarketItemCount,
+    bool IsGameAvailable = true);
+
+public sealed record RetainerEvidenceReceipt(
+    long Revision,
+    ulong RetainerId,
+    OwnerScope Owner,
+    string EvidenceSessionId,
+    RetainerEvidenceDomain Domains,
+    DateTime ObservedAtUtc,
+    string Code,
+    string Message);
+
 public sealed record CacheInvalidationResult(bool Removed, bool Persisted, string? Error);
 public sealed record RetainerVariantObservation(
     ulong RetainerId,
@@ -24,7 +54,8 @@ public sealed record RetainerListingsObservation(
     string RetainerName,
     OwnerScope Owner,
     DateTime ObservedAtUtc,
-    IReadOnlyList<CachedMarketListing> Listings);
+    IReadOnlyList<CachedMarketListing> Listings,
+    string EvidenceSessionId = "");
 
 public sealed class RetainerCacheRepository
 {
@@ -40,6 +71,7 @@ public sealed class RetainerCacheRepository
 
     public event Action<RetainerCacheChangeKind>? Changed;
     public event Action<RetainerListingCaptureReceipt>? ListingCaptured;
+    public event Action<RetainerEvidenceReceipt>? EvidenceAccepted;
     public long Revision { get; private set; }
 
     public IReadOnlyDictionary<ulong, CachedRetainer> Snapshot()
@@ -58,6 +90,161 @@ public sealed class RetainerCacheRepository
             Revision++;
         }
         Changed?.Invoke(RetainerCacheChangeKind.All);
+    }
+
+    public void ReconcileRoster(
+        OwnerScope owner,
+        IReadOnlyList<RetainerRosterProjectionEntry> roster,
+        DateTime observedAtUtc)
+    {
+        if (!owner.HasStableIdentity)
+            throw new InvalidOperationException("A stable owner identity is required.");
+        if (roster.Any(entry => entry.RetainerId == 0) ||
+            roster.Select(entry => entry.RetainerId).Distinct().Count() != roster.Count)
+            throw new InvalidOperationException("The assigned retainer roster is incomplete or duplicated.");
+
+        lock (gate)
+        {
+            if (cache.Values.Any(retainer =>
+                    retainer.Owner.Matches(owner) &&
+                    retainer.RosterObservedAtUtc > observedAtUtc))
+                return;
+            var candidate = cache.ToDictionary(pair => pair.Key, pair => Copy(pair.Value));
+            foreach (var existing in candidate.Values.Where(retainer => retainer.Owner.Matches(owner)))
+            {
+                existing.IsCurrentlyAssigned = false;
+                existing.RosterObservedAtUtc = observedAtUtc;
+            }
+            foreach (var entry in roster)
+            {
+                var current = candidate.GetValueOrDefault(entry.RetainerId) ?? new CachedRetainer
+                {
+                    RetainerId = entry.RetainerId,
+                    Owner = owner with { },
+                };
+                current.RetainerName = entry.RetainerName;
+                current.Owner = owner with { };
+                current.IsCurrentlyAssigned = true;
+                current.DisplayOrder = entry.DisplayOrder;
+                if (entry.IsUiAccessible.HasValue &&
+                    (!current.UiAccessibilityObservedAtUtc.HasValue || observedAtUtc >= current.UiAccessibilityObservedAtUtc))
+                {
+                    current.IsUiAccessible = entry.IsUiAccessible;
+                    current.UiAccessibilityObservedAtUtc = observedAtUtc;
+                }
+                current.IsGameAvailable = entry.IsGameAvailable;
+                current.ClassJobId = entry.ClassJobId;
+                current.Level = entry.Level;
+                current.MarketItemCount = entry.MarketItemCount;
+                current.RosterObservedAtUtc = observedAtUtc;
+                candidate[entry.RetainerId] = current;
+            }
+            store.Save(candidate);
+            cache = candidate;
+            Revision++;
+        }
+        Changed?.Invoke(RetainerCacheChangeKind.All);
+    }
+
+    public void ObserveUiAccessibility(
+        OwnerScope owner,
+        ulong retainerId,
+        bool isAccessible,
+        DateTime observedAtUtc)
+    {
+        if (!owner.HasStableIdentity || retainerId == 0)
+            throw new InvalidOperationException("Stable owner and retainer identities are required.");
+        lock (gate)
+        {
+            if (!cache.TryGetValue(retainerId, out var current) || !current.Owner.Matches(owner))
+                return;
+            if (current.UiAccessibilityObservedAtUtc.HasValue && current.UiAccessibilityObservedAtUtc > observedAtUtc)
+                return;
+            var updated = Copy(current);
+            updated.IsUiAccessible = isAccessible;
+            updated.UiAccessibilityObservedAtUtc = observedAtUtc;
+            var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [retainerId] = updated };
+            store.Save(candidate);
+            cache = candidate;
+            Revision++;
+        }
+        Changed?.Invoke(RetainerCacheChangeKind.All);
+    }
+
+    public void ReplaceInventoryObservation(
+        ulong retainerId,
+        OwnerScope owner,
+        DateTime observedAtUtc,
+        IReadOnlyList<CachedBag> bags,
+        IReadOnlyList<string> requestedSources,
+        IReadOnlyList<string> observedSources,
+        string evidenceSessionId = "")
+    {
+        if (retainerId == 0 || !owner.HasStableIdentity)
+            throw new InvalidOperationException("Stable owner and retainer identities are required.");
+
+        RetainerEvidenceReceipt receipt;
+        lock (gate)
+        {
+            if (cache.TryGetValue(retainerId, out var existing) &&
+                existing.Owner.Matches(owner) &&
+                existing.ObservedAtUtc > observedAtUtc)
+                return;
+            var updated = cache.TryGetValue(retainerId, out var current)
+                ? Copy(current)
+                : new CachedRetainer { RetainerId = retainerId, Owner = owner with { } };
+            updated.Owner = owner with { };
+            updated.ObservedAtUtc = observedAtUtc;
+            updated.Bags = bags.Select(Copy).ToList();
+            updated.RequestedSources = requestedSources.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList();
+            updated.ObservedSources = observedSources.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList();
+            var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [retainerId] = updated };
+            store.Save(candidate);
+            cache = candidate;
+            var revision = ++Revision;
+            var domains = RetainerEvidenceDomain.None;
+            if (InventoryScanner.RequiredRetainerContainers
+                .Select(container => container.ToString())
+                .All(updated.ObservedSources.Contains))
+                domains |= RetainerEvidenceDomain.Inventory;
+            if (updated.ObservedSources.Contains(FFXIVClientStructs.FFXIV.Client.Game.InventoryType.RetainerCrystals.ToString(), StringComparer.Ordinal))
+                domains |= RetainerEvidenceDomain.Crystals;
+            receipt = new(revision, retainerId, owner with { }, evidenceSessionId, domains, observedAtUtc, "RetainerInventoryObserved", "Retainer inventory evidence was accepted.");
+        }
+        Changed?.Invoke(RetainerCacheChangeKind.Stock);
+        EvidenceAccepted?.Invoke(receipt);
+    }
+
+    public void ReplaceGilObservation(
+        ulong retainerId,
+        OwnerScope owner,
+        DateTime observedAtUtc,
+        ulong gil,
+        string evidenceSessionId = "")
+    {
+        if (retainerId == 0 || !owner.HasStableIdentity)
+            throw new InvalidOperationException("Stable owner and retainer identities are required.");
+
+        RetainerEvidenceReceipt receipt;
+        lock (gate)
+        {
+            if (cache.TryGetValue(retainerId, out var existing) &&
+                existing.Owner.Matches(owner) &&
+                existing.GilObservedAtUtc > observedAtUtc)
+                return;
+            var updated = cache.TryGetValue(retainerId, out var current)
+                ? Copy(current)
+                : new CachedRetainer { RetainerId = retainerId, Owner = owner with { } };
+            updated.Owner = owner with { };
+            updated.Gil = gil;
+            updated.GilObservedAtUtc = observedAtUtc;
+            var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [retainerId] = updated };
+            store.Save(candidate);
+            cache = candidate;
+            receipt = new(++Revision, retainerId, owner with { }, evidenceSessionId, RetainerEvidenceDomain.Gil, observedAtUtc, "RetainerGilObserved", "Retainer gil evidence was accepted.");
+        }
+        Changed?.Invoke(RetainerCacheChangeKind.Stock);
+        EvidenceAccepted?.Invoke(receipt);
     }
 
     public void ReplaceObservedVariant(RetainerVariantObservation observation)
@@ -129,8 +316,13 @@ public sealed class RetainerCacheRepository
             throw new InvalidOperationException("A stable owner identity is required.");
 
         RetainerListingCaptureReceipt receipt;
+        RetainerEvidenceReceipt evidenceReceipt;
         lock (gate)
         {
+            if (cache.TryGetValue(observation.RetainerId, out var existing) &&
+                existing.Owner.Matches(observation.Owner) &&
+                existing.ListingsObservedAtUtc > observation.ObservedAtUtc)
+                return;
             var marketSource = FFXIVClientStructs.FFXIV.Client.Game.InventoryType.RetainerMarket.ToString();
             var comparisonAvailable = cache.TryGetValue(observation.RetainerId, out var current) &&
                                       observation.Owner.Matches(current.Owner) &&
@@ -160,7 +352,7 @@ public sealed class RetainerCacheRepository
             var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [observation.RetainerId] = updated };
             store.Save(candidate);
             cache = candidate;
-            Revision++;
+            var revision = ++Revision;
             receipt = new RetainerListingCaptureReceipt
             {
                 Semantics = RetainerListingCaptureReceipt.ChangedListingsV1,
@@ -173,9 +365,19 @@ public sealed class RetainerCacheRepository
                     ? ChangedListingItems(previousListings, updated.Listings)
                     : [],
             };
+            evidenceReceipt = new(
+                revision,
+                observation.RetainerId,
+                observation.Owner with { },
+                observation.EvidenceSessionId,
+                RetainerEvidenceDomain.Listings,
+                observation.ObservedAtUtc,
+                "RetainerListingsObserved",
+                "Retainer listing evidence was accepted.");
         }
         Changed?.Invoke(RetainerCacheChangeKind.Listings);
         ListingCaptured?.Invoke(receipt);
+        EvidenceAccepted?.Invoke(evidenceReceipt);
     }
 
     private static List<RetainerListingCaptureItem> ChangedListingItems(
@@ -282,6 +484,15 @@ public sealed class RetainerCacheRepository
         RetainerId = source.RetainerId,
         RetainerName = source.RetainerName,
         Owner = source.Owner with { },
+        IsCurrentlyAssigned = source.IsCurrentlyAssigned,
+        DisplayOrder = source.DisplayOrder,
+        IsUiAccessible = source.IsUiAccessible,
+        UiAccessibilityObservedAtUtc = source.UiAccessibilityObservedAtUtc,
+        IsGameAvailable = source.IsGameAvailable,
+        ClassJobId = source.ClassJobId,
+        Level = source.Level,
+        MarketItemCount = source.MarketItemCount,
+        RosterObservedAtUtc = source.RosterObservedAtUtc,
         ObservedAtUtc = source.ObservedAtUtc,
         Gil = source.Gil,
         GilObservedAtUtc = source.GilObservedAtUtc,

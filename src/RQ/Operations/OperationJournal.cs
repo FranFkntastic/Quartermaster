@@ -250,6 +250,9 @@ public sealed class OperationJournal
 
         var now = utcNow();
         var routes = batch.Routes.Where(route => route.RoutedQuantity > 0).ToArray();
+        var indexedRoutes = routes
+            .Select((route, index) => new { Route = route, AuthorizationKey = $"route:{index}" })
+            .ToArray();
         var operation = new OperationRecord
         {
             OperationId = $"rq-{Guid.NewGuid():N}",
@@ -263,41 +266,62 @@ public sealed class OperationJournal
             SourcePlanId = sourcePlan?.Id,
             SourcePlanRevision = sourcePlan?.Revision,
             SourcePlanName = sourcePlan?.Name,
-            Lines = routes
-                .GroupBy(route => (route.Request.ItemId, route.Request.IsHighQuality))
-                .Select(group => new OperationLine
+            Lines = indexedRoutes
+                .Select(entry => new OperationLine
                 {
-                    SourcePlanId = group.Select(route => route.Request.SourcePlanId).Distinct().Count() == 1
-                        ? group.First().Request.SourcePlanId
-                        : null,
-                    SourceRuleId = group.Select(route => route.Request.SourceRuleId).Distinct().Count() == 1
-                        ? group.First().Request.SourceRuleId
-                        : null,
-                    ItemId = group.Key.ItemId,
-                    ItemName = group.Select(route => route.Request.ItemName).First(name => !string.IsNullOrWhiteSpace(name)),
-                    IsHighQuality = group.Key.IsHighQuality,
-                    Quality = group.Key.IsHighQuality ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly,
-                    TargetQuantity = group.Sum(route => route.RoutedQuantity),
-                    ShortageQuantity = group.Sum(route => route.RoutedQuantity),
+                    AuthorizationKey = entry.AuthorizationKey,
+                    SourcePlanId = entry.Route.Request.SourcePlanId,
+                    SourceRuleId = entry.Route.Request.SourceRuleId,
+                    ItemId = entry.Route.Request.ItemId,
+                    ItemName = entry.Route.Request.ItemName,
+                    IsHighQuality = entry.Route.Request.IsHighQuality,
+                    Quality = entry.Route.Request.IsHighQuality ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly,
+                    TargetQuantity = entry.Route.RoutedQuantity,
+                    ShortageQuantity = entry.Route.RoutedQuantity,
+                    MaxStackSize = entry.Route.Request.MaxStackSize,
+                    Routing = CopyRouting(entry.Route.Request.Routing),
                 })
                 .ToList(),
-            DepositCandidates = routes
-                .SelectMany(route => route.Allocations.Select(allocation => new
-                {
-                    Route = route,
-                    Allocation = allocation,
-                }))
-                .GroupBy(entry => entry.Allocation.RetainerId)
+            DepositCandidates = indexedRoutes
+                .SelectMany(entry => entry.Route.Candidates.Count != 0
+                    ? entry.Route.Candidates.Select((candidate, priority) => new
+                    {
+                        entry.AuthorizationKey,
+                        Candidate = candidate,
+                        Priority = priority,
+                        AuthorizedCapacity = candidate.TotalCapacity,
+                        UsesLiveCapacity = true,
+                    })
+                    : entry.Route.Allocations.Select((allocation, priority) => new
+                    {
+                        entry.AuthorizationKey,
+                        Candidate = new RetainerStowageCapacity(
+                            allocation.RetainerId,
+                            allocation.RetainerName,
+                            allocation.ObservedAtUtc,
+                            allocation.Capacity,
+                            0),
+                        Priority = priority,
+                        AuthorizedCapacity = allocation.Quantity,
+                        UsesLiveCapacity = false,
+                    }))
+                .GroupBy(entry => entry.Candidate.RetainerId)
                 .Select(group => new DepositCandidateAuthorization
                 {
                     RetainerId = group.Key,
-                    RetainerName = group.First().Allocation.RetainerName,
-                    ObservedAtUtc = group.First().Allocation.ObservedAtUtc,
+                    RetainerName = group.First().Candidate.RetainerName,
+                    ObservedAtUtc = group.First().Candidate.ObservedAtUtc,
                     CapacityByVariant = group
-                        .GroupBy(entry => VariantKey(entry.Route.Request.ItemId, entry.Route.Request.IsHighQuality))
+                        .GroupBy(entry => entry.AuthorizationKey)
                         .ToDictionary(
                             entries => entries.Key,
-                            entries => entries.Sum(entry => entry.Allocation.Quantity)),
+                            entries => entries.Max(entry => entry.AuthorizedCapacity)),
+                    PriorityByVariant = group
+                        .GroupBy(entry => entry.AuthorizationKey)
+                        .ToDictionary(
+                            entries => entries.Key,
+                            entries => entries.Min(entry => entry.Priority)),
+                    UsesLiveCapacity = group.Any(entry => entry.UsesLiveCapacity),
                 })
                 .ToList(),
         };
@@ -391,6 +415,28 @@ public sealed class OperationJournal
         ulong retainerId,
         int quantity,
         string code,
+        string message) =>
+        RecordDepositTransferCore(operationId, null, itemId, isHighQuality, retainerId, quantity, code, message);
+
+    public void RecordDepositTransfer(
+        string operationId,
+        string authorizationKey,
+        uint itemId,
+        bool isHighQuality,
+        ulong retainerId,
+        int quantity,
+        string code,
+        string message) =>
+        RecordDepositTransferCore(operationId, authorizationKey, itemId, isHighQuality, retainerId, quantity, code, message);
+
+    private void RecordDepositTransferCore(
+        string operationId,
+        string? authorizationKey,
+        uint itemId,
+        bool isHighQuality,
+        ulong retainerId,
+        int quantity,
+        string code,
         string message)
     {
         if (quantity <= 0)
@@ -402,7 +448,9 @@ public sealed class OperationJournal
             if (operation.Status != OperationStatuses.Running)
                 throw new InvalidOperationException("Transfers can only be recorded for a running operation.");
             var line = operation.Lines.Single(candidate =>
-                candidate.ItemId == itemId && candidate.IsHighQuality == isHighQuality);
+                candidate.ItemId == itemId &&
+                candidate.IsHighQuality == isHighQuality &&
+                (authorizationKey is null || AuthorizationKey(candidate) == authorizationKey));
             if (line.TransferredQuantity > line.TargetQuantity - quantity)
                 throw new InvalidOperationException("Verified transfer exceeds persisted operation authorization.");
             line.TransferredQuantity = checked(line.TransferredQuantity + quantity);
@@ -419,6 +467,7 @@ public sealed class OperationJournal
                 ItemId = itemId,
                 RetainerId = retainerId,
                 Quantity = quantity,
+                AuthorizationKey = authorizationKey,
             });
             changed = Copy(operation);
         });
@@ -538,9 +587,12 @@ public sealed class OperationJournal
             ObservedAtUtc = candidate.ObservedAtUtc,
             CapacityByItem = candidate.CapacityByItem.ToDictionary(entry => entry.Key, entry => entry.Value),
             CapacityByVariant = candidate.CapacityByVariant.ToDictionary(entry => entry.Key, entry => entry.Value),
+            PriorityByVariant = candidate.PriorityByVariant.ToDictionary(entry => entry.Key, entry => entry.Value),
+            UsesLiveCapacity = candidate.UsesLiveCapacity,
         }).ToList(),
         Lines = operation.Lines.Select(line => new OperationLine
         {
+            AuthorizationKey = line.AuthorizationKey,
             SourcePlanId = line.SourcePlanId,
             SourceRuleId = line.SourceRuleId,
             ItemId = line.ItemId,
@@ -550,6 +602,8 @@ public sealed class OperationJournal
             TargetQuantity = line.TargetQuantity,
             ShortageQuantity = line.ShortageQuantity,
             TransferredQuantity = line.TransferredQuantity,
+            MaxStackSize = line.MaxStackSize,
+            Routing = CopyRouting(line.Routing),
         }).ToList(),
     };
 
@@ -571,8 +625,20 @@ public sealed class OperationJournal
         Enabled = item.Enabled,
     };
 
+    private static StowageRoutingPolicy CopyRouting(StowageRoutingPolicy? routing) => new()
+    {
+        Mode = routing?.Mode ?? StowageRoutingMode.ConsolidateFirst,
+        Overflow = routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
+        PreferredRetainerIds = routing?.PreferredRetainerIds.ToList() ?? [],
+    };
+
     public static string VariantKey(uint itemId, bool isHighQuality) =>
         $"{itemId}:{(isHighQuality ? "hq" : "nq")}";
+
+    public static string AuthorizationKey(OperationLine line) =>
+        string.IsNullOrWhiteSpace(line.AuthorizationKey)
+            ? VariantKey(line.ItemId, line.IsHighQuality)
+            : line.AuthorizationKey;
 
     private static bool QualityMatches(ItemQualityPolicy quality, bool isHighQuality) => quality switch
     {

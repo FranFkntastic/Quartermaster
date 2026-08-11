@@ -129,8 +129,9 @@ public static class BrowserProjectionBuilder
         Func<uint, ItemMetadata>? resolveMetadata = null)
     {
         var retainers = cache.Values
-            .Where(retainer => retainer.Owner.Matches(owner))
-            .OrderBy(retainer => retainer.RetainerName)
+            .Where(retainer => retainer.Owner.Matches(owner) && retainer.IsCurrentlyAssigned is not false)
+            .OrderBy(retainer => retainer.DisplayOrder ?? int.MaxValue)
+            .ThenBy(retainer => retainer.RetainerName)
             .ThenBy(retainer => retainer.RetainerId)
             .ToArray();
         var scopes = new List<BrowserScope>
@@ -288,8 +289,9 @@ public static class BrowserProjectionBuilder
                 stacks.Add(new(BrowserScope.PlayerKey, BrowserScopeKind.Player, null, "Player", item.ContainerKey ?? bag.Location ?? bag.BagName, item.SlotIndex, item.ItemId, DisplayName(item.ItemId, item.ItemName), checked((int)item.Quantity), item.IsHq ? FfxivItemQuality.HQ : FfxivItemQuality.NQ, null, item.ItemType, item.ConditionPercent is { } condition ? (decimal)condition : null, item.Equipped));
 
         var retainers = cache.Values
-            .Where(retainer => retainer.Owner.Matches(owner))
-            .OrderBy(retainer => retainer.RetainerName)
+            .Where(retainer => retainer.Owner.Matches(owner) && retainer.IsCurrentlyAssigned is not false)
+            .OrderBy(retainer => retainer.DisplayOrder ?? int.MaxValue)
+            .ThenBy(retainer => retainer.RetainerName)
             .ThenBy(retainer => retainer.RetainerId)
             .ToArray();
         var retainerInventoryCompleteByScope = new Dictionary<string, bool>(StringComparer.Ordinal)

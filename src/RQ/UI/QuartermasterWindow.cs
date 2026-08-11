@@ -29,7 +29,7 @@ public sealed class QuartermasterWindow : Window
     private readonly QuartermasterRuntimeSnapshotSource runtimeSnapshots;
     private readonly OperationJournal journal;
     private readonly TransferCoordinator transfers;
-    private readonly AutoRetainerRefreshService autoRetainer;
+    private readonly RetainerRefreshCoordinator retainerRefresh;
     private readonly ListingNavigationCoordinator listingNavigation;
     private readonly IDataManager dataManager;
     private readonly PluginConfiguration configuration;
@@ -127,7 +127,7 @@ public sealed class QuartermasterWindow : Window
         QuartermasterRuntimeSnapshotSource runtimeSnapshots,
         OperationJournal journal,
         TransferCoordinator transfers,
-        AutoRetainerRefreshService autoRetainer,
+        RetainerRefreshCoordinator retainerRefresh,
         ListingNavigationCoordinator listingNavigation,
         IDataManager dataManager,
         PluginConfiguration configuration,
@@ -139,7 +139,7 @@ public sealed class QuartermasterWindow : Window
         this.runtimeSnapshots = runtimeSnapshots;
         this.journal = journal;
         this.transfers = transfers;
-        this.autoRetainer = autoRetainer;
+        this.retainerRefresh = retainerRefresh;
         this.listingNavigation = listingNavigation;
         this.dataManager = dataManager;
         this.configuration = configuration;
@@ -1091,16 +1091,48 @@ public sealed class QuartermasterWindow : Window
         }
 
         ImGui.SameLine();
-        if (ImGuiComponents.IconButton("QuartermasterRefresh", FontAwesomeIcon.BookOpen))
-            autoRetainer.Start();
+        if (!retainerRefresh.CanStart)
+            ImGui.BeginDisabled();
+        if (ImGui.SmallButton("Refresh retainers"))
+            retainerRefresh.Start();
+        if (!retainerRefresh.CanStart)
+            ImGui.EndDisabled();
         reviewRegistry.RegisterLastButton(
             "quartermaster.refresh-retainers",
             "Refresh retainers",
-            autoRetainer.IsAvailable,
-            () => autoRetainer.Start(),
-            autoRetainer.Status);
+            retainerRefresh.CanStart,
+            () => retainerRefresh.Start(),
+            retainerRefresh.Status);
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("Refresh all Quartermaster retainer inventory caches.");
+        if (retainerRefresh.CanCancel)
+        {
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Cancel refresh"))
+                retainerRefresh.Cancel();
+        }
+        else if (retainerRefresh.HasRecovery)
+        {
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Retry refresh"))
+                retainerRefresh.Retry();
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Dismiss##RetainerRefreshRecovery"))
+                DismissRetainerRefreshRecovery();
+        }
+        if (retainerRefresh.IsRefreshing || retainerRefresh.HasRecovery ||
+            retainerRefresh.Results.Any(result => result.Outcome == "NotAccessible"))
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled(retainerRefresh.Status);
+            if (ImGui.IsItemHovered() && retainerRefresh.Results.Count != 0)
+            {
+                ImGui.BeginTooltip();
+                foreach (var result in retainerRefresh.Results)
+                    ImGui.TextUnformatted($"{result.RetainerName}: {result.Outcome}");
+                ImGui.EndTooltip();
+            }
+        }
     }
 
     private void DrawStockSelectionBar(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> availableItems)
@@ -1478,8 +1510,8 @@ public sealed class QuartermasterWindow : Window
                          evaluation.NeededQuantity > 0 &&
                          owner.HasStableIdentity &&
                          transfers.CanStart &&
-                         !autoRetainer.IsRefreshing &&
-                         !autoRetainer.IsQueued;
+                         !retainerRefresh.IsRefreshing &&
+                         !retainerRefresh.IsQueued;
         if (!canExecute)
             ImGui.BeginDisabled();
         if (ImGui.Button($"Retrieve missing ({evaluation.NeededQuantity:N0})"))
@@ -2808,6 +2840,7 @@ public sealed class QuartermasterWindow : Window
                     document.PlanItems.RemoveAll(rule => rule.StowagePlanId == planId);
                     document.TransferPlanListingLinks.RemoveAll(link => link.StowagePlanId == planId);
                     document.StowagePlans.RemoveAll(candidate => candidate.Id == planId && candidate.Owner.Matches(owner));
+                    StowagePlanCatalog.ClearStaleRecovery(document);
                     return StowagePlanCatalog.OwnerPlans(document, owner).FirstOrDefault()?.Id;
                 });
             });
@@ -2992,7 +3025,7 @@ public sealed class QuartermasterWindow : Window
             hasMovement || projection.HasUnknownListingDemand,
             owner.HasStableIdentity,
             transfers.CanStart,
-            autoRetainer.IsRefreshing || autoRetainer.IsQueued);
+            retainerRefresh.IsRefreshing || retainerRefresh.IsQueued);
         var canExecute = availability.CanExecute;
 
         ImGui.SameLine();
@@ -3022,6 +3055,20 @@ public sealed class QuartermasterWindow : Window
             canExecute
                 ? projection.HasUnknownListingDemand ? "Listing demand will be verified first" : $"{movements:N0} movements"
                 : availability.BlockReason);
+
+        var recovery = runtime.State.TransferPlanRecovery;
+        if (recovery is not null &&
+            recovery.Owner.Matches(owner) &&
+            recovery.PlanId == selected.Id &&
+            recovery.PlanRevision == selected.Revision)
+        {
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Retry plan##TransferPlanRecovery"))
+                RetryTransferPlanRecovery(selected);
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Dismiss##TransferPlanRecovery"))
+                DismissTransferPlanRecovery();
+        }
 
         ImGui.Separator();
         ImGui.TextUnformatted($"{ownerRules.Count:N0} items");
@@ -4637,7 +4684,7 @@ public sealed class QuartermasterWindow : Window
             hasMovement || projection.HasUnknownListingDemand,
             runtime.Owner.HasStableIdentity,
             transfers.CanStart,
-            autoRetainer.IsRefreshing || autoRetainer.IsQueued);
+            retainerRefresh.IsRefreshing || retainerRefresh.IsQueued);
         ImGui.SameLine();
         ImGui.TextDisabled(
             projection.HasUnknownListingDemand
@@ -4684,16 +4731,16 @@ public sealed class QuartermasterWindow : Window
             .ToArray();
         if (ListingPlanEvaluator.HasUnknownLinkedDemand(current.State, current.Browser, current.Owner, plan.Id))
         {
-            var completionSequence = autoRetainer.CompletedRunSequence;
-            if (allowCapacityRecovery && autoRetainer.Start())
+            if (allowCapacityRecovery && retainerRefresh.StartForPlan(out var refreshRunId))
             {
-                pendingTransferPlanRecovery = new(planId, completionSequence);
+                PersistTransferPlanRecovery(plan, refreshRunId);
+                pendingTransferPlanRecovery = new(planId, refreshRunId);
                 transferStatus = "Verifying listing demand before executing the plan.";
                 return;
             }
-            inlineTransferError = autoRetainer.Status.Length == 0
+            inlineTransferError = retainerRefresh.Status.Length == 0
                 ? "Listing demand could not be verified."
-                : autoRetainer.Status;
+                : retainerRefresh.Status;
             transferStatus = inlineTransferError;
             return;
         }
@@ -4707,14 +4754,14 @@ public sealed class QuartermasterWindow : Window
         var currentBatch = BuildSurplusBatch(current, currentStowage);
         if (allowCapacityRecovery && TransferExecutionPolicy.RequiresCapacityRecovery(currentBatch))
         {
-            var completionSequence = autoRetainer.CompletedRunSequence;
-            if (autoRetainer.Start())
+            if (retainerRefresh.StartForPlan(out var refreshRunId))
             {
-                pendingTransferPlanRecovery = new(planId, completionSequence);
+                PersistTransferPlanRecovery(plan, refreshRunId);
+                pendingTransferPlanRecovery = new(planId, refreshRunId);
                 transferStatus = "Refreshing retainer capacity before executing the plan.";
                 return;
             }
-            inlineTransferError = autoRetainer.Status;
+            inlineTransferError = retainerRefresh.Status;
             return;
         }
         if (!allowCapacityRecovery && currentBatch.RequestedQuantity > 0 && currentBatch.PlannedQuantity == 0)
@@ -4735,16 +4782,67 @@ public sealed class QuartermasterWindow : Window
     public void Tick()
     {
         if (pendingTransferPlanRecovery is not { } pending ||
-            autoRetainer.CompletedRunSequence <= pending.CompletionSequence)
+            !string.Equals(retainerRefresh.LastCompletedRunId, pending.RefreshRunId, StringComparison.Ordinal))
             return;
         pendingTransferPlanRecovery = null;
-        if (autoRetainer.LastRunSucceeded != true)
+        if (retainerRefresh.LastRunSucceeded != true)
         {
-            inlineTransferError = autoRetainer.Status;
-            transferStatus = autoRetainer.Status;
+            inlineTransferError = retainerRefresh.Status;
+            transferStatus = retainerRefresh.Status;
             return;
         }
+        var currentState = state.Snapshot();
+        var recovery = currentState.TransferPlanRecovery;
+        var currentPlan = currentState.StowagePlans.FirstOrDefault(plan =>
+            plan.Id == pending.PlanId && plan.Owner.Matches(runtimeSnapshots.Current.Owner));
+        if (recovery is null || currentPlan is null ||
+            recovery.PlanId != currentPlan.Id ||
+            recovery.PlanRevision != currentPlan.Revision ||
+            !string.Equals(recovery.RefreshRunId, pending.RefreshRunId, StringComparison.Ordinal))
+        {
+            state.Mutate(StateChangeKind.Recovery, document => document.TransferPlanRecovery = null);
+            inlineTransferError = currentPlan is null
+                ? "The pending Transfer Plan no longer exists."
+                : "The Transfer Plan changed while evidence was refreshed; run the current plan when ready.";
+            transferStatus = inlineTransferError;
+            return;
+        }
+        state.Mutate(StateChangeKind.Recovery, document => document.TransferPlanRecovery = null);
         ExecuteTransferPlan(pending.PlanId, false);
+    }
+
+    private void PersistTransferPlanRecovery(StowagePlan plan, string refreshRunId) =>
+        state.Mutate(StateChangeKind.Recovery, document => document.TransferPlanRecovery = new()
+        {
+            Owner = runtimeSnapshots.Current.Owner with { },
+            PlanId = plan.Id,
+            PlanRevision = plan.Revision,
+            RefreshRunId = refreshRunId,
+            RequestedAtUtc = DateTime.UtcNow,
+        });
+
+    private void DismissRetainerRefreshRecovery()
+    {
+        retainerRefresh.DismissRecovery();
+    }
+
+    private void RetryTransferPlanRecovery(StowagePlan plan)
+    {
+        if (!retainerRefresh.StartForPlan(out var refreshRunId))
+        {
+            inlineTransferError = retainerRefresh.Status;
+            return;
+        }
+        PersistTransferPlanRecovery(plan, refreshRunId);
+        pendingTransferPlanRecovery = new(plan.Id, refreshRunId);
+        inlineTransferError = string.Empty;
+        transferStatus = "Refreshing retainer evidence before retrying the plan.";
+    }
+
+    private void DismissTransferPlanRecovery()
+    {
+        pendingTransferPlanRecovery = null;
+        state.Mutate(StateChangeKind.Recovery, document => document.TransferPlanRecovery = null);
     }
 
     private void DrawOperation(OwnerScope owner)
@@ -4761,7 +4859,7 @@ public sealed class QuartermasterWindow : Window
         ImGui.TextWrapped(operation.Message);
         if (operation.Status == OperationStatuses.Accepted)
         {
-            var canExecute = transfers.CanStart && !autoRetainer.IsRefreshing && !autoRetainer.IsQueued;
+            var canExecute = transfers.CanStart && !retainerRefresh.IsRefreshing && !retainerRefresh.IsQueued;
             if (!canExecute)
                 ImGui.BeginDisabled();
             if (ImGui.Button($"Execute this operation##{operation.OperationId}"))
@@ -4932,7 +5030,7 @@ public sealed class QuartermasterWindow : Window
         bool HasUnknownListingDemand,
         IReadOnlyList<TransferWorkbenchRow> Rows);
 
-    private sealed record PendingTransferPlanRecovery(Guid PlanId, long CompletionSequence);
+    private sealed record PendingTransferPlanRecovery(Guid PlanId, string RefreshRunId);
 
     private sealed record RestockPlanRow(
         RestockPlanItem Item,

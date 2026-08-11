@@ -6,18 +6,19 @@ using RQ.Domain;
 
 namespace RQ.Observations;
 
-internal sealed record PlayerInventoryObservationDelivery(
+internal sealed record QuartermasterObservationDelivery(
     ObservationOwner Owner,
     long Revision,
-    IReadOnlyList<TrustedObservation> Baselines,
-    IReadOnlyList<InventoryChangeBatch> Changes);
+    IReadOnlyList<TrustedObservation> PlayerBaselines,
+    IReadOnlyList<InventoryChangeBatch> PlayerChanges,
+    IReadOnlyList<TrustedObservation> RetainerObservations);
 
-internal sealed class PlayerInventoryObservationConsumer : IAsyncDisposable
+internal sealed class QuartermasterObservationConsumer : IAsyncDisposable
 {
     private static readonly TimeSpan MinimumRetryDelay = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan MaximumRetryDelay = TimeSpan.FromSeconds(5);
     private readonly Func<OwnerScope> currentOwner;
-    private readonly Func<PlayerInventoryObservationDelivery, CancellationToken, ValueTask> deliver;
+    private readonly Func<QuartermasterObservationDelivery, CancellationToken, ValueTask> deliver;
     private readonly Action<string, Exception?> diagnostic;
     private readonly ObservationStoreOptions options;
     private SqliteObservationReader? reader;
@@ -32,14 +33,15 @@ internal sealed class PlayerInventoryObservationConsumer : IAsyncDisposable
     private Task worker = Task.CompletedTask;
     private ObservationOwner? owner;
     private long revision;
+    private readonly Dictionary<string, long> retainerRevisions = new(StringComparer.Ordinal);
     private TimeSpan retryDelay = MinimumRetryDelay;
     private bool started;
     private bool disposed;
 
-    public PlayerInventoryObservationConsumer(
+    public QuartermasterObservationConsumer(
         string pluginConfigDirectory,
         Func<OwnerScope> currentOwner,
-        Func<PlayerInventoryObservationDelivery, CancellationToken, ValueTask> deliver,
+        Func<QuartermasterObservationDelivery, CancellationToken, ValueTask> deliver,
         Action<string, Exception?> diagnostic)
     {
         this.currentOwner = currentOwner ?? throw new ArgumentNullException(nameof(currentOwner));
@@ -110,7 +112,7 @@ internal sealed class PlayerInventoryObservationConsumer : IAsyncDisposable
             }
             catch (Exception exception)
             {
-                diagnostic("Quartermaster could not consume shared inventory changes.", exception);
+                diagnostic("Quartermaster could not consume shared observations.", exception);
             }
 
             try
@@ -143,9 +145,12 @@ internal sealed class PlayerInventoryObservationConsumer : IAsyncDisposable
         {
             owner = nextOwner;
             revision = 0;
+            retainerRevisions.Clear();
         }
 
         var changes = await reader.ReadInventoryChangesAsync(nextOwner, revision, cancellationToken).ConfigureAwait(false);
+        IReadOnlyList<TrustedObservation> playerBaselines = [];
+        IReadOnlyList<InventoryChangeBatch> playerChanges = [];
         switch (changes.Status)
         {
             case InventoryChangeReadStatus.SnapshotRequired:
@@ -155,29 +160,21 @@ internal sealed class PlayerInventoryObservationConsumer : IAsyncDisposable
                 if (player.Status is ObservationReadStatus.Busy or ObservationReadStatus.Unavailable ||
                     saddlebag.Status is ObservationReadStatus.Busy or ObservationReadStatus.Unavailable)
                     return false;
-                if (player.Observations.Count == 0)
-                    return true;
                 if (player.Observations.Any(observation => observation.IsStale) ||
                     saddlebag.Observations.Any(observation => observation.IsStale))
                 {
                     diagnostic("Quartermaster is preserving its last truthful inventory projection while the shared collector obtains a fresh complete baseline.", null);
                     return false;
                 }
-                await deliver(
-                    new(nextOwner, changes.CurrentRevision, [.. player.Observations, .. saddlebag.Observations], []),
-                    cancellationToken).ConfigureAwait(false);
-                revision = changes.CurrentRevision;
-                return true;
+                playerBaselines = [.. player.Observations, .. saddlebag.Observations];
+                break;
             }
             case InventoryChangeReadStatus.Found:
-                await deliver(new(nextOwner, changes.CurrentRevision, [], changes.Batches), cancellationToken).ConfigureAwait(false);
-                revision = changes.CurrentRevision;
-                return true;
+                playerChanges = changes.Batches;
+                break;
             case InventoryChangeReadStatus.NoChanges:
-                revision = changes.CurrentRevision;
-                return true;
             case InventoryChangeReadStatus.NotObserved:
-                return true;
+                break;
             case InventoryChangeReadStatus.Busy:
             case InventoryChangeReadStatus.Unavailable:
                 diagnostic($"Quartermaster shared inventory read will retry: {changes.Message}", null);
@@ -185,5 +182,41 @@ internal sealed class PlayerInventoryObservationConsumer : IAsyncDisposable
             default:
                 throw new ArgumentOutOfRangeException(nameof(changes.Status), changes.Status, null);
         }
+
+        var retainerObservations = new List<TrustedObservation>();
+        foreach (var container in new[]
+                 {
+                     ObservationContainerKind.RetainerRoster,
+                     ObservationContainerKind.RetainerInventory,
+                     ObservationContainerKind.RetainerGil,
+                     ObservationContainerKind.RetainerMarketListings,
+                 })
+        {
+            var read = await reader.ReadCurrentByOwnerAsync(nextOwner, container, cancellationToken).ConfigureAwait(false);
+            if (read.Status is ObservationReadStatus.Busy or ObservationReadStatus.Unavailable)
+            {
+                diagnostic($"Quartermaster shared retainer read will retry: {read.Message}", null);
+                return false;
+            }
+            foreach (var observation in read.Observations.Where(observation => !observation.IsStale))
+            {
+                var key = $"{observation.Scope.Container}:{observation.Scope.Subject.Kind}:{observation.Scope.Subject.Id}";
+                if (observation.Revision > retainerRevisions.GetValueOrDefault(key))
+                    retainerObservations.Add(observation);
+            }
+        }
+
+        if (playerBaselines.Count > 0 || playerChanges.Count > 0 || retainerObservations.Count > 0)
+            await deliver(
+                new(nextOwner, changes.CurrentRevision, playerBaselines, playerChanges, retainerObservations),
+                cancellationToken).ConfigureAwait(false);
+
+        revision = changes.CurrentRevision;
+        foreach (var observation in retainerObservations)
+        {
+            var key = $"{observation.Scope.Container}:{observation.Scope.Subject.Kind}:{observation.Scope.Subject.Id}";
+            retainerRevisions[key] = observation.Revision;
+        }
+        return true;
     }
 }

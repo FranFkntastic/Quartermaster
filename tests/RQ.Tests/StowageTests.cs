@@ -315,10 +315,73 @@ public sealed class StowageTests
         var line = Assert.Single(operation.Lines);
         Assert.True(line.IsHighQuality);
         Assert.Equal(4, line.TargetQuantity);
-        Assert.Equal(4, Assert.Single(operation.DepositCandidates).CapacityByVariant["100:hq"]);
+        Assert.Equal(4, Assert.Single(operation.DepositCandidates).CapacityByVariant[line.AuthorizationKey]);
         journal.Transition(operation.OperationId, OperationStatuses.Running, "started", "started");
         Assert.Throws<InvalidOperationException>(() =>
             journal.RecordDepositTransfer(operation.OperationId, 100, true, 10, 5, "verified", "verified"));
+    }
+
+    [Fact]
+    public void DepositBatch_PersistsEveryEligibleRouteForLiveRecalculation()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var request = new StowageDepositRequest(null, null, 100, "Ore", false, 4, new StowageRoutingPolicy());
+        var batch = StowageRouter.BuildBatch(
+            [request],
+            new Dictionary<ulong, CachedRetainer>
+            {
+                [10] = Retainer(10, "First"),
+                [20] = Retainer(20, "Second"),
+            },
+            TestData.Owner,
+            _ => 99,
+            DateTime.UtcNow);
+
+        var operation = journal.CreateDeposit(TestData.Owner, batch);
+        var key = Assert.Single(operation.Lines).AuthorizationKey;
+
+        Assert.Equal(2, operation.DepositCandidates.Count);
+        Assert.All(operation.DepositCandidates, candidate => Assert.True(candidate.UsesLiveCapacity));
+        Assert.Equal(0, operation.DepositCandidates.Single(candidate => candidate.RetainerId == 10).PriorityByVariant[key]);
+        Assert.Equal(1, operation.DepositCandidates.Single(candidate => candidate.RetainerId == 20).PriorityByVariant[key]);
+    }
+
+    [Fact]
+    public void DepositBatch_PreservesDistinctSameVariantRoutingAuthorizations()
+    {
+        using var directory = new TemporaryDirectory();
+        var journal = new OperationJournal(TestData.Repository(directory.Path));
+        var firstRule = Guid.NewGuid();
+        var secondRule = Guid.NewGuid();
+        var first = new StowageDepositRequest(
+            null, firstRule, 100, "Ore", false, 2,
+            new StowageRoutingPolicy { Mode = StowageRoutingMode.HomeFirst, PreferredRetainerIds = [10] });
+        var second = new StowageDepositRequest(
+            null, secondRule, 100, "Ore", false, 3,
+            new StowageRoutingPolicy { Mode = StowageRoutingMode.ConsolidateFirst, PreferredRetainerIds = [20] });
+        var observed = DateTime.UtcNow;
+        var batch = new StowageDepositBatch(observed,
+        [
+            new StowageRoute(first, [new StowageAllocation(10, "First", 2, 2, observed)], 2, 0),
+            new StowageRoute(second, [new StowageAllocation(20, "Second", 3, 3, observed)], 3, 0),
+        ]);
+
+        var operation = journal.CreateDeposit(TestData.Owner, batch);
+
+        Assert.Equal(2, operation.Lines.Count);
+        Assert.Equal(2, operation.Lines.Select(line => line.AuthorizationKey).Distinct().Count());
+        Assert.Contains(operation.Lines, line => line.SourceRuleId == firstRule && line.Routing.Mode == StowageRoutingMode.HomeFirst);
+        Assert.Contains(operation.Lines, line => line.SourceRuleId == secondRule && line.Routing.Mode == StowageRoutingMode.ConsolidateFirst);
+        Assert.Contains(operation.DepositCandidates.Single(candidate => candidate.RetainerId == 10).CapacityByVariant, entry => entry.Key == operation.Lines.Single(line => line.SourceRuleId == firstRule).AuthorizationKey);
+        Assert.Contains(operation.DepositCandidates.Single(candidate => candidate.RetainerId == 20).CapacityByVariant, entry => entry.Key == operation.Lines.Single(line => line.SourceRuleId == secondRule).AuthorizationKey);
+
+        journal.Transition(operation.OperationId, OperationStatuses.Running, "started", "started");
+        foreach (var line in operation.Lines)
+            journal.RecordDepositTransfer(operation.OperationId, line.AuthorizationKey, line.ItemId, line.IsHighQuality, 10, line.TargetQuantity, "verified", "verified");
+        var recorded = journal.Get(operation.OperationId)!;
+        Assert.All(recorded.Lines, line => Assert.Equal(line.TargetQuantity, line.TransferredQuantity));
     }
 
     private static BrowserProjection Browser(

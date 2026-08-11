@@ -199,9 +199,20 @@ public static class StowagePlanCatalog
         state.TransferPlanListingLinks.RemoveAll(link =>
             link.StowagePlanId == plan.Id &&
             !state.PlanItems.Any(rule => rule.StowagePlanId == plan.Id && rule.Enabled &&
-                                         rule.ItemId == link.ItemId && rule.Quality == link.Quality));
+                                          rule.ItemId == link.ItemId && rule.Quality == link.Quality));
+        ClearStaleRecovery(state);
         state.Schema = "gooseworks-quartermaster-state/v5";
         return plan;
+    }
+
+    public static void ClearStaleRecovery(QuartermasterState state)
+    {
+        if (state.TransferPlanRecovery is not { } recovery)
+            return;
+        var current = state.StowagePlans.FirstOrDefault(plan =>
+            plan.Id == recovery.PlanId && plan.Owner.Matches(recovery.Owner));
+        if (current is null || current.Revision != recovery.PlanRevision)
+            state.TransferPlanRecovery = null;
     }
 
     public static string UniqueName(

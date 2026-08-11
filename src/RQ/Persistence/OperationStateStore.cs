@@ -447,6 +447,7 @@ internal sealed class OperationStateStore
         ItemId = receipt.ItemId,
         RetainerId = receipt.RetainerId,
         Quantity = receipt.Quantity,
+        AuthorizationKey = receipt.AuthorizationKey,
     };
 
     private static PendingCacheInvalidation Copy(PendingCacheInvalidation invalidation) => new()
@@ -495,9 +496,12 @@ internal sealed class OperationStateStore
             ObservedAtUtc = candidate.ObservedAtUtc,
             CapacityByItem = candidate.CapacityByItem.ToDictionary(entry => entry.Key, entry => entry.Value),
             CapacityByVariant = candidate.CapacityByVariant.ToDictionary(entry => entry.Key, entry => entry.Value),
+            PriorityByVariant = candidate.PriorityByVariant.ToDictionary(entry => entry.Key, entry => entry.Value),
+            UsesLiveCapacity = candidate.UsesLiveCapacity,
         }).ToList(),
         Lines = operation.Lines.Select(line => new OperationLine
         {
+            AuthorizationKey = line.AuthorizationKey,
             SourcePlanId = line.SourcePlanId,
             SourceRuleId = line.SourceRuleId,
             ItemId = line.ItemId,
@@ -507,6 +511,13 @@ internal sealed class OperationStateStore
             TargetQuantity = line.TargetQuantity,
             ShortageQuantity = line.ShortageQuantity,
             TransferredQuantity = line.TransferredQuantity,
+            MaxStackSize = line.MaxStackSize,
+            Routing = new StowageRoutingPolicy
+            {
+                Mode = line.Routing?.Mode ?? StowageRoutingMode.ConsolidateFirst,
+                Overflow = line.Routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
+                PreferredRetainerIds = line.Routing?.PreferredRetainerIds.ToList() ?? [],
+            },
         }).ToList(),
     };
 }
