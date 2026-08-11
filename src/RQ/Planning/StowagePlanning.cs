@@ -219,8 +219,8 @@ public static class StowageEvaluator
             .ThenBy(plan => plan.Id)
             .Select(plan =>
             {
-                var lines = state.PlanItems
-                    .Where(rule => rule.StowagePlanId == plan.Id && rule.Enabled && rule.ItemId > 0)
+                var lines = ListingPlanEvaluator.ComposeRules(state, stock, owner, plan.Id)
+                    .Where(rule => rule.Enabled && rule.ItemId > 0)
                     .Select(rule => BuildLine(plan, rule, groups.GetValueOrDefault(rule.ItemId)))
                     .OrderBy(line => line.ItemName, StringComparer.OrdinalIgnoreCase)
                     .ThenBy(line => line.ItemId)
@@ -241,8 +241,8 @@ public static class StowageEvaluator
         if (plan is null)
             return null;
         var groups = stock.Items.ToDictionary(group => group.ItemId);
-        var lines = state.PlanItems
-            .Where(rule => rule.StowagePlanId == plan.Id && rule.Enabled && rule.ItemId > 0)
+        var lines = ListingPlanEvaluator.ComposeRules(state, stock, owner, plan.Id)
+            .Where(rule => rule.Enabled && rule.ItemId > 0)
             .Select(rule => BuildLine(plan, rule, groups.GetValueOrDefault(rule.ItemId)))
             .OrderBy(line => line.ItemName, StringComparer.OrdinalIgnoreCase)
             .ThenBy(line => line.ItemId)

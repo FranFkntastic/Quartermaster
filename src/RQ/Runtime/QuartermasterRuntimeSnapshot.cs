@@ -75,7 +75,7 @@ public sealed class QuartermasterRuntimeSnapshotSource
             var stateChanged = (domains & (RuntimeDomain.Plans | RuntimeDomain.Listings)) != 0;
             var retainersChanged = (domains & (RuntimeDomain.RetainerStock | RuntimeDomain.Listings)) != 0;
             var stockChanged = (domains & (RuntimeDomain.PlayerInventory | RuntimeDomain.RetainerStock)) != 0;
-            var planningChanged = stockChanged || (domains & RuntimeDomain.Plans) != 0;
+            var planningChanged = RequiresPlanningRefresh(domains);
             var listingsChanged = (domains & RuntimeDomain.Listings) != 0;
             var operationsChanged = (domains & RuntimeDomain.Operations) != 0;
 
@@ -143,6 +143,10 @@ public sealed class QuartermasterRuntimeSnapshotSource
         }
     }
 
+    internal static bool RequiresPlanningRefresh(RuntimeDomain domains) =>
+        (domains & (RuntimeDomain.PlayerInventory | RuntimeDomain.RetainerStock |
+                    RuntimeDomain.Plans | RuntimeDomain.Listings)) != 0;
+
     public QuartermasterRuntimeSnapshot ApplyPlayerInventoryChange(PlayerInventoryCacheChange change) =>
         Refresh(RuntimeDomain.PlayerInventory, change);
 
@@ -183,7 +187,7 @@ public sealed class QuartermasterRuntimeSnapshotSource
         var playerCounts = browser.Items
             .Where(item => item.PlayerQuantity > 0)
             .ToDictionary(item => item.ItemId, item => item.PlayerQuantity);
-        var ownerRules = StowagePlanMigration.OwnerRules(stateSnapshot, owner);
+        var ownerRules = ListingPlanEvaluator.ComposeOwnerRules(stateSnapshot, browser, owner);
         var retrieval = RestockPlanner.Build(ownerRules, playerCounts, retainers, owner, capturedAtUtc, browser);
         var crystalContainer = FFXIVClientStructs.FFXIV.Client.Game.InventoryType.Crystals.ToString();
         var crystalCounts = browser.Items

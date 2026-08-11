@@ -196,6 +196,10 @@ public static class StowagePlanCatalog
             .Where(rule => rule.ItemId > 0)
             .GroupBy(rule => (rule.ItemId, rule.Quality))
             .Select(group => CopyRule(group.First(), plan.Id, newIdentity: false)));
+        state.TransferPlanListingLinks.RemoveAll(link =>
+            link.StowagePlanId == plan.Id &&
+            !state.PlanItems.Any(rule => rule.StowagePlanId == plan.Id && rule.Enabled &&
+                                         rule.ItemId == link.ItemId && rule.Quality == link.Quality));
         state.Schema = "gooseworks-quartermaster-state/v5";
         return plan;
     }
