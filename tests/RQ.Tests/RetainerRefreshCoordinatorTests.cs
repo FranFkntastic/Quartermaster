@@ -67,6 +67,49 @@ public sealed class RetainerRefreshCoordinatorTests
         Assert.Equal((byte)0, cache[9].ClassJobId);
     }
 
+    [Theory]
+    [InlineData("RetainerRosterNotReady")]
+    [InlineData("RetainerManagerUnavailable")]
+    public void RosterDiscovery_QuietlyRetriesExpectedNotReadyEvidence(string code)
+    {
+        using var directory = new TemporaryDirectory();
+        var now = new DateTime(2026, 8, 11, 20, 0, 0, DateTimeKind.Utc);
+        var scans = 0;
+        var warnings = 0;
+        var session = CreateProxy<IRetainerAutomationSession>((method, _) => method.Name switch
+        {
+            nameof(IRetainerAutomationSession.ScanRetainerRosterAsync) => Task.FromResult(
+                ++scans == 1
+                    ? RetainerRosterResult.Failed(code, "The assigned retainer roster is not ready.")
+                    : RetainerRosterResult.Succeeded([new(1, "Retainer 1", 0, null, 1, 90, 0, true)])),
+            _ => throw new InvalidOperationException(method.Name),
+        });
+        var log = CreateProxy<IPluginLog>((method, _) =>
+        {
+            if (method.Name.Contains("Warning", StringComparison.Ordinal))
+                warnings++;
+            return null;
+        });
+        using var coordinator = CreateCoordinator(
+            directory,
+            CreateProxy<IFramework>((method, _) => throw new InvalidOperationException(method.Name)),
+            session,
+            new FakeAutoRetainerIpc(),
+            log,
+            () => now);
+
+        coordinator.TickRosterDiscovery(stockBrowserVisible: true);
+        Assert.True(SpinWait.SpinUntil(() => scans == 1, TimeSpan.FromSeconds(2)));
+        Assert.Empty(new RetainerCacheStore(Path.Combine(directory.Path, "retainers.json")).Load());
+        Assert.Equal(0, warnings);
+
+        now = now.AddSeconds(5);
+        coordinator.TickRosterDiscovery(stockBrowserVisible: true);
+        Assert.True(SpinWait.SpinUntil(() => scans == 2, TimeSpan.FromSeconds(2)));
+        Assert.Single(new RetainerCacheStore(Path.Combine(directory.Path, "retainers.json")).Load());
+        Assert.Equal(0, warnings);
+    }
+
     [Fact]
     public void Start_DoesNotRequireAutoRetainerPresence()
     {
@@ -148,20 +191,23 @@ public sealed class RetainerRefreshCoordinatorTests
         TemporaryDirectory directory,
         IFramework framework,
         IRetainerAutomationSession session,
-        IAutoRetainerIpc ipc)
+        IAutoRetainerIpc ipc,
+        IPluginLog? log = null,
+        Func<DateTime>? utcNow = null)
     {
         var cache = new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory.Path, "retainers.json")));
         var state = new StateRepository(new QuartermasterStateStore(Path.Combine(directory.Path, "state.json")));
         return new(
             framework,
-            CreateProxy<IPluginLog>((_, _) => null),
+            log ?? CreateProxy<IPluginLog>((_, _) => null),
             cache,
             state,
             session,
             new Franthropy.Observations.V1.ObservationCaptureSessionRegistry(),
             ipc,
             new AutomationLease(),
-            () => TestData.Owner);
+            () => TestData.Owner,
+            utcNow);
     }
 
     private static T CreateProxy<T>(Func<MethodInfo, object?[]?, object?> handler) where T : class

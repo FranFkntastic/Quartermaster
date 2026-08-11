@@ -28,6 +28,7 @@ public sealed class RetainerRefreshCoordinator : IDisposable
     private readonly IAutoRetainerIpc autoRetainer;
     private readonly AutomationLease automation;
     private readonly Func<OwnerScope> currentOwner;
+    private readonly Func<DateTime> utcNow;
     private readonly CancellationTokenSource lifetime = new();
     private readonly ActiveTaskTracker activeTasks = new();
     private CancellationTokenSource? activeRun;
@@ -50,7 +51,8 @@ public sealed class RetainerRefreshCoordinator : IDisposable
         ObservationCaptureSessionRegistry captureSessions,
         IAutoRetainerIpc autoRetainer,
         AutomationLease? automation,
-        Func<OwnerScope> currentOwner)
+        Func<OwnerScope> currentOwner,
+        Func<DateTime>? utcNow = null)
     {
         this.framework = framework;
         this.log = log;
@@ -61,6 +63,7 @@ public sealed class RetainerRefreshCoordinator : IDisposable
         this.autoRetainer = autoRetainer;
         this.automation = automation ?? new AutomationLease();
         this.currentOwner = currentOwner;
+        this.utcNow = utcNow ?? (() => DateTime.UtcNow);
     }
 
     public bool IsRefreshing => phase is RetainerRefreshPhase.Preparing or RetainerRefreshPhase.Refreshing;
@@ -90,7 +93,7 @@ public sealed class RetainerRefreshCoordinator : IDisposable
         }
 
         var owner = currentOwner();
-        if (!owner.HasStableIdentity || rosterDiscoveryRunning || DateTime.UtcNow < nextRosterDiscoveryAtUtc)
+        if (!owner.HasStableIdentity || rosterDiscoveryRunning || utcNow() < nextRosterDiscoveryAtUtc)
             return;
         if (string.Equals(discoveredOwnerKey, OwnerKey(owner), StringComparison.Ordinal))
             return;
@@ -179,17 +182,22 @@ public sealed class RetainerRefreshCoordinator : IDisposable
         {
             var roster = await session.ScanRetainerRosterAsync(cancellationToken).ConfigureAwait(false);
             if (!roster.Success || !roster.IsComplete)
+            {
+                nextRosterDiscoveryAtUtc = utcNow().AddSeconds(5);
+                if (roster.Code is "RetainerManagerUnavailable" or "RetainerRosterNotReady")
+                    return;
                 throw new InvalidOperationException($"{roster.Code}: {roster.Message}");
+            }
             if (!currentOwner().Matches(owner))
                 return;
-            ReconcileRoster(owner, roster.Retainers, DateTime.UtcNow);
+            ReconcileRoster(owner, roster.Retainers, utcNow());
             discoveredOwnerKey = OwnerKey(owner);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
         catch (Exception exception)
         {
             log.Warning(exception, "Quartermaster could not hydrate the assigned retainer roster.");
-            nextRosterDiscoveryAtUtc = DateTime.UtcNow.AddSeconds(5);
+            nextRosterDiscoveryAtUtc = utcNow().AddSeconds(5);
         }
         finally
         {
