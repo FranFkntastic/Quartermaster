@@ -369,10 +369,10 @@ public sealed class ListingNavigationCoordinator : IDisposable
         private readonly OwnerScope owner;
         private readonly ulong retainerId;
         private readonly ObservationCaptureSession session;
-        private readonly long checkpoint;
         private readonly object gate = new();
         private readonly TaskCompletionSource<ListingEvidenceAcceptance> accepted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private DateTime? actionStartedAtUtc;
+        private long actionCheckpoint;
 
         public ListingEvidenceBoundary(
             RetainerCacheRepository cache,
@@ -384,14 +384,16 @@ public sealed class ListingNavigationCoordinator : IDisposable
             this.owner = owner with { };
             this.retainerId = retainerId;
             this.session = session;
-            checkpoint = cache.Revision;
             cache.EvidenceAccepted += OnEvidenceAccepted;
         }
 
         public void BeginAction(DateTime startedAtUtc)
         {
             lock (gate)
+            {
+                actionCheckpoint = cache.Revision;
                 actionStartedAtUtc = startedAtUtc;
+            }
         }
 
         public async Task<ListingEvidenceAcceptance?> WaitAsync(TimeSpan timeout, CancellationToken cancellationToken)
@@ -413,7 +415,7 @@ public sealed class ListingNavigationCoordinator : IDisposable
                 if (actionStartedAtUtc is { } actionStarted &&
                     receipt.RetainerId == retainerId &&
                     receipt.Owner.Matches(owner) &&
-                    receipt.Revision > checkpoint &&
+                    receipt.Revision > actionCheckpoint &&
                     receipt.ObservedAtUtc >= actionStarted &&
                     receipt.Domains.HasFlag(RetainerEvidenceDomain.Listings) &&
                     string.Equals(receipt.EvidenceSessionId, session.SessionId, StringComparison.Ordinal))
