@@ -1,4 +1,6 @@
 using System.Text.Json;
+using System.Threading.Channels;
+using System.Diagnostics;
 using Franthropy.Dalamud.Persistence;
 using RQ.Domain;
 
@@ -25,22 +27,241 @@ public sealed class AtomicDocumentStore<T> where T : new()
     public void Save(T value) => AtomicJsonFile.Write(Path, value, JsonOptions);
 }
 
-public sealed class RetainerCacheStore
+public sealed record RetainerListingPersistenceReceipt(
+    ulong RetainerId,
+    DateTime ObservedAtUtc,
+    DateTime PersistedAtUtc,
+    double WriteMilliseconds);
+
+public sealed class RetainerCacheStore : IDisposable
 {
     private readonly AtomicDocumentStore<Dictionary<ulong, CachedRetainer>> store;
+    private readonly AtomicDocumentStore<Dictionary<ulong, RetainerListingCheckpoint>> listingStore;
+    private readonly object listingGate = new();
+    private readonly SemaphoreSlim listingWriteGate = new(1, 1);
+    private readonly CancellationTokenSource listingShutdown = new();
+    private Dictionary<ulong, RetainerListingCheckpoint> listingCheckpoints;
+    private Channel<bool>? listingSignals;
+    private Task? listingWorker;
+    private bool disposed;
 
-    public RetainerCacheStore(string path) => store = new(path);
+    public event Action<Exception>? ListingWriteFailed;
+    public event Action<RetainerListingPersistenceReceipt>? ListingPersisted;
+
+    public RetainerCacheStore(string path)
+    {
+        store = new(path);
+        listingStore = new(System.IO.Path.Combine(
+            System.IO.Path.GetDirectoryName(store.Path)!,
+            "retainer-listings-cache.json"));
+        listingCheckpoints = listingStore.Load();
+    }
 
     public string Path => store.Path;
     public bool Exists => store.Exists;
-    public Dictionary<ulong, CachedRetainer> Load() => store.Load();
+    public Dictionary<ulong, CachedRetainer> Load()
+    {
+        var cache = store.Load();
+        lock (listingGate)
+        {
+            foreach (var checkpoint in listingCheckpoints.Values)
+            {
+                var current = cache.GetValueOrDefault(checkpoint.RetainerId);
+                if (current is not null && current.ListingsObservedAtUtc > checkpoint.ObservedAtUtc)
+                    continue;
+                current ??= new CachedRetainer { RetainerId = checkpoint.RetainerId };
+                current.RetainerName = checkpoint.RetainerName;
+                current.Owner = checkpoint.Owner with { };
+                current.ListingsObservedAtUtc = checkpoint.ObservedAtUtc;
+                current.Listings = checkpoint.Listings.Select(Copy).ToList();
+                var marketSource = FFXIVClientStructs.FFXIV.Client.Game.InventoryType.RetainerMarket.ToString();
+                if (!current.RequestedSources.Contains(marketSource, StringComparer.Ordinal))
+                    current.RequestedSources.Add(marketSource);
+                if (!current.ObservedSources.Contains(marketSource, StringComparer.Ordinal))
+                    current.ObservedSources.Add(marketSource);
+                cache[checkpoint.RetainerId] = current;
+            }
+        }
+        return cache;
+    }
     public void Save(IReadOnlyDictionary<ulong, CachedRetainer> cache) => store.Save(cache.ToDictionary(entry => entry.Key, entry => entry.Value));
+
+    public void SaveListing(CachedRetainer retainer)
+    {
+        ObjectDisposedException.ThrowIf(disposed, this);
+        var checkpoint = new RetainerListingCheckpoint
+        {
+            RetainerId = retainer.RetainerId,
+            RetainerName = retainer.RetainerName,
+            Owner = retainer.Owner with { },
+            ObservedAtUtc = retainer.ListingsObservedAtUtc,
+            Listings = retainer.Listings.Select(Copy).ToList(),
+        };
+        lock (listingGate)
+        {
+            listingCheckpoints[retainer.RetainerId] = checkpoint;
+            EnsureListingWorker();
+            listingSignals!.Writer.TryWrite(true);
+        }
+    }
 
     public void SaveAfterInvalidation(IReadOnlyDictionary<ulong, CachedRetainer> cache)
     {
-        File.Delete(Path);
-        if (cache.Count > 0)
-            Save(cache);
+        listingWriteGate.Wait();
+        try
+        {
+            File.Delete(Path);
+            if (cache.Count > 0)
+                Save(cache);
+            Dictionary<ulong, RetainerListingCheckpoint>? listingSnapshot = null;
+            lock (listingGate)
+            {
+                var removed = listingCheckpoints.Keys.Where(retainerId => !cache.ContainsKey(retainerId)).ToArray();
+                foreach (var retainerId in removed)
+                    listingCheckpoints.Remove(retainerId);
+                if (removed.Length > 0)
+                    listingSnapshot = listingCheckpoints.ToDictionary(pair => pair.Key, pair => Copy(pair.Value));
+            }
+            if (listingSnapshot is not null)
+                listingStore.Save(listingSnapshot);
+        }
+        finally
+        {
+            listingWriteGate.Release();
+        }
+    }
+
+    public void Dispose()
+    {
+        Task? worker;
+        lock (listingGate)
+        {
+            if (disposed)
+                return;
+            disposed = true;
+            listingShutdown.Cancel();
+            listingSignals?.Writer.TryComplete();
+            worker = listingWorker;
+        }
+        worker?.GetAwaiter().GetResult();
+        listingShutdown.Dispose();
+    }
+
+    private void EnsureListingWorker()
+    {
+        if (listingWorker is not null)
+            return;
+        listingSignals = Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.DropWrite,
+        });
+        listingWorker = Task.Run(ProcessListingWritesAsync);
+    }
+
+    private async Task ProcessListingWritesAsync()
+    {
+        var persisted = new Dictionary<ulong, DateTime?>();
+        await foreach (var signal in listingSignals!.Reader.ReadAllAsync().ConfigureAwait(false))
+        {
+            _ = signal;
+            while (listingSignals.Reader.TryRead(out _)) { }
+            var retryDelay = TimeSpan.FromMilliseconds(50);
+            while (true)
+            {
+                Exception? failure = null;
+                var receipts = new List<RetainerListingPersistenceReceipt>();
+                await listingWriteGate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    Dictionary<ulong, RetainerListingCheckpoint> snapshot;
+                    lock (listingGate)
+                        snapshot = listingCheckpoints.ToDictionary(pair => pair.Key, pair => Copy(pair.Value));
+                    var started = Stopwatch.GetTimestamp();
+                    listingStore.Save(snapshot);
+                    var writeMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                    var persistedAtUtc = DateTime.UtcNow;
+                    foreach (var checkpoint in snapshot.Values.Where(checkpoint =>
+                                 checkpoint.ObservedAtUtc.HasValue &&
+                                 (!persisted.TryGetValue(checkpoint.RetainerId, out var previous) || checkpoint.ObservedAtUtc > previous)))
+                    {
+                        persisted[checkpoint.RetainerId] = checkpoint.ObservedAtUtc;
+                        receipts.Add(new(
+                            checkpoint.RetainerId,
+                            checkpoint.ObservedAtUtc!.Value,
+                            persistedAtUtc,
+                            writeMilliseconds));
+                    }
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
+                {
+                    failure = exception;
+                }
+                finally
+                {
+                    listingWriteGate.Release();
+                }
+
+                if (failure is null)
+                {
+                    foreach (var receipt in receipts)
+                        ListingPersisted?.Invoke(receipt);
+                    break;
+                }
+
+                ListingWriteFailed?.Invoke(failure);
+                bool stopping;
+                lock (listingGate)
+                    stopping = disposed;
+                if (stopping)
+                    break;
+                try
+                {
+                    await Task.Delay(retryDelay, listingShutdown.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (listingShutdown.IsCancellationRequested)
+                {
+                    // Disposal immediately advances to one final write attempt.
+                }
+                retryDelay = TimeSpan.FromMilliseconds(Math.Min(2000, retryDelay.TotalMilliseconds * 2));
+            }
+        }
+    }
+
+    private static RetainerListingCheckpoint Copy(RetainerListingCheckpoint source) => new()
+    {
+        RetainerId = source.RetainerId,
+        RetainerName = source.RetainerName,
+        Owner = source.Owner with { },
+        ObservedAtUtc = source.ObservedAtUtc,
+        Listings = source.Listings.Select(Copy).ToList(),
+    };
+
+    private static CachedMarketListing Copy(CachedMarketListing source) => new()
+    {
+        ItemId = source.ItemId,
+        ItemName = source.ItemName,
+        ItemType = source.ItemType,
+        Quantity = source.Quantity,
+        IsHq = source.IsHq,
+        Condition = source.Condition,
+        ConditionPercent = source.ConditionPercent,
+        ContainerKey = source.ContainerKey,
+        SlotIndex = source.SlotIndex,
+        UnitPrice = source.UnitPrice,
+        ListedAtUtc = source.ListedAtUtc,
+    };
+
+    private sealed class RetainerListingCheckpoint
+    {
+        public RetainerListingCheckpoint() { }
+
+        public ulong RetainerId { get; set; }
+        public string RetainerName { get; set; } = string.Empty;
+        public OwnerScope Owner { get; set; } = new();
+        public DateTime? ObservedAtUtc { get; set; }
+        public List<CachedMarketListing> Listings { get; set; } = [];
     }
 }
 

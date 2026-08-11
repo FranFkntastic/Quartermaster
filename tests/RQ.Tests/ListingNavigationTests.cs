@@ -1,11 +1,83 @@
 using System.Reflection;
 using Franthropy.Dalamud.Automation.Retainers;
+using Franthropy.Observations.V1;
 using RQ.Automation;
+using RQ.Domain;
+using RQ.Inventory;
+using RQ.Persistence;
 
 namespace RQ.Tests;
 
 public sealed class ListingNavigationTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task OpenRetainerListings_CompletesAfterExactEmptyOrUnchangedListingEvidence(bool unchanged)
+    {
+        using var directory = new TemporaryDirectory();
+        using var cache = new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory.Path, "retainer-cache.json")));
+        var captureSessions = new ObservationCaptureSessionRegistry();
+        var owner = TestData.Owner;
+        var observationOwner = new ObservationOwner(owner.LocalContentId!.Value, owner.HomeWorldId!.Value);
+        var scope = new ObservationScope(
+            observationOwner,
+            ObservationSubject.Retainer(44, observationOwner),
+            ObservationContainerKind.RetainerMarketListings);
+        var original = TestData.Retainer(44, "Eris");
+        original.ListingsObservedAtUtc = DateTime.UtcNow.AddMinutes(-1);
+        original.ObservedSources.Add("RetainerMarket");
+        original.Listings.Add(new CachedMarketListing
+        {
+            ItemId = 200,
+            ItemName = "Whale-class Pressure Hull",
+            Quantity = 16,
+            UnitPrice = 1_045_000,
+        });
+        cache.Upsert(original);
+        IReadOnlyList<CachedMarketListing> freshListings = unchanged
+            ? [new CachedMarketListing { ItemId = 200, ItemName = "Whale-class Pressure Hull", Quantity = 16, UnitPrice = 1_045_000 }]
+            : [];
+        var session = DispatchProxy.Create<IRetainerAutomationSession, SessionProxy>();
+        ((SessionProxy)(object)session).Handler = (method, _) => method.Name switch
+        {
+            nameof(IRetainerAutomationSession.EnsureRetainerListAsync) =>
+                Task.FromResult(RetainerAutomationResult.Succeeded("ready", "ready")),
+            nameof(IRetainerAutomationSession.OpenRetainerAsync) =>
+                Task.FromResult(RetainerAutomationResult.Succeeded("opened", "opened")),
+            nameof(IRetainerAutomationSession.OpenSellingListAsync) =>
+                Task.FromResult(PublishEvidence()),
+            _ => throw new InvalidOperationException($"Unexpected call: {method.Name}"),
+        };
+        using var coordinator = new ListingNavigationCoordinator(
+            session,
+            new FakeAutoRetainer { IsAvailable = false },
+            new AutomationLease(),
+            cache,
+            captureSessions,
+            () => owner);
+
+        var result = await coordinator.OpenRetainerListingsAsync(new(44, "Eris"));
+
+        Assert.True(result.Success);
+        Assert.Contains("fresh listings", result.Message, StringComparison.Ordinal);
+        Assert.Equal((ulong)44, coordinator.LastRefreshTiming?.RetainerId);
+        Assert.InRange(coordinator.LastRefreshTiming!.ObservedToAppliedMilliseconds, 0, 250);
+        Assert.Equal(unchanged ? 1 : 0, cache.Snapshot()[44].Listings.Count);
+
+        RetainerAutomationResult PublishEvidence()
+        {
+            cache.ReplaceListings(new RetainerListingsObservation(
+                44,
+                "Eris",
+                owner,
+                DateTime.UtcNow,
+                freshListings,
+                captureSessions.Resolve(scope)));
+            return RetainerAutomationResult.Succeeded("opened", "opened");
+        }
+    }
+
     [Fact]
     public async Task OpenRetainerListings_StopsAtTheReusableSellingList()
     {

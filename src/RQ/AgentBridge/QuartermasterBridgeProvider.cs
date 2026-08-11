@@ -49,7 +49,14 @@ public sealed record QuartermasterBridgeTruth(
     string RefreshStatus,
     bool TransferActive,
     bool ListingNavigationActive,
-    string ListingNavigationStatus);
+    string ListingNavigationStatus,
+    ulong? LastListingRefreshRetainerId,
+    DateTimeOffset? LastListingRefreshCompletedAtUtc,
+    double? LastListingObservedToAppliedMilliseconds,
+    double? LastListingActionToAppliedMilliseconds,
+    DateTimeOffset? LastListingPersistedAtUtc,
+    double? LastListingObservedToPersistedMilliseconds,
+    double? LastListingWriteMilliseconds);
 
 public sealed class QuartermasterBridgeProvider
 {

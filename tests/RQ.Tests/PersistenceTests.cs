@@ -133,7 +133,7 @@ public sealed class PersistenceTests
         var retainer = TestData.Retainer(10, "Eris", (100, "Darksteel Ore", 37));
         retainer.Listings.Add(new CachedMarketListing { ItemId = 100, Quantity = 2, UnitPrice = 44 });
         store.Save(new Dictionary<ulong, CachedRetainer> { [10] = retainer });
-        var repository = new RetainerCacheRepository(store);
+        using var repository = new RetainerCacheRepository(store);
         var observedAt = new DateTime(2026, 7, 26, 20, 0, 0, DateTimeKind.Utc);
 
         repository.ReplaceListings(new RetainerListingsObservation(
@@ -148,6 +148,90 @@ public sealed class PersistenceTests
         Assert.Equal(observedAt, updated.ListingsObservedAtUtc);
         Assert.Equal((uint)37, Assert.Single(Assert.Single(updated.Bags).Items).Quantity);
         Assert.Contains("RetainerMarket", updated.ObservedSources);
+    }
+
+    [Fact]
+    public void ReplaceListings_PersistsOnlyTheLatestListingCheckpointAcrossReload()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "retainer-cache.json");
+        var store = new RetainerCacheStore(path);
+        var retainer = TestData.Retainer(10, "Scrongle", (100, "Darksteel Ore", 37));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = retainer });
+        var originalWholeCache = File.ReadAllBytes(path);
+        RetainerListingPersistenceReceipt? persisted = null;
+        using (var repository = new RetainerCacheRepository(store))
+        {
+            repository.ListingPersisted += receipt => persisted = receipt;
+            repository.ReplaceListings(new RetainerListingsObservation(
+                10,
+                "Scrongle",
+                TestData.Owner,
+                new DateTime(2026, 8, 11, 16, 0, 0, DateTimeKind.Utc),
+                [new CachedMarketListing { ItemId = 200, ItemName = "Pressure Hull", Quantity = 2, UnitPrice = 1_045_000 }]));
+            repository.ReplaceListings(new RetainerListingsObservation(
+                10,
+                "Scrongle",
+                TestData.Owner,
+                new DateTime(2026, 8, 11, 16, 0, 1, DateTimeKind.Utc),
+                [new CachedMarketListing { ItemId = 200, ItemName = "Pressure Hull", Quantity = 20, UnitPrice = 1_045_000 }]));
+        }
+
+        using var reloadedStore = new RetainerCacheStore(path);
+        var reloaded = Assert.Single(reloadedStore.Load().Values);
+
+        Assert.True(originalWholeCache.SequenceEqual(File.ReadAllBytes(path)));
+        Assert.Equal((uint)37, Assert.Single(Assert.Single(reloaded.Bags).Items).Quantity);
+        Assert.Equal((uint)20, Assert.Single(reloaded.Listings).Quantity);
+        Assert.Equal(new DateTime(2026, 8, 11, 16, 0, 1, DateTimeKind.Utc), reloaded.ListingsObservedAtUtc);
+        Assert.Equal((ulong)10, persisted?.RetainerId);
+        Assert.Equal(new DateTime(2026, 8, 11, 16, 0, 1, DateTimeKind.Utc), persisted?.ObservedAtUtc);
+        Assert.InRange(persisted!.WriteMilliseconds, 0, 250);
+    }
+
+    [Fact]
+    public async Task ReplaceListings_RetriesFailedCheckpointWriteUntilLatestListingIsDurable()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "retainer-cache.json");
+        var listingPath = Path.Combine(directory.Path, "retainer-listings-cache.json");
+        var initialObservedAt = new DateTime(2026, 8, 11, 16, 0, 0, DateTimeKind.Utc);
+        using (var initialRepository = new RetainerCacheRepository(new RetainerCacheStore(path)))
+        {
+            initialRepository.ReplaceListings(new RetainerListingsObservation(
+                10,
+                "Scrongle",
+                TestData.Owner,
+                initialObservedAt,
+                [new CachedMarketListing { ItemId = 200, ItemName = "Pressure Hull", Quantity = 2 }]));
+        }
+
+        var failure = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var persisted = new TaskCompletionSource<RetainerListingPersistenceReceipt>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using (var repository = new RetainerCacheRepository(new RetainerCacheStore(path)))
+        {
+            repository.ListingPersistenceFailed += _ => failure.TrySetResult();
+            repository.ListingPersisted += receipt =>
+            {
+                if (receipt.ObservedAtUtc > initialObservedAt)
+                    persisted.TrySetResult(receipt);
+            };
+            using (File.Open(listingPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                repository.ReplaceListings(new RetainerListingsObservation(
+                    10,
+                    "Scrongle",
+                    TestData.Owner,
+                    initialObservedAt.AddSeconds(1),
+                    [new CachedMarketListing { ItemId = 200, ItemName = "Pressure Hull", Quantity = 20 }]));
+                await failure.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            }
+            var receipt = await persisted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.Equal((ulong)10, receipt.RetainerId);
+        }
+
+        using var reloadedStore = new RetainerCacheStore(path);
+        Assert.Equal((uint)20, Assert.Single(Assert.Single(reloadedStore.Load().Values).Listings).Quantity);
     }
 
     [Fact]
@@ -172,7 +256,7 @@ public sealed class PersistenceTests
             [existing.RetainerId] = existing,
             [otherOwner.RetainerId] = otherOwner,
         });
-        var repository = new RetainerCacheRepository(store);
+        using var repository = new RetainerCacheRepository(store);
         var receipts = new List<RetainerListingCaptureReceipt>();
         repository.ListingCaptured += receipts.Add;
         var observedAt = new DateTime(2026, 7, 31, 17, 30, 0, DateTimeKind.Utc);
@@ -213,7 +297,7 @@ public sealed class PersistenceTests
             new CachedMarketListing { ItemId = 100, Quantity = 1, IsHq = false, UnitPrice = 44, SlotIndex = 2 },
         ]);
         store.Save(new Dictionary<ulong, CachedRetainer> { [10] = existing });
-        var repository = new RetainerCacheRepository(store);
+        using var repository = new RetainerCacheRepository(store);
         RetainerListingCaptureReceipt? receipt = null;
         repository.ListingCaptured += value => receipt = value;
 
@@ -237,7 +321,7 @@ public sealed class PersistenceTests
     {
         using var directory = new TemporaryDirectory();
         var store = new RetainerCacheStore(Path.Combine(directory.Path, "retainer-cache.json"));
-        var repository = new RetainerCacheRepository(store);
+        using var repository = new RetainerCacheRepository(store);
         RetainerListingCaptureReceipt? receipt = null;
         repository.ListingCaptured += value => receipt = value;
 
@@ -266,6 +350,33 @@ public sealed class PersistenceTests
 
         Assert.False(File.Exists(path));
         Assert.Empty(store.Load());
+    }
+
+    [Fact]
+    public void Invalidate_RemovesListingCheckpointDurablyBeforeReportingSuccess()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "retainer-cache.json");
+        using (var repository = new RetainerCacheRepository(new RetainerCacheStore(path)))
+        {
+            repository.ReplaceListings(new RetainerListingsObservation(
+                10,
+                "Eris",
+                TestData.Owner,
+                new DateTime(2026, 8, 11, 16, 0, 0, DateTimeKind.Utc),
+                [new CachedMarketListing { ItemId = 200, ItemName = "Whale-class Pressure Hull", Quantity = 16 }]));
+        }
+
+        using (var repository = new RetainerCacheRepository(new RetainerCacheStore(path)))
+        {
+            Assert.Equal((uint)16, Assert.Single(Assert.Single(repository.Snapshot().Values).Listings).Quantity);
+            var result = repository.Invalidate(10);
+            Assert.True(result.Removed);
+            Assert.True(result.Persisted);
+        }
+
+        using var reloadedStore = new RetainerCacheStore(path);
+        Assert.Empty(reloadedStore.Load());
     }
 
     [Fact]

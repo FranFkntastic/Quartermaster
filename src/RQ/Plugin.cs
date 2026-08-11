@@ -112,6 +112,8 @@ public sealed class Plugin : IDalamudPlugin
             scanner.CapturePlayerStorage,
             PlayerInventoryReconciliationInterval);
         cache = new(new RetainerCacheStore(cachePath));
+        cache.ListingPersistenceFailed += exception =>
+            log.Error(exception, "Quartermaster could not persist its latest retainer listings; the in-memory projection remains current.");
         state = new(new QuartermasterStateStore(statePath));
         workQueue = new();
         try
@@ -164,7 +166,14 @@ public sealed class Plugin : IDalamudPlugin
         journal.ReconcileInterruptedOperations();
         var driver = new RetainerLiveDriver(retainerSession);
         var autoRetainerSuppression = new AutoRetainerSuppression(autoRetainerIpc);
-        listingNavigation = new(retainerSession, autoRetainerIpc, automation, autoRetainerSuppression);
+        listingNavigation = new(
+            retainerSession,
+            autoRetainerIpc,
+            automation,
+            cache,
+            observationHost.CaptureSessions,
+            CurrentOwner,
+            autoRetainerSuppression);
         transfers = new TransferCoordinator(
             journal,
             driver,
@@ -440,8 +449,10 @@ public sealed class Plugin : IDalamudPlugin
         var selectedPlanRules = selectedPlanId is { } planId
             ? runtime.State.PlanItems.Where(item => item.StowagePlanId == planId).ToArray()
             : [];
+        var listingTiming = listingNavigation.LastRefreshTiming;
+        var listingPersistence = cache.LastListingPersistence;
         return new QuartermasterBridgeTruth(
-            12,
+            13,
             configuration.PluginInstanceId,
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
@@ -486,7 +497,14 @@ public sealed class Plugin : IDalamudPlugin
             retainerRefresh.Status,
             transfers.IsRunning,
             listingNavigation.IsRunning,
-            listingNavigation.Status);
+            listingNavigation.Status,
+            listingTiming?.RetainerId,
+            listingTiming is null ? null : new DateTimeOffset(DateTime.SpecifyKind(listingTiming.CompletedAtUtc, DateTimeKind.Utc)),
+            listingTiming?.ObservedToAppliedMilliseconds,
+            listingTiming?.ActionToAppliedMilliseconds,
+            listingPersistence is null ? null : new DateTimeOffset(DateTime.SpecifyKind(listingPersistence.PersistedAtUtc, DateTimeKind.Utc)),
+            listingPersistence is null ? null : Math.Max(0, (listingPersistence.PersistedAtUtc - listingPersistence.ObservedAtUtc).TotalMilliseconds),
+            listingPersistence?.WriteMilliseconds);
     }
 
     private void ApplyInventoryObservation(QuartermasterObservationDelivery delivery)
@@ -721,6 +739,7 @@ public sealed class Plugin : IDalamudPlugin
         ipc.Dispose();
         retainerRefresh.Dispose();
         observationHost.Dispose();
+        cache.Dispose();
         windows.RemoveAllWindows();
     }
 }
