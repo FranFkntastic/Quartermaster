@@ -283,8 +283,11 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnFrameworkUpdate(IFramework _)
     {
-        StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
-        TransferPlanMigration.EnsureOwnerPlans(state, CurrentOwner());
+        var liveOwner = CurrentOwner();
+        StowagePlanMigration.EnsureOwnerPlan(state, liveOwner);
+        TransferPlanMigration.EnsureOwnerPlans(state, liveOwner);
+        if (RuntimeOwnerTransition.RequiresReconciliation(runtimeSnapshots.Current.Owner, liveOwner))
+            reconciliation.Request(RuntimeDomain.All, "owner_transition");
         workQueue.Drain();
         playerInventoryReconciler.ReconcileIfDue(DateTime.UtcNow);
         automaticRetrievals.Tick();
