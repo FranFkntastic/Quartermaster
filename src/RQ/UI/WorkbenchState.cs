@@ -19,6 +19,7 @@ public sealed class WorkbenchState
     public bool ListingSortDescending { get; set; }
     public ListingItemKey? SelectedListingItem { get; set; }
     public ItemQualityPolicy SelectedStockListingQuality { get; set; } = ItemQualityPolicy.NqOnly;
+    public uint? FocusedStockItemId { get; set; }
     public StockGroup? SelectedStock { get; private set; }
     public string StagedTargetText { get; set; } = string.Empty;
 
