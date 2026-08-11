@@ -33,7 +33,7 @@ public sealed record ListingRefreshTiming(
 public sealed class ListingNavigationCoordinator : IDisposable
 {
     private static readonly TimeSpan AutoRetainerWait = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan ListingEvidenceWait = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan ListingEvidenceWait = TimeSpan.FromSeconds(6);
     private readonly IRetainerAutomationSession session;
     private readonly IAutoRetainerIpc autoRetainer;
     private readonly AutoRetainerSuppression autoRetainerSuppression;

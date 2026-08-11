@@ -38,6 +38,8 @@ public sealed class RetainerCacheStore : IDisposable
     private readonly AtomicDocumentStore<Dictionary<ulong, CachedRetainer>> store;
     private readonly AtomicDocumentStore<Dictionary<ulong, RetainerListingCheckpoint>> listingStore;
     private readonly object listingGate = new();
+    private readonly SemaphoreSlim listingWriteGate = new(1, 1);
+    private readonly CancellationTokenSource listingShutdown = new();
     private Dictionary<ulong, RetainerListingCheckpoint> listingCheckpoints;
     private Channel<bool>? listingSignals;
     private Task? listingWorker;
@@ -105,19 +107,27 @@ public sealed class RetainerCacheStore : IDisposable
 
     public void SaveAfterInvalidation(IReadOnlyDictionary<ulong, CachedRetainer> cache)
     {
-        File.Delete(Path);
-        if (cache.Count > 0)
-            Save(cache);
-        lock (listingGate)
+        listingWriteGate.Wait();
+        try
         {
-            var removed = listingCheckpoints.Keys.Where(retainerId => !cache.ContainsKey(retainerId)).ToArray();
-            foreach (var retainerId in removed)
-                listingCheckpoints.Remove(retainerId);
-            if (removed.Length > 0)
+            File.Delete(Path);
+            if (cache.Count > 0)
+                Save(cache);
+            Dictionary<ulong, RetainerListingCheckpoint>? listingSnapshot = null;
+            lock (listingGate)
             {
-                EnsureListingWorker();
-                listingSignals!.Writer.TryWrite(true);
+                var removed = listingCheckpoints.Keys.Where(retainerId => !cache.ContainsKey(retainerId)).ToArray();
+                foreach (var retainerId in removed)
+                    listingCheckpoints.Remove(retainerId);
+                if (removed.Length > 0)
+                    listingSnapshot = listingCheckpoints.ToDictionary(pair => pair.Key, pair => Copy(pair.Value));
             }
+            if (listingSnapshot is not null)
+                listingStore.Save(listingSnapshot);
+        }
+        finally
+        {
+            listingWriteGate.Release();
         }
     }
 
@@ -129,10 +139,12 @@ public sealed class RetainerCacheStore : IDisposable
             if (disposed)
                 return;
             disposed = true;
+            listingShutdown.Cancel();
             listingSignals?.Writer.TryComplete();
             worker = listingWorker;
         }
         worker?.GetAwaiter().GetResult();
+        listingShutdown.Dispose();
     }
 
     private void EnsureListingWorker()
@@ -151,32 +163,68 @@ public sealed class RetainerCacheStore : IDisposable
     private async Task ProcessListingWritesAsync()
     {
         var persisted = new Dictionary<ulong, DateTime?>();
-        await foreach (var _ in listingSignals!.Reader.ReadAllAsync().ConfigureAwait(false))
+        await foreach (var signal in listingSignals!.Reader.ReadAllAsync().ConfigureAwait(false))
         {
-            Dictionary<ulong, RetainerListingCheckpoint> snapshot;
-            lock (listingGate)
-                snapshot = listingCheckpoints.ToDictionary(pair => pair.Key, pair => Copy(pair.Value));
-            try
+            _ = signal;
+            while (listingSignals.Reader.TryRead(out _)) { }
+            var retryDelay = TimeSpan.FromMilliseconds(50);
+            while (true)
             {
-                var started = Stopwatch.GetTimestamp();
-                listingStore.Save(snapshot);
-                var writeMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-                var persistedAtUtc = DateTime.UtcNow;
-                foreach (var checkpoint in snapshot.Values.Where(checkpoint =>
-                             checkpoint.ObservedAtUtc.HasValue &&
-                             (!persisted.TryGetValue(checkpoint.RetainerId, out var previous) || checkpoint.ObservedAtUtc > previous)))
+                Exception? failure = null;
+                var receipts = new List<RetainerListingPersistenceReceipt>();
+                await listingWriteGate.WaitAsync().ConfigureAwait(false);
+                try
                 {
-                    persisted[checkpoint.RetainerId] = checkpoint.ObservedAtUtc;
-                    ListingPersisted?.Invoke(new(
-                        checkpoint.RetainerId,
-                        checkpoint.ObservedAtUtc!.Value,
-                        persistedAtUtc,
-                        writeMilliseconds));
+                    Dictionary<ulong, RetainerListingCheckpoint> snapshot;
+                    lock (listingGate)
+                        snapshot = listingCheckpoints.ToDictionary(pair => pair.Key, pair => Copy(pair.Value));
+                    var started = Stopwatch.GetTimestamp();
+                    listingStore.Save(snapshot);
+                    var writeMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                    var persistedAtUtc = DateTime.UtcNow;
+                    foreach (var checkpoint in snapshot.Values.Where(checkpoint =>
+                                 checkpoint.ObservedAtUtc.HasValue &&
+                                 (!persisted.TryGetValue(checkpoint.RetainerId, out var previous) || checkpoint.ObservedAtUtc > previous)))
+                    {
+                        persisted[checkpoint.RetainerId] = checkpoint.ObservedAtUtc;
+                        receipts.Add(new(
+                            checkpoint.RetainerId,
+                            checkpoint.ObservedAtUtc!.Value,
+                            persistedAtUtc,
+                            writeMilliseconds));
+                    }
                 }
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
-            {
-                ListingWriteFailed?.Invoke(exception);
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
+                {
+                    failure = exception;
+                }
+                finally
+                {
+                    listingWriteGate.Release();
+                }
+
+                if (failure is null)
+                {
+                    foreach (var receipt in receipts)
+                        ListingPersisted?.Invoke(receipt);
+                    break;
+                }
+
+                ListingWriteFailed?.Invoke(failure);
+                bool stopping;
+                lock (listingGate)
+                    stopping = disposed;
+                if (stopping)
+                    break;
+                try
+                {
+                    await Task.Delay(retryDelay, listingShutdown.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (listingShutdown.IsCancellationRequested)
+                {
+                    // Disposal immediately advances to one final write attempt.
+                }
+                retryDelay = TimeSpan.FromMilliseconds(Math.Min(2000, retryDelay.TotalMilliseconds * 2));
             }
         }
     }
