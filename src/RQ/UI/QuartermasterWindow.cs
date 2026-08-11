@@ -11,6 +11,7 @@ using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.UI.Filtering;
 using Franthropy.Dalamud.UI.Tables;
 using Franthropy.FFXIV.Filtering;
+using Franthropy.Filtering.Evaluation;
 using Lumina.Excel.Sheets;
 using RQ.Automation;
 using RQ.Domain;
@@ -37,7 +38,7 @@ public sealed class QuartermasterWindow : Window
     private readonly AgentBridgeUiCaptureTransactionManager captureTransactions;
     private readonly WorkbenchState workbench = new();
     private readonly TableSelectionModel<uint> stockSelection = new();
-    private readonly TableSelectionModel<uint> listingGroupSelection = new();
+    private readonly TableSelectionModel<ListingItemKey> listingGroupSelection = new();
     private readonly TableSelectionModel<ListingRowKey> physicalListingSelection = new();
     private readonly DalamudTableProjection<ListingGroupView> listingGroupTable;
     private readonly DalamudTableProjection<ListingRow> physicalListingTable;
@@ -111,6 +112,15 @@ public sealed class QuartermasterWindow : Window
     private bool capturePreviousTransferReviewOpenRequest;
     private ListingRowKey? focusedListing;
     private PendingTransferPlanRecovery? pendingTransferPlanRecovery;
+    private ListingPlanDraft? listingPlanDraft;
+    private bool requestListingPlanEditorOpen;
+    private bool listingPlanEditorVisible;
+    private ListingItemKey? listingPlanEditorFocus;
+    private string listingPlanEditorFilter = string.Empty;
+    private string listingPlanItemSearch = string.Empty;
+    private ItemChoice? selectedListingPlanChoice;
+    private string listingPlanEditorError = string.Empty;
+    private IReadOnlyList<ListingPlanValidationIssue> listingPlanEditorConflicts = [];
 
     public QuartermasterWindow(
         StateRepository state,
@@ -140,33 +150,37 @@ public sealed class QuartermasterWindow : Window
             new(
                 "Item",
                 1.45f,
-                row => row.ItemName,
+                row => $"{row.ItemName} {QualityLabel(row.Quality)}",
                 row => row.ItemName,
                 ImGuiTableColumnFlags.WidthStretch),
             new(
-                "Listed",
+                "Desired",
                 62,
-                row => row.Quantity.ToString("N0"),
-                row => row.Quantity,
+                row => row.DesiredUnits.ToString("N0"),
+                row => row.DesiredUnits,
                 Alignment: DalamudTableCellAlignment.Right),
             new(
-                "Unlisted",
+                "Listed",
                 72,
-                row => row.UnlistedQuantity.IsKnown ? row.UnlistedQuantity.Value.ToString("N0") : "—",
-                row => row.UnlistedQuantity.IsKnown ? row.UnlistedQuantity.Value : -1,
+                row => EvidenceText(row.ListedUnits),
+                row => row.ListedUnits.IsKnown ? row.ListedUnits.Value : -1,
                 Alignment: DalamudTableCellAlignment.Right),
             new(
-                "Retainers",
+                "Need",
                 72,
-                row => row.RetainerCount.ToString("N0"),
-                row => row.RetainerCount,
+                row => EvidenceText(row.NeedUnits),
+                row => row.NeedUnits.IsKnown ? row.NeedUnits.Value : -1,
                 Alignment: DalamudTableCellAlignment.Right),
             new(
-                "Price range",
-                154,
-                ListingPriceRange,
-                row => row.HasKnownPrice ? row.LowestPrice : decimal.MinValue,
-                Alignment: DalamudTableCellAlignment.Right),
+                "Coverage",
+                132,
+                ListingCoverageText,
+                row => ListingCoverageText(row)),
+            new(
+                "State",
+                118,
+                ListingStateText,
+                row => ListingStateText(row)),
         ]);
         physicalListingTable = new(
         [
@@ -245,6 +259,12 @@ public sealed class QuartermasterWindow : Window
             row => row.Item.RetainerQuantity.ToString("N0"),
             row => row.Item.RetainerQuantity,
             Alignment: DalamudTableCellAlignment.Right,
+            DrawContextMenu: DrawStockRowContextMenu),
+        new(
+            "Listing demand",
+            138,
+            row => StockListingDemand(row.ListingDemand),
+            row => StockListingDemand(row.ListingDemand),
             DrawContextMenu: DrawStockRowContextMenu),
         new(
             "Target",
@@ -383,11 +403,11 @@ public sealed class QuartermasterWindow : Window
             row => row.PlayerQuantity.ToString("N0"),
             row => row.PlayerQuantity,
             Alignment: DalamudTableCellAlignment.Right),
-        new("Target", 82, row => row.Rule.TargetQuantity.ToString("N0"), Draw: DrawTransferTarget),
+        new("Target", 112, row => row.ListingContribution.IsKnown ? (row.Line?.DesiredPlayerQuantity ?? row.Rule.TargetQuantity).ToString("N0") : "Unknown", Draw: DrawTransferTarget),
         new(
             "Diff",
             68,
-            row => SignedQuantity(row.Difference),
+            row => row.ListingContribution.IsKnown ? SignedQuantity(row.Difference) : "—",
             row => row.Difference,
             TextColor: row => TransferActionColor(row.Line?.Action),
             Alignment: DalamudTableCellAlignment.Right),
@@ -404,6 +424,7 @@ public sealed class QuartermasterWindow : Window
             row => RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Owner),
             ImGuiTableColumnFlags.WidthStretch,
             Draw: row => DrawInlineTransferRoute(row.Owner, row.PlanId, row.Rule, row.Runtime)),
+        new("Source", 92, row => row.ListingLink is null ? "Independent" : "Listing Plan", Draw: DrawTransferSource),
         new("##remove", 28, _ => string.Empty, Draw: row =>
         {
             if (ImGui.SmallButton($"X##remove-transfer:{row.Rule.Id}"))
@@ -447,11 +468,11 @@ public sealed class QuartermasterWindow : Window
             row => row.Rule.ItemName,
             row => row.Rule.ItemName,
             ImGuiTableColumnFlags.WidthStretch),
-        new("Player / target", 120, row => $"{row.PlayerQuantity:N0} / {row.Rule.TargetQuantity:N0}"),
+        new("Player / target", 120, row => row.ListingContribution.IsKnown ? $"{row.PlayerQuantity:N0} / {row.Line?.DesiredPlayerQuantity ?? row.Rule.TargetQuantity:N0}" : $"{row.PlayerQuantity:N0} / —"),
         new(
             "Diff",
             72,
-            row => SignedQuantity(row.Difference),
+            row => row.ListingContribution.IsKnown ? SignedQuantity(row.Difference) : "—",
             row => row.Difference,
             TextColor: row => TransferActionColor(row.Line?.Action),
             Alignment: DalamudTableCellAlignment.Right),
@@ -735,13 +756,14 @@ public sealed class QuartermasterWindow : Window
             if (listingsOpen)
             {
                 workbench.View = WorkbenchView.Listings;
-                DrawListings(runtime.Browser, runtime.ListingsRevision);
+                DrawListings(runtime);
                 ImGui.EndTabItem();
             }
             ImGui.EndTabBar();
             requestedView = null;
         }
         DrawStowageEditorModal(runtime);
+        DrawListingPlanEditorModal(runtime);
         DrawTransferReviewModal();
         confirmationDialog.Draw();
     }
@@ -854,27 +876,37 @@ public sealed class QuartermasterWindow : Window
     {
         var drawStarted = Stopwatch.GetTimestamp();
         var projection = runtime.Browser;
-        DrawStockToolbar(projection);
+        var availableItems = StockItemsWithListingDemand(runtime, workbench.ScopeKey);
+        var queryProjection = new BrowserProjection
+        {
+            Scopes = projection.Scopes,
+            Items = availableItems,
+            Listings = projection.Listings,
+            Owner = projection.Owner,
+            RetainerInventoryCompleteByScope = projection.RetainerInventoryCompleteByScope,
+            RetainerListingsCompleteByScope = projection.RetainerListingsCompleteByScope,
+        };
+        DrawStockToolbar(projection, availableItems);
         var result = queries.QueryItems(
-            projection,
+            queryProjection,
             workbench.ItemFilterState.Expression,
-            workbench.ScopeKey,
+            BrowserScope.AllKey,
             workbench.ItemFilterState.IsInputActive,
-            runtime.StockRevision);
+            runtime.Revision);
         VisibleStockCount = result.Items.Count;
         if (!result.Filter.IsValid)
             ImGui.TextColored(
                 new Vector4(1f, .65f, .25f, 1f),
                 result.Filter.Diagnostics.FirstOrDefault()?.Message ?? "Invalid filter");
 
-        if (stockSelectionRevision != runtime.StockRevision)
+        if (stockSelectionRevision != runtime.Revision)
         {
-            stockSelection.Retain(projection.Items.Select(item => item.ItemId));
-            stockSelectionRevision = runtime.StockRevision;
+            stockSelection.Retain(availableItems.Select(item => item.ItemId));
+            stockSelectionRevision = runtime.Revision;
         }
         var selectedPlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
         var sourceRows = ResolveStockWorkbenchProjection(runtime, result.Items, selectedPlan);
-        DrawStockSelectionBar(runtime);
+        DrawStockSelectionBar(runtime, availableItems);
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
                     ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
                     ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.Sortable;
@@ -919,13 +951,45 @@ public sealed class QuartermasterWindow : Window
         StockDrawMilliseconds = Stopwatch.GetElapsedTime(drawStarted).TotalMilliseconds;
     }
 
+    private static IReadOnlyList<StockGroup> StockItemsWithListingDemand(QuartermasterRuntimeSnapshot runtime, string scopeKey)
+    {
+        var stock = runtime.Browser.GetItems(scopeKey);
+        var plan = ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner);
+        if (plan is null)
+            return stock;
+
+        var existing = stock.Select(item => item.ItemId).ToHashSet();
+        var planned = plan.Assignments
+            .Where(assignment => assignment.Enabled && !existing.Contains(assignment.ItemId))
+            .Where(assignment => ScopeIncludesAssignment(runtime, scopeKey, assignment))
+            .GroupBy(assignment => assignment.ItemId)
+            .Select(group => new StockGroup(
+                group.Key,
+                group.Select(assignment => assignment.ItemName).FirstOrDefault(name => !string.IsNullOrWhiteSpace(name)) ?? $"Item {group.Key}",
+                []))
+            .ToArray();
+        if (planned.Length == 0)
+            return stock;
+
+        return stock.Concat(planned)
+            .OrderBy(item => item.ItemName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(item => item.ItemId)
+            .ToArray();
+
+        static bool ScopeIncludesAssignment(QuartermasterRuntimeSnapshot snapshot, string selectedScopeKey, ListingPlanAssignment assignment)
+        {
+            var scope = snapshot.Browser.Scopes.FirstOrDefault(candidate => candidate.Key == selectedScopeKey);
+            return scope?.Kind != BrowserScopeKind.Retainer || scope.RetainerId == assignment.RetainerId;
+        }
+    }
+
     private IReadOnlyList<StockWorkbenchRow> ResolveStockWorkbenchProjection(
         QuartermasterRuntimeSnapshot runtime,
         IReadOnlyList<StockGroup> queryItems,
         StowagePlan? selectedPlan)
     {
         if (stockWorkbenchProjection is { } cached &&
-            cached.RuntimeRevision == runtime.PlanningRevision &&
+            cached.RuntimeRevision == runtime.Revision &&
             cached.PlanId == selectedPlan?.Id &&
             ReferenceEquals(cached.QueryItems, queryItems))
             return cached.Rows;
@@ -941,22 +1005,25 @@ public sealed class QuartermasterWindow : Window
             : runtime.Stowage
                 .FirstOrDefault(plan => plan.PlanId == selectedPlan.Id)?
                 .Lines.ToDictionary(line => line.RuleId) ?? [];
+        var listingEvaluation = ListingPlanEvaluator.Evaluate(
+            ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner),
+            runtime.Browser);
         var rows = queryItems
             .Select(item =>
             {
                 rules.TryGetValue(item.ItemId, out var rule);
                 evaluated.TryGetValue(rule?.Id ?? Guid.Empty, out var line);
-                return new StockWorkbenchRow(item, rule, line);
+                var demand = listingEvaluation.Items.Where(candidate => candidate.ItemId == item.ItemId).ToArray();
+                return new StockWorkbenchRow(item, rule, line, demand);
             })
             .ToArray();
-        stockWorkbenchProjection = new(runtime.PlanningRevision, selectedPlan?.Id, queryItems, rows);
+        stockWorkbenchProjection = new(runtime.Revision, selectedPlan?.Id, queryItems, rows);
         stockProjectionBuildCount++;
         return rows;
     }
 
-    private void DrawStockToolbar(BrowserProjection projection)
+    private void DrawStockToolbar(BrowserProjection projection, IReadOnlyList<StockGroup> sourceItems)
     {
-        var sourceItems = projection.GetItems(workbench.ScopeKey);
         var context = BrowserQueryController.CreateItemContext(sourceItems, projection.Owner);
         var trailingWidth = 180f;
         DalamudFilterAutocompleteRenderer.Draw(
@@ -1036,15 +1103,15 @@ public sealed class QuartermasterWindow : Window
             ImGui.SetTooltip("Refresh all Quartermaster retainer inventory caches.");
     }
 
-    private void DrawStockSelectionBar(QuartermasterRuntimeSnapshot runtime)
+    private void DrawStockSelectionBar(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> availableItems)
     {
-        var selected = runtime.Browser.Items
+        var selected = availableItems
             .Where(item => stockSelection.IsSelected(item.ItemId))
             .ToArray();
         if (selected.Length != stockSelection.Count)
         {
-            stockSelection.Retain(runtime.Browser.Items.Select(item => item.ItemId));
-            selected = runtime.Browser.Items
+            stockSelection.Retain(availableItems.Select(item => item.ItemId));
+            selected = availableItems
                 .Where(item => stockSelection.IsSelected(item.ItemId))
                 .ToArray();
         }
@@ -1068,7 +1135,7 @@ public sealed class QuartermasterWindow : Window
             () =>
             {
                 var current = runtimeSnapshots.Current;
-                var currentItems = current.Browser.Items
+                var currentItems = StockItemsWithListingDemand(current, workbench.ScopeKey)
                     .Where(item => stockSelection.IsSelected(item.ItemId))
                     .ToArray();
                 UpsertSelectedStockRules(current, currentItems, stowCarried: false);
@@ -1106,19 +1173,93 @@ public sealed class QuartermasterWindow : Window
             stockSelection.Clear();
         if (selected.Length == 0)
             ImGui.EndDisabled();
+
+        if (selected.Length == 1)
+        {
+            var listingPlan = ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner);
+            var demand = ListingPlanEvaluator.Evaluate(listingPlan, runtime.Browser).Items
+                .Where(item => item.ItemId == selected[0].ItemId && item.IsPlanned)
+                .ToArray();
+            if (listingPlan is not null && demand.Length > 0)
+            {
+                ImGui.Separator();
+                ImGui.TextUnformatted(selected[0].ItemName);
+                ImGui.SameLine();
+                if (demand.All(item => item.Quality != workbench.SelectedStockListingQuality))
+                    workbench.SelectedStockListingQuality = demand[0].Quality;
+                ImGui.SetNextItemWidth(62);
+                if (ImGui.BeginCombo("##stocklistingquality", QualityLabel(workbench.SelectedStockListingQuality)))
+                {
+                    foreach (var item in demand)
+                        if (ImGui.Selectable(QualityLabel(item.Quality), item.Quality == workbench.SelectedStockListingQuality))
+                            workbench.SelectedStockListingQuality = item.Quality;
+                    ImGui.EndCombo();
+                }
+                var selectedDemand = demand.Single(item => item.Quality == workbench.SelectedStockListingQuality);
+                ImGui.SameLine();
+                ImGui.TextDisabled(StockListingDemand([selectedDemand]));
+                ImGui.SameLine();
+                if (ImGui.SmallButton("Edit Listing Plan…##stock"))
+                    OpenListingPlanEditor(runtime, new(selectedDemand.ItemId, selectedDemand.Quality));
+                ImGui.SameLine();
+                var transferPlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
+                var linked = transferPlan is not null && runtime.State.TransferPlanListingLinks.Any(link =>
+                    link.StowagePlanId == transferPlan.Id && link.ListingPlanId == listingPlan.Id &&
+                    link.ItemId == selectedDemand.ItemId && link.Quality == selectedDemand.Quality);
+                if (ImGui.SmallButton(linked ? "Unlink demand" : "Link demand to Transfer Plan"))
+                    SetListingDemandLink(runtime, listingPlan, transferPlan, selectedDemand, !linked);
+            }
+        }
+    }
+
+    private void SetListingDemandLink(
+        QuartermasterRuntimeSnapshot runtime,
+        ListingPlan listingPlan,
+        StowagePlan? selectedTransferPlan,
+        ListingPlanItemEvaluation demand,
+        bool linked)
+    {
+        try
+        {
+            workbench.SelectedStowagePlanId = state.Mutate(document =>
+            {
+                var transferPlan = selectedTransferPlan is null
+                    ? StowagePlanCatalog.Create(document, runtime.Owner, "Transfer plan")
+                    : document.StowagePlans.Single(plan => plan.Id == selectedTransferPlan.Id && plan.Owner.Matches(runtime.Owner));
+                if (!linked)
+                {
+                    ListingPlanCatalog.Unlink(document, runtime.Owner, transferPlan.Id, listingPlan.Id, demand.ItemId, demand.Quality);
+                    return transferPlan.Id;
+                }
+                if (document.PlanItems.Any(rule => rule.StowagePlanId == transferPlan.Id && rule.ItemId == demand.ItemId &&
+                                                   rule.Quality == ItemQualityPolicy.Any && rule.Enabled))
+                    throw new InvalidOperationException($"{demand.ItemName} has an Any-quality Transfer Plan target. Choose NQ or HQ there before linking exact listing demand.");
+                if (document.PlanItems.All(rule => rule.StowagePlanId != transferPlan.Id || rule.ItemId != demand.ItemId || rule.Quality != demand.Quality))
+                {
+                    document.PlanItems.Add(new TargetPlanItem
+                    {
+                        StowagePlanId = transferPlan.Id,
+                        ItemId = demand.ItemId,
+                        ItemName = demand.ItemName,
+                        Quality = demand.Quality,
+                        TargetQuantity = 0,
+                    });
+                }
+                ListingPlanCatalog.Link(document, runtime.Owner, transferPlan.Id, listingPlan.Id, demand.ItemId, demand.Quality);
+                return transferPlan.Id;
+            });
+            inlineTransferError = string.Empty;
+        }
+        catch (Exception exception)
+        {
+            inlineTransferError = exception.Message;
+        }
     }
 
     private void DrawStockRowContextMenu(StockWorkbenchRow row)
     {
         var runtime = runtimeSnapshots.Current;
-        var item = runtime.Browser.Items.FirstOrDefault(candidate => candidate.ItemId == row.Item.ItemId);
-        if (item is null)
-        {
-            ImGui.BeginDisabled();
-            ImGui.MenuItem("Item is no longer available");
-            ImGui.EndDisabled();
-            return;
-        }
+        var item = row.Item;
 
         if (!runtime.Owner.HasStableIdentity)
             ImGui.BeginDisabled();
@@ -2403,6 +2544,32 @@ public sealed class QuartermasterWindow : Window
                     _ => "On target",
                 };
 
+    private static string StockListingDemand(IReadOnlyList<ListingPlanItemEvaluation> demand)
+    {
+        if (demand.Count == 0 || demand.All(item => !item.IsPlanned))
+            return "—";
+        return string.Join(" · ", demand.Where(item => item.IsPlanned).Select(item =>
+        {
+            var quality = QualityLabel(item.Quality);
+            if (!item.NeedUnits.IsKnown)
+                return $"{quality} unknown";
+            if (item.NeedUnits.Value == 0)
+                return item.Assignments.Any(assignment => assignment.UnknownPriceListings + assignment.WrongPriceListings +
+                                                          assignment.WrongShapeListings + assignment.WrongRetainerListings > 0) ||
+                       item.UnmanagedPhysicalListings.Count > 0
+                    ? $"{quality} no stock deficit"
+                    : $"{quality} satisfied";
+            return item.Coverage switch
+            {
+                ListingCoverageState.ReadyOnAssignedRetainer => $"{quality} list {item.NeedUnits.Value:N0} now",
+                ListingCoverageState.ReadyOnPlayer => $"{quality} move {EvidenceText(item.MovementNeedUnits)} from player",
+                ListingCoverageState.Retrievable => $"{quality} retrieve {item.RetrievableUnits.Value:N0}",
+                ListingCoverageState.Missing => $"{quality} missing {item.MissingUnits.Value:N0}",
+                _ => $"{quality} need {item.NeedUnits.Value:N0} · source?",
+            };
+        }));
+    }
+
     private void DrawRestockPlanItemLink(RestockPlanRow row)
     {
         if (ImGui.Selectable($"{row.Item.ItemName}##restockrow{row.Item.Id}"))
@@ -2486,16 +2653,60 @@ public sealed class QuartermasterWindow : Window
 
     private void DrawTransferTarget(TransferWorkbenchRow row)
     {
-        ImGui.SetNextItemWidth(-1);
+        ImGui.SetNextItemWidth(row.ListingContribution.IsKnown && row.ListingContribution.Value == 0 ? -1 : 66);
         var target = row.Rule.TargetQuantity;
         if (ImGui.InputInt($"##target:{row.Rule.Id}", ref target, 0))
             UpdateTransferRule(row.Owner, row.PlanId, row.Rule.Id, draftRule =>
                 draftRule.TargetQuantity = Math.Max(0, target));
+        if (!row.ListingContribution.IsKnown)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(1f, .7f, .3f, 1f), "+ ?");
+        }
+        else if (row.ListingContribution.Value > 0)
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled($"+{row.ListingContribution.Value:N0}");
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(row.ListingContribution.IsKnown
+                ? $"Independent target {row.Rule.TargetQuantity:N0} + Listing Plan {row.ListingContribution.Value:N0}"
+                : $"Independent target {row.Rule.TargetQuantity:N0}; Listing Plan demand is not yet known.");
+    }
+
+    private void DrawTransferSource(TransferWorkbenchRow row)
+    {
+        if (row.ListingLink is null)
+        {
+            ImGui.TextDisabled("Independent");
+            return;
+        }
+        ImGui.TextDisabled("Listing Plan");
+        ImGui.SameLine();
+        if (!ImGui.SmallButton($"Unlink##transfer-listing:{row.ListingLink.Id}"))
+            return;
+        try
+        {
+            state.Mutate(document => ListingPlanCatalog.Unlink(
+                document,
+                row.Owner,
+                row.PlanId,
+                row.ListingLink.ListingPlanId,
+                row.ListingLink.ItemId,
+                row.ListingLink.Quality));
+            inlineTransferError = string.Empty;
+        }
+        catch (Exception exception)
+        {
+            inlineTransferError = exception.Message;
+        }
     }
 
     private static string TransferOutcome(TransferWorkbenchRow row) =>
         !row.Rule.Enabled
             ? "Off"
+            : !row.ListingContribution.IsKnown
+                ? "Verify demand"
             : row.Line?.Action switch
             {
                 StowageAction.Retrieve => $"Retrieve {row.Line.RetrieveQuantity:N0}",
@@ -2534,7 +2745,9 @@ public sealed class QuartermasterWindow : Window
     }
 
     private static string TransferReviewOutcome(TransferReviewRow row) =>
-        row.Line?.Action switch
+        !row.ListingContribution.IsKnown
+            ? "Verify listing demand"
+            : row.Line?.Action switch
         {
             StowageAction.Retrieve => $"Retrieve {row.Line.RetrieveQuantity:N0}",
             StowageAction.Deposit => $"Stow {row.Line.DepositQuantity:N0} · {RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner)}",
@@ -2593,6 +2806,7 @@ public sealed class QuartermasterWindow : Window
                 workbench.SelectedStowagePlanId = state.Mutate(document =>
                 {
                     document.PlanItems.RemoveAll(rule => rule.StowagePlanId == planId);
+                    document.TransferPlanListingLinks.RemoveAll(link => link.StowagePlanId == planId);
                     document.StowagePlans.RemoveAll(candidate => candidate.Id == planId && candidate.Owner.Matches(owner));
                     return StowagePlanCatalog.OwnerPlans(document, owner).FirstOrDefault()?.Id;
                 });
@@ -2700,6 +2914,7 @@ public sealed class QuartermasterWindow : Window
     {
         CloseRestockEditor();
         CloseStowageEditor();
+        CloseListingPlanEditor();
     }
 
     private void DrawStowageWorkspace(QuartermasterRuntimeSnapshot runtime)
@@ -2774,7 +2989,7 @@ public sealed class QuartermasterWindow : Window
         var movements = projection.Movements;
         var hasMovement = projection.HasMovement;
         var availability = TransferExecutionPolicy.ForExplicitRun(
-            hasMovement,
+            hasMovement || projection.HasUnknownListingDemand,
             owner.HasStableIdentity,
             transfers.CanStart,
             autoRetainer.IsRefreshing || autoRetainer.IsQueued);
@@ -2804,18 +3019,20 @@ public sealed class QuartermasterWindow : Window
                     requestTransferReviewOpen = true;
                 }
             },
-            canExecute ? $"{movements:N0} movements" : availability.BlockReason);
+            canExecute
+                ? projection.HasUnknownListingDemand ? "Listing demand will be verified first" : $"{movements:N0} movements"
+                : availability.BlockReason);
 
         ImGui.Separator();
         ImGui.TextUnformatted($"{ownerRules.Count:N0} items");
         ImGui.SameLine();
         ImGui.TextDisabled("·");
         ImGui.SameLine();
-        ImGui.TextUnformatted($"{movements:N0} movements");
+        ImGui.TextUnformatted(projection.HasUnknownListingDemand ? "Movements pending verification" : $"{movements:N0} movements");
         ImGui.SameLine();
-        ImGui.TextColored(new Vector4(.52f, .79f, .94f, 1f), $"Retrieve {retrieval.NeededQuantity:N0}");
+        ImGui.TextColored(new Vector4(.52f, .79f, .94f, 1f), projection.HasUnknownListingDemand ? "Retrieve —" : $"Retrieve {retrieval.NeededQuantity:N0}");
         ImGui.SameLine();
-        ImGui.TextColored(new Vector4(.53f, .83f, .64f, 1f), $"Stow {surplusBatch.RequestedQuantity:N0}");
+        ImGui.TextColored(new Vector4(.53f, .83f, .64f, 1f), projection.HasUnknownListingDemand ? "Stow —" : $"Stow {surplusBatch.RequestedQuantity:N0}");
         if (!string.IsNullOrWhiteSpace(inlineTransferError))
         {
             ImGui.SameLine();
@@ -2858,7 +3075,7 @@ public sealed class QuartermasterWindow : Window
         StowagePlan plan)
     {
         if (transferWorkbenchProjection is { } cached &&
-            cached.RuntimeRevision == runtime.PlanningRevision &&
+            cached.RuntimeRevision == runtime.Revision &&
             cached.PlanId == plan.Id)
             return cached;
 
@@ -2866,12 +3083,16 @@ public sealed class QuartermasterWindow : Window
             .Where(rule => rule.StowagePlanId == plan.Id)
             .OrderBy(rule => rule.ItemName, StringComparer.OrdinalIgnoreCase)
             .ToArray();
+        var effectiveRules = ListingPlanEvaluator.ComposeRules(runtime.State, runtime.Browser, runtime.Owner, plan.Id);
+        var listingEvaluation = ListingPlanEvaluator.Evaluate(ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner), runtime.Browser);
+        var listingContributions = ListingPlanEvaluator.Contributions(runtime.State, plan.Id, listingEvaluation)
+            .ToDictionary(contribution => (contribution.Link.ItemId, contribution.Link.Quality));
         var stowage = StowageEvaluator.BuildPlan(
             runtime.State,
             runtime.Browser,
             runtime.Owner,
             plan.Id);
-        var retrieval = BuildTransferRetrievalEvaluation(runtime, rules);
+        var retrieval = BuildTransferRetrievalEvaluation(runtime, effectiveRules);
         var deposit = BuildSurplusBatch(runtime, stowage);
         var evaluated = stowage?.Lines.ToDictionary(line => line.RuleId) ?? [];
         var retrievalLines = retrieval.Lines.ToDictionary(line => line.PlanItemId);
@@ -2885,19 +3106,22 @@ public sealed class QuartermasterWindow : Window
                 var playerQuantity = StowageEvaluator.PlayerQuantity(
                     rule,
                     runtime.Browser.Items.FirstOrDefault(item => item.ItemId == rule.ItemId));
+                listingContributions.TryGetValue((rule.ItemId, rule.Quality), out var listingContribution);
                 return new TransferWorkbenchRow(
                     rule,
                     line,
                     retrievalLine,
                     playerQuantity,
-                    rule.TargetQuantity - playerQuantity,
+                    (line?.DesiredPlayerQuantity ?? rule.TargetQuantity) - playerQuantity,
+                    listingContribution?.Quantity ?? Evidence.Known(0),
+                    listingContribution?.Link,
                     runtime.Owner,
                     plan.Id,
                     runtime);
             })
             .ToArray();
         transferWorkbenchProjection = new(
-            runtime.PlanningRevision,
+            runtime.Revision,
             plan.Id,
             rules,
             stowage,
@@ -2905,6 +3129,7 @@ public sealed class QuartermasterWindow : Window
             deposit,
             movements,
             TransferExecutionPolicy.HasMovement(retrieval.NeededQuantity, deposit),
+            ListingPlanEvaluator.HasUnknownLinkedDemand(runtime.State, runtime.Browser, runtime.Owner, plan.Id),
             rows);
         transferProjectionBuildCount++;
         return transferWorkbenchProjection;
@@ -3453,8 +3678,361 @@ public sealed class QuartermasterWindow : Window
             .ToArray();
     }
 
-    private void DrawListings(BrowserProjection projection, long revision)
+    private void FocusStockFromListings(QuartermasterRuntimeSnapshot runtime, ListingItemKey key)
     {
+        stockSelection.Clear();
+        stockSelection.SetSelected(key.ItemId, true);
+        workbench.SelectedStockListingQuality = key.Quality;
+        requestedView = WorkbenchView.Stock;
+        workbench.View = WorkbenchView.Stowage;
+    }
+
+    private void OpenListingPlanEditor(QuartermasterRuntimeSnapshot runtime, ListingItemKey? focus)
+    {
+        listingPlanDraft = ListingPlanCatalog.Draft(state.Snapshot(), runtime.Owner, runtime.Browser);
+        listingPlanEditorFocus = focus;
+        listingPlanEditorFilter = string.Empty;
+        listingPlanItemSearch = string.Empty;
+        selectedListingPlanChoice = null;
+        listingPlanEditorError = string.Empty;
+        listingPlanEditorConflicts = [];
+        requestListingPlanEditorOpen = true;
+    }
+
+    private void CloseListingPlanEditor()
+    {
+        listingPlanDraft = null;
+        requestListingPlanEditorOpen = false;
+        listingPlanEditorVisible = false;
+        listingPlanEditorFocus = null;
+        listingPlanEditorError = string.Empty;
+        listingPlanEditorConflicts = [];
+        selectedListingPlanChoice = null;
+    }
+
+    private void DrawListingPlanEditorModal(QuartermasterRuntimeSnapshot runtime)
+    {
+        const string popup = "Edit Listing Plan##RQListingPlanEditor";
+        listingPlanEditorVisible = false;
+        if (requestListingPlanEditorOpen)
+        {
+            ImGui.OpenPopup(popup);
+            requestListingPlanEditorOpen = false;
+        }
+        if (listingPlanDraft is null)
+            return;
+        var available = ImGui.GetMainViewport().WorkSize;
+        ImGui.SetNextWindowSize(new(Math.Min(1320, available.X - 48), Math.Min(720, available.Y - 48)), ImGuiCond.Appearing);
+        if (!ImGui.BeginPopupModal(popup, ImGuiWindowFlags.NoScrollbar))
+        {
+            if (listingPlanEditorVisible)
+                CloseListingPlanEditor();
+            return;
+        }
+        listingPlanEditorVisible = true;
+        var draft = listingPlanDraft;
+        ImGui.TextUnformatted("Edit Listing Plan");
+        ImGui.SameLine();
+        ImGui.TextDisabled($"{runtime.Owner.CharacterName} @ {runtime.Owner.HomeWorldName} · one active plan · {draft.Assignments.Count:N0} assignments");
+        if (draft.IncompleteListingRetainerIds.Count > 0)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(1f, .7f, .3f, 1f), $"· {draft.IncompleteListingRetainerIds.Count:N0} retainers not seeded");
+        }
+        DrawListingPlanEditorToolbar(draft, runtime);
+
+        var validation = ListingPlanCatalog.Validate(
+            draft.Assignments,
+            itemId => ResolveListingMaxStack(runtime.Browser, itemId),
+            runtime.Retainers.Values.Where(retainer => retainer.Owner.Matches(runtime.Owner)).Select(retainer => retainer.RetainerId).ToHashSet());
+        var capacityIssues = validation.Where(issue => issue.Field == "RetainerCapacity").ToArray();
+        if (capacityIssues.Length > 0)
+            ImGui.TextColored(new Vector4(1f, .45f, .35f, 1f), capacityIssues[0].Message);
+        else
+        {
+            var fullest = draft.Assignments.Where(assignment => assignment.Enabled)
+                .GroupBy(assignment => new { assignment.RetainerId, assignment.RetainerName })
+                .Select(group => new { group.Key.RetainerName, Slots = group.Sum(assignment => assignment.ListingCount) })
+                .OrderByDescending(row => row.Slots)
+                .FirstOrDefault();
+            ImGui.TextDisabled(fullest is null ? "No planned slots yet." : $"Highest planned capacity: {fullest.RetainerName} {fullest.Slots:N0} / 20");
+        }
+        var transitionConflict = ListingCapacityTransitionConflict(draft, runtime.Browser);
+        if (transitionConflict is not null)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(1f, .7f, .3f, 1f), transitionConflict);
+        }
+        if (!string.IsNullOrWhiteSpace(listingPlanEditorError))
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), listingPlanEditorError);
+        }
+        if (listingPlanEditorConflicts.Count > 0)
+        {
+            ImGui.TextColored(
+                new Vector4(1f, .7f, .3f, 1f),
+                $"{listingPlanEditorConflicts.Count:N0} concurrent field changes were rebased. Your values remain highlighted; edit them or Save again to keep them.");
+        }
+
+        if (ImGui.BeginChild("RQListingPlanRows", new Vector2(0, Math.Max(230, ImGui.GetContentRegionAvail().Y - 42)), false))
+            DrawListingPlanRows(draft, runtime, validation.Concat(listingPlanEditorConflicts).ToArray());
+        ImGui.EndChild();
+        ImGui.Separator();
+        ImGui.TextDisabled(validation.Count == 0 ? "Changes apply together; current listings never rewrite this plan automatically." : $"{validation.Count:N0} fields need attention before Save.");
+        ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetWindowContentRegionMax().X - 176));
+        if (ImGui.Button("Cancel##listingplan"))
+        {
+            CloseListingPlanEditor();
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.SameLine();
+        if (validation.Count != 0)
+            ImGui.BeginDisabled();
+        if (ImGui.Button("Save Listing Plan"))
+        {
+            try
+            {
+                state.Mutate(document => ListingPlanCatalog.Apply(
+                    document,
+                    runtime.Owner,
+                    draft,
+                    itemId => ResolveListingMaxStack(runtime.Browser, itemId),
+                    runtime.Retainers.Values.Where(retainer => retainer.Owner.Matches(runtime.Owner)).Select(retainer => retainer.RetainerId).ToHashSet(),
+                    DateTime.UtcNow));
+                CloseListingPlanEditor();
+                ImGui.CloseCurrentPopup();
+            }
+            catch (ListingPlanConflictException exception)
+            {
+                var canonical = state.Snapshot().ListingPlans.Single(plan =>
+                    plan.Id == draft.PlanId && plan.Owner.Matches(runtime.Owner));
+                draft.Assignments = exception.RebasedAssignments.Select(ListingPlanCatalog.Copy).ToList();
+                draft.BaselineAssignments = canonical.Assignments.Select(ListingPlanCatalog.Copy).ToList();
+                draft.SourceRevision = canonical.Revision;
+                listingPlanEditorConflicts = exception.Conflicts;
+                listingPlanEditorError = string.Empty;
+            }
+            catch (InvalidOperationException exception)
+            {
+                listingPlanEditorError = exception.Message;
+            }
+        }
+        if (validation.Count != 0)
+            ImGui.EndDisabled();
+        ImGui.EndPopup();
+    }
+
+    internal static string? ListingCapacityTransitionConflict(ListingPlanDraft draft, BrowserProjection browser)
+    {
+        var plan = new ListingPlan
+        {
+            Owner = draft.Owner,
+            Assignments = draft.Assignments.Select(ListingPlanCatalog.Copy).ToList(),
+        };
+        foreach (var retainer in draft.Assignments.Where(assignment => assignment.Enabled && assignment.RetainerId != 0)
+                     .GroupBy(assignment => new { assignment.RetainerId, assignment.RetainerName }))
+        {
+            var scopeKey = BrowserScope.RetainerKey(retainer.Key.RetainerId);
+            if (!browser.RetainerListingsCompleteByScope.GetValueOrDefault(scopeKey))
+                continue;
+            var planned = retainer.Sum(assignment => assignment.ListingCount);
+            var unmanaged = ListingPlanEvaluator.Evaluate(plan, browser, scopeKey).Items
+                .SelectMany(item => item.UnmanagedPhysicalListings)
+                .Count();
+            if (planned + unmanaged > 20)
+                return $"Current transition: {retainer.Key.RetainerName} has {planned + unmanaged:N0} occupied ({unmanaged:N0} outside this plan); Save remains available.";
+        }
+        return null;
+    }
+
+    private void DrawListingPlanEditorToolbar(ListingPlanDraft draft, QuartermasterRuntimeSnapshot runtime)
+    {
+        ImGui.Separator();
+        ImGui.SetNextItemWidth(250);
+        if (ImGui.InputTextWithHint("##listingplanitem", "Add an item by name", ref listingPlanItemSearch, 96))
+            selectedListingPlanChoice = null;
+        if (listingPlanItemSearch.Trim().Length >= 2 && selectedListingPlanChoice is null)
+        {
+            foreach (var choice in SearchItems(listingPlanItemSearch, 5))
+                if (ImGui.Selectable($"{choice.Label}##listingplanchoice{choice.ItemId}", false, ImGuiSelectableFlags.DontClosePopups))
+                {
+                    selectedListingPlanChoice = choice;
+                    listingPlanItemSearch = choice.Name;
+                }
+        }
+        ImGui.SameLine();
+        if (selectedListingPlanChoice is null)
+            ImGui.BeginDisabled();
+        if (ImGui.Button("Add item") && selectedListingPlanChoice is { } selectedChoice)
+        {
+            var retainer = runtime.Retainers.Values.Where(retainer => retainer.Owner.Matches(runtime.Owner))
+                .OrderBy(retainer => retainer.RetainerName, StringComparer.OrdinalIgnoreCase).FirstOrDefault();
+            var observedPrice = runtime.Browser.Listings.FirstOrDefault(listing => listing.ItemId == selectedChoice.ItemId && listing.UnitPrice.IsKnown)?.UnitPrice.Value;
+            draft.Assignments.Add(new ListingPlanAssignment
+            {
+                ItemId = selectedChoice.ItemId,
+                ItemName = selectedChoice.Name,
+                RetainerId = retainer?.RetainerId ?? 0,
+                RetainerName = retainer?.RetainerName ?? "Missing retainer",
+                UnitPrice = observedPrice is null ? 0 : checked((int)observedPrice.Value),
+            });
+            listingPlanEditorFocus = new(selectedChoice.ItemId, ItemQualityPolicy.NqOnly);
+            selectedListingPlanChoice = null;
+            listingPlanItemSearch = string.Empty;
+        }
+        if (selectedListingPlanChoice is null)
+            ImGui.EndDisabled();
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Add current unplanned listings"))
+        {
+            var observed = ListingPlanCatalog.Draft(new QuartermasterState(), runtime.Owner, runtime.Browser).Assignments;
+            foreach (var assignment in observed)
+            {
+                var exists = draft.Assignments.Any(current => current.ItemId == assignment.ItemId && current.Quality == assignment.Quality &&
+                    current.RetainerId == assignment.RetainerId && current.QuantityPerListing == assignment.QuantityPerListing && current.UnitPrice == assignment.UnitPrice);
+                if (!exists)
+                    draft.Assignments.Add(ListingPlanCatalog.Copy(assignment));
+            }
+        }
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(190);
+        ImGui.InputTextWithHint("##listingplanfilter", "Filter assignments", ref listingPlanEditorFilter, 80);
+        ImGui.SameLine();
+        if (listingPlanEditorFocus is not null && ImGui.SmallButton("All assignments"))
+            listingPlanEditorFocus = null;
+    }
+
+    private void DrawListingPlanRows(
+        ListingPlanDraft draft,
+        QuartermasterRuntimeSnapshot runtime,
+        IReadOnlyList<ListingPlanValidationIssue> issues)
+    {
+        var rows = draft.Assignments
+            .Where(assignment => listingPlanEditorFocus is { } focus
+                ? assignment.ItemId == focus.ItemId && assignment.Quality == focus.Quality
+                : listingPlanEditorFilter.Length == 0 || assignment.ItemName.Contains(listingPlanEditorFilter, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(assignment => assignment.ItemName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(assignment => assignment.Quality)
+            .ThenBy(assignment => assignment.RetainerName, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var retainers = runtime.Retainers.Values.Where(retainer => retainer.Owner.Matches(runtime.Owner))
+            .OrderBy(retainer => retainer.RetainerName, StringComparer.OrdinalIgnoreCase).ToArray();
+        if (!ImGui.BeginTable("RQListingPlanAssignments", 9, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.Resizable))
+            return;
+        ImGui.TableSetupColumn("On", ImGuiTableColumnFlags.WidthFixed, 36);
+        ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.4f);
+        ImGui.TableSetupColumn("Quality", ImGuiTableColumnFlags.WidthFixed, 74);
+        ImGui.TableSetupColumn("Retainer", ImGuiTableColumnFlags.WidthStretch, 1.2f);
+        ImGui.TableSetupColumn("Listings", ImGuiTableColumnFlags.WidthFixed, 74);
+        ImGui.TableSetupColumn("Qty each", ImGuiTableColumnFlags.WidthFixed, 74);
+        ImGui.TableSetupColumn("Unit price", ImGuiTableColumnFlags.WidthFixed, 112);
+        ImGui.TableSetupColumn("Units", ImGuiTableColumnFlags.WidthFixed, 68);
+        ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 28);
+        ImGui.TableHeadersRow();
+        foreach (var assignment in rows)
+        {
+            ImGui.PushID(assignment.Id.ToString());
+            ImGui.TableNextRow();
+            ImGui.TableNextColumn(); var enabled = assignment.Enabled; if (ImGui.Checkbox("##on", ref enabled)) assignment.Enabled = enabled;
+            ImGui.TableNextColumn();
+            var itemIssue = FindListingIssue(issues, assignment.Id, nameof(assignment.ItemId)) ??
+                            FindListingIssue(issues, assignment.Id, "Assignment");
+            if (itemIssue is null) ImGui.TextUnformatted(assignment.ItemName); else ImGui.TextColored(new Vector4(1f, .5f, .4f, 1f), assignment.ItemName);
+            if (itemIssue is not null && ImGui.IsItemHovered()) ImGui.SetTooltip(itemIssue.Message);
+            ImGui.TableNextColumn();
+            var qualityIssue = PushListingIssue(issues, assignment.Id, nameof(assignment.Quality));
+            DrawListingQuality(assignment);
+            PopListingIssue(qualityIssue);
+            ImGui.TableNextColumn();
+            var retainerIssue = PushListingIssue(issues, assignment.Id, nameof(assignment.RetainerId));
+            DrawListingRetainer(assignment, retainers);
+            PopListingIssue(retainerIssue);
+            ImGui.TableNextColumn();
+            var countIssue = PushListingIssue(issues, assignment.Id, nameof(assignment.ListingCount));
+            var count = assignment.ListingCount; ImGui.SetNextItemWidth(-1); if (ImGui.InputInt("##count", ref count, 0)) assignment.ListingCount = count;
+            PopListingIssue(countIssue);
+            ImGui.TableNextColumn();
+            var quantityIssue = PushListingIssue(issues, assignment.Id, nameof(assignment.QuantityPerListing));
+            var quantity = assignment.QuantityPerListing; ImGui.SetNextItemWidth(-1); if (ImGui.InputInt("##quantity", ref quantity, 0)) assignment.QuantityPerListing = quantity;
+            PopListingIssue(quantityIssue);
+            ImGui.TableNextColumn();
+            var priceIssue = PushListingIssue(issues, assignment.Id, nameof(assignment.UnitPrice));
+            var price = assignment.UnitPrice; ImGui.SetNextItemWidth(-1); if (ImGui.InputInt("##price", ref price, 0)) assignment.UnitPrice = price;
+            PopListingIssue(priceIssue);
+            ImGui.TableNextColumn(); ImGui.TextUnformatted(assignment.DesiredUnits.ToString("N0"));
+            ImGui.TableNextColumn(); if (ImGui.SmallButton("X")) draft.Assignments.Remove(assignment);
+            ImGui.PopID();
+        }
+        ImGui.EndTable();
+    }
+
+    private static ListingPlanValidationIssue? FindListingIssue(
+        IReadOnlyList<ListingPlanValidationIssue> issues,
+        Guid assignmentId,
+        string field) =>
+        issues.FirstOrDefault(issue => issue.AssignmentId == assignmentId && issue.Field == field);
+
+    private static ListingPlanValidationIssue? PushListingIssue(
+        IReadOnlyList<ListingPlanValidationIssue> issues,
+        Guid assignmentId,
+        string field)
+    {
+        var issue = FindListingIssue(issues, assignmentId, field) ?? FindListingIssue(issues, assignmentId, "Assignment");
+        if (issue is not null)
+            ImGui.PushStyleColor(ImGuiCol.FrameBg, new Vector4(.45f, .12f, .1f, .72f));
+        return issue;
+    }
+
+    private static void PopListingIssue(ListingPlanValidationIssue? issue)
+    {
+        if (issue is null)
+            return;
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(issue.Message);
+        ImGui.PopStyleColor();
+    }
+
+    private static void DrawListingQuality(ListingPlanAssignment assignment)
+    {
+        ImGui.SetNextItemWidth(-1);
+        if (!ImGui.BeginCombo("##quality", QualityLabel(assignment.Quality)))
+            return;
+        foreach (var quality in new[] { ItemQualityPolicy.NqOnly, ItemQualityPolicy.HqOnly })
+            if (ImGui.Selectable(QualityLabel(quality), assignment.Quality == quality))
+                assignment.Quality = quality;
+        ImGui.EndCombo();
+    }
+
+    private static void DrawListingRetainer(ListingPlanAssignment assignment, IReadOnlyList<CachedRetainer> retainers)
+    {
+        ImGui.SetNextItemWidth(-1);
+        var current = retainers.FirstOrDefault(retainer => retainer.RetainerId == assignment.RetainerId);
+        var label = current?.RetainerName ?? $"Missing retainer · ID {assignment.RetainerId}";
+        if (!ImGui.BeginCombo("##retainer", label))
+            return;
+        foreach (var retainer in retainers)
+            if (ImGui.Selectable($"{retainer.RetainerName}##{retainer.RetainerId}", assignment.RetainerId == retainer.RetainerId))
+            {
+                assignment.RetainerId = retainer.RetainerId;
+                assignment.RetainerName = retainer.RetainerName;
+            }
+        ImGui.EndCombo();
+    }
+
+    private int ResolveListingMaxStack(BrowserProjection browser, uint itemId)
+    {
+        var observed = browser.Items.FirstOrDefault(item => item.ItemId == itemId)?.Definition?.MaxStackSize;
+        if (observed is > 0)
+            return checked((int)Math.Min(observed.Value, int.MaxValue));
+        var item = dataManager.GetExcelSheet<Item>().GetRowOrDefault(itemId);
+        return item is { } value && value.StackSize > 0 ? checked((int)value.StackSize) : 1;
+    }
+
+    private void DrawListings(QuartermasterRuntimeSnapshot runtime)
+    {
+        var projection = runtime.Browser;
+        var revision = runtime.ListingsRevision;
         var sourceListings = projection.GetListings(workbench.ScopeKey);
         var context = BrowserQueryController.CreateListingContext(sourceListings, projection.Owner);
         DalamudFilterAutocompleteRenderer.Draw(
@@ -3462,7 +4040,7 @@ public sealed class QuartermasterWindow : Window
             "Search listed items",
             context,
             workbench.ListingFilterState,
-            Math.Max(240, ImGui.GetContentRegionAvail().X - 200));
+            Math.Max(240, ImGui.GetContentRegionAvail().X - 340));
         ImGui.SameLine();
         ImGui.SetNextItemWidth(170);
         var selectedScope = projection.Scopes.First(scope => scope.Key == workbench.ScopeKey);
@@ -3475,6 +4053,9 @@ public sealed class QuartermasterWindow : Window
             }
             ImGui.EndCombo();
         }
+        ImGui.SameLine();
+        if (ImGui.Button("Edit Listing Plan…##top"))
+            OpenListingPlanEditor(runtime, workbench.SelectedListingItem);
 
         var result = queries.QueryListings(
             projection,
@@ -3487,16 +4068,38 @@ public sealed class QuartermasterWindow : Window
                 new Vector4(1f, .65f, .25f, 1f),
                 result.Filter.Diagnostics.FirstOrDefault()?.Message ?? "Invalid filter");
 
-        var groups = result.Listings
-            .GroupBy(listing => (listing.ItemId, listing.ItemName))
-            .Select(group => new ListingGroupView(
-                group.Key.ItemId,
-                group.Key.ItemName,
-                group.Sum(listing => listing.Quantity),
-                group.Select(listing => listing.RetainerId).Distinct().Count(),
-                projection.GetUnlistedRetainerQuantity(group.Key.ItemId, workbench.ScopeKey),
-                group.OrderBy(listing => listing.RetainerName, StringComparer.OrdinalIgnoreCase).ToArray()))
+        var evaluation = ListingPlanEvaluator.Evaluate(
+            ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner),
+            projection,
+            workbench.ScopeKey);
+        var resultKeys = result.Listings.Select(listing => new ListingItemKey(
+            listing.ItemId,
+            listing.Quality == FfxivItemQuality.HQ ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly)).ToHashSet();
+        var hasFilter = !string.IsNullOrWhiteSpace(workbench.ListingFilterState.Expression);
+        var groups = evaluation.Items
+            .Where(item => !hasFilter || resultKeys.Contains(new(item.ItemId, item.Quality)) ||
+                           item.ItemName.Contains(workbench.ListingFilterState.Expression, StringComparison.OrdinalIgnoreCase))
+            .Select(item => new ListingGroupView(
+                new(item.ItemId, item.Quality),
+                item.ItemId,
+                item.ItemName,
+                item.Quality,
+                item.DesiredUnits,
+                item.ListedUnits,
+                item.NeedUnits,
+                item.PlayerUnits,
+                item.RetainerUnits,
+                item.ImmediatelyListableUnits,
+                item.MovementNeedUnits,
+                item.OtherRetainerUnits,
+                item.RetrievableUnits,
+                item.MissingUnits,
+                item.Coverage,
+                item.Assignments,
+                item.PhysicalListings,
+                item.UnmanagedPhysicalListings))
             .OrderBy(group => group.ItemName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(group => group.Quality)
             .ToArray();
         if (groups.Length == 0)
         {
@@ -3525,12 +4128,12 @@ public sealed class QuartermasterWindow : Window
             return;
         }
 
-        if (workbench.SelectedListingItemId is not { } selectedItemId ||
-            groups.All(group => group.ItemId != selectedItemId))
-            workbench.SelectedListingItemId = groups[0].ItemId;
-        var selected = groups.Single(group => group.ItemId == workbench.SelectedListingItemId);
-        listingGroupSelection.Retain(groups.Select(group => group.ItemId));
-        listingGroupSelection.SelectOnly(selected.ItemId);
+        if (workbench.SelectedListingItem is not { } selectedItem ||
+            groups.All(group => group.Key != selectedItem))
+            workbench.SelectedListingItem = groups[0].Key;
+        var selected = groups.Single(group => group.Key == workbench.SelectedListingItem);
+        listingGroupSelection.Retain(groups.Select(group => group.Key));
+        listingGroupSelection.SelectOnly(selected.Key);
         var listingKeys = selected.Listings.Select(ListingRowKey.From).ToArray();
         physicalListingSelection.Retain(listingKeys);
         if (focusedListing is not { } focusedKey || !listingKeys.Contains(focusedKey))
@@ -3553,7 +4156,7 @@ public sealed class QuartermasterWindow : Window
             {
                 listingGroupTable.DrawFilterRow();
                 var visibleGroups = listingGroupTable.Apply(groups, ImGui.TableGetSortSpecs());
-                var groupKeys = visibleGroups.Select(group => group.ItemId).ToArray();
+                var groupKeys = visibleGroups.Select(group => group.Key).ToArray();
                 for (var groupIndex = 0; groupIndex < visibleGroups.Count; groupIndex++)
                 {
                     var group = visibleGroups[groupIndex];
@@ -3562,10 +4165,10 @@ public sealed class QuartermasterWindow : Window
                             listingGroupSelection,
                             groupKeys,
                             groupIndex,
-                            $"##listing-group:{group.ItemId}"))
+                            $"##listing-group:{group.ItemId}:{group.Quality}"))
                     {
-                        listingGroupSelection.SelectOnly(group.ItemId);
-                        workbench.SelectedListingItemId = group.ItemId;
+                        listingGroupSelection.SelectOnly(group.Key);
+                        workbench.SelectedListingItem = group.Key;
                         physicalListingSelection.Clear();
                         focusedListing = null;
                     }
@@ -3580,49 +4183,68 @@ public sealed class QuartermasterWindow : Window
         if (ImGui.BeginChild("RQListingDetail", Vector2.Zero, false))
         {
             ImGui.TextUnformatted(selected.ItemName);
-            var navigationTarget = ResolveListingNavigationTarget(selected.Listings);
-            var canOpenListings = navigationTarget is not null && !listingNavigation.IsRunning;
-            var openButtonWidth = ImGui.CalcTextSize("Open retainer listings").X +
-                                  ImGui.GetStyle().FramePadding.X * 2;
-            ImGui.SameLine(Math.Max(
-                ImGui.GetCursorPosX(),
-                ImGui.GetWindowContentRegionMax().X - openButtonWidth));
+            ImGui.SameLine();
+            ImGui.TextDisabled(QualityLabel(selected.Quality));
+            var physicalTarget = ResolveListingNavigationTarget(selected.Listings);
+            var assignmentTarget = selected.Assignments.FirstOrDefault()?.Assignment;
+            var canOpenListings = (physicalTarget is not null || assignmentTarget is not null) && !listingNavigation.IsRunning;
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Show stock"))
+                FocusStockFromListings(runtime, selected.Key);
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Edit Listing Plan…"))
+                OpenListingPlanEditor(runtime, selected.Key);
+            ImGui.SameLine();
             if (!canOpenListings)
                 ImGui.BeginDisabled();
-            if (ImGui.Button("Open retainer listings") && navigationTarget is not null)
-                OpenRetainerListings(navigationTarget);
+            if (ImGui.SmallButton("Open retainer listings"))
+            {
+                if (physicalTarget is not null)
+                    OpenRetainerListings(physicalTarget);
+                else if (assignmentTarget is not null)
+                    _ = listingNavigation.OpenRetainerListingsAsync(new(assignmentTarget.RetainerId, assignmentTarget.RetainerName));
+            }
             if (!canOpenListings)
                 ImGui.EndDisabled();
-            reviewRegistry.RegisterLastButton(
-                "quartermaster.listings.open-first",
-                navigationTarget is null
-                    ? "Open retainer listings"
-                    : $"Open {navigationTarget.RetainerName}'s listings",
-                canOpenListings,
-                () =>
-                {
-                    if (ResolveListingNavigationTarget(selected.Listings) is { } target)
-                        OpenRetainerListings(target);
-                },
-                listingNavigation.IsRunning ? listingNavigation.Status : "Ready");
             ImGui.TextDisabled(
-                $"{selected.Listings.Count:N0} physical {(selected.Listings.Count == 1 ? "listing" : "listings")} across {selected.RetainerCount:N0} {(selected.RetainerCount == 1 ? "retainer" : "retainers")}");
-            ImGui.Separator();
-            ImGui.TextDisabled("Total listed");
-            ImGui.SameLine();
-            ImGui.TextUnformatted(selected.Quantity.ToString("N0"));
-            if (selected.HasKnownPrice)
+                $"{selected.DesiredUnits:N0} desired · {EvidenceText(selected.ListedUnits)} listed · {EvidenceText(selected.NeedUnits)} need · {ListingCoverageText(selected)}");
+            if (selected.Assignments.Count > 0)
             {
-                ImGui.SameLine();
-                ImGui.TextDisabled("Lowest");
-                ImGui.SameLine();
-                ImGui.TextUnformatted($"{selected.LowestPrice:N0} gil");
-                ImGui.SameLine();
-                ImGui.TextDisabled("Highest");
-                ImGui.SameLine();
-                ImGui.TextUnformatted($"{selected.HighestPrice:N0} gil");
+                ImGui.Separator();
+                ImGui.TextDisabled("Listing Plan assignments");
+                if (ImGui.BeginTable("RQListingAssignments", 5, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.SizingStretchProp))
+                {
+                    ImGui.TableSetupColumn("Retainer", ImGuiTableColumnFlags.WidthStretch);
+                    ImGui.TableSetupColumn("Shape", ImGuiTableColumnFlags.WidthFixed, 76);
+                    ImGui.TableSetupColumn("Exact", ImGuiTableColumnFlags.WidthFixed, 52);
+                    ImGui.TableSetupColumn("Price", ImGuiTableColumnFlags.WidthFixed, 94);
+                    ImGui.TableSetupColumn("Exceptions", ImGuiTableColumnFlags.WidthStretch);
+                    ImGui.TableHeadersRow();
+                    foreach (var assignment in selected.Assignments)
+                    {
+                        ImGui.TableNextRow();
+                        ImGui.TableNextColumn(); ImGui.TextUnformatted(assignment.Assignment.RetainerName);
+                        ImGui.TableNextColumn(); ImGui.TextUnformatted($"{assignment.Assignment.ListingCount:N0} × {assignment.Assignment.QuantityPerListing:N0}");
+                        ImGui.TableNextColumn(); ImGui.TextUnformatted(selected.ListedUnits.IsKnown ? assignment.ExactListings.ToString("N0") : "—");
+                        ImGui.TableNextColumn(); ImGui.TextUnformatted($"{assignment.Assignment.UnitPrice:N0}");
+                        ImGui.TableNextColumn();
+                        if (!selected.ListedUnits.IsKnown)
+                            ImGui.TextDisabled("—");
+                        else
+                        {
+                            var exceptions = new List<string>();
+                            if (assignment.UnknownPriceListings > 0) exceptions.Add($"{assignment.UnknownPriceListings:N0} price unknown");
+                            if (assignment.WrongPriceListings > 0) exceptions.Add($"{assignment.WrongPriceListings:N0} price");
+                            if (assignment.WrongShapeListings > 0) exceptions.Add($"{assignment.WrongShapeListings:N0} shape");
+                            if (assignment.WrongRetainerListings > 0) exceptions.Add($"{assignment.WrongRetainerListings:N0} retainer");
+                            ImGui.TextDisabled(exceptions.Count == 0 ? "—" : string.Join(" · ", exceptions));
+                        }
+                    }
+                    ImGui.EndTable();
+                }
             }
             ImGui.Separator();
+            ImGui.TextDisabled("Current physical listings");
             if (physicalListingSelection.Count > 0)
             {
                 ImGui.TextDisabled(
@@ -3734,12 +4356,56 @@ public sealed class QuartermasterWindow : Window
     private static string ListingUnitPrice(ListingRow listing) =>
         listing.UnitPrice.IsKnown ? $"{listing.UnitPrice.Value:N0} gil" : "Unknown";
 
-    private static string ListingPriceRange(ListingGroupView group) =>
-        !group.HasKnownPrice
-            ? "Unknown"
-            : group.LowestPrice == group.HighestPrice
-                ? $"{group.LowestPrice:N0} gil"
-                : $"{group.LowestPrice:N0}–{group.HighestPrice:N0}";
+    private static string EvidenceText(Franthropy.Filtering.Evaluation.FieldEvidence<int> value) =>
+        value.IsKnown ? value.Value.ToString("N0") : "—";
+
+    private static string ListingCoverageText(ListingGroupView group)
+    {
+        if (group.Coverage == ListingCoverageState.Satisfied &&
+            (group.Assignments.Any(assignment => assignment.UnknownPriceListings + assignment.WrongPriceListings +
+                                                  assignment.WrongShapeListings + assignment.WrongRetainerListings > 0) ||
+             group.UnmanagedListings.Count > 0))
+            return "No stock deficit";
+        return group.Coverage switch
+        {
+            ListingCoverageState.Satisfied => "Satisfied",
+            ListingCoverageState.ReadyOnAssignedRetainer => $"{group.NeedUnits.Value:N0} on assigned retainer",
+            ListingCoverageState.ReadyOnPlayer => $"{EvidenceText(group.MovementNeedUnits)} on player",
+            ListingCoverageState.Retrievable => $"{group.RetrievableUnits.Value:N0} / {group.NeedUnits.Value:N0} retrievable",
+            ListingCoverageState.Missing => $"{group.MissingUnits.Value:N0} missing",
+            _ => "Unknown",
+        };
+    }
+
+    private static string ListingStateText(ListingGroupView group)
+    {
+        var price = group.Assignments.Sum(assignment => assignment.WrongPriceListings);
+        var shape = group.Assignments.Sum(assignment => assignment.WrongShapeListings);
+        var unknownPrice = group.Assignments.Sum(assignment => assignment.UnknownPriceListings);
+        var wrongRetainer = group.Assignments.Sum(assignment => assignment.WrongRetainerListings);
+        if (!group.ListedUnits.IsKnown)
+            return "Listings unknown";
+        if (group.NeedUnits.IsKnown && group.NeedUnits.Value > 0)
+            return group.Coverage switch
+            {
+                ListingCoverageState.ReadyOnAssignedRetainer => $"List {group.NeedUnits.Value:N0}",
+                ListingCoverageState.ReadyOnPlayer => $"Move {EvidenceText(group.MovementNeedUnits)} from player",
+                ListingCoverageState.Retrievable => $"Retrieve {group.RetrievableUnits.Value:N0}",
+                ListingCoverageState.Missing => $"Missing {group.MissingUnits.Value:N0}",
+                _ => $"Need {group.NeedUnits.Value:N0} · source?",
+            };
+        if (price > 0)
+            return $"{price:N0} wrong price";
+        if (shape > 0)
+            return $"{shape:N0} wrong shape";
+        if (wrongRetainer > 0)
+            return $"{wrongRetainer:N0} wrong retainer";
+        if (unknownPrice > 0)
+            return $"{unknownPrice:N0} price unknown";
+        if (group.UnmanagedListings.Count > 0)
+            return $"{group.UnmanagedListings.Count:N0} off plan";
+        return group.Assignments.Count == 0 ? "Not planned" : "On plan";
+    }
 
     private static string QualityLabel(ItemQualityPolicy quality) => quality switch
     {
@@ -3931,7 +4597,7 @@ public sealed class QuartermasterWindow : Window
         ImGui.SameLine();
         ImGui.TextColored(new Vector4(.52f, .79f, .94f, 1f), $"Retrieve {retrieval.NeededQuantity:N0}");
         ImGui.SameLine();
-        ImGui.TextColored(new Vector4(.53f, .83f, .64f, 1f), $"Stow {deposit.RequestedQuantity:N0}");
+        ImGui.TextColored(new Vector4(.53f, .83f, .64f, 1f), projection.HasUnknownListingDemand ? "Stow —" : $"Stow {deposit.RequestedQuantity:N0}");
         ImGui.Separator();
 
         var reviewRows = projection.Rows
@@ -3940,6 +4606,7 @@ public sealed class QuartermasterWindow : Window
                 row.Line,
                 row.PlayerQuantity,
                 row.Difference,
+                row.ListingContribution,
                 runtime))
             .ToArray();
         if (transferReviewTable.Begin(
@@ -3967,13 +4634,15 @@ public sealed class QuartermasterWindow : Window
             () => transferReview = null,
             "No inventory movement");
         var availability = TransferExecutionPolicy.ForExplicitRun(
-            hasMovement,
+            hasMovement || projection.HasUnknownListingDemand,
             runtime.Owner.HasStableIdentity,
             transfers.CanStart,
             autoRetainer.IsRefreshing || autoRetainer.IsQueued);
         ImGui.SameLine();
         ImGui.TextDisabled(
-            availability.BlockReason ??
+            projection.HasUnknownListingDemand
+                ? "Listing demand will be verified before any movement."
+                : availability.BlockReason ??
             "Balanced items remain in the plan but require no movement.");
         var canExecute = availability.CanExecute;
         ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - 110));
@@ -4013,6 +4682,22 @@ public sealed class QuartermasterWindow : Window
         var rules = current.State.PlanItems
             .Where(rule => rule.StowagePlanId == plan.Id)
             .ToArray();
+        if (ListingPlanEvaluator.HasUnknownLinkedDemand(current.State, current.Browser, current.Owner, plan.Id))
+        {
+            var completionSequence = autoRetainer.CompletedRunSequence;
+            if (allowCapacityRecovery && autoRetainer.Start())
+            {
+                pendingTransferPlanRecovery = new(planId, completionSequence);
+                transferStatus = "Verifying listing demand before executing the plan.";
+                return;
+            }
+            inlineTransferError = autoRetainer.Status.Length == 0
+                ? "Listing demand could not be verified."
+                : autoRetainer.Status;
+            transferStatus = inlineTransferError;
+            return;
+        }
+        rules = ListingPlanEvaluator.ComposeRules(current.State, current.Browser, current.Owner, plan.Id).ToArray();
         var currentStowage = StowageEvaluator.BuildPlan(
             current.State,
             current.Browser,
@@ -4226,7 +4911,8 @@ public sealed class QuartermasterWindow : Window
     private sealed record StockWorkbenchRow(
         StockGroup Item,
         TargetPlanItem? Rule,
-        StowageEvaluationLine? Line);
+        StowageEvaluationLine? Line,
+        IReadOnlyList<ListingPlanItemEvaluation> ListingDemand);
 
     private sealed record StockWorkbenchProjection(
         long RuntimeRevision,
@@ -4243,6 +4929,7 @@ public sealed class QuartermasterWindow : Window
         StowageDepositBatch Deposit,
         int Movements,
         bool HasMovement,
+        bool HasUnknownListingDemand,
         IReadOnlyList<TransferWorkbenchRow> Rows);
 
     private sealed record PendingTransferPlanRecovery(Guid PlanId, long CompletionSequence);
@@ -4259,6 +4946,8 @@ public sealed class QuartermasterWindow : Window
         PlanLine? RetrievalLine,
         int PlayerQuantity,
         int Difference,
+        FieldEvidence<int> ListingContribution,
+        TransferPlanListingLink? ListingLink,
         OwnerScope Owner,
         Guid PlanId,
         QuartermasterRuntimeSnapshot Runtime);
@@ -4272,30 +4961,30 @@ public sealed class QuartermasterWindow : Window
         StowageEvaluationLine? Line,
         int PlayerQuantity,
         int Difference,
+        FieldEvidence<int> ListingContribution,
         QuartermasterRuntimeSnapshot Runtime);
 
     private sealed record TransferReviewRequest(Guid PlanId, string PlanName);
 
     private sealed record ListingGroupView(
+        ListingItemKey Key,
         uint ItemId,
         string ItemName,
-        int Quantity,
-        int RetainerCount,
-        Franthropy.Filtering.Evaluation.FieldEvidence<int> UnlistedQuantity,
-        IReadOnlyList<ListingRow> Listings)
-    {
-        public bool HasKnownPrice => Listings.Any(listing => listing.UnitPrice.IsKnown);
-        public decimal LowestPrice => Listings
-            .Where(listing => listing.UnitPrice.IsKnown)
-            .Select(listing => listing.UnitPrice.Value)
-            .DefaultIfEmpty()
-            .Min();
-        public decimal HighestPrice => Listings
-            .Where(listing => listing.UnitPrice.IsKnown)
-            .Select(listing => listing.UnitPrice.Value)
-            .DefaultIfEmpty()
-            .Max();
-    }
+        ItemQualityPolicy Quality,
+        int DesiredUnits,
+        Franthropy.Filtering.Evaluation.FieldEvidence<int> ListedUnits,
+        Franthropy.Filtering.Evaluation.FieldEvidence<int> NeedUnits,
+        int PlayerUnits,
+        Franthropy.Filtering.Evaluation.FieldEvidence<int> RetainerUnits,
+        Franthropy.Filtering.Evaluation.FieldEvidence<int> ImmediatelyListableUnits,
+        Franthropy.Filtering.Evaluation.FieldEvidence<int> MovementNeedUnits,
+        Franthropy.Filtering.Evaluation.FieldEvidence<int> OtherRetainerUnits,
+        Franthropy.Filtering.Evaluation.FieldEvidence<int> RetrievableUnits,
+        Franthropy.Filtering.Evaluation.FieldEvidence<int> MissingUnits,
+        ListingCoverageState Coverage,
+        IReadOnlyList<ListingAssignmentEvaluation> Assignments,
+        IReadOnlyList<ListingRow> Listings,
+        IReadOnlyList<ListingRow> UnmanagedListings);
 
     private readonly record struct ListingRowKey(
         ulong RetainerId,

@@ -163,6 +163,45 @@ public sealed class StowagePlan
     public int Priority { get; set; }
 }
 
+public sealed class ListingPlan
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public long Revision { get; set; } = 1;
+    public OwnerScope Owner { get; set; } = new();
+    public List<ListingPlanAssignment> Assignments { get; set; } = [];
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
+public sealed class ListingPlanAssignment
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public uint ItemId { get; set; }
+    public string ItemName { get; set; } = string.Empty;
+    public ItemQualityPolicy Quality { get; set; } = ItemQualityPolicy.NqOnly;
+    public ulong RetainerId { get; set; }
+    public string RetainerName { get; set; } = string.Empty;
+    public int ListingCount { get; set; } = 1;
+    public int QuantityPerListing { get; set; } = 1;
+    public int UnitPrice { get; set; }
+    public bool Enabled { get; set; } = true;
+
+    [JsonIgnore]
+    public int DesiredUnits => ListingCount <= 0 || QuantityPerListing <= 0
+        ? 0
+        : ListingCount > int.MaxValue / QuantityPerListing
+            ? int.MaxValue
+            : ListingCount * QuantityPerListing;
+}
+
+public sealed class TransferPlanListingLink
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid StowagePlanId { get; set; }
+    public Guid ListingPlanId { get; set; }
+    public uint ItemId { get; set; }
+    public ItemQualityPolicy Quality { get; set; } = ItemQualityPolicy.NqOnly;
+}
+
 public sealed class StowageMigrationRecord
 {
     public string MigrationId { get; set; } = "target-plan-to-stowage-v1";
@@ -335,6 +374,8 @@ public sealed class QuartermasterState
     public string Schema { get; set; } = "gooseworks-quartermaster-state/v5";
     public long Revision { get; set; }
     public List<StowagePlan> StowagePlans { get; set; } = [];
+    public List<ListingPlan> ListingPlans { get; set; } = [];
+    public List<TransferPlanListingLink> TransferPlanListingLinks { get; set; } = [];
     public List<StowageMigrationRecord> StowageMigrations { get; set; } = [];
     public List<TransferPlanMigrationRecord> TransferPlanMigrations { get; set; } = [];
     public List<TargetPlanItem> PlanItems { get; set; } = [];

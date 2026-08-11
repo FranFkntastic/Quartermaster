@@ -65,6 +65,8 @@ public sealed class BrowserProjection
     public required OwnerScope Owner { get; init; }
     public IReadOnlyDictionary<string, bool> RetainerInventoryCompleteByScope { get; init; } =
         new Dictionary<string, bool>(StringComparer.Ordinal);
+    public IReadOnlyDictionary<string, bool> RetainerListingsCompleteByScope { get; init; } =
+        new Dictionary<string, bool>(StringComparer.Ordinal);
 
     public IReadOnlyList<StockGroup> GetItems(string? scopeKey) => string.IsNullOrWhiteSpace(scopeKey) || scopeKey == BrowserScope.AllKey
         ? Items
@@ -116,6 +118,7 @@ public static class BrowserProjectionBuilder
             Listings = current.Listings,
             Owner = rebuilt.Owner,
             RetainerInventoryCompleteByScope = rebuilt.RetainerInventoryCompleteByScope,
+            RetainerListingsCompleteByScope = current.RetainerListingsCompleteByScope,
         };
     }
 
@@ -135,9 +138,14 @@ public static class BrowserProjectionBuilder
             new(BrowserScope.AllKey, "All accessible stock", BrowserScopeKind.All, null),
             new(BrowserScope.PlayerKey, "Player", BrowserScopeKind.Player, null),
         };
-        var completeness = new Dictionary<string, bool>(StringComparer.Ordinal)
+        var inventoryCompleteness = new Dictionary<string, bool>(StringComparer.Ordinal)
         {
             [BrowserScope.AllKey] = retainers.All(HasCompleteRetainerInventory),
+            [BrowserScope.PlayerKey] = true,
+        };
+        var listingCompleteness = new Dictionary<string, bool>(StringComparer.Ordinal)
+        {
+            [BrowserScope.AllKey] = retainers.All(HasCompleteRetainerListings),
             [BrowserScope.PlayerKey] = true,
         };
         var listings = new List<ListingRow>();
@@ -148,7 +156,8 @@ public static class BrowserProjectionBuilder
                 ? $"Retainer {retainer.RetainerId}"
                 : retainer.RetainerName;
             scopes.Add(new(key, name, BrowserScopeKind.Retainer, retainer.RetainerId));
-            completeness[key] = HasCompleteRetainerInventory(retainer);
+            inventoryCompleteness[key] = HasCompleteRetainerInventory(retainer);
+            listingCompleteness[key] = HasCompleteRetainerListings(retainer);
             foreach (var listing in retainer.Listings.Where(listing => listing.ItemId > 0 && listing.Quantity > 0))
             {
                 var price = listing.UnitPrice is { } known
@@ -184,7 +193,8 @@ public static class BrowserProjectionBuilder
                 .ThenBy(listing => listing.RetainerName, StringComparer.OrdinalIgnoreCase)
                 .ToArray(),
             Owner = owner,
-            RetainerInventoryCompleteByScope = completeness,
+            RetainerInventoryCompleteByScope = inventoryCompleteness,
+            RetainerListingsCompleteByScope = listingCompleteness,
         };
     }
 
@@ -256,6 +266,7 @@ public static class BrowserProjectionBuilder
             Listings = current.Listings,
             Owner = current.Owner,
             RetainerInventoryCompleteByScope = current.RetainerInventoryCompleteByScope,
+            RetainerListingsCompleteByScope = current.RetainerListingsCompleteByScope,
         };
     }
 
@@ -286,12 +297,18 @@ public static class BrowserProjectionBuilder
             [BrowserScope.AllKey] = retainers.All(HasCompleteRetainerInventory),
             [BrowserScope.PlayerKey] = true,
         };
+        var retainerListingsCompleteByScope = new Dictionary<string, bool>(StringComparer.Ordinal)
+        {
+            [BrowserScope.AllKey] = retainers.All(HasCompleteRetainerListings),
+            [BrowserScope.PlayerKey] = true,
+        };
         foreach (var retainer in retainers)
         {
             var key = BrowserScope.RetainerKey(retainer.RetainerId);
             var name = string.IsNullOrWhiteSpace(retainer.RetainerName) ? $"Retainer {retainer.RetainerId}" : retainer.RetainerName;
             scopes.Add(new(key, name, BrowserScopeKind.Retainer, retainer.RetainerId));
             retainerInventoryCompleteByScope[key] = HasCompleteRetainerInventory(retainer);
+            retainerListingsCompleteByScope[key] = HasCompleteRetainerListings(retainer);
             foreach (var bag in retainer.Bags.Where(bag => bag.BagName is not "RetainerGil" and not "RetainerMarket"))
                 foreach (var item in bag.Items.Where(item => item.ItemId > 0 && item.Quantity > 0))
                     stacks.Add(new(key, BrowserScopeKind.Retainer, retainer.RetainerId, name, item.ContainerKey ?? bag.Location ?? bag.BagName, item.SlotIndex, item.ItemId, DisplayName(item.ItemId, item.ItemName), checked((int)item.Quantity), item.IsHq ? FfxivItemQuality.HQ : FfxivItemQuality.NQ, bag.ObservedAtUtc, item.ItemType, item.ConditionPercent is { } condition ? (decimal)condition : null, item.Equipped));
@@ -317,6 +334,7 @@ public static class BrowserProjectionBuilder
             Listings = sortedListings,
             Owner = owner,
             RetainerInventoryCompleteByScope = retainerInventoryCompleteByScope,
+            RetainerListingsCompleteByScope = retainerListingsCompleteByScope,
         };
     }
 
@@ -324,6 +342,9 @@ public static class BrowserProjectionBuilder
         InventoryScanner.RequiredRetainerContainers
             .Select(container => container.ToString())
             .All(required => retainer.ObservedSources.Contains(required, StringComparer.Ordinal));
+
+    private static bool HasCompleteRetainerListings(CachedRetainer retainer) =>
+        retainer.ListingsObservedAtUtc.HasValue;
 
     private static string DisplayName(uint id, string? name) => string.IsNullOrWhiteSpace(name) ? $"Item {id}" : name;
 }

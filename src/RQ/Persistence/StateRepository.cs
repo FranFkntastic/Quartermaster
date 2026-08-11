@@ -144,6 +144,8 @@ public sealed class StateRepository
         Schema = configuration.Schema,
         Revision = Math.Max(configuration.Revision, operations.Revision),
         StowagePlans = configuration.StowagePlans,
+        ListingPlans = configuration.ListingPlans,
+        TransferPlanListingLinks = configuration.TransferPlanListingLinks,
         StowageMigrations = configuration.StowageMigrations,
         TransferPlanMigrations = configuration.TransferPlanMigrations,
         PlanItems = configuration.PlanItems,

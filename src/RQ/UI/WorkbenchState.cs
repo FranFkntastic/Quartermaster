@@ -17,7 +17,8 @@ public sealed class WorkbenchState
     public DalamudFilterAutocompleteState ListingFilterState { get; } = new();
     public string ListingSort { get; set; } = "Item";
     public bool ListingSortDescending { get; set; }
-    public uint? SelectedListingItemId { get; set; }
+    public ListingItemKey? SelectedListingItem { get; set; }
+    public ItemQualityPolicy SelectedStockListingQuality { get; set; } = ItemQualityPolicy.NqOnly;
     public StockGroup? SelectedStock { get; private set; }
     public string StagedTargetText { get; set; } = string.Empty;
 
