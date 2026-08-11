@@ -435,15 +435,128 @@ public static class StowageRouter
         IReadOnlyDictionary<ulong, CachedRetainer> cache,
         OwnerScope owner,
         Func<uint, int> maxStackSize,
-        DateTime nowUtc) =>
-        new(nowUtc, requests
-            .Where(request => request.Quantity > 0)
-            .Select(request =>
+        DateTime nowUtc)
+    {
+        var projectedCache = cache.ToDictionary(entry => entry.Key, entry => Copy(entry.Value));
+        var routes = new List<StowageRoute>();
+        foreach (var request in requests.Where(request => request.Quantity > 0))
+        {
+            var resolvedMaxStackSize = Math.Max(1, maxStackSize(request.ItemId));
+            var resolvedRequest = request with { MaxStackSize = resolvedMaxStackSize };
+            var planned = Route(resolvedRequest, projectedCache, owner, resolvedMaxStackSize);
+            var eligible = Route(resolvedRequest, cache, owner, resolvedMaxStackSize);
+            routes.Add(planned with { Candidates = eligible.Candidates });
+            foreach (var allocation in planned.Allocations)
             {
-                var resolvedMaxStackSize = Math.Max(1, maxStackSize(request.ItemId));
-                return Route(request with { MaxStackSize = resolvedMaxStackSize }, cache, owner, resolvedMaxStackSize);
-            })
-            .ToArray());
+                if (projectedCache.TryGetValue(allocation.RetainerId, out var retainer))
+                    ApplyProjectedDeposit(retainer, resolvedRequest, allocation.Quantity, resolvedMaxStackSize);
+            }
+        }
+        return new(nowUtc, routes);
+    }
+
+    private static void ApplyProjectedDeposit(
+        CachedRetainer retainer,
+        StowageDepositRequest request,
+        int quantity,
+        int maxStackSize)
+    {
+        var remaining = Math.Max(0, quantity);
+        if (remaining == 0)
+            return;
+        if (ElementalCurrencyCatalog.IsElementalCurrency(request.ItemId))
+        {
+            var bag = retainer.Bags.FirstOrDefault(candidate => candidate.BagName == "RetainerCrystals");
+            if (bag is null)
+            {
+                bag = new CachedBag { BagName = "RetainerCrystals", Location = "RetainerCrystals" };
+                retainer.Bags.Add(bag);
+            }
+            var item = bag.Items.FirstOrDefault(candidate => candidate.ItemId == request.ItemId);
+            if (item is null)
+            {
+                item = new CachedItem { ItemId = request.ItemId, ItemName = request.ItemName };
+                bag.Items.Add(item);
+            }
+            item.Quantity = checked(item.Quantity + (uint)remaining);
+            return;
+        }
+
+        var pages = retainer.Bags.Where(bag => RetainerPageNames.Contains(bag.BagName, StringComparer.Ordinal)).ToList();
+        foreach (var item in pages
+                     .SelectMany(page => page.Items)
+                     .Where(item => item.ItemId == request.ItemId && item.IsHq == request.IsHighQuality && item.Quantity < maxStackSize))
+        {
+            var moved = Math.Min(remaining, maxStackSize - checked((int)item.Quantity));
+            item.Quantity = checked(item.Quantity + (uint)moved);
+            remaining -= moved;
+            if (remaining == 0)
+                return;
+        }
+
+        var targetPage = pages.FirstOrDefault();
+        if (targetPage is null)
+        {
+            targetPage = new CachedBag { BagName = RetainerPageNames[0], Location = RetainerPageNames[0] };
+            retainer.Bags.Add(targetPage);
+        }
+        while (remaining > 0)
+        {
+            var moved = Math.Min(remaining, maxStackSize);
+            targetPage.Items.Add(new CachedItem
+            {
+                ItemId = request.ItemId,
+                ItemName = request.ItemName,
+                Quantity = checked((uint)moved),
+                IsHq = request.IsHighQuality,
+            });
+            remaining -= moved;
+        }
+    }
+
+    private static CachedRetainer Copy(CachedRetainer source) => new()
+    {
+        RetainerId = source.RetainerId,
+        RetainerName = source.RetainerName,
+        Owner = source.Owner with { },
+        IsCurrentlyAssigned = source.IsCurrentlyAssigned,
+        DisplayOrder = source.DisplayOrder,
+        IsUiAccessible = source.IsUiAccessible,
+        UiAccessibilityObservedAtUtc = source.UiAccessibilityObservedAtUtc,
+        IsGameAvailable = source.IsGameAvailable,
+        ClassJobId = source.ClassJobId,
+        Level = source.Level,
+        MarketItemCount = source.MarketItemCount,
+        RosterObservedAtUtc = source.RosterObservedAtUtc,
+        ObservedAtUtc = source.ObservedAtUtc,
+        Gil = source.Gil,
+        GilObservedAtUtc = source.GilObservedAtUtc,
+        ListingsObservedAtUtc = source.ListingsObservedAtUtc,
+        RequestedSources = [.. source.RequestedSources],
+        ObservedSources = [.. source.ObservedSources],
+        Bags = source.Bags.Select(Copy).ToList(),
+        Listings = [.. source.Listings],
+    };
+
+    private static CachedBag Copy(CachedBag source) => new()
+    {
+        BagName = source.BagName,
+        Location = source.Location,
+        ObservedAtUtc = source.ObservedAtUtc,
+        Items = source.Items.Select(item => new CachedItem
+        {
+            ItemId = item.ItemId,
+            ItemName = item.ItemName,
+            ItemType = item.ItemType,
+            Quantity = item.Quantity,
+            IsHq = item.IsHq,
+            Condition = item.Condition,
+            ConditionPercent = item.ConditionPercent,
+            ContainerKey = item.ContainerKey,
+            SlotIndex = item.SlotIndex,
+            Equipped = item.Equipped,
+        }).ToList(),
+    };
 
     public static RetainerStowageCapacity Capacity(
         CachedRetainer retainer,

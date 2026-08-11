@@ -294,6 +294,34 @@ public sealed class StowageTests
     }
 
     [Fact]
+    public void DepositBatch_DoesNotDoubleBookOneEmptySlotAcrossQualityVariants()
+    {
+        var retainer = Retainer(10, "Storage", Enumerable.Range(0, 174)
+            .Select(index => new CachedItem
+            {
+                ItemId = checked((uint)(1_000 + index)),
+                ItemName = $"Filler {index}",
+                Quantity = 1,
+            })
+            .ToArray());
+        var ruleId = Guid.NewGuid();
+        var batch = StowageRouter.BuildBatch(
+            [
+                new StowageDepositRequest(null, ruleId, 100, "Ore", false, 60, new StowageRoutingPolicy()),
+                new StowageDepositRequest(null, ruleId, 100, "Ore", true, 60, new StowageRoutingPolicy()),
+            ],
+            new Dictionary<ulong, CachedRetainer> { [retainer.RetainerId] = retainer },
+            TestData.Owner,
+            _ => 99,
+            DateTime.UtcNow);
+
+        Assert.Equal(120, batch.RequestedQuantity);
+        Assert.Equal(60, batch.PlannedQuantity);
+        Assert.Equal(60, batch.RemainingQuantity);
+        Assert.Equal([60, 0], batch.Routes.Select(route => route.RoutedQuantity));
+    }
+
+    [Fact]
     public void DepositBatch_PersistsExactVariantAndDestinationAuthorization()
     {
         using var directory = new TemporaryDirectory();

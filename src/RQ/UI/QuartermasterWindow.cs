@@ -246,28 +246,35 @@ public sealed class QuartermasterWindow : Window
             1.8f,
             row => row.Item.ItemName,
             row => row.Item.ItemName,
-            ImGuiTableColumnFlags.WidthStretch | ImGuiTableColumnFlags.DefaultSort,
-            DrawContextMenu: DrawStockRowContextMenu),
+            ImGuiTableColumnFlags.WidthStretch | ImGuiTableColumnFlags.DefaultSort | ImGuiTableColumnFlags.NoHide,
+            DrawContextMenu: DrawStockRowContextMenu,
+            Id: "item"),
         new(
             "Player",
             80,
             row => row.Item.PlayerQuantity.ToString("N0"),
             row => row.Item.PlayerQuantity,
             Alignment: DalamudTableCellAlignment.Right,
-            DrawContextMenu: DrawStockRowContextMenu),
+            DrawContextMenu: DrawStockRowContextMenu,
+            Id: "player"),
         new(
-            "Stored",
+            "Retainers",
             84,
-            row => row.Item.RetainerQuantity.ToString("N0"),
-            row => row.Item.RetainerQuantity,
+            row => row.AccessibleRetainerQuantity.ToString("N0"),
+            row => row.AccessibleRetainerQuantity,
             Alignment: DalamudTableCellAlignment.Right,
-            DrawContextMenu: DrawStockRowContextMenu),
+            DrawContextMenu: DrawStockRowContextMenu,
+            Id: "retainers",
+            HeaderTooltip: "Current matching quantity in accessible retainer storage."),
         new(
-            "Listing demand",
+            "Listing shortfall",
             138,
-            row => StockListingDemand(row.ListingDemand),
-            row => StockListingDemand(row.ListingDemand),
-            DrawContextMenu: DrawStockRowContextMenu),
+            row => StockListingShortfall(row.ListingDemand),
+            row => StockListingShortfall(row.ListingDemand),
+            ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.DefaultHide,
+            DrawContextMenu: DrawStockRowContextMenu,
+            Id: "listing-shortfall",
+            HeaderTooltip: "Units still needed by linked Listing Plans."),
         new(
             "Target",
             80,
@@ -277,7 +284,8 @@ public sealed class QuartermasterWindow : Window
                 ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
                 : null,
             Alignment: DalamudTableCellAlignment.Right,
-            DrawContextMenu: DrawStockRowContextMenu),
+            DrawContextMenu: DrawStockRowContextMenu,
+            Id: "target"),
         new(
             "Plan state",
             1f,
@@ -287,7 +295,8 @@ public sealed class QuartermasterWindow : Window
             TextColor: row => row.Rule is null
                 ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
                 : TransferActionColor(row.Line?.Action),
-            DrawContextMenu: DrawStockRowContextMenu),
+            DrawContextMenu: DrawStockRowContextMenu,
+            Id: "plan-state"),
     ]);
 
     private DalamudTableProjection<RestockPlanRow> CreateRestockPlanTable() => new(
@@ -392,46 +401,75 @@ public sealed class QuartermasterWindow : Window
             1.5f,
             row => $"{row.Rule.ItemName} {QualityLabel(row.Rule.Quality)}",
             row => row.Rule.ItemName,
-            ImGuiTableColumnFlags.WidthStretch,
+            ImGuiTableColumnFlags.WidthStretch | ImGuiTableColumnFlags.NoHide,
             Draw: row =>
             {
                 ImGui.TextUnformatted(row.Rule.ItemName);
                 ImGui.SameLine();
                 ImGui.TextDisabled(QualityLabel(row.Rule.Quality));
-            }),
+            },
+            Id: "item"),
         new(
-            "Player",
+            "On player",
             64,
             row => row.PlayerQuantity.ToString("N0"),
             row => row.PlayerQuantity,
-            Alignment: DalamudTableCellAlignment.Right),
-        new("Target", 112, row => row.ListingContribution.IsKnown ? (row.Line?.DesiredPlayerQuantity ?? row.Rule.TargetQuantity).ToString("N0") : "Unknown", Draw: DrawTransferTarget),
+            Alignment: DalamudTableCellAlignment.Right,
+            Id: "player"),
         new(
-            "Diff",
-            68,
-            row => row.ListingContribution.IsKnown ? SignedQuantity(row.Difference) : "—",
-            row => row.Difference,
-            TextColor: row => TransferActionColor(row.Line?.Action),
-            Alignment: DalamudTableCellAlignment.Right),
+            "Target",
+            132,
+            TransferTargetText,
+            row => row.ListingContribution.IsKnown ? row.Line?.DesiredPlayerQuantity ?? row.Rule.TargetQuantity : row.Rule.TargetQuantity,
+            Draw: DrawTransferTarget,
+            Id: "target",
+            HeaderTooltip: "Desired player quantity with its signed delta from current player stock."),
+        new(
+            "Accessible storage",
+            128,
+            row => row.AccessibleStorageQuantity.ToString("N0"),
+            row => row.AccessibleStorageQuantity,
+            Alignment: DalamudTableCellAlignment.Right,
+            Id: "accessible-storage",
+            HeaderTooltip: "Current matching quantity in accessible retainer storage."),
         new(
             "Outcome",
-            112,
-            TransferOutcome,
-            row => TransferOutcome(row),
-            TextColor: row => TransferActionColor(row.Line?.Action)),
+            156,
+            row => TransferOutcome(row).Text,
+            row => TransferOutcome(row).Text,
+            Draw: DrawTransferOutcome,
+            Id: "outcome",
+            HeaderTooltip: "Executable result under the stock and capacity evidence currently available."),
         new(
             "Route",
             1.1f,
             row => RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Owner),
             row => RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Owner),
             ImGuiTableColumnFlags.WidthStretch,
-            Draw: row => DrawInlineTransferRoute(row.Owner, row.PlanId, row.Rule, row.Runtime)),
-        new("Source", 92, row => row.ListingLink is null ? "Independent" : "Listing Plan", Draw: DrawTransferSource),
-        new("##remove", 28, _ => string.Empty, Draw: row =>
+            Draw: row => DrawInlineTransferRoute(row.Owner, row.PlanId, row.Rule, row.Runtime),
+            Id: "route"),
+        new(
+            "Source",
+            92,
+            row => row.ListingLink is null ? "Independent" : "Listing Plan",
+            Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.DefaultHide,
+            Draw: DrawTransferSource,
+            Id: "source",
+            HeaderTooltip: "Independent target or linked Listing Plan contribution."),
+        new(
+            "Listing shortfall",
+            118,
+            TransferListingShortfall,
+            row => row.ListingContribution.IsKnown ? row.ListingContribution.Value : -1,
+            ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.DefaultHide,
+            Alignment: DalamudTableCellAlignment.Right,
+            Id: "listing-shortfall",
+            HeaderTooltip: "Units still needed by the linked Listing Plan."),
+        new("##remove", 28, _ => string.Empty, Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoHide, Draw: row =>
         {
             if (ImGui.SmallButton($"X##remove-transfer:{row.Rule.Id}"))
                 RemoveTransferRule(row.Owner, row.PlanId, row.Rule.Id);
-        }),
+        }, Id: "remove"),
     ]);
 
     private DalamudTableProjection<StowageDraftRow> CreateStowageDraftTable() => new(
@@ -909,13 +947,15 @@ public sealed class QuartermasterWindow : Window
         var selectedPlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
         var sourceRows = ResolveStockWorkbenchProjection(runtime, result.Items, selectedPlan);
         DrawStockSelectionBar(runtime, availableItems);
+        DrawTableColumnsToolbar(stockTable, "RQStockColumns", "Visible stock");
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
-                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
-                    ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.Sortable;
+                     ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
+                     ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.Sortable |
+                     ImGuiTableFlags.Reorderable | ImGuiTableFlags.Hideable;
         var tableHeight = Math.Max(180, ImGui.GetContentRegionAvail().Y);
         RenderedStockRowCount = 0;
         if (stockTable.Begin(
-                "RQStockWorkbenchV3",
+                "RQStockWorkbenchV4",
                 new DalamudTableLayout(
                     new Vector2(0, tableHeight),
                     flags,
@@ -1016,7 +1056,12 @@ public sealed class QuartermasterWindow : Window
                 rules.TryGetValue(item.ItemId, out var rule);
                 evaluated.TryGetValue(rule?.Id ?? Guid.Empty, out var line);
                 var demand = listingEvaluation.Items.Where(candidate => candidate.ItemId == item.ItemId).ToArray();
-                return new StockWorkbenchRow(item, rule, line, demand);
+                var accessibleRetainerQuantity = TransferWorkbenchPresentation.AccessibleStorageQuantity(
+                    item,
+                    ItemQualityPolicy.Any,
+                    runtime.Retainers,
+                    runtime.Owner);
+                return new StockWorkbenchRow(item, accessibleRetainerQuantity, rule, line, demand);
             })
             .ToArray();
         stockWorkbenchProjection = new(runtime.Revision, selectedPlan?.Id, queryItems, rows);
@@ -1231,7 +1276,7 @@ public sealed class QuartermasterWindow : Window
                 }
                 var selectedDemand = demand.Single(item => item.Quality == workbench.SelectedStockListingQuality);
                 ImGui.SameLine();
-                ImGui.TextDisabled(StockListingDemand([selectedDemand]));
+                ImGui.TextDisabled(StockListingShortfall([selectedDemand]));
                 ImGui.SameLine();
                 if (ImGui.SmallButton("Edit Listing Plan…##stock"))
                     OpenListingPlanEditor(runtime, new(selectedDemand.ItemId, selectedDemand.Quality));
@@ -1244,6 +1289,24 @@ public sealed class QuartermasterWindow : Window
                     SetListingDemandLink(runtime, listingPlan, transferPlan, selectedDemand, !linked);
             }
         }
+    }
+
+    private void DrawTableColumnsToolbar<TRow>(
+        DalamudTableProjection<TRow> table,
+        string id,
+        string context)
+    {
+        ImGui.TextDisabled(context);
+        ImGui.SameLine();
+        var buttonWidth = ImGui.CalcTextSize("Columns").X + (ImGui.GetStyle().FramePadding.X * 2f);
+        ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - buttonWidth));
+        table.DrawColumnMenuButton(id);
+        reviewRegistry.RegisterLastButton(
+            $"quartermaster.{id}.columns",
+            $"Manage {context.ToLowerInvariant()} columns",
+            true,
+            table.RequestColumnMenu,
+            "Available");
     }
 
     private void SetListingDemandLink(
@@ -2578,7 +2641,7 @@ public sealed class QuartermasterWindow : Window
                     _ => "On target",
                 };
 
-    private static string StockListingDemand(IReadOnlyList<ListingPlanItemEvaluation> demand)
+    private static string StockListingShortfall(IReadOnlyList<ListingPlanItemEvaluation> demand)
     {
         if (demand.Count == 0 || demand.All(item => !item.IsPlanned))
             return "—";
@@ -2587,20 +2650,7 @@ public sealed class QuartermasterWindow : Window
             var quality = QualityLabel(item.Quality);
             if (!item.NeedUnits.IsKnown)
                 return $"{quality} unknown";
-            if (item.NeedUnits.Value == 0)
-                return item.Assignments.Any(assignment => assignment.UnknownPriceListings + assignment.WrongPriceListings +
-                                                          assignment.WrongShapeListings + assignment.WrongRetainerListings > 0) ||
-                       item.UnmanagedPhysicalListings.Count > 0
-                    ? $"{quality} no stock deficit"
-                    : $"{quality} satisfied";
-            return item.Coverage switch
-            {
-                ListingCoverageState.ReadyOnAssignedRetainer => $"{quality} list {item.NeedUnits.Value:N0} now",
-                ListingCoverageState.ReadyOnPlayer => $"{quality} move {EvidenceText(item.MovementNeedUnits)} from player",
-                ListingCoverageState.Retrievable => $"{quality} retrieve {item.RetrievableUnits.Value:N0}",
-                ListingCoverageState.Missing => $"{quality} missing {item.MissingUnits.Value:N0}",
-                _ => $"{quality} need {item.NeedUnits.Value:N0} · source?",
-            };
+            return $"{quality} {item.NeedUnits.Value:N0}";
         }));
     }
 
@@ -2685,26 +2735,33 @@ public sealed class QuartermasterWindow : Window
             ? $"+{quantity:N0}"
             : quantity.ToString("N0", CultureInfo.CurrentCulture);
 
+    private static string TransferTargetText(TransferWorkbenchRow row) =>
+        TransferWorkbenchPresentation.Target(
+            row.Line?.DesiredPlayerQuantity ?? row.Rule.TargetQuantity,
+            row.PlayerQuantity,
+            row.ListingContribution.IsKnown);
+
     private void DrawTransferTarget(TransferWorkbenchRow row)
     {
-        ImGui.SetNextItemWidth(row.ListingContribution.IsKnown && row.ListingContribution.Value == 0 ? -1 : 66);
-        var target = row.Rule.TargetQuantity;
+        var listingShortfall = row.ListingContribution.IsKnown ? row.ListingContribution.Value : 0;
+        var target = row.ListingContribution.IsKnown
+            ? row.Rule.TargetQuantity + listingShortfall
+            : row.Rule.TargetQuantity;
+        ImGui.SetNextItemWidth(66);
         if (ImGui.InputInt($"##target:{row.Rule.Id}", ref target, 0))
             UpdateTransferRule(row.Owner, row.PlanId, row.Rule.Id, draftRule =>
-                draftRule.TargetQuantity = Math.Max(0, target));
+                draftRule.TargetQuantity = Math.Max(0, target - listingShortfall));
+        var targetHovered = ImGui.IsItemHovered();
+        ImGui.SameLine();
         if (!row.ListingContribution.IsKnown)
-        {
-            ImGui.SameLine();
-            ImGui.TextColored(new Vector4(1f, .7f, .3f, 1f), "+ ?");
-        }
-        else if (row.ListingContribution.Value > 0)
-        {
-            ImGui.SameLine();
-            ImGui.TextDisabled($"+{row.ListingContribution.Value:N0}");
-        }
-        if (ImGui.IsItemHovered())
+            ImGui.TextColored(new Vector4(1f, .7f, .3f, 1f), "(+?)");
+        else
+            ImGui.TextColored(
+                TransferActionColor(row.Line?.Action),
+                $"({SignedQuantity(row.Difference)})");
+        if (targetHovered || ImGui.IsItemHovered())
             ImGui.SetTooltip(row.ListingContribution.IsKnown
-                ? $"Independent target {row.Rule.TargetQuantity:N0} + Listing Plan {row.ListingContribution.Value:N0}"
+                ? $"Target {row.Rule.TargetQuantity + listingShortfall:N0}: independent {row.Rule.TargetQuantity:N0} + Listing Plan {listingShortfall:N0}; current player stock {row.PlayerQuantity:N0}."
                 : $"Independent target {row.Rule.TargetQuantity:N0}; Listing Plan demand is not yet known.");
     }
 
@@ -2736,17 +2793,41 @@ public sealed class QuartermasterWindow : Window
         }
     }
 
-    private static string TransferOutcome(TransferWorkbenchRow row) =>
-        !row.Rule.Enabled
-            ? "Off"
+    private static string TransferListingShortfall(TransferWorkbenchRow row) =>
+        row.ListingLink is null
+            ? "—"
+            : row.ListingContribution.IsKnown
+                ? row.ListingContribution.Value.ToString("N0")
+                : "Unknown";
+
+    private static TransferOutcomePresentation TransferOutcome(TransferWorkbenchRow row)
+    {
+        if (!row.Rule.Enabled)
+            return new("Off");
+        if (!row.ListingContribution.IsKnown)
+            return new("Verify listing shortfall");
+        var action = row.Line?.Action ?? StowageAction.None;
+        return TransferWorkbenchPresentation.Outcome(
+            action,
+            Math.Abs(row.Difference),
+            row.AccessibleStorageQuantity,
+            row.RoutedDepositQuantity);
+    }
+
+    private static void DrawTransferOutcome(TransferWorkbenchRow row)
+    {
+        var outcome = TransferOutcome(row);
+        var primaryColor = !row.Rule.Enabled
+            ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
             : !row.ListingContribution.IsKnown
-                ? "Verify demand"
-            : row.Line?.Action switch
-            {
-                StowageAction.Retrieve => $"Retrieve {row.Line.RetrieveQuantity:N0}",
-                StowageAction.Deposit => $"Stow {row.Line.DepositQuantity:N0}",
-                _ => "On target",
-            };
+                ? new Vector4(1f, .7f, .3f, 1f)
+                : TransferActionColor(row.Line?.Action);
+        ImGui.TextColored(primaryColor, outcome.Primary);
+        if (string.IsNullOrWhiteSpace(outcome.Constraint))
+            return;
+        ImGui.SameLine();
+        ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), $"· {outcome.Constraint}");
+    }
 
     private static void DrawStowageTarget(StowageDraftRow row)
     {
@@ -3065,15 +3146,6 @@ public sealed class QuartermasterWindow : Window
             recovery.Owner.Matches(owner) &&
             recovery.PlanId == selected.Id &&
             recovery.PlanRevision == selected.Revision;
-        if (hasCurrentRecovery)
-        {
-            ImGui.SameLine();
-            if (ImGui.SmallButton("Retry plan##TransferPlanRecovery"))
-                RetryTransferPlanRecovery(selected);
-            ImGui.SameLine();
-            if (ImGui.SmallButton("Dismiss##TransferPlanRecovery"))
-                DismissTransferPlanRecovery();
-        }
 
         ImGui.Separator();
         ImGui.TextUnformatted($"{ownerRules.Count:N0} items");
@@ -3085,8 +3157,16 @@ public sealed class QuartermasterWindow : Window
         ImGui.TextColored(new Vector4(.52f, .79f, .94f, 1f), projection.HasUnknownListingDemand ? "Retrieve —" : $"Retrieve {retrieval.NeededQuantity:N0}");
         ImGui.SameLine();
         ImGui.TextColored(new Vector4(.53f, .83f, .64f, 1f), projection.HasUnknownListingDemand ? "Stow —" : $"Stow {surplusBatch.RequestedQuantity:N0}");
-        var stockWarning = projection.Rows
-            .FirstOrDefault(row => row.Line?.Action == StowageAction.Retrieve && row.RetrievalLine?.MissingQuantity > 0);
+        if (!projection.HasUnknownListingDemand && retrieval.MissingQuantity > 0)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), $"{retrieval.MissingQuantity:N0} short");
+        }
+        if (!projection.HasUnknownListingDemand && surplusBatch.RemainingQuantity > 0)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), $"No room for {surplusBatch.RemainingQuantity:N0}");
+        }
         var planProgress = hasCurrentRecovery && retainerRefresh.IsRefreshing
             ? retainerRefresh.Status
             : string.Empty;
@@ -3096,32 +3176,27 @@ public sealed class QuartermasterWindow : Window
                 ? recovery.FailureMessage
                 : hasCurrentRecovery && !retainerRefresh.IsRefreshing
                     ? "Retainer evidence refresh did not complete. Retry plan to continue."
-                    : !hasCurrentRecovery && stockWarning is not null
-                        ? $"{stockWarning.Rule.ItemName}: {stockWarning.RetrievalLine!.MissingQuantity:N0} missing from known retainer stock."
-                        : string.Empty;
-        if (!string.IsNullOrWhiteSpace(planProgress))
-        {
-            ImGui.SameLine();
-            ImGui.TextColored(new Vector4(.52f, .79f, .94f, 1f), planProgress);
-        }
-        else if (!string.IsNullOrWhiteSpace(planNotice))
-        {
-            ImGui.SameLine();
-            ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), planNotice);
-        }
+                    : string.Empty;
+        DrawTransferPlanNotice(selected, hasCurrentRecovery, planProgress, planNotice);
+        DrawTableColumnsToolbar(transferWorkbenchTable, "RQTransferColumns", "Plan quantities use the latest accessible stock.");
 
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
-                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
-                    ImGuiTableFlags.SizingStretchProp;
+                     ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
+                     ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.Sortable |
+                     ImGuiTableFlags.Reorderable | ImGuiTableFlags.Hideable;
         var footerHeight = ImGui.GetTextLineHeightWithSpacing() + 4;
-        var transferRows = projection.Rows;
+        IReadOnlyList<TransferWorkbenchRow> transferRows = projection.Rows;
         RenderedTransferRowCount = 0;
         if (transferWorkbenchTable.Begin(
-                "RQTransferWorkbench",
+                "RQTransferWorkbenchV2",
                 new DalamudTableLayout(
                     new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y - footerHeight)),
                     flags)))
         {
+            unsafe
+            {
+                transferRows = transferWorkbenchTable.Apply(transferRows, ImGui.TableGetSortSpecs());
+            }
             RenderedTransferRowCount = transferWorkbenchTable.DrawClippedRows(
                 transferRows,
                 (row, _) =>
@@ -3137,6 +3212,67 @@ public sealed class QuartermasterWindow : Window
         ImGui.TextDisabled(
             availability.BlockReason ??
             "Balanced items stay visible and are skipped during execution.");
+    }
+
+    private void DrawTransferPlanNotice(
+        StowagePlan plan,
+        bool hasCurrentRecovery,
+        string progress,
+        string notice)
+    {
+        var isProgress = !string.IsNullOrWhiteSpace(progress);
+        if (!isProgress && string.IsNullOrWhiteSpace(notice))
+            return;
+
+        var title = isProgress
+            ? "Refreshing retainer stock"
+            : hasCurrentRecovery
+                ? "Retainer refresh stopped"
+                : "Plan couldn't continue";
+        var body = isProgress
+            ? progress
+            : hasCurrentRecovery
+                ? $"{notice} The plan is still intact; Retry recalculates remaining work from current evidence."
+                : notice;
+        var accent = isProgress
+            ? new Vector4(.52f, .79f, .94f, 1f)
+            : new Vector4(1f, .4f, .4f, 1f);
+        var background = isProgress
+            ? new Vector4(.06f, .13f, .17f, .92f)
+            : new Vector4(.16f, .07f, .08f, .92f);
+
+        var flags = ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.BordersInnerV;
+        if (!ImGui.BeginTable("RQTransferPlanNotice", 2, flags))
+            return;
+        ImGui.TableSetupColumn("Message", ImGuiTableColumnFlags.WidthStretch, 1f);
+        ImGui.TableSetupColumn("Actions", ImGuiTableColumnFlags.WidthFixed, 150);
+        ImGui.TableNextRow();
+        ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0, ImGui.GetColorU32(background));
+        ImGui.TableNextColumn();
+        ImGui.TextColored(accent, title);
+        ImGui.PushTextWrapPos(ImGui.GetCursorPosX() + Math.Max(220, ImGui.GetContentRegionAvail().X));
+        ImGui.TextWrapped(body);
+        ImGui.PopTextWrapPos();
+
+        ImGui.TableNextColumn();
+        if (isProgress)
+        {
+            if (retainerRefresh.CanCancel && ImGui.Button("Cancel##TransferPlanRecovery"))
+                retainerRefresh.Cancel();
+        }
+        else if (hasCurrentRecovery)
+        {
+            if (ImGui.Button("Retry plan##TransferPlanRecovery"))
+                RetryTransferPlanRecovery(plan);
+            ImGui.SameLine();
+            if (ImGui.Button("Dismiss##TransferPlanRecovery"))
+                DismissTransferPlanRecovery();
+        }
+        else if (ImGui.Button("Dismiss##TransferPlanNotice"))
+        {
+            inlineTransferError = string.Empty;
+        }
+        ImGui.EndTable();
     }
 
     private TransferWorkbenchProjection ResolveTransferWorkbenchProjection(
@@ -3172,15 +3308,25 @@ public sealed class QuartermasterWindow : Window
             {
                 evaluated.TryGetValue(rule.Id, out var line);
                 retrievalLines.TryGetValue(rule.Id, out var retrievalLine);
+                var routedDepositQuantity = deposit.Routes
+                    .Where(route => route.Request.SourceRuleId == rule.Id)
+                    .Sum(route => route.RoutedQuantity);
                 var playerQuantity = StowageEvaluator.PlayerQuantity(
                     rule,
                     runtime.Browser.Items.FirstOrDefault(item => item.ItemId == rule.ItemId));
+                var accessibleStorageQuantity = TransferWorkbenchPresentation.AccessibleStorageQuantity(
+                    runtime.Browser.Items.FirstOrDefault(item => item.ItemId == rule.ItemId),
+                    rule.Quality,
+                    runtime.Retainers,
+                    runtime.Owner);
                 listingContributions.TryGetValue((rule.ItemId, rule.Quality), out var listingContribution);
                 return new TransferWorkbenchRow(
                     rule,
                     line,
                     retrievalLine,
+                    routedDepositQuantity,
                     playerQuantity,
+                    accessibleStorageQuantity,
                     (line?.DesiredPlayerQuantity ?? rule.TargetQuantity) - playerQuantity,
                     listingContribution?.Quantity ?? Evidence.Known(0),
                     listingContribution?.Link,
@@ -5054,6 +5200,7 @@ public sealed class QuartermasterWindow : Window
 
     private sealed record StockWorkbenchRow(
         StockGroup Item,
+        int AccessibleRetainerQuantity,
         TargetPlanItem? Rule,
         StowageEvaluationLine? Line,
         IReadOnlyList<ListingPlanItemEvaluation> ListingDemand);
@@ -5088,7 +5235,9 @@ public sealed class QuartermasterWindow : Window
         TargetPlanItem Rule,
         StowageEvaluationLine? Line,
         PlanLine? RetrievalLine,
+        int RoutedDepositQuantity,
         int PlayerQuantity,
+        int AccessibleStorageQuantity,
         int Difference,
         FieldEvidence<int> ListingContribution,
         TransferPlanListingLink? ListingLink,
