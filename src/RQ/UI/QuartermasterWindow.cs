@@ -100,6 +100,8 @@ public sealed class QuartermasterWindow : Window
     private ItemQualityPolicy itemGroupAddQuality = ItemQualityPolicy.Any;
     private string itemGroupEditorError = string.Empty;
     private string inlineTransferError = string.Empty;
+    private OwnerScope? inlineTransferErrorOwner;
+    private Guid? inlineTransferErrorPlanId;
     private string itemGroupWorkspaceStatus = string.Empty;
     private bool requestDeleteItemGroup;
     private bool requestHistoryOpen;
@@ -3009,11 +3011,13 @@ public sealed class QuartermasterWindow : Window
         selected = ResolveSelectedStowagePlan(runtime.State, owner);
         if (selected is null)
         {
+            ClearInlineTransferErrorContext();
             ImGui.Spacing();
             ImGui.TextUnformatted("No Transfer Plans yet.");
             ImGui.TextDisabled("Create one, then select stock on the left or add items by name.");
             return;
         }
+        EnsureInlineTransferErrorContext(owner, selected.Id);
 
         var projection = ResolveTransferWorkbenchProjection(runtime, selected);
         var ownerRules = projection.Rules;
@@ -3057,10 +3061,11 @@ public sealed class QuartermasterWindow : Window
                 : availability.BlockReason);
 
         var recovery = runtime.State.TransferPlanRecovery;
-        if (recovery is not null &&
+        var hasCurrentRecovery = recovery is not null &&
             recovery.Owner.Matches(owner) &&
             recovery.PlanId == selected.Id &&
-            recovery.PlanRevision == selected.Revision)
+            recovery.PlanRevision == selected.Revision;
+        if (hasCurrentRecovery)
         {
             ImGui.SameLine();
             if (ImGui.SmallButton("Retry plan##TransferPlanRecovery"))
@@ -3080,10 +3085,29 @@ public sealed class QuartermasterWindow : Window
         ImGui.TextColored(new Vector4(.52f, .79f, .94f, 1f), projection.HasUnknownListingDemand ? "Retrieve —" : $"Retrieve {retrieval.NeededQuantity:N0}");
         ImGui.SameLine();
         ImGui.TextColored(new Vector4(.53f, .83f, .64f, 1f), projection.HasUnknownListingDemand ? "Stow —" : $"Stow {surplusBatch.RequestedQuantity:N0}");
-        if (!string.IsNullOrWhiteSpace(inlineTransferError))
+        var stockWarning = projection.Rows
+            .FirstOrDefault(row => row.Line?.Action == StowageAction.Retrieve && row.RetrievalLine?.MissingQuantity > 0);
+        var planProgress = hasCurrentRecovery && retainerRefresh.IsRefreshing
+            ? retainerRefresh.Status
+            : string.Empty;
+        var planNotice = !string.IsNullOrWhiteSpace(inlineTransferError)
+            ? inlineTransferError
+            : hasCurrentRecovery && !string.IsNullOrWhiteSpace(recovery!.FailureMessage)
+                ? recovery.FailureMessage
+                : hasCurrentRecovery && !retainerRefresh.IsRefreshing
+                    ? "Retainer evidence refresh did not complete. Retry plan to continue."
+                    : !hasCurrentRecovery && stockWarning is not null
+                        ? $"{stockWarning.Rule.ItemName}: {stockWarning.RetrievalLine!.MissingQuantity:N0} missing from known retainer stock."
+                        : string.Empty;
+        if (!string.IsNullOrWhiteSpace(planProgress))
         {
             ImGui.SameLine();
-            ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), inlineTransferError);
+            ImGui.TextColored(new Vector4(.52f, .79f, .94f, 1f), planProgress);
+        }
+        else if (!string.IsNullOrWhiteSpace(planNotice))
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), planNotice);
         }
 
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
@@ -3106,8 +3130,6 @@ public sealed class QuartermasterWindow : Window
                         row,
                         row.Rule.Enabled ? null : new Vector4(.38f, .12f, .14f, .42f),
                         id: $"transfer:{row.Rule.Id}");
-                    if (row.Line?.Action == StowageAction.Retrieve && row.RetrievalLine?.MissingQuantity > 0)
-                        inlineTransferError = $"{row.Rule.ItemName}: {row.RetrievalLine.MissingQuantity:N0} missing from known retainer stock.";
                 });
             transferWorkbenchTable.End();
         }
@@ -4789,6 +4811,13 @@ public sealed class QuartermasterWindow : Window
         {
             inlineTransferError = retainerRefresh.Status;
             transferStatus = retainerRefresh.Status;
+            state.Mutate(StateChangeKind.Recovery, document =>
+            {
+                if (document.TransferPlanRecovery is { } recovery &&
+                    recovery.PlanId == pending.PlanId &&
+                    string.Equals(recovery.RefreshRunId, pending.RefreshRunId, StringComparison.Ordinal))
+                    recovery.FailureMessage = retainerRefresh.Status;
+            });
             return;
         }
         var currentState = state.Snapshot();
@@ -4843,6 +4872,23 @@ public sealed class QuartermasterWindow : Window
     {
         pendingTransferPlanRecovery = null;
         state.Mutate(StateChangeKind.Recovery, document => document.TransferPlanRecovery = null);
+        inlineTransferError = string.Empty;
+    }
+
+    private void EnsureInlineTransferErrorContext(OwnerScope owner, Guid planId)
+    {
+        if (inlineTransferErrorPlanId == planId && inlineTransferErrorOwner?.Matches(owner) == true)
+            return;
+        inlineTransferError = string.Empty;
+        inlineTransferErrorOwner = owner with { };
+        inlineTransferErrorPlanId = planId;
+    }
+
+    private void ClearInlineTransferErrorContext()
+    {
+        inlineTransferError = string.Empty;
+        inlineTransferErrorOwner = null;
+        inlineTransferErrorPlanId = null;
     }
 
     private void DrawOperation(OwnerScope owner)

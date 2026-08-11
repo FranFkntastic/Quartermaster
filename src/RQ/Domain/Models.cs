@@ -413,6 +413,7 @@ public sealed class TransferPlanRecoveryState
     public long PlanRevision { get; set; }
     public string RefreshRunId { get; set; } = string.Empty;
     public DateTime RequestedAtUtc { get; set; }
+    public string FailureMessage { get; set; } = string.Empty;
 }
 
 public sealed class RetainerRefreshRecoveryState
