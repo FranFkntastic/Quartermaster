@@ -9,6 +9,7 @@ public enum StateChangeKind
     Plans,
     Listings,
     Operations,
+    Recovery,
 }
 
 public sealed class StateRepository
@@ -152,6 +153,8 @@ public sealed class StateRepository
         RestockPlans = configuration.RestockPlans,
         ItemGroups = configuration.ItemGroups,
         LatestRetainerListingCapture = configuration.LatestRetainerListingCapture,
+        RetainerRefreshRecovery = configuration.RetainerRefreshRecovery,
+        TransferPlanRecovery = configuration.TransferPlanRecovery,
         OperationJournalMigration = configuration.OperationJournalMigration,
         Requests = operations.Requests,
         Operations = operations.Operations,

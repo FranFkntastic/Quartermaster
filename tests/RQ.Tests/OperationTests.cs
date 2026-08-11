@@ -799,6 +799,174 @@ public sealed class OperationTests
     }
 
     [Fact]
+    public async Task DepositNoCapacity_DoesNotSuppressAnotherVariantOnSameRetainer()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateDeposit(
+            TestData.Owner,
+            new StowageDepositBatch(
+                DateTime.UtcNow,
+                [
+                    new StowageRoute(
+                        new StowageDepositRequest(null, null, 100, "Ore", false, 4, new StowageRoutingPolicy()),
+                        [new StowageAllocation(10, "Skor", 4, 4, DateTime.UtcNow)],
+                        4,
+                        0),
+                    new StowageRoute(
+                        new StowageDepositRequest(null, null, 200, "Ingot", false, 3, new StowageRoutingPolicy()),
+                        [new StowageAllocation(10, "Skor", 3, 3, DateTime.UtcNow)],
+                        3,
+                        0),
+                ]));
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Skor") });
+        var driver = new CapacityDepositDriver
+        {
+            PlayerStacks =
+            [
+                new DalamudInventoryStack(InventoryType.Inventory1, 0, 100, 4),
+                new DalamudInventoryStack(InventoryType.Inventory1, 1, 200, 3),
+            ],
+            RetainerStacks = [new DalamudInventoryStack(InventoryType.RetainerPage1, 0, 200, 3)],
+        };
+        driver.DepositBehavior.Enqueue((_, _) => new RetainerDepositResult(false, 0, "NoCapacity", "Ore cannot fit."));
+        var coordinator = new TransferCoordinator(
+            journal,
+            driver,
+            new RetainerCacheRepository(store),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>());
+
+        await coordinator.ExecuteDepositAsync(operation.OperationId);
+
+        var completed = journal.Get(operation.OperationId)!;
+        Assert.Equal(OperationStatuses.PartiallySucceeded, completed.Status);
+        Assert.Equal(0, completed.Lines.Single(line => line.ItemId == 100).TransferredQuantity);
+        Assert.Equal(3, completed.Lines.Single(line => line.ItemId == 200).TransferredQuantity);
+        Assert.Equal([(100u, 4), (200u, 3)], driver.DepositAttempts);
+    }
+
+    [Fact]
+    public async Task AdaptiveDeposit_MeldsIntoPartialStackBeforeTrustingEmptySlots()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var cached = TestData.Retainer(10, "Skor");
+        cached.ObservedSources = Enumerable.Range(1, 7).Select(index => $"RetainerPage{index}").ToList();
+        cached.Bags =
+        [
+            new CachedBag
+            {
+                BagName = "RetainerPage1",
+                Items = [new CachedItem { ItemId = 100, ItemName = "Ore", Quantity = 95 }],
+            },
+        ];
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = cached });
+        var batch = StowageRouter.BuildBatch(
+            [new StowageDepositRequest(null, null, 100, "Ore", false, 10, new StowageRoutingPolicy())],
+            new RetainerCacheRepository(store).Snapshot(),
+            TestData.Owner,
+            _ => 99,
+            DateTime.UtcNow);
+        var operation = journal.CreateDeposit(TestData.Owner, batch);
+        var driver = new CapacityDepositDriver
+        {
+            PlayerStacks = [new DalamudInventoryStack(InventoryType.Inventory1, 0, 100, 10)],
+            RetainerStacks = [new DalamudInventoryStack(InventoryType.RetainerPage1, 0, 100, 99)],
+        };
+        var coordinator = new TransferCoordinator(
+            journal,
+            driver,
+            new RetainerCacheRepository(store),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>());
+
+        await coordinator.ExecuteDepositAsync(operation.OperationId);
+
+        Assert.Equal((100u, 4), Assert.Single(driver.DepositAttempts));
+        Assert.Equal(4, Assert.Single(journal.Get(operation.OperationId)!.Lines).TransferredQuantity);
+    }
+
+    [Fact]
+    public async Task AdaptiveDeposit_HonorsRoutingPriorityPerVariant()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var observedAt = DateTime.UtcNow;
+        var first = TestData.Retainer(10, "First");
+        var second = TestData.Retainer(20, "Second");
+        foreach (var retainer in new[] { first, second })
+        {
+            retainer.IsCurrentlyAssigned = true;
+            retainer.IsUiAccessible = true;
+            retainer.ObservedSources = Enumerable.Range(1, 7).Select(index => $"RetainerPage{index}").ToList();
+            retainer.Bags = [new CachedBag { BagName = "RetainerPage1" }];
+        }
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = first, [20] = second });
+        var batch = new StowageDepositBatch(
+            observedAt,
+            [
+                new StowageRoute(
+                    new StowageDepositRequest(null, null, 100, "Ore", false, 1, new StowageRoutingPolicy()),
+                    [new StowageAllocation(10, "First", 1, 99, observedAt)],
+                    1,
+                    0)
+                {
+                    Candidates =
+                    [
+                        new RetainerStowageCapacity(10, "First", observedAt, 0, 99),
+                        new RetainerStowageCapacity(20, "Second", observedAt, 0, 99),
+                    ],
+                },
+                new StowageRoute(
+                    new StowageDepositRequest(null, null, 200, "Ingot", false, 1, new StowageRoutingPolicy()),
+                    [new StowageAllocation(20, "Second", 1, 99, observedAt)],
+                    1,
+                    0)
+                {
+                    Candidates =
+                    [
+                        new RetainerStowageCapacity(20, "Second", observedAt, 0, 99),
+                        new RetainerStowageCapacity(10, "First", observedAt, 0, 99),
+                    ],
+                },
+            ]);
+        var operation = journal.CreateDeposit(TestData.Owner, batch);
+        var playerStacks = new[]
+        {
+            new DalamudInventoryStack(InventoryType.Inventory1, 0, 100, 1),
+            new DalamudInventoryStack(InventoryType.Inventory1, 1, 200, 1),
+        };
+        var driver = new CapacityDepositDriver
+        {
+            PlayerStacks = playerStacks.ToList(),
+            ScanPlayerInventory = wanted => playerStacks.Where(stack => wanted.Contains(stack.ItemId)).ToArray(),
+            RetainerStacks =
+            [
+                new DalamudInventoryStack(InventoryType.RetainerPage1, 0, 100, 1),
+                new DalamudInventoryStack(InventoryType.RetainerPage1, 1, 200, 1),
+            ],
+        };
+        var coordinator = new TransferCoordinator(
+            journal,
+            driver,
+            new RetainerCacheRepository(store),
+            () => TestData.Owner,
+            () => new Dictionary<uint, int>());
+
+        await coordinator.ExecuteDepositAsync(operation.OperationId);
+
+        Assert.Equal([10ul, 20ul], driver.OpenedRetainers);
+        Assert.Equal([(100u, 1), (200u, 1)], driver.DepositAttempts);
+    }
+
+    [Fact]
     public async Task DepositCrystalFull_SkipsWithReceiptInsteadOfSilentAbandonment()
     {
         using var directory = new TemporaryDirectory();
@@ -957,8 +1125,13 @@ public sealed class OperationTests
         public Func<IReadOnlySet<uint>, IReadOnlyList<DalamudInventoryStack>>? ScanPlayerInventory { get; set; }
         public List<(uint ItemId, int Quantity)> DepositAttempts { get; } = [];
         public List<(uint ItemId, int Quantity)> CrystalAttempts { get; } = [];
+        public List<ulong> OpenedRetainers { get; } = [];
         public Task RequireRetainerListAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken cancellationToken)
+        {
+            OpenedRetainers.Add(candidate.RetainerId);
+            return Task.CompletedTask;
+        }
         public Task OpenInventoryAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task<IReadOnlyList<DalamudInventoryStack>> ScanRetainerAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken) =>
             Task.FromResult<IReadOnlyList<DalamudInventoryStack>>(RetainerStacks);

@@ -301,7 +301,8 @@ public sealed record StowageDepositRequest(
     bool IsHighQuality,
     int Quantity,
     StowageRoutingPolicy Routing,
-    ulong? DestinationOverride = null);
+    ulong? DestinationOverride = null,
+    int MaxStackSize = 999);
 
 public sealed record RetainerStowageCapacity(
     ulong RetainerId,
@@ -324,7 +325,10 @@ public sealed record StowageRoute(
     StowageDepositRequest Request,
     IReadOnlyList<StowageAllocation> Allocations,
     int RoutedQuantity,
-    int RemainingQuantity);
+    int RemainingQuantity)
+{
+    public IReadOnlyList<RetainerStowageCapacity> Candidates { get; init; } = [];
+}
 
 public sealed record StowageDepositBatch(
     DateTime BuiltAtUtc,
@@ -363,6 +367,8 @@ public static class StowageRouter
             .ToDictionary(entry => entry.id, entry => entry.index);
         var capacities = cache.Values
             .Where(retainer => retainer.Owner.Matches(owner))
+            .Where(retainer => retainer.IsCurrentlyAssigned is not false)
+            .Where(retainer => retainer.IsUiAccessible is not false)
             .Where(retainer => request.DestinationOverride is null ||
                                retainer.RetainerId == request.DestinationOverride)
             .Where(retainer => request.DestinationOverride is not null ||
@@ -418,7 +424,10 @@ public static class StowageRouter
                 break;
         }
 
-        return new(request, allocations, request.Quantity - remaining, remaining);
+        return new(request, allocations, request.Quantity - remaining, remaining)
+        {
+            Candidates = ordered.ToArray(),
+        };
     }
 
     public static StowageDepositBatch BuildBatch(
@@ -429,10 +438,14 @@ public static class StowageRouter
         DateTime nowUtc) =>
         new(nowUtc, requests
             .Where(request => request.Quantity > 0)
-            .Select(request => Route(request, cache, owner, Math.Max(1, maxStackSize(request.ItemId))))
+            .Select(request =>
+            {
+                var resolvedMaxStackSize = Math.Max(1, maxStackSize(request.ItemId));
+                return Route(request with { MaxStackSize = resolvedMaxStackSize }, cache, owner, resolvedMaxStackSize);
+            })
             .ToArray());
 
-    private static RetainerStowageCapacity Capacity(
+    public static RetainerStowageCapacity Capacity(
         CachedRetainer retainer,
         uint itemId,
         bool isHighQuality,

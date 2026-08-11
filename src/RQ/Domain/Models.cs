@@ -29,6 +29,15 @@ public sealed class CachedRetainer
     public ulong RetainerId { get; set; }
     public string RetainerName { get; set; } = string.Empty;
     public OwnerScope Owner { get; set; } = new();
+    public bool? IsCurrentlyAssigned { get; set; }
+    public int? DisplayOrder { get; set; }
+    public bool? IsUiAccessible { get; set; }
+    public DateTime? UiAccessibilityObservedAtUtc { get; set; }
+    public bool? IsGameAvailable { get; set; }
+    public byte? ClassJobId { get; set; }
+    public byte? Level { get; set; }
+    public byte? MarketItemCount { get; set; }
+    public DateTime? RosterObservedAtUtc { get; set; }
     public DateTime ObservedAtUtc { get; set; }
     public ulong Gil { get; set; }
     public DateTime? GilObservedAtUtc { get; set; }
@@ -315,6 +324,8 @@ public sealed class DepositCandidateAuthorization
     public DateTime ObservedAtUtc { get; set; }
     public Dictionary<uint, int> CapacityByItem { get; set; } = [];
     public Dictionary<string, int> CapacityByVariant { get; set; } = [];
+    public Dictionary<string, int> PriorityByVariant { get; set; } = [];
+    public bool UsesLiveCapacity { get; set; }
 }
 
 public sealed class PendingCacheInvalidation
@@ -326,6 +337,7 @@ public sealed class PendingCacheInvalidation
 
 public sealed class OperationLine
 {
+    public string AuthorizationKey { get; set; } = string.Empty;
     public Guid? SourcePlanId { get; set; }
     public Guid? SourceRuleId { get; set; }
     public uint ItemId { get; set; }
@@ -335,6 +347,8 @@ public sealed class OperationLine
     public int TargetQuantity { get; set; }
     public int ShortageQuantity { get; set; }
     public int TransferredQuantity { get; set; }
+    public int MaxStackSize { get; set; } = 999;
+    public StowageRoutingPolicy Routing { get; set; } = new();
 }
 
 public sealed class OperationReceipt
@@ -348,6 +362,7 @@ public sealed class OperationReceipt
     public uint? ItemId { get; set; }
     public ulong? RetainerId { get; set; }
     public int? Quantity { get; set; }
+    public string? AuthorizationKey { get; set; }
 }
 
 public sealed class RetainerListingCaptureReceipt
@@ -386,7 +401,27 @@ public sealed class QuartermasterState
     public List<OperationReceipt> Receipts { get; set; } = [];
     public List<PendingCacheInvalidation> PendingCacheInvalidations { get; set; } = [];
     public RetainerListingCaptureReceipt? LatestRetainerListingCapture { get; set; }
+    public RetainerRefreshRecoveryState? RetainerRefreshRecovery { get; set; }
+    public TransferPlanRecoveryState? TransferPlanRecovery { get; set; }
     public OperationJournalMigrationRecord? OperationJournalMigration { get; set; }
+}
+
+public sealed class TransferPlanRecoveryState
+{
+    public OwnerScope Owner { get; set; } = new();
+    public Guid PlanId { get; set; }
+    public long PlanRevision { get; set; }
+    public string RefreshRunId { get; set; } = string.Empty;
+    public DateTime RequestedAtUtc { get; set; }
+}
+
+public sealed class RetainerRefreshRecoveryState
+{
+    public string RunId { get; set; } = string.Empty;
+    public OwnerScope Owner { get; set; } = new();
+    public List<ulong> PendingRetainerIds { get; set; } = [];
+    public DateTime FailedAtUtc { get; set; }
+    public string Message { get; set; } = string.Empty;
 }
 
 public sealed class OperationJournalMigrationRecord
