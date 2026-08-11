@@ -149,6 +149,35 @@ public sealed class ListingPlanTests
     }
 
     [Fact]
+    public void Validation_CapacityNamesRetainerAndIdentifiesEveryAffectedAssignment()
+    {
+        var first = Assignment(1, "Bow", 10, "Taffy-marauder", 12, 1, 100);
+        var second = Assignment(2, "Hull", 10, "Taffy-marauder", 9, 1, 200);
+
+        var issues = ListingPlanCatalog.Validate([first, second], _ => 1, new HashSet<ulong> { 10 })
+            .Where(issue => issue.Field == "RetainerCapacity")
+            .ToArray();
+
+        Assert.Equal([first.Id, second.Id], issues.Select(issue => issue.AssignmentId));
+        Assert.All(issues, issue => Assert.Equal("Taffy-marauder has 21 / 20 planned listing slots.", issue.Message));
+    }
+
+    [Fact]
+    public void CrossViewItemFocus_UsesStableIdentityWhenDisplayNamesCollide()
+    {
+        var projection = Projection(
+            [],
+            [
+                new(BrowserScope.PlayerKey, BrowserScopeKind.Player, null, "Player", "Bag", 0, 1, "Duplicate Name", 2, FfxivItemQuality.NQ, DateTime.UnixEpoch),
+                new(BrowserScope.PlayerKey, BrowserScopeKind.Player, null, "Player", "Bag", 1, 2, "Duplicate Name", 4, FfxivItemQuality.NQ, DateTime.UnixEpoch),
+            ]);
+
+        var focused = QuartermasterWindow.ApplyStockItemFocus(projection.GetItems(BrowserScope.AllKey), 2);
+
+        Assert.Equal((uint)2, Assert.Single(focused).ItemId);
+    }
+
+    [Fact]
     public void StaleSave_RebasesDifferentFieldsAndReportsSameFieldCollision()
     {
         var assignment = Assignment(1, "Bow", 10, "Retainer", 2, 1, 100);

@@ -171,8 +171,16 @@ public static class ListingPlanCatalog
                 issues.Add(new(assignment.Id, nameof(assignment.UnitPrice), "Unit price must be between 1 and 999,999,999 gil."));
         }
         foreach (var retainer in assignments.Where(assignment => assignment.Enabled).GroupBy(assignment => assignment.RetainerId))
-            if (retainer.Sum(assignment => assignment.ListingCount) > 20)
-                issues.Add(new(null, "RetainerCapacity", $"Retainer {retainer.Key} has more than 20 planned listing slots."));
+        {
+            var plannedSlots = retainer.Sum(assignment => assignment.ListingCount);
+            if (plannedSlots <= 20)
+                continue;
+            var retainerName = retainer.Select(assignment => assignment.RetainerName)
+                .FirstOrDefault(name => !string.IsNullOrWhiteSpace(name)) ?? $"Retainer {retainer.Key}";
+            var message = $"{retainerName} has {plannedSlots:N0} / 20 planned listing slots.";
+            foreach (var assignment in retainer)
+                issues.Add(new(assignment.Id, "RetainerCapacity", message));
+        }
         return issues;
     }
 
