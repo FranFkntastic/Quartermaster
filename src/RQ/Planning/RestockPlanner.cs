@@ -79,6 +79,8 @@ public static class RestockPlanner
             ? []
             : cache.Values
                 .Where(retainer => retainer.Owner.Matches(owner))
+                .Where(retainer => retainer.IsCurrentlyAssigned is not false)
+                .Where(retainer => retainer.IsUiAccessible is not false)
                 .Select(retainer =>
                 {
                     var evidence = retainer.Bags

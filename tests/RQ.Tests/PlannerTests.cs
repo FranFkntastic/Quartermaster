@@ -85,6 +85,31 @@ public sealed class PlannerTests
     }
 
     [Fact]
+    public void Build_Excludes_retainer_stock_known_to_be_inaccessible()
+    {
+        var accessible = TestData.Retainer(10, "Accessible", (100, "Ore", 41));
+        accessible.IsUiAccessible = true;
+        var inaccessible = TestData.Retainer(20, "Inaccessible", (100, "Ore", 9));
+        inaccessible.IsUiAccessible = false;
+
+        var plan = RestockPlanner.Build(
+            [new TargetPlanItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 50 }],
+            new Dictionary<uint, int>(),
+            new Dictionary<ulong, CachedRetainer>
+            {
+                [accessible.RetainerId] = accessible,
+                [inaccessible.RetainerId] = inaccessible,
+            },
+            TestData.Owner,
+            DateTime.UtcNow);
+
+        var line = Assert.Single(plan.Lines);
+        Assert.Equal(41, line.CachedRetainerQuantity);
+        Assert.Equal(9, line.MissingQuantity);
+        Assert.Equal("Accessible", Assert.Single(line.Candidates).RetainerName);
+    }
+
+    [Fact]
     public void Build_IgnoresDisabledRowsAndMarksSatisfiedTargets()
     {
         var plan = RestockPlanner.Build(
