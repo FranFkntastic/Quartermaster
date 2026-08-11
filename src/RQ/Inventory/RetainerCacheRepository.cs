@@ -57,7 +57,7 @@ public sealed record RetainerListingsObservation(
     IReadOnlyList<CachedMarketListing> Listings,
     string EvidenceSessionId = "");
 
-public sealed class RetainerCacheRepository
+public sealed class RetainerCacheRepository : IDisposable
 {
     private readonly object gate = new();
     private readonly RetainerCacheStore store;
@@ -66,12 +66,17 @@ public sealed class RetainerCacheRepository
     public RetainerCacheRepository(RetainerCacheStore store)
     {
         this.store = store;
+        store.ListingWriteFailed += OnListingWriteFailed;
+        store.ListingPersisted += OnListingPersisted;
         cache = store.Load();
     }
 
     public event Action<RetainerCacheChangeKind>? Changed;
     public event Action<RetainerListingCaptureReceipt>? ListingCaptured;
     public event Action<RetainerEvidenceReceipt>? EvidenceAccepted;
+    public event Action<Exception>? ListingPersistenceFailed;
+    public event Action<RetainerListingPersistenceReceipt>? ListingPersisted;
+    public RetainerListingPersistenceReceipt? LastListingPersistence { get; private set; }
     public long Revision { get; private set; }
 
     public IReadOnlyDictionary<ulong, CachedRetainer> Snapshot()
@@ -350,7 +355,7 @@ public sealed class RetainerCacheRepository
                 updated.ObservedSources.Add(marketSource);
 
             var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [observation.RetainerId] = updated };
-            store.Save(candidate);
+            store.SaveListing(updated);
             cache = candidate;
             var revision = ++Revision;
             receipt = new RetainerListingCaptureReceipt
@@ -378,6 +383,21 @@ public sealed class RetainerCacheRepository
         Changed?.Invoke(RetainerCacheChangeKind.Listings);
         ListingCaptured?.Invoke(receipt);
         EvidenceAccepted?.Invoke(evidenceReceipt);
+    }
+
+    public void Dispose()
+    {
+        store.Dispose();
+        store.ListingWriteFailed -= OnListingWriteFailed;
+        store.ListingPersisted -= OnListingPersisted;
+    }
+
+    private void OnListingWriteFailed(Exception exception) => ListingPersistenceFailed?.Invoke(exception);
+
+    private void OnListingPersisted(RetainerListingPersistenceReceipt receipt)
+    {
+        LastListingPersistence = receipt;
+        ListingPersisted?.Invoke(receipt);
     }
 
     private static List<RetainerListingCaptureItem> ChangedListingItems(

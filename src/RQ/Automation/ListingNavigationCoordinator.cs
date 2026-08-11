@@ -1,4 +1,7 @@
 using Franthropy.Dalamud.Automation.Retainers;
+using Franthropy.Observations.V1;
+using RQ.Domain;
+using RQ.Inventory;
 
 namespace RQ.Automation;
 
@@ -14,6 +17,14 @@ public sealed record ListingOpenRequest(
 
 public sealed record ListingOpenResult(bool Started, bool Success, string Message);
 public sealed record RetainerListingsOpenRequest(ulong RetainerId, string RetainerName);
+public sealed record ListingRefreshTiming(
+    ulong RetainerId,
+    DateTime ActionStartedAtUtc,
+    DateTime EvidenceObservedAtUtc,
+    DateTime AppliedAtUtc,
+    DateTime CompletedAtUtc,
+    double ObservedToAppliedMilliseconds,
+    double ActionToAppliedMilliseconds);
 
 /// <summary>
 /// Owns the product workflow for navigating from a cached Quartermaster listing to
@@ -22,15 +33,19 @@ public sealed record RetainerListingsOpenRequest(ulong RetainerId, string Retain
 public sealed class ListingNavigationCoordinator : IDisposable
 {
     private static readonly TimeSpan AutoRetainerWait = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ListingEvidenceWait = TimeSpan.FromSeconds(3);
     private readonly IRetainerAutomationSession session;
     private readonly IAutoRetainerIpc autoRetainer;
     private readonly AutoRetainerSuppression autoRetainerSuppression;
     private readonly AutomationLease automation;
+    private readonly RetainerCacheRepository? cache;
+    private readonly ObservationCaptureSessionRegistry? captureSessions;
+    private readonly Func<OwnerScope>? currentOwner;
     private readonly CancellationTokenSource lifetime = new();
     private int running;
     private bool disposed;
 
-    public ListingNavigationCoordinator(
+    internal ListingNavigationCoordinator(
         IRetainerAutomationSession session,
         IAutoRetainerIpc autoRetainer,
         AutomationLease automation,
@@ -42,8 +57,24 @@ public sealed class ListingNavigationCoordinator : IDisposable
         this.autoRetainerSuppression = autoRetainerSuppression ?? new AutoRetainerSuppression(autoRetainer);
     }
 
+    public ListingNavigationCoordinator(
+        IRetainerAutomationSession session,
+        IAutoRetainerIpc autoRetainer,
+        AutomationLease automation,
+        RetainerCacheRepository cache,
+        ObservationCaptureSessionRegistry captureSessions,
+        Func<OwnerScope> currentOwner,
+        AutoRetainerSuppression? autoRetainerSuppression = null)
+        : this(session, autoRetainer, automation, autoRetainerSuppression)
+    {
+        this.cache = cache ?? throw new ArgumentNullException(nameof(cache));
+        this.captureSessions = captureSessions ?? throw new ArgumentNullException(nameof(captureSessions));
+        this.currentOwner = currentOwner ?? throw new ArgumentNullException(nameof(currentOwner));
+    }
+
     public bool IsRunning => Volatile.Read(ref running) != 0;
     public string Status { get; private set; } = string.Empty;
+    public ListingRefreshTiming? LastRefreshTiming { get; private set; }
 
     public async Task<ListingOpenResult> OpenAsync(
         ListingOpenRequest request,
@@ -73,6 +104,10 @@ public sealed class ListingNavigationCoordinator : IDisposable
                     suppressionScope = autoRetainerSuppression.Acquire();
 
                 Status = $"Opening {request.RetainerName}…";
+                using var evidence = BeginListingEvidence(request.RetainerId, out var evidenceFailure);
+                if (evidenceFailure is not null)
+                    return Complete(false, false, evidenceFailure);
+
                 var list = await session.EnsureRetainerListAsync(token).ConfigureAwait(false);
                 if (!list.Success)
                     return Complete(true, false, Format(list));
@@ -83,6 +118,7 @@ public sealed class ListingNavigationCoordinator : IDisposable
                 if (!retainer.Success)
                     return Complete(true, false, Format(retainer));
 
+                var listingActionStartedAtUtc = DateTime.UtcNow;
                 var listing = await session.OpenSellingListingAsync(
                     new(
                         request.SlotIndex ?? -1,
@@ -92,7 +128,16 @@ public sealed class ListingNavigationCoordinator : IDisposable
                         request.UnitPrice),
                     token).ConfigureAwait(false);
                 if (listing.Success)
-                    return Complete(true, true, $"Opened {request.ItemName} on {request.RetainerName}.");
+                {
+                    if (evidence is not null)
+                    {
+                        var accepted = await evidence.WaitAsync(ListingEvidenceWait, token).ConfigureAwait(false);
+                        if (accepted is null)
+                            return Complete(true, false, $"Opened {request.ItemName} on {request.RetainerName}, but fresh listing evidence did not arrive.");
+                        RecordTiming(request.RetainerId, listingActionStartedAtUtc, accepted);
+                    }
+                    return Complete(true, true, $"Opened {request.ItemName} on {request.RetainerName} with fresh listings.");
+                }
 
                 var failure = Format(listing);
                 var recovery = await session.ReturnToRetainerListAsync(token).ConfigureAwait(false);
@@ -147,6 +192,10 @@ public sealed class ListingNavigationCoordinator : IDisposable
                 if (autoRetainer.IsAvailable)
                     suppressionScope = autoRetainerSuppression.Acquire();
 
+                using var evidence = BeginListingEvidence(request.RetainerId, out var evidenceFailure);
+                if (evidenceFailure is not null)
+                    return Complete(false, false, evidenceFailure);
+
                 Status = $"Opening {request.RetainerName}'s listings…";
                 var list = await session.EnsureRetainerListAsync(token).ConfigureAwait(false);
                 if (!list.Success)
@@ -158,9 +207,19 @@ public sealed class ListingNavigationCoordinator : IDisposable
                 if (!retainer.Success)
                     return Complete(true, false, Format(retainer));
 
+                var listingActionStartedAtUtc = DateTime.UtcNow;
                 var listings = await session.OpenSellingListAsync(token).ConfigureAwait(false);
                 if (listings.Success)
-                    return Complete(true, true, $"Opened {request.RetainerName}'s listings.");
+                {
+                    if (evidence is not null)
+                    {
+                        var accepted = await evidence.WaitAsync(ListingEvidenceWait, token).ConfigureAwait(false);
+                        if (accepted is null)
+                            return Complete(true, false, $"Opened {request.RetainerName}'s listings, but fresh listing evidence did not arrive.");
+                        RecordTiming(request.RetainerId, listingActionStartedAtUtc, accepted);
+                    }
+                    return Complete(true, true, $"Opened {request.RetainerName}'s fresh listings.");
+                }
 
                 var failure = Format(listings);
                 var recovery = await session.ReturnToRetainerListAsync(token).ConfigureAwait(false);
@@ -260,6 +319,102 @@ public sealed class ListingNavigationCoordinator : IDisposable
             await Task.Delay(100, cancellationToken).ConfigureAwait(false);
         }
         return !autoRetainer.IsBusy;
+    }
+
+    private ListingEvidenceBoundary? BeginListingEvidence(ulong retainerId, out string? failure)
+    {
+        failure = null;
+        if (cache is null || captureSessions is null || currentOwner is null)
+            return null;
+        var owner = currentOwner();
+        if (!owner.HasStableIdentity)
+        {
+            failure = "A stable character identity is required to refresh retainer listings.";
+            return null;
+        }
+        try
+        {
+            var session = captureSessions.Begin(
+                new ObservationOwner(owner.LocalContentId!.Value, owner.HomeWorldId!.Value),
+                retainerId);
+            return new ListingEvidenceBoundary(cache, owner, retainerId, session);
+        }
+        catch (Exception exception)
+        {
+            failure = $"Fresh listing capture could not start: {exception.Message}";
+            return null;
+        }
+    }
+
+    private void RecordTiming(ulong retainerId, DateTime actionStartedAtUtc, ListingEvidenceAcceptance accepted)
+    {
+        var completedAtUtc = DateTime.UtcNow;
+        LastRefreshTiming = new(
+            retainerId,
+            actionStartedAtUtc,
+            accepted.Receipt.ObservedAtUtc,
+            accepted.AppliedAtUtc,
+            completedAtUtc,
+            Math.Max(0, (accepted.AppliedAtUtc - accepted.Receipt.ObservedAtUtc).TotalMilliseconds),
+            Math.Max(0, (accepted.AppliedAtUtc - actionStartedAtUtc).TotalMilliseconds));
+    }
+
+    private sealed record ListingEvidenceAcceptance(RetainerEvidenceReceipt Receipt, DateTime AppliedAtUtc);
+
+    private sealed class ListingEvidenceBoundary : IDisposable
+    {
+        private readonly RetainerCacheRepository cache;
+        private readonly OwnerScope owner;
+        private readonly ulong retainerId;
+        private readonly ObservationCaptureSession session;
+        private readonly long checkpoint;
+        private readonly DateTime startedAtUtc = DateTime.UtcNow;
+        private readonly TaskCompletionSource<ListingEvidenceAcceptance> accepted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public ListingEvidenceBoundary(
+            RetainerCacheRepository cache,
+            OwnerScope owner,
+            ulong retainerId,
+            ObservationCaptureSession session)
+        {
+            this.cache = cache;
+            this.owner = owner with { };
+            this.retainerId = retainerId;
+            this.session = session;
+            checkpoint = cache.Revision;
+            cache.EvidenceAccepted += OnEvidenceAccepted;
+        }
+
+        public async Task<ListingEvidenceAcceptance?> WaitAsync(TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            try
+            {
+                return await accepted.Task.WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                return null;
+            }
+        }
+
+        private void OnEvidenceAccepted(RetainerEvidenceReceipt receipt)
+        {
+            if (receipt.RetainerId == retainerId &&
+                receipt.Owner.Matches(owner) &&
+                receipt.Revision > checkpoint &&
+                receipt.ObservedAtUtc >= startedAtUtc &&
+                receipt.Domains.HasFlag(RetainerEvidenceDomain.Listings) &&
+                string.Equals(receipt.EvidenceSessionId, session.SessionId, StringComparison.Ordinal))
+            {
+                accepted.TrySetResult(new ListingEvidenceAcceptance(receipt, DateTime.UtcNow));
+            }
+        }
+
+        public void Dispose()
+        {
+            cache.EvidenceAccepted -= OnEvidenceAccepted;
+            session.Dispose();
+        }
     }
 
     private ListingOpenResult Complete(bool started, bool success, string message)

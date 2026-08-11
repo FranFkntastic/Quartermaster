@@ -10,7 +10,7 @@ public sealed class AgentBridgeTests
     public void Provider_ExposesQuartermasterReviewSurfacesWithoutTransferActions()
     {
         var truth = new QuartermasterBridgeTruth(
-            SchemaVersion: 12,
+            SchemaVersion: 13,
             PluginInstanceId: "provider",
             ProcessId: 42,
             PluginVersion: "1.0",
@@ -55,7 +55,14 @@ public sealed class AgentBridgeTests
             RefreshStatus: "Ready",
             TransferActive: false,
             ListingNavigationActive: false,
-            ListingNavigationStatus: string.Empty);
+            ListingNavigationStatus: string.Empty,
+            LastListingRefreshRetainerId: null,
+            LastListingRefreshCompletedAtUtc: null,
+            LastListingObservedToAppliedMilliseconds: null,
+            LastListingActionToAppliedMilliseconds: null,
+            LastListingPersistedAtUtc: null,
+            LastListingObservedToPersistedMilliseconds: null,
+            LastListingWriteMilliseconds: null);
         var openedTarget = string.Empty;
         var invoked = false;
         var registry = new AgentBridgeUiReviewRegistry();
