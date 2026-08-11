@@ -260,8 +260,8 @@ public sealed class QuartermasterWindow : Window
         new(
             "Retainers",
             84,
-            row => row.Item.RetainerQuantity.ToString("N0"),
-            row => row.Item.RetainerQuantity,
+            row => row.AccessibleRetainerQuantity.ToString("N0"),
+            row => row.AccessibleRetainerQuantity,
             Alignment: DalamudTableCellAlignment.Right,
             DrawContextMenu: DrawStockRowContextMenu,
             Id: "retainers",
@@ -1056,7 +1056,12 @@ public sealed class QuartermasterWindow : Window
                 rules.TryGetValue(item.ItemId, out var rule);
                 evaluated.TryGetValue(rule?.Id ?? Guid.Empty, out var line);
                 var demand = listingEvaluation.Items.Where(candidate => candidate.ItemId == item.ItemId).ToArray();
-                return new StockWorkbenchRow(item, rule, line, demand);
+                var accessibleRetainerQuantity = TransferWorkbenchPresentation.AccessibleStorageQuantity(
+                    item,
+                    ItemQualityPolicy.Any,
+                    runtime.Retainers,
+                    runtime.Owner);
+                return new StockWorkbenchRow(item, accessibleRetainerQuantity, rule, line, demand);
             })
             .ToArray();
         stockWorkbenchProjection = new(runtime.Revision, selectedPlan?.Id, queryItems, rows);
@@ -3226,7 +3231,9 @@ public sealed class QuartermasterWindow : Window
                 : "Plan couldn't continue";
         var body = isProgress
             ? progress
-            : $"{notice} The plan is still intact; Retry recalculates remaining work from current evidence.";
+            : hasCurrentRecovery
+                ? $"{notice} The plan is still intact; Retry recalculates remaining work from current evidence."
+                : notice;
         var accent = isProgress
             ? new Vector4(.52f, .79f, .94f, 1f)
             : new Vector4(1f, .4f, .4f, 1f);
@@ -5193,6 +5200,7 @@ public sealed class QuartermasterWindow : Window
 
     private sealed record StockWorkbenchRow(
         StockGroup Item,
+        int AccessibleRetainerQuantity,
         TargetPlanItem? Rule,
         StowageEvaluationLine? Line,
         IReadOnlyList<ListingPlanItemEvaluation> ListingDemand);
