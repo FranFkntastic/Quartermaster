@@ -79,6 +79,67 @@ public sealed class ListingNavigationTests
     }
 
     [Fact]
+    public async Task OpenRetainerListings_IgnoresExactEvidenceCapturedBeforeTheSellingListAction()
+    {
+        using var directory = new TemporaryDirectory();
+        using var cache = new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory.Path, "retainer-cache.json")));
+        var captureSessions = new ObservationCaptureSessionRegistry();
+        var owner = TestData.Owner;
+        var observationOwner = new ObservationOwner(owner.LocalContentId!.Value, owner.HomeWorldId!.Value);
+        var scope = new ObservationScope(
+            observationOwner,
+            ObservationSubject.Retainer(44, observationOwner),
+            ObservationContainerKind.RetainerMarketListings);
+        DateTime? listingActionEnteredAtUtc = null;
+        var session = DispatchProxy.Create<IRetainerAutomationSession, SessionProxy>();
+        ((SessionProxy)(object)session).Handler = (method, _) => method.Name switch
+        {
+            nameof(IRetainerAutomationSession.EnsureRetainerListAsync) =>
+                Task.FromResult(RetainerAutomationResult.Succeeded("ready", "ready")),
+            nameof(IRetainerAutomationSession.OpenRetainerAsync) =>
+                Task.FromResult(PublishEvidence(16)),
+            nameof(IRetainerAutomationSession.OpenSellingListAsync) =>
+                CompleteSellingListAfterFreshEvidenceAsync(),
+            _ => throw new InvalidOperationException($"Unexpected call: {method.Name}"),
+        };
+        using var coordinator = new ListingNavigationCoordinator(
+            session,
+            new FakeAutoRetainer { IsAvailable = false },
+            new AutomationLease(),
+            cache,
+            captureSessions,
+            () => owner);
+
+        var result = await coordinator.OpenRetainerListingsAsync(new(44, "Eris"));
+
+        Assert.True(result.Success);
+        Assert.NotNull(listingActionEnteredAtUtc);
+        Assert.True(coordinator.LastRefreshTiming!.EvidenceObservedAtUtc >= listingActionEnteredAtUtc);
+        Assert.Empty(cache.Snapshot()[44].Listings);
+
+        RetainerAutomationResult PublishEvidence(uint quantity)
+        {
+            cache.ReplaceListings(new RetainerListingsObservation(
+                44,
+                "Eris",
+                owner,
+                DateTime.UtcNow,
+                quantity == 0
+                    ? []
+                    : [new CachedMarketListing { ItemId = 200, ItemName = "Whale-class Pressure Hull", Quantity = quantity }],
+                captureSessions.Resolve(scope)));
+            return RetainerAutomationResult.Succeeded("opened", "opened");
+        }
+
+        async Task<RetainerAutomationResult> CompleteSellingListAfterFreshEvidenceAsync()
+        {
+            listingActionEnteredAtUtc = DateTime.UtcNow;
+            await Task.Delay(25);
+            return PublishEvidence(0);
+        }
+    }
+
+    [Fact]
     public async Task OpenRetainerListings_StopsAtTheReusableSellingList()
     {
         var calls = new List<string>();

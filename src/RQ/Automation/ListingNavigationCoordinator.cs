@@ -119,6 +119,7 @@ public sealed class ListingNavigationCoordinator : IDisposable
                     return Complete(true, false, Format(retainer));
 
                 var listingActionStartedAtUtc = DateTime.UtcNow;
+                evidence?.BeginAction(listingActionStartedAtUtc);
                 var listing = await session.OpenSellingListingAsync(
                     new(
                         request.SlotIndex ?? -1,
@@ -208,6 +209,7 @@ public sealed class ListingNavigationCoordinator : IDisposable
                     return Complete(true, false, Format(retainer));
 
                 var listingActionStartedAtUtc = DateTime.UtcNow;
+                evidence?.BeginAction(listingActionStartedAtUtc);
                 var listings = await session.OpenSellingListAsync(token).ConfigureAwait(false);
                 if (listings.Success)
                 {
@@ -368,8 +370,9 @@ public sealed class ListingNavigationCoordinator : IDisposable
         private readonly ulong retainerId;
         private readonly ObservationCaptureSession session;
         private readonly long checkpoint;
-        private readonly DateTime startedAtUtc = DateTime.UtcNow;
+        private readonly object gate = new();
         private readonly TaskCompletionSource<ListingEvidenceAcceptance> accepted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private DateTime? actionStartedAtUtc;
 
         public ListingEvidenceBoundary(
             RetainerCacheRepository cache,
@@ -383,6 +386,12 @@ public sealed class ListingNavigationCoordinator : IDisposable
             this.session = session;
             checkpoint = cache.Revision;
             cache.EvidenceAccepted += OnEvidenceAccepted;
+        }
+
+        public void BeginAction(DateTime startedAtUtc)
+        {
+            lock (gate)
+                actionStartedAtUtc = startedAtUtc;
         }
 
         public async Task<ListingEvidenceAcceptance?> WaitAsync(TimeSpan timeout, CancellationToken cancellationToken)
@@ -399,14 +408,18 @@ public sealed class ListingNavigationCoordinator : IDisposable
 
         private void OnEvidenceAccepted(RetainerEvidenceReceipt receipt)
         {
-            if (receipt.RetainerId == retainerId &&
-                receipt.Owner.Matches(owner) &&
-                receipt.Revision > checkpoint &&
-                receipt.ObservedAtUtc >= startedAtUtc &&
-                receipt.Domains.HasFlag(RetainerEvidenceDomain.Listings) &&
-                string.Equals(receipt.EvidenceSessionId, session.SessionId, StringComparison.Ordinal))
+            lock (gate)
             {
-                accepted.TrySetResult(new ListingEvidenceAcceptance(receipt, DateTime.UtcNow));
+                if (actionStartedAtUtc is { } actionStarted &&
+                    receipt.RetainerId == retainerId &&
+                    receipt.Owner.Matches(owner) &&
+                    receipt.Revision > checkpoint &&
+                    receipt.ObservedAtUtc >= actionStarted &&
+                    receipt.Domains.HasFlag(RetainerEvidenceDomain.Listings) &&
+                    string.Equals(receipt.EvidenceSessionId, session.SessionId, StringComparison.Ordinal))
+                {
+                    accepted.TrySetResult(new ListingEvidenceAcceptance(receipt, DateTime.UtcNow));
+                }
             }
         }
 
