@@ -5281,10 +5281,8 @@ public sealed class QuartermasterWindow : Window
             ImGui.BeginDisabled();
         if (ImGui.Button("Start vendor buy"))
         {
-            if (vendorProcurement.TryStart(review, out var error))
+            if (TryStartVendorProcurement(review, out var error))
             {
-                vendorStatus = string.Empty;
-                vendorReview = null;
                 ImGui.CloseCurrentPopup();
             }
             else
@@ -5300,7 +5298,7 @@ public sealed class QuartermasterWindow : Window
             canStart,
             () =>
             {
-                if (vendorReview is { } current && !vendorProcurement.TryStart(current, out var error))
+                if (vendorReview is { } current && !TryStartVendorProcurement(current, out var error))
                     vendorStatus = error;
             },
             canStart ? $"Maximum {review.MaximumGil:N0} gil" : "No startable reviewed purchase");
@@ -5308,6 +5306,17 @@ public sealed class QuartermasterWindow : Window
         ImGui.EndPopup();
         if (!open)
             vendorReview = null;
+    }
+
+    private bool TryStartVendorProcurement(TransferVendorProcurementReview review, out string error)
+    {
+        if (!vendorProcurement.TryStart(review, out error))
+            return false;
+
+        vendorStatus = string.Empty;
+        vendorReview = null;
+        requestVendorReviewOpen = false;
+        return true;
     }
 
     private void DrawTransferReviewModal()
