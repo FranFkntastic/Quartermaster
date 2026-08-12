@@ -46,7 +46,7 @@ public sealed class AgentBridgeHost : IDisposable
             AgentBridgeRuntimeIdentity.FromAssembly("RQ", Assembly.GetExecutingAssembly(), mainDllPath),
             profile.Id,
             profile.Alias,
-            "Quartermaster.truth.v8",
+            "Quartermaster.truth.v9",
             [new("snapshot"), new("reviewed-actions"), new("operations"), new("encrypted-capture"), new("capture-transactions")],
             provider.GetReviewSurfaces(),
             provider.GetCaptureSurfaces(),
@@ -272,6 +272,18 @@ public sealed class AgentBridgeHost : IDisposable
                 "quartermaster.transfer.review.execute",
                 "Execute the reviewed Transfer Plan",
                 "transfer-review",
+                AgentBridgeUiControlKind.Button,
+                true),
+            new(
+                "quartermaster.vendor.review",
+                "Review vendor coverage for the selected Transfer Plan",
+                "transfer",
+                AgentBridgeUiControlKind.Button,
+                true),
+            new(
+                "quartermaster.vendor.start",
+                "Start the reviewed ordinary-gil vendor purchase",
+                "vendor-review",
                 AgentBridgeUiControlKind.Button,
                 true),
             new(

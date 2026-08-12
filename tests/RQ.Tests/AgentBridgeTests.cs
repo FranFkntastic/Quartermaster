@@ -10,7 +10,7 @@ public sealed class AgentBridgeTests
     public void Provider_ExposesQuartermasterReviewSurfacesWithoutTransferActions()
     {
         var truth = new QuartermasterBridgeTruth(
-            SchemaVersion: 13,
+            SchemaVersion: 14,
             PluginInstanceId: "provider",
             ProcessId: 42,
             PluginVersion: "1.0",
@@ -62,7 +62,11 @@ public sealed class AgentBridgeTests
             LastListingActionToAppliedMilliseconds: null,
             LastListingPersistedAtUtc: null,
             LastListingObservedToPersistedMilliseconds: null,
-            LastListingWriteMilliseconds: null);
+            LastListingWriteMilliseconds: null,
+            VendorProcurementPhase: "Paused",
+            VendorProcurementMessage: "Review current inventory.",
+            VendorPurchasedQuantity: 12,
+            VendorSpentGil: 2_400);
         var openedTarget = string.Empty;
         var invoked = false;
         var registry = new AgentBridgeUiReviewRegistry();
@@ -81,8 +85,8 @@ public sealed class AgentBridgeTests
         var provider = new QuartermasterBridgeProvider(() => truth, target => openedTarget = target, () => { }, registry);
 
         Assert.Same(truth, provider.CreateTruth());
-        Assert.Equal(["transfer", "transfer-review", "item-groups", "listings", "activity"], provider.GetReviewSurfaces().Select(surface => surface.Id));
-        Assert.Equal(["transfer", "transfer-review", "item-groups", "listings", "activity"], provider.GetCaptureSurfaces().Select(surface => surface.Id));
+        Assert.Equal(["transfer", "transfer-review", "vendor-review", "item-groups", "listings", "activity"], provider.GetReviewSurfaces().Select(surface => surface.Id));
+        Assert.Equal(["transfer", "transfer-review", "vendor-review", "item-groups", "listings", "activity"], provider.GetCaptureSurfaces().Select(surface => surface.Id));
         Assert.True(provider.GetCaptureSurfaces().Single(surface => surface.Id == "transfer").IsDefault);
         Assert.All(provider.GetReviewSurfaces(), surface => Assert.Equal("open-main-window", surface.Command));
         Assert.True(provider.TryOpenMainWindow("listings"));
@@ -93,6 +97,8 @@ public sealed class AgentBridgeTests
         Assert.Equal("transfer", openedTarget);
         Assert.True(provider.TryOpenMainWindow("transfer-review"));
         Assert.Equal("transfer-review", openedTarget);
+        Assert.True(provider.TryOpenMainWindow("vendor-review"));
+        Assert.Equal("vendor-review", openedTarget);
         Assert.True(provider.TryOpenMainWindow("item-groups"));
         Assert.Equal("item-groups", openedTarget);
         Assert.True(provider.TryOpenMainWindow("stock-and-plan"));

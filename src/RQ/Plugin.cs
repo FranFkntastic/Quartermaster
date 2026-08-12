@@ -3,9 +3,13 @@ using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Franthropy.Dalamud.AgentBridge;
+using Franthropy.Dalamud.Automation;
 using Franthropy.Dalamud.Automation.Retainers;
+using Franthropy.Dalamud.Automation.Vendors;
+using Franthropy.Dalamud.Automation.Vendors.Coordination;
 using Franthropy.Dalamud.Diagnostics;
 using Franthropy.Dalamud.Observations;
+using Franthropy.Dalamud.Travel;
 using Franthropy.Observations.V1;
 using RQ.AgentBridge;
 using RQ.Automation;
@@ -44,6 +48,8 @@ public sealed class Plugin : IDalamudPlugin
     private readonly OperationJournal journal;
     private readonly TransferCoordinator transfers;
     private readonly ListingNavigationCoordinator listingNavigation;
+    private readonly TransferVendorProcurementService vendorProcurement;
+    private readonly DalamudExternalUiAutomationSuppression externalUiSuppression;
     private readonly AutomaticRetrievalQueue automaticRetrievals;
     private readonly QuartermasterRuntimeSnapshotSource runtimeSnapshots;
     private readonly SnapshotPublisher snapshots;
@@ -65,7 +71,10 @@ public sealed class Plugin : IDalamudPlugin
         IDalamudPluginInterface pluginInterface,
         ICommandManager commands,
         IFramework framework,
+        IClientState clientState,
+        ICondition condition,
         IPlayerState playerState,
+        IAetheryteList aetheryteList,
         IAddonLifecycle addonLifecycle,
         IGameInventory gameInventory,
         IGameGui gameGui,
@@ -184,6 +193,57 @@ public sealed class Plugin : IDalamudPlugin
             autoRetainerSuppression: autoRetainerSuppression);
         automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerSuppression);
         runtimeSnapshots = new(scanner, playerInventory, cache, state, CurrentOwner);
+        var vendorAccess = new DalamudGilVendorAccessReader(
+            clientState,
+            playerState,
+            objects,
+            aetheryteList);
+        var vendorPlanner = new TransferVendorProcurementPlanner(
+            DalamudGilVendorCatalogBuilder.Build(dataManager),
+            vendorAccess.Assess);
+        externalUiSuppression = new(pluginInterface, log, "Quartermaster");
+        var vendorOwnership = new VendorAutomationOwnership(
+            automation,
+            autoRetainerSuppression,
+            externalUiSuppression);
+        var vendorRuntime = new DalamudGilVendorBuyRuntime(
+            vendorAccess,
+            new DalamudOrdinaryGilShop(gameGui, dataManager),
+            new DalamudVNavmeshTravel(pluginInterface),
+            new DalamudLifestreamAetheryteTravel(pluginInterface),
+            new DalamudLifestreamAethernetTravel(pluginInterface),
+            new DalamudLifestreamObjectInteractor(pluginInterface),
+            new DalamudTravelReadiness(
+                condition,
+                gameGui,
+                objects,
+                [
+                    "RetainerList",
+                    "SelectString",
+                    "Talk",
+                    "InventoryRetainer",
+                    "InventoryRetainerLarge",
+                    "InventoryRetainerSmall",
+                ]),
+            dataManager,
+            clientState,
+            objects,
+            condition,
+            commands,
+            beginAutomation: () =>
+            {
+                if (!vendorOwnership.TryAcquire(out var error))
+                    throw new InvalidOperationException(error);
+            },
+            endAutomation: vendorOwnership.Release);
+        vendorProcurement = new(
+            configuration,
+            SaveConfiguration,
+            runtimeSnapshots,
+            vendorPlanner,
+            vendorAccess,
+            vendorRuntime,
+            vendorOwnership);
         playerInventoryReconciler.ReconcileIfDue(DateTime.UtcNow, force: true);
         var initialSnapshot = runtimeSnapshots.Refresh();
         nextPlayerInventoryFlushAt = DateTime.UtcNow.Add(PlayerInventoryFlushInterval);
@@ -200,6 +260,7 @@ public sealed class Plugin : IDalamudPlugin
             transfers,
             retainerRefresh,
             listingNavigation,
+            vendorProcurement,
             dataManager,
             configuration,
             SaveConfiguration,
@@ -300,6 +361,7 @@ public sealed class Plugin : IDalamudPlugin
         workQueue.Drain();
         playerInventoryReconciler.ReconcileIfDue(DateTime.UtcNow);
         automaticRetrievals.Tick();
+        vendorProcurement.Tick();
         retainerRefresh.TickRosterDiscovery(window.StockBrowserVisible);
         agentBridge.Tick();
         FlushPlayerInventoryIfDue();
@@ -451,8 +513,9 @@ public sealed class Plugin : IDalamudPlugin
             : [];
         var listingTiming = listingNavigation.LastRefreshTiming;
         var listingPersistence = cache.LastListingPersistence;
+        var vendorRun = vendorProcurement.ActiveRun;
         return new QuartermasterBridgeTruth(
-            13,
+            14,
             configuration.PluginInstanceId,
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
@@ -504,7 +567,11 @@ public sealed class Plugin : IDalamudPlugin
             listingTiming?.ActionToAppliedMilliseconds,
             listingPersistence is null ? null : new DateTimeOffset(DateTime.SpecifyKind(listingPersistence.PersistedAtUtc, DateTimeKind.Utc)),
             listingPersistence is null ? null : Math.Max(0, (listingPersistence.PersistedAtUtc - listingPersistence.ObservedAtUtc).TotalMilliseconds),
-            listingPersistence?.WriteMilliseconds);
+            listingPersistence?.WriteMilliseconds,
+            vendorRun?.Phase.ToString(),
+            vendorRun?.Message,
+            vendorRun?.Receipts.Sum(receipt => receipt.Quantity) ?? 0,
+            vendorRun?.Receipts.Aggregate(0UL, (sum, receipt) => checked(sum + receipt.SpentGil)) ?? 0);
     }
 
     private void ApplyInventoryObservation(QuartermasterObservationDelivery delivery)
@@ -723,6 +790,8 @@ public sealed class Plugin : IDalamudPlugin
         automaticRetrievals.Dispose();
         listingNavigation.Dispose();
         window.CancelAndWaitForActiveTransfer(TimeSpan.FromSeconds(2));
+        vendorProcurement.Dispose();
+        externalUiSuppression.Dispose();
         agentBridge.Dispose();
         framework.Update -= OnFrameworkUpdate;
         pluginInterface.UiBuilder.Draw -= windows.Draw;

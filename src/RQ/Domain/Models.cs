@@ -132,6 +132,7 @@ public sealed class TargetPlanItem
     public int TargetQuantity { get; set; }
     public ItemQualityPolicy Quality { get; set; } = ItemQualityPolicy.Any;
     public StowageRoutingPolicy Routing { get; set; } = new();
+    public bool AllowVendorPurchase { get; set; }
     public string Notes { get; set; } = string.Empty;
     public bool Enabled { get; set; } = true;
 }

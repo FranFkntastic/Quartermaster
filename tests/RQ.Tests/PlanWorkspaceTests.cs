@@ -78,6 +78,30 @@ public sealed class PlanWorkspaceTests
     }
 
     [Fact]
+    public void VendorPermission_IsCopiedComparedAndPersistedWithTransferRule()
+    {
+        var plan = new StowagePlan { Owner = TestData.Owner };
+        var rule = Rule(plan.Id, 100, "Ore", 10);
+        rule.AllowVendorPurchase = true;
+        var state = new QuartermasterState
+        {
+            StowagePlans = [plan],
+            PlanItems = [rule],
+        };
+
+        var draft = StowagePlanCatalog.Draft(state, TestData.Owner, plan.Id);
+
+        Assert.True(Assert.Single(draft.Rules).AllowVendorPurchase);
+        Assert.False(StowagePlanCatalog.CanApply(state, TestData.Owner, draft));
+        draft.Rules[0].AllowVendorPurchase = false;
+        Assert.True(StowagePlanCatalog.CanApply(state, TestData.Owner, draft));
+
+        StowagePlanCatalog.Apply(state, TestData.Owner, draft);
+
+        Assert.False(Assert.Single(state.PlanItems).AllowVendorPurchase);
+    }
+
+    [Fact]
     public void Apply_PersistsOrderedRoutingOnceAndDisablesOtherPlan()
     {
         var first = new StowagePlan { Owner = TestData.Owner, Name = "First", Enabled = true };
