@@ -118,6 +118,11 @@ public sealed class TransferVendorProcurementService : IDisposable
         if (coordinator.ActiveRun?.Phase == GilVendorBuyPhase.Indeterminate)
         {
             ownership.Release();
+            if (!string.Equals(
+                    CurrentContextSignature(),
+                    coordinator.ActiveRun.ContextSignature,
+                    StringComparison.Ordinal))
+                return;
             if (DateTime.UtcNow >= nextIndeterminateReconciliationAt)
             {
                 nextIndeterminateReconciliationAt = DateTime.UtcNow.AddSeconds(1);
