@@ -63,7 +63,8 @@ public sealed class QuartermasterWindow : Window
     private Task? activeTransferTask;
     private bool clearAgentReviewWindowOverride;
     private int captureCollapseRestoreFramesRemaining;
-    private bool requestCaptureFocus;
+    private int viewportReopenGuardFramesRemaining;
+    private bool viewportReopenGuardNeedsRelease;
     private StowagePlanDraft? stowageDraft;
     private readonly TableSelectionModel<Guid> selectedStowageRuleIds = new();
     private Guid? activeStowageRuleId;
@@ -632,6 +633,7 @@ public sealed class QuartermasterWindow : Window
                 AgentCaptureRegion = new AgentBridgeCaptureRegion(
                     windowPosition,
                     windowSize,
+                    viewport.ID,
                     viewport.Pos,
                     viewport.Size,
                     DateTimeOffset.UtcNow);
@@ -654,21 +656,34 @@ public sealed class QuartermasterWindow : Window
     public override void PreDraw()
     {
         ReleaseRestoredCaptureCollapseOverride();
+        ApplyViewportReopenGuard();
+    }
 
-        if (ActiveCapturePresentationTarget() is null)
+    private void ApplyViewportReopenGuard()
+    {
+        if (viewportReopenGuardFramesRemaining > 0)
+        {
+            ApplyWindowClass(ImGuiViewportFlags.NoAutoMerge);
+            viewportReopenGuardFramesRemaining--;
+            return;
+        }
+
+        if (!viewportReopenGuardNeedsRelease)
             return;
 
-        var viewport = ImGui.GetMainViewport();
-        ImGui.SetNextWindowViewport(viewport.ID);
-        ImGui.SetNextWindowPos(viewport.WorkPos + new Vector2(16, 16), ImGuiCond.Always);
-        ImGui.SetNextWindowSize(
-            Vector2.Min(new Vector2(1440, 900), viewport.WorkSize - new Vector2(32, 32)),
-            ImGuiCond.Always);
-        if (requestCaptureFocus)
+        ApplyWindowClass(ImGuiViewportFlags.None);
+        viewportReopenGuardNeedsRelease = false;
+    }
+
+    private static void ApplyWindowClass(ImGuiViewportFlags viewportFlags)
+    {
+        var windowClass = new ImGuiWindowClass
         {
-            ImGui.SetNextWindowFocus();
-            requestCaptureFocus = false;
-        }
+            ParentViewportId = uint.MaxValue,
+            ViewportFlagsOverrideSet = viewportFlags,
+            DockingAllowUnclassed = 1,
+        };
+        ImGui.SetNextWindowClass(ref windowClass);
     }
 
     private void RestoreCaptureCollapseState(bool wasOpen, bool wasCollapsed)
@@ -711,7 +726,7 @@ public sealed class QuartermasterWindow : Window
     private string? ActiveCapturePresentationTarget()
     {
         foreach (var target in new[] { "transfer", "transfer-review", "item-groups", "listings", "activity" })
-            if (captureTransactions.ShouldPresentInMainViewport(target))
+            if (captureTransactions.ShouldPresent(target))
                 return target;
         return null;
     }
@@ -721,7 +736,6 @@ public sealed class QuartermasterWindow : Window
         capturePreviousView = workbench.View;
         capturePreviousTransferReview = transferReview;
         capturePreviousTransferReviewOpenRequest = requestTransferReviewOpen;
-        requestCaptureFocus = true;
         var target = ActiveCapturePresentationTarget();
         capturePresentingHistory = target == "activity";
         requestedView = target switch
@@ -747,7 +761,6 @@ public sealed class QuartermasterWindow : Window
         if (capturePresentingHistory)
             requestHistoryClose = true;
         capturePresentingHistory = false;
-        requestCaptureFocus = false;
     }
 
     private void DrawContent()
@@ -902,6 +915,15 @@ public sealed class QuartermasterWindow : Window
         ClosePlanEditors();
         ClearAgentReviewWindowOverride();
         IsOpen = false;
+    }
+
+    public override void OnOpen()
+    {
+        // Keep the first two active frames out of ImGui's auto-merge scan. This gives a
+        // platform viewport retired by an earlier close one full frame to become inactive,
+        // without changing where the user placed the window or disabling later docking.
+        viewportReopenGuardFramesRemaining = 2;
+        viewportReopenGuardNeedsRelease = true;
     }
 
     public override void OnClose()
