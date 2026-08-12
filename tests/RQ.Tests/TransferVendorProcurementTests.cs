@@ -68,6 +68,32 @@ public sealed class TransferVendorProcurementTests
         Assert.Equal(accessible.NpcId, Assert.Single(review.Lines).SelectedCandidate!.Offer.NpcId);
     }
 
+    [Fact]
+    public void Locked_shop_never_enters_the_executable_vendor_plan()
+    {
+        var plan = Plan();
+        var rule = Rule(plan, ItemQualityPolicy.Any);
+        var locked = Offer(100, 12, 700, "Locked Vendor");
+        var planner = new TransferVendorProcurementPlanner(
+            GilVendorCatalog.Create([locked]),
+            _ => new(
+                GilVendorAccessState.Unavailable,
+                "ShopLocked",
+                "Locked Vendor's shop is not unlocked for this character."));
+        var retrieval = new RetrievalPlan(
+            DateTime.UtcNow,
+            [new(rule.Id, 100, "Iron Ore", rule.Quality, 10, 0, 10, 0, 10, [], PlanLineStatus.NoCachedStock, null)]);
+
+        var review = planner.Build(TestData.Owner, plan, 1, [rule], retrieval);
+
+        var refused = Assert.Single(review.Lines);
+        Assert.Equal(TransferVendorProcurementState.VendorUnavailable, refused.State);
+        Assert.False(review.CanStart);
+        Assert.Empty(review.Stops);
+        Assert.Empty(review.ToBuyPlan().Lines);
+        Assert.Empty(review.ToBuyPlan().Stops);
+    }
+
     private static TransferVendorProcurementPlanner Planner(params GilVendorOffer[] offers) => new(
         GilVendorCatalog.Create(offers),
         _ => new(GilVendorAccessState.Probeable, "RouteReady", "The route can be probed."));
