@@ -13,6 +13,7 @@ public sealed class SnapshotPublisher
     public const string TransferPlansCapability = "transferPlans.v1";
     public const string StowagePlansCapability = "stowagePlans.v1";
     public const string RestockPlansCapability = "restockPlans.v1";
+    public const string VendorProcurementCapability = "vendorProcurement.v1";
     public const string AutomaticElementalDepositCapability = "automaticElementalDeposit";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string providerInstanceId;
@@ -208,7 +209,7 @@ public sealed class SnapshotPublisher
         providerInstanceId,
         revision = Revision,
         channels = new[] { IpcChannels.GetCapabilities, IpcChannels.GetSnapshot, IpcChannels.SubmitShortages, IpcChannels.SubmitElementalDeposit, IpcChannels.GetOperation, IpcChannels.Changed },
-        capabilities = new[] { AutomaticRetrievalCapability, AutomaticElementalDepositCapability, TransferPlansCapability, StowagePlansCapability, RestockPlansCapability },
+        capabilities = new[] { AutomaticRetrievalCapability, AutomaticElementalDepositCapability, TransferPlansCapability, StowagePlansCapability, RestockPlansCapability, VendorProcurementCapability },
         requestSchemas = new[] { ShortageSubmissionService.RequestSchema, ElementalDepositSubmissionService.RequestSchema },
         statusVocabulary = new[] { OperationStatuses.Queued, OperationStatuses.Accepted, OperationStatuses.Running, OperationStatuses.Succeeded, OperationStatuses.PartiallySucceeded, OperationStatuses.Indeterminate, OperationStatuses.Failed, OperationStatuses.Cancelled, OperationStatuses.Rejected },
         executionPolicy = "request_selected",
@@ -217,6 +218,7 @@ public sealed class SnapshotPublisher
         {
             new { id = "transfer", label = "Stock and Transfer Plans", command = "/rq", target = "transfer" },
             new { id = "transfer-review", label = "Transfer Plan review", command = "/rq", target = "transfer-review" },
+            new { id = "vendor-review", label = "Vendor procurement review", command = "/rq", target = "vendor-review" },
             new { id = "item-groups", label = "Item Groups", command = "/rq", target = "item-groups" },
             new { id = "listings", label = "Retainer listings", command = "/rq", target = "listings" },
             new { id = "activity", label = "Operations and receipts", command = "/rq", target = "activity" },
@@ -319,6 +321,7 @@ public sealed class SnapshotPublisher
                                 rule.ItemName,
                                 desiredPlayerQuantity = rule.TargetQuantity,
                                 quality = rule.Quality.ToString(),
+                                rule.AllowVendorPurchase,
                                 routing = new
                                 {
                                     mode = (rule.Routing?.Mode ?? StowageRoutingMode.ConsolidateFirst).ToString(),

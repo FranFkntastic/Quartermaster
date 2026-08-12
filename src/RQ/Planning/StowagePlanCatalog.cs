@@ -253,6 +253,7 @@ public static class StowagePlanCatalog
             Overflow = source.Routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
             PreferredRetainerIds = source.Routing?.PreferredRetainerIds.ToList() ?? [],
         },
+        AllowVendorPurchase = source.AllowVendorPurchase,
         Notes = source.Notes,
         Enabled = source.Enabled,
     };
@@ -269,6 +270,7 @@ public static class StowagePlanCatalog
             pair.First.ItemName == pair.Second.ItemName &&
             pair.First.TargetQuantity == pair.Second.TargetQuantity &&
             pair.First.Quality == pair.Second.Quality &&
+            pair.First.AllowVendorPurchase == pair.Second.AllowVendorPurchase &&
             pair.First.Notes == pair.Second.Notes &&
             pair.First.Enabled == pair.Second.Enabled &&
             pair.First.Routing.Mode == pair.Second.Routing.Mode &&

@@ -127,8 +127,11 @@ public sealed class IpcTests
         Assert.Contains(
             SnapshotPublisher.RestockPlansCapability,
             document.RootElement.GetProperty("capabilities").EnumerateArray().Select(value => value.GetString()));
+        Assert.Contains(
+            SnapshotPublisher.VendorProcurementCapability,
+            document.RootElement.GetProperty("capabilities").EnumerateArray().Select(value => value.GetString()));
         Assert.Equal(
-            ["transfer", "transfer-review", "item-groups", "listings", "activity"],
+            ["transfer", "transfer-review", "vendor-review", "item-groups", "listings", "activity"],
             document.RootElement.GetProperty("reviewSurfaces").EnumerateArray()
                 .Select(surface => surface.GetProperty("id").GetString()));
     }
@@ -152,6 +155,7 @@ public sealed class IpcTests
                 ItemId = 100,
                 ItemName = "Darksteel Ore",
                 TargetQuantity = 50,
+                AllowVendorPurchase = true,
             });
         });
         var snapshots = new SnapshotPublisher("provider", repository, () => new Dictionary<ulong, CachedRetainer>());
@@ -165,6 +169,7 @@ public sealed class IpcTests
         Assert.Equal("Workshop supply", plan.GetProperty("name").GetString());
         var rule = Assert.Single(plan.GetProperty("rules").EnumerateArray());
         Assert.Equal(50, rule.GetProperty("desiredPlayerQuantity").GetInt32());
+        Assert.True(rule.GetProperty("allowVendorPurchase").GetBoolean());
     }
 
     [Fact]

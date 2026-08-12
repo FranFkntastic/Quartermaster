@@ -1,4 +1,5 @@
 using Dalamud.Configuration;
+using Franthropy.Dalamud.Automation.Vendors.Coordination;
 
 namespace RQ;
 
@@ -16,4 +17,5 @@ public sealed class PluginConfiguration : IPluginConfiguration
     public bool IncludeSaddlebag { get; set; }
     public bool LegacyStorageSettingsImported { get; set; }
     public bool EnableSharedObservationShadow { get; set; }
+    public GilVendorBuyRunSnapshot? ActiveTransferPlanVendorBuy { get; set; }
 }

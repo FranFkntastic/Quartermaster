@@ -56,7 +56,11 @@ public sealed record QuartermasterBridgeTruth(
     double? LastListingActionToAppliedMilliseconds,
     DateTimeOffset? LastListingPersistedAtUtc,
     double? LastListingObservedToPersistedMilliseconds,
-    double? LastListingWriteMilliseconds);
+    double? LastListingWriteMilliseconds,
+    string? VendorProcurementPhase,
+    string? VendorProcurementMessage,
+    int VendorPurchasedQuantity,
+    ulong VendorSpentGil);
 
 public sealed class QuartermasterBridgeProvider
 {
@@ -64,17 +68,19 @@ public sealed class QuartermasterBridgeProvider
     [
         new("transfer", "Stock and Transfer Plans", "open-main-window", "transfer", 10),
         new("transfer-review", "Transfer Plan review", "open-main-window", "transfer-review", 20),
-        new("item-groups", "Item Groups", "open-main-window", "item-groups", 30),
-        new("listings", "Retainer listings", "open-main-window", "listings", 40),
-        new("activity", "Operations and receipts", "open-main-window", "activity", 50),
+        new("vendor-review", "Vendor procurement review", "open-main-window", "vendor-review", 30),
+        new("item-groups", "Item Groups", "open-main-window", "item-groups", 40),
+        new("listings", "Retainer listings", "open-main-window", "listings", 50),
+        new("activity", "Operations and receipts", "open-main-window", "activity", 60),
     ];
     private static readonly IReadOnlyList<AgentBridgeCaptureSurfaceDescriptor> CaptureSurfaces =
     [
         new("transfer", "Stock and Transfer Plans", 10, IsDefault: true),
         new("transfer-review", "Transfer Plan review", 20),
-        new("item-groups", "Item Groups", 30),
-        new("listings", "Retainer listings", 40),
-        new("activity", "Operations and receipts", 50),
+        new("vendor-review", "Vendor procurement review", 30),
+        new("item-groups", "Item Groups", 40),
+        new("listings", "Retainer listings", 50),
+        new("activity", "Operations and receipts", 60),
     ];
 
     private readonly Func<QuartermasterBridgeTruth> createTruth;
@@ -103,7 +109,7 @@ public sealed class QuartermasterBridgeProvider
         reviewRegistry.Invoke(id, frameId, arguments);
     public bool TryOpenMainWindow(string target)
     {
-        if (target.Trim().ToLowerInvariant() is not ("stock" or "stock-and-plan" or "transfer" or "transfer-review" or "restock" or "stowage" or "item-groups" or "groups" or "listings" or "operation" or "activity"))
+        if (target.Trim().ToLowerInvariant() is not ("stock" or "stock-and-plan" or "transfer" or "transfer-review" or "vendor-review" or "restock" or "stowage" or "item-groups" or "groups" or "listings" or "operation" or "activity"))
             return false;
         openMainWindow(target);
         return true;
