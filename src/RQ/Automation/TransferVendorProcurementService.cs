@@ -78,9 +78,9 @@ public sealed class TransferVendorProcurementService : IDisposable
             error = "The reviewed Transfer Plan does not belong to the current character.";
             return false;
         }
-        if (plan.Revision != review.PlanRevision || runtime.Revision != review.RuntimeRevision)
+        if (plan.Revision != review.PlanRevision)
         {
-            error = "The Transfer Plan or inventory changed after review; review the current vendor shortfall again.";
+            error = "The Transfer Plan changed after review; review the current vendor shortfall again.";
             return false;
         }
         var effectiveRules = ListingPlanEvaluator.ComposeRules(runtime.State, runtime.Browser, runtime.Owner, plan.Id);
