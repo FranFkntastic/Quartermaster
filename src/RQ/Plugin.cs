@@ -501,13 +501,14 @@ public sealed class Plugin : IDalamudPlugin
     private QuartermasterBridgeTruth CreateAgentBridgeTruth()
     {
         var runtime = runtimeSnapshots.Current;
+        var ui = window.CreateUiSnapshot();
         var retainers = runtime.Retainers.Values
             .Where(retainer => runtime.Owner.Matches(retainer.Owner) && retainer.IsCurrentlyAssigned is not false)
             .ToArray();
         // Operation history advances independently from the heavier runtime
         // projection, so bridge truth reads it from the journal authority.
         var operation = journal.Current(runtime.Owner);
-        var selectedPlanId = window.SelectedStowagePlanId;
+        var selectedPlanId = ui.SelectedTransferPlanId;
         var selectedPlanRules = selectedPlanId is { } planId
             ? runtime.State.PlanItems.Where(item => item.StowagePlanId == planId).ToArray()
             : [];
@@ -519,28 +520,28 @@ public sealed class Plugin : IDalamudPlugin
             configuration.PluginInstanceId,
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
-            window.IsOpen,
-            window.CurrentWorkspace,
-            window.StockFilter,
-            window.VisibleStockCount,
-            window.RenderedStockRowCount,
-            window.StockProjectionBuildCount,
-            window.StockTableApplyCount,
-            window.TransferProjectionBuildCount,
-            window.RenderedTransferRowCount,
-            window.WindowDrawMilliseconds,
-            window.ContentDrawMilliseconds,
-            window.StockDrawMilliseconds,
-            window.PlanDrawMilliseconds,
-            window.ReviewFinalizeMilliseconds,
-            window.CurrentTransferDirection,
-            window.RestockEditorOpen || window.StowageEditorOpen,
-            window.PlanEditorHasUnsavedChanges,
+            ui.MainWindowOpen,
+            ui.CurrentWorkspace,
+            ui.StockFilter,
+            ui.VisibleStockCount,
+            ui.RenderedStockRowCount,
+            ui.StockProjectionBuildCount,
+            ui.StockTableApplyCount,
+            ui.TransferProjectionBuildCount,
+            ui.RenderedTransferRowCount,
+            ui.WindowDrawMilliseconds,
+            ui.ContentDrawMilliseconds,
+            ui.StockDrawMilliseconds,
+            ui.PlanDrawMilliseconds,
+            ui.ReviewFinalizeMilliseconds,
+            ui.TransferDirection,
+            ui.PlanEditorOpen,
+            ui.PlanEditorHasUnsavedChanges,
             runtime.State.ItemGroups.Count,
-            window.SelectedItemGroupId,
-            window.SelectedItemGroupName,
-            window.ItemGroupEditorOpen,
-            window.ItemGroupEditorHasUnsavedChanges,
+            ui.SelectedItemGroupId,
+            ui.SelectedItemGroupName,
+            ui.ItemGroupEditorOpen,
+            ui.ItemGroupEditorHasUnsavedChanges,
             runtime.Owner.HasStableIdentity ? $"{runtime.Owner.CharacterName} @ {runtime.Owner.HomeWorldName}" : "Unavailable",
             runtime.Owner.HasStableIdentity,
             retainers.Length,
@@ -548,11 +549,11 @@ public sealed class Plugin : IDalamudPlugin
             selectedPlanRules.Length,
             selectedPlanRules.Count(item => item.Enabled),
             StowagePlanCatalog.OwnerPlans(runtime.State, runtime.Owner).Count,
-            window.SelectedStowagePlanId,
-            window.SelectedStowagePlanName,
-            window.SelectedRestockNeededQuantity,
-            window.SelectedTransferDepositQuantity,
-            window.StowageEditorOpen,
+            ui.SelectedTransferPlanId,
+            ui.SelectedTransferPlanName,
+            ui.SelectedTransferRetrieveQuantity,
+            ui.SelectedTransferDepositQuantity,
+            ui.TransferEditorOpen,
             operation?.OperationId,
             operation?.Status,
             retainerRefresh.IsAvailable,
