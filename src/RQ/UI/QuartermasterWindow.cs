@@ -56,6 +56,7 @@ public sealed class QuartermasterWindow : Window
     private readonly DalamudTableProjection<OperationLine> operationLineTable;
     private readonly BrowserQueryController queries = new();
     private readonly RootConfirmationDialog confirmationDialog = new();
+    private readonly OperationHistoryDialog historyDialog;
     private StockWorkbenchProjection? stockWorkbenchProjection;
     private TransferWorkbenchProjection? transferWorkbenchProjection;
     private long stockSelectionRevision = -1;
@@ -108,9 +109,6 @@ public sealed class QuartermasterWindow : Window
     private Guid? inlineTransferErrorPlanId;
     private string itemGroupWorkspaceStatus = string.Empty;
     private bool requestDeleteItemGroup;
-    private bool requestHistoryOpen;
-    private bool requestHistoryClose;
-    private bool capturePresentingHistory;
     private bool requestTransferReviewOpen;
     private TransferReviewRequest? transferReview;
     private bool requestVendorReviewOpen;
@@ -160,6 +158,7 @@ public sealed class QuartermasterWindow : Window
         this.configuration = configuration;
         this.saveConfiguration = saveConfiguration;
         this.reviewRegistry = reviewRegistry;
+        historyDialog = new(journal);
         listingGroupTable = new(
         [
             new(
@@ -782,7 +781,8 @@ public sealed class QuartermasterWindow : Window
         capturePreviousVendorReview = vendorReview;
         capturePreviousVendorReviewOpenRequest = requestVendorReviewOpen;
         var target = ActiveCapturePresentationTarget();
-        capturePresentingHistory = target == "activity";
+        if (target == "activity")
+            historyDialog.BeginCapturePresentation();
         requestedView = target switch
         {
             "listings" => WorkbenchView.Listings,
@@ -809,9 +809,7 @@ public sealed class QuartermasterWindow : Window
         requestVendorReviewOpen = capturePreviousVendorReviewOpenRequest;
         capturePreviousVendorReview = null;
         capturePreviousVendorReviewOpenRequest = false;
-        if (capturePresentingHistory)
-            requestHistoryClose = true;
-        capturePresentingHistory = false;
+        historyDialog.RestoreCapturePresentation();
     }
 
     private void DrawContent()
@@ -822,7 +820,7 @@ public sealed class QuartermasterWindow : Window
         {
             if (requested == WorkbenchView.Activity)
             {
-                requestHistoryOpen = true;
+                historyDialog.RequestOpen();
                 requestedView = WorkbenchView.Stowage;
             }
             if (requested == WorkbenchView.Listings)
@@ -834,14 +832,14 @@ public sealed class QuartermasterWindow : Window
         var historyWidth = ImGui.CalcTextSize("History").X + (ImGui.GetStyle().FramePadding.X * 2);
         ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - historyWidth));
         if (ImGui.SmallButton("History"))
-            requestHistoryOpen = true;
+            historyDialog.RequestOpen();
         reviewRegistry.RegisterLastButton(
             "quartermaster.history.open",
             "Open transfer history",
             true,
-            () => requestHistoryOpen = true,
+            historyDialog.RequestOpen,
             "Recent Quartermaster operations");
-        DrawHistoryPopup(runtime.Owner);
+        historyDialog.Draw(runtime.Owner);
 
         if (ImGui.BeginTabBar("RQViews"))
         {
@@ -5123,70 +5121,6 @@ public sealed class QuartermasterWindow : Window
         Overflow = routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
         PreferredRetainerIds = routing?.PreferredRetainerIds.ToList() ?? [],
     };
-
-    private void DrawHistoryPopup(OwnerScope owner)
-    {
-        const string popup = "Transfer history##RQ";
-        if (requestHistoryOpen || capturePresentingHistory)
-        {
-            if (!ImGui.IsPopupOpen(popup))
-            {
-                ImGui.SetNextWindowSize(
-                    new Vector2(430, Math.Min(620, ImGui.GetMainViewport().WorkSize.Y - 80)),
-                    ImGuiCond.Appearing);
-                ImGui.OpenPopup(popup);
-            }
-            requestHistoryOpen = false;
-        }
-        if (!ImGui.BeginPopup(popup))
-        {
-            requestHistoryClose = false;
-            return;
-        }
-        if (requestHistoryClose)
-        {
-            requestHistoryClose = false;
-            ImGui.CloseCurrentPopup();
-            ImGui.EndPopup();
-            return;
-        }
-
-        ImGui.TextUnformatted("Transfer history");
-        ImGui.Separator();
-        var operations = journal.History(owner, 30);
-        if (operations.Count == 0)
-        {
-            ImGui.TextDisabled("No Quartermaster operations yet.");
-            ImGui.EndPopup();
-            return;
-        }
-
-        if (ImGui.BeginChild(
-                "RQHistoryRows",
-                new Vector2(410, Math.Min(540, ImGui.GetContentRegionAvail().Y)),
-                false))
-        {
-            foreach (var operation in operations)
-            {
-                var succeeded = operation.Status == OperationStatuses.Succeeded;
-                var failed = operation.Status is OperationStatuses.Failed or OperationStatuses.Indeterminate;
-                ImGui.TextColored(
-                    failed
-                        ? new Vector4(1f, .45f, .45f, 1f)
-                        : succeeded
-                            ? new Vector4(.53f, .83f, .64f, 1f)
-                            : new Vector4(.69f, .74f, .77f, 1f),
-                    operation.Status);
-                ImGui.SameLine();
-                ImGui.TextDisabled(operation.UpdatedAtUtc.ToLocalTime().ToString("g", CultureInfo.CurrentCulture));
-                ImGui.TextUnformatted(operation.SourcePlanName ?? "Quartermaster transfer");
-                ImGui.TextWrapped(operation.Message);
-                ImGui.Separator();
-            }
-        }
-        ImGui.EndChild();
-        ImGui.EndPopup();
-    }
 
     private void DrawVendorProcurementReviewModal()
     {
