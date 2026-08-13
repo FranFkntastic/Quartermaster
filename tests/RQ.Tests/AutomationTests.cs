@@ -1,8 +1,10 @@
 using System.Reflection;
+using System.Numerics;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using Franthropy.Dalamud.Automation.Inventory;
 using Franthropy.Dalamud.Automation.Retainers;
+using Franthropy.Dalamud.Travel;
 using RQ.Automation;
 using RQ.Domain;
 using RQ.Interop;
@@ -50,6 +52,158 @@ public sealed class AutomationTests
             driver.OpenInventoryAsync(CancellationToken.None));
 
         Assert.Contains("RetainerMenuUnavailable", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RetainerLiveDriver_LeavesHealthyRetainerListPathAlone()
+    {
+        var sessionCalls = 0;
+        var session = CreateProxy<IRetainerAutomationSession>((method, _) => method.Name switch
+        {
+            nameof(IRetainerAutomationSession.EnsureRetainerListAsync) => Task.FromResult(
+                ++sessionCalls == 1
+                    ? RetainerAutomationResult.Succeeded("RetainerListReady", "Ready.")
+                    : throw new InvalidOperationException("Retainer list was retried unexpectedly.")),
+            _ => throw new InvalidOperationException($"Unexpected session call: {method.Name}."),
+        });
+        var route = new RecordingBellRoute(RetainerBellRouteResult.Succeeded("Ready."));
+
+        await new RetainerLiveDriver(session, route).RequireRetainerListAsync(CancellationToken.None);
+
+        Assert.Equal(1, sessionCalls);
+        Assert.Equal(0, route.Calls);
+    }
+
+    [Theory]
+    [InlineData("NoNearbySummoningBell")]
+    [InlineData("NoInteractableSummoningBell")]
+    public async Task RetainerLiveDriver_AcquiresBellThenRetriesRetainerListOnce(string initialFailure)
+    {
+        var sessionCalls = 0;
+        var session = CreateProxy<IRetainerAutomationSession>((method, _) => method.Name switch
+        {
+            nameof(IRetainerAutomationSession.EnsureRetainerListAsync) => Task.FromResult(
+                ++sessionCalls == 1
+                    ? RetainerAutomationResult.Failed(initialFailure, "Bell unavailable.")
+                    : RetainerAutomationResult.Succeeded("RetainerListReady", "Ready.")),
+            _ => throw new InvalidOperationException($"Unexpected session call: {method.Name}."),
+        });
+        var route = new RecordingBellRoute(RetainerBellRouteResult.Succeeded("Ready."));
+
+        await new RetainerLiveDriver(session, route).RequireRetainerListAsync(CancellationToken.None);
+
+        Assert.Equal(2, sessionCalls);
+        Assert.Equal(1, route.Calls);
+    }
+
+    [Fact]
+    public async Task RetainerLiveDriver_DoesNotRetryRetainerListWhenBellRouteFails()
+    {
+        var sessionCalls = 0;
+        var session = CreateProxy<IRetainerAutomationSession>((method, _) => method.Name switch
+        {
+            nameof(IRetainerAutomationSession.EnsureRetainerListAsync) => Task.FromResult(
+                ++sessionCalls == 1
+                    ? RetainerAutomationResult.Failed("NoNearbySummoningBell", "Bell unavailable.")
+                    : throw new InvalidOperationException("Retainer list was retried after route failure.")),
+            _ => throw new InvalidOperationException($"Unexpected session call: {method.Name}."),
+        });
+        var route = new RecordingBellRoute(
+            RetainerBellRouteResult.Failed("AutomaticRetainerTravelUnavailable", "Lifestream rejected the command."));
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new RetainerLiveDriver(session, route).RequireRetainerListAsync(CancellationToken.None));
+
+        Assert.Contains("AutomaticRetainerTravelUnavailable", failure.Message, StringComparison.Ordinal);
+        Assert.Equal(1, sessionCalls);
+        Assert.Equal(1, route.Calls);
+    }
+
+    [Fact]
+    public void RetainerBellRouteState_SubmitsAutomaticTravelOnlyOnceUntilBellLoads()
+    {
+        var port = new RecordingBellRoutePort
+        {
+            Bell = MissingBell(),
+            Navigation = Navigation(VNavmeshLifecycleState.Ready),
+        };
+        var state = new RetainerBellRouteState(port);
+
+        Assert.Equal(RetainerBellRouteStepState.Waiting, state.Advance().State);
+        Assert.Equal(RetainerBellRouteStepState.Waiting, state.Advance().State);
+
+        Assert.Equal(1, port.AutomaticTravelSubmissions);
+        Assert.Equal(0, port.PathSubmissions);
+    }
+
+    [Fact]
+    public void RetainerBellRouteState_FailsClosedWhenAutomaticTravelIsRejected()
+    {
+        var port = new RecordingBellRoutePort
+        {
+            Bell = MissingBell(),
+            Navigation = Navigation(VNavmeshLifecycleState.Ready),
+            AcceptAutomaticTravel = false,
+        };
+
+        var step = new RetainerBellRouteState(port).Advance();
+
+        Assert.Equal(RetainerBellRouteStepState.Failed, step.State);
+        Assert.Equal("AutomaticRetainerTravelUnavailable", step.Code);
+        Assert.Equal(1, port.AutomaticTravelSubmissions);
+    }
+
+    [Fact]
+    public void RetainerBellRouteState_PathsToLoadedBellAndStopsOwnedPathOnArrival()
+    {
+        var port = new RecordingBellRoutePort
+        {
+            Bell = BellAt(distance: 12, interactionDistance: 4.75f),
+            Navigation = Navigation(VNavmeshLifecycleState.Ready),
+        };
+        var state = new RetainerBellRouteState(port);
+
+        Assert.Equal("BellPathSubmitted", state.Advance().Code);
+        port.Navigation = Navigation(VNavmeshLifecycleState.Running);
+        Assert.Equal("ApproachingBell", state.Advance().Code);
+        port.Bell = BellAt(distance: 3, interactionDistance: 4.75f);
+
+        Assert.Equal(RetainerBellRouteStepState.Succeeded, state.Advance().State);
+        Assert.Equal(1, port.PathSubmissions);
+        Assert.Equal(1, port.StopCalls);
+        Assert.Equal(4f, port.LastRange);
+    }
+
+    [Fact]
+    public void RetainerBellRouteState_DoesNotRequireVnavmeshWhenBellIsAlreadyInRange()
+    {
+        var port = new RecordingBellRoutePort
+        {
+            Bell = BellAt(distance: 3, interactionDistance: 4.75f),
+            Navigation = Navigation(VNavmeshLifecycleState.Unavailable),
+        };
+
+        var step = new RetainerBellRouteState(port).Advance();
+
+        Assert.Equal(RetainerBellRouteStepState.Succeeded, step.State);
+        Assert.Equal(0, port.AutomaticTravelSubmissions);
+        Assert.Equal(0, port.PathSubmissions);
+    }
+
+    [Fact]
+    public void RetainerBellRouteState_RefusesToTakeOverForeignNavigation()
+    {
+        var port = new RecordingBellRoutePort
+        {
+            Bell = BellAt(distance: 12, interactionDistance: 4.75f),
+            Navigation = Navigation(VNavmeshLifecycleState.Running),
+        };
+
+        var step = new RetainerBellRouteState(port).Advance();
+
+        Assert.Equal(RetainerBellRouteStepState.Failed, step.State);
+        Assert.Equal("NavigationAlreadyRunning", step.Code);
+        Assert.Equal(0, port.StopCalls);
     }
 
     [Fact]
@@ -304,6 +458,62 @@ public sealed class AutomationTests
             SuppressionChanges.Add(suppressed);
         }
         public void Dispose() { }
+    }
+
+    private static SummoningBellNavigationTargetObservation MissingBell() =>
+        new(false, "NoLoadedSummoningBell", "No bell.", 0, default, 0, 0);
+
+    private static SummoningBellNavigationTargetObservation BellAt(float distance, float interactionDistance) =>
+        new(true, "NavigationTargetAvailable", "Bell.", 0x1234, new Vector3(10, 0, 10), distance, interactionDistance);
+
+    private static VNavmeshLifecycleObservation Navigation(VNavmeshLifecycleState state) =>
+        new(state, state.ToString(), state.ToString());
+
+    private sealed class RecordingBellRoute : IRetainerBellRoute
+    {
+        private readonly RetainerBellRouteResult result;
+
+        public RecordingBellRoute(RetainerBellRouteResult result) => this.result = result;
+
+        public int Calls { get; private set; }
+
+        public Task<RetainerBellRouteResult> EnsureBellInRangeAsync(CancellationToken cancellationToken)
+        {
+            Calls++;
+            return Task.FromResult(result);
+        }
+
+        public void Cancel() { }
+    }
+
+    private sealed class RecordingBellRoutePort : IRetainerBellRoutePort
+    {
+        public SummoningBellNavigationTargetObservation Bell { get; set; } = MissingBell();
+        public VNavmeshLifecycleObservation Navigation { get; set; } = AutomationTests.Navigation(VNavmeshLifecycleState.Ready);
+        public int AutomaticTravelSubmissions { get; private set; }
+        public int PathSubmissions { get; private set; }
+        public int StopCalls { get; private set; }
+        public float LastRange { get; private set; }
+        public bool AcceptAutomaticTravel { get; set; } = true;
+
+        public SummoningBellNavigationTargetObservation ObserveBell() => Bell;
+        public VNavmeshLifecycleObservation ObserveNavigation() => Navigation;
+        public VNavmeshPathSubmissionResult TryMoveCloseTo(Vector3 destination, float range)
+        {
+            PathSubmissions++;
+            LastRange = range;
+            return new(VNavmeshPathSubmissionState.Submitted, "Submitted", "Submitted.");
+        }
+        public bool SubmitAutomaticRetainerTravel()
+        {
+            AutomaticTravelSubmissions++;
+            return AcceptAutomaticTravel;
+        }
+        public bool TryStopNavigation()
+        {
+            StopCalls++;
+            return true;
+        }
     }
 
     [Fact]
