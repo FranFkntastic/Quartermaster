@@ -7,6 +7,8 @@ param(
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Release',
 
+    [string]$FranthropyRoot,
+
     [switch]$SkipBuild
 )
 
@@ -17,7 +19,16 @@ $source = Join-Path $repository "src\RQ\bin\$Configuration"
 $targetPath = [System.IO.Path]::GetFullPath($Target)
 
 if (-not $SkipBuild) {
-    & dotnet build $project -c $Configuration
+    $arguments = @('build', $project, '-c', $Configuration)
+    if (-not [string]::IsNullOrWhiteSpace($FranthropyRoot)) {
+        $resolvedFranthropy = [System.IO.Path]::GetFullPath($FranthropyRoot)
+        $arguments += @(
+            "-p:FranthropyDalamudProject=$(Join-Path $resolvedFranthropy 'src\Franthropy.Dalamud\Franthropy.Dalamud.csproj')",
+            "-p:FranthropyFfxivProject=$(Join-Path $resolvedFranthropy 'src\Franthropy.FFXIV\Franthropy.FFXIV.csproj')",
+            "-p:FranthropyObservationsProject=$(Join-Path $resolvedFranthropy 'src\Franthropy.Observations\Franthropy.Observations.csproj')"
+        )
+    }
+    & dotnet @arguments
     if ($LASTEXITCODE -ne 0) {
         throw "Quartermaster $Configuration build failed with exit code $LASTEXITCODE."
     }
@@ -43,4 +54,18 @@ $files | Where-Object Name -NE 'RQ.dll' | ForEach-Object {
 }
 Copy-Item -LiteralPath $assembly -Destination (Join-Path $targetPath 'RQ.dll') -Force
 
-"Deployed Quartermaster to '$targetPath'."
+$targetDll = Join-Path $targetPath 'RQ.dll'
+$sourceHash = (Get-FileHash -LiteralPath $assembly -Algorithm SHA256).Hash
+$targetHash = (Get-FileHash -LiteralPath $targetDll -Algorithm SHA256).Hash
+if ($sourceHash -ne $targetHash) {
+    throw 'Quartermaster target hash does not match the built artifact.'
+}
+
+[pscustomobject]@{
+    Product = 'Quartermaster'
+    Branch = (& git -C $repository branch --show-current).Trim()
+    Commit = (& git -C $repository rev-parse HEAD).Trim()
+    TargetDll = $targetDll
+    SourceSha256 = $sourceHash
+    TargetSha256 = $targetHash
+} | ConvertTo-Json -Depth 4
