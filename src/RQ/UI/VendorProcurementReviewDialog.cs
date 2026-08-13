@@ -44,6 +44,10 @@ internal sealed class VendorProcurementReviewDialog
 
     public VendorProcurementReviewDialogState CaptureState() => new(review, openRequested, status);
 
+    public string? CaptureWindowName => review is { } current
+        ? $"Buy vendor shortfalls for {current.PlanName}##RQVendorReview"
+        : null;
+
     public void RestoreState(VendorProcurementReviewDialogState state)
     {
         review = state.Review;
@@ -56,7 +60,7 @@ internal sealed class VendorProcurementReviewDialog
         if (review is not { } currentReview)
             return;
 
-        var popup = $"Buy vendor shortfalls for {currentReview.PlanName}##RQVendorReview";
+        var popup = CaptureWindowName!;
         if (openRequested)
         {
             ImGui.SetNextWindowSize(

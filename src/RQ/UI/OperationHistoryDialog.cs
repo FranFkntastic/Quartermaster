@@ -8,6 +8,8 @@ namespace RQ.UI;
 
 internal sealed class OperationHistoryDialog(OperationJournal journal)
 {
+    public const string CaptureWindowName = "Transfer history##RQ";
+
     private bool openRequested;
     private bool closeRequested;
     private bool capturePresentationActive;
@@ -25,7 +27,7 @@ internal sealed class OperationHistoryDialog(OperationJournal journal)
 
     public void Draw(OwnerScope owner)
     {
-        const string popup = "Transfer history##RQ";
+        const string popup = CaptureWindowName;
         if (openRequested || capturePresentationActive)
         {
             if (!ImGui.IsPopupOpen(popup))
