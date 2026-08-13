@@ -29,6 +29,7 @@ internal static class RetainerRetrievalResultPolicy
 public sealed class RetainerLiveDriver : IRetainerTransferDriver
 {
     private readonly IRetainerAutomationSession session;
+    private readonly IRetainerBellRoute? bellRoute;
 
     public RetainerLiveDriver(
         IFramework framework,
@@ -42,10 +43,29 @@ public sealed class RetainerLiveDriver : IRetainerTransferDriver
     {
     }
 
-    internal RetainerLiveDriver(IRetainerAutomationSession session) => this.session = session;
+    internal RetainerLiveDriver(IRetainerAutomationSession session, IRetainerBellRoute? bellRoute = null)
+    {
+        this.session = session;
+        this.bellRoute = bellRoute;
+    }
 
-    public async Task RequireRetainerListAsync(CancellationToken cancellationToken) =>
+    public async Task RequireRetainerListAsync(CancellationToken cancellationToken)
+    {
+        var result = await session.EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);
+        if (result.Success)
+            return;
+        if (bellRoute is null || !RequiresBellRoute(result.Code))
+        {
+            RequireSuccess(result);
+            return;
+        }
+
+        var route = await bellRoute.EnsureBellInRangeAsync(cancellationToken).ConfigureAwait(false);
+        if (!route.Success)
+            throw new InvalidOperationException($"{route.Code}: {route.Message}");
+
         RequireSuccess(await session.EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false));
+    }
 
     public async Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken cancellationToken) =>
         RequireSuccess(await session.OpenRetainerAsync(
@@ -122,7 +142,15 @@ public sealed class RetainerLiveDriver : IRetainerTransferDriver
     public async Task CloseRetainerListAsync(CancellationToken cancellationToken) =>
         RequireSuccess(await session.CloseRetainerListAsync(cancellationToken).ConfigureAwait(false));
 
-    public void CancelActive() => session.CancelActive();
+    public void CancelActive()
+    {
+        bellRoute?.Cancel();
+        session.CancelActive();
+    }
+
+    private static bool RequiresBellRoute(string code) =>
+        string.Equals(code, "NoNearbySummoningBell", StringComparison.Ordinal) ||
+        string.Equals(code, "NoInteractableSummoningBell", StringComparison.Ordinal);
 
     private static void RequireSuccess(RetainerAutomationResult result)
     {

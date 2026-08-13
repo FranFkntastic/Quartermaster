@@ -45,6 +45,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly RetainerCacheRepository cache;
     private readonly StateRepository state;
     private readonly RetainerRefreshCoordinator retainerRefresh;
+    private readonly RetainerBellRoute retainerBellRoute;
     private readonly OperationJournal journal;
     private readonly TransferCoordinator transfers;
     private readonly ListingNavigationCoordinator listingNavigation;
@@ -173,7 +174,13 @@ public sealed class Plugin : IDalamudPlugin
         journal = new OperationJournal(state);
         RetainerStockMutationPersistence.RecoverPending(journal, cache);
         journal.ReconcileInterruptedOperations();
-        var driver = new RetainerLiveDriver(retainerSession);
+        retainerBellRoute = new(
+            framework,
+            new DalamudRetainerBellRoutePort(
+                new DalamudSummoningBellInteractor(objects, targets, dataManager),
+                new DalamudVNavmeshTravel(pluginInterface),
+                commands));
+        var driver = new RetainerLiveDriver(retainerSession, retainerBellRoute);
         var autoRetainerSuppression = new AutoRetainerSuppression(autoRetainerIpc);
         listingNavigation = new(
             retainerSession,
@@ -808,6 +815,7 @@ public sealed class Plugin : IDalamudPlugin
         automaticRetrievals.Dispose();
         listingNavigation.Dispose();
         window.CancelAndWaitForActiveTransfer(TimeSpan.FromSeconds(2));
+        retainerBellRoute.Dispose();
         vendorProcurement.Dispose();
         externalUiSuppression.Dispose();
         agentBridge.Dispose();
