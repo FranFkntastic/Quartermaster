@@ -178,7 +178,7 @@ public sealed class QuartermasterWindow : Window
 
     public string AgentCaptureWindowName => ActiveCapturePresentationTarget() switch
     {
-        "activity" => OperationHistoryDialog.CaptureWindowName,
+        "activity" => historyDialog.CaptureWindowName ?? MainWindowName,
         "transfer-review" => transferReviewDialog.CaptureWindowName ?? MainWindowName,
         "vendor-review" => vendorReviewDialog.CaptureWindowName ?? MainWindowName,
         _ => MainWindowName,

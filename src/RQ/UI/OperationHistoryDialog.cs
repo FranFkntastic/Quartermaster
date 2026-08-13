@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using Dalamud.Bindings.ImGui;
 using RQ.Domain;
 using RQ.Operations;
@@ -8,11 +9,13 @@ namespace RQ.UI;
 
 internal sealed class OperationHistoryDialog(OperationJournal journal)
 {
-    public const string CaptureWindowName = "Transfer history##RQ";
+    private const string PopupLabel = "Transfer history##RQ";
 
     private bool openRequested;
     private bool closeRequested;
     private bool capturePresentationActive;
+
+    public string? CaptureWindowName { get; private set; }
 
     public void RequestOpen() => openRequested = true;
 
@@ -27,7 +30,7 @@ internal sealed class OperationHistoryDialog(OperationJournal journal)
 
     public void Draw(OwnerScope owner)
     {
-        const string popup = CaptureWindowName;
+        const string popup = PopupLabel;
         if (openRequested || capturePresentationActive)
         {
             if (!ImGui.IsPopupOpen(popup))
@@ -45,8 +48,13 @@ internal sealed class OperationHistoryDialog(OperationJournal journal)
         }
         if (!ImGui.BeginPopup(popup))
         {
+            CaptureWindowName = null;
             closeRequested = false;
             return;
+        }
+        unsafe
+        {
+            CaptureWindowName = Marshal.PtrToStringUTF8((nint)ImGuiP.GetCurrentWindow().Name);
         }
         if (closeRequested)
         {
