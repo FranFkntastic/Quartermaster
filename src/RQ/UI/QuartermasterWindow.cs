@@ -20,6 +20,8 @@ namespace RQ.UI;
 
 public sealed class QuartermasterWindow : Window
 {
+    private const string MainWindowName = "Quartermaster###RQMain";
+
     private readonly StateRepository state;
     private readonly QuartermasterRuntimeSnapshotSource runtimeSnapshots;
     private readonly IDataManager dataManager;
@@ -59,7 +61,7 @@ public sealed class QuartermasterWindow : Window
         PluginConfiguration configuration,
         System.Action saveConfiguration,
         AgentBridgeUiReviewRegistry reviewRegistry)
-        : base("Quartermaster###RQMain", ImGuiWindowFlags.NoScrollbar)
+        : base(MainWindowName, ImGuiWindowFlags.NoScrollbar)
     {
         this.state = state;
         this.runtimeSnapshots = runtimeSnapshots;
@@ -173,6 +175,14 @@ public sealed class QuartermasterWindow : Window
     private double PlanDrawMilliseconds { get; set; }
     private double ReviewFinalizeMilliseconds { get; set; }
     public AgentBridgeCaptureRegion? AgentCaptureRegion { get; private set; }
+
+    public string AgentCaptureWindowName => ActiveCapturePresentationTarget() switch
+    {
+        "activity" => OperationHistoryDialog.CaptureWindowName,
+        "transfer-review" => transferReviewDialog.CaptureWindowName ?? MainWindowName,
+        "vendor-review" => vendorReviewDialog.CaptureWindowName ?? MainWindowName,
+        _ => MainWindowName,
+    };
 
     internal QuartermasterUiSnapshot CreateUiSnapshot()
     {

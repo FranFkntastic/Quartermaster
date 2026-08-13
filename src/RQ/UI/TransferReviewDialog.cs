@@ -49,6 +49,10 @@ internal sealed class TransferReviewDialog
 
     public TransferReviewDialogState CaptureState() => new(request, openRequested);
 
+    public string? CaptureWindowName => request is { } current
+        ? $"Execute {current.PlanName}##RQTransferReview"
+        : null;
+
     public void RestoreState(TransferReviewDialogState state)
     {
         request = state.Request;
@@ -60,7 +64,7 @@ internal sealed class TransferReviewDialog
         if (request is not { } currentRequest)
             return;
 
-        var popup = $"Execute {currentRequest.PlanName}##RQTransferReview";
+        var popup = CaptureWindowName!;
         if (openRequested)
         {
             ImGui.SetNextWindowSize(

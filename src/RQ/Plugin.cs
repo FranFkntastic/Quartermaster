@@ -283,7 +283,12 @@ public sealed class Plugin : IDalamudPlugin
             window.BeginAgentCapturePresentation,
             window.CompleteAgentCapturePresentation,
             window.CancelAgentCapturePresentation,
-            agentBridgeViewportCapture.CaptureAsync);
+            (fullViewport, cancellationToken) => fullViewport
+                ? agentBridgeViewportCapture.CaptureAsync(true, cancellationToken)
+                : agentBridgeViewportCapture.CaptureWindowAsync(
+                    () => window.AgentCaptureWindowName,
+                    "PluginWindow",
+                    cancellationToken));
         windows.AddWindow(window);
 
         try
@@ -303,7 +308,7 @@ public sealed class Plugin : IDalamudPlugin
             commandHelp += " Use '/rq bridge on|off' to control the local development bridge.";
 #endif
             commands.AddHandler(Command, new CommandInfo((_, arguments) => HandleCommand(arguments)) { HelpMessage = commandHelp });
-            pluginInterface.UiBuilder.Draw += windows.Draw;
+            pluginInterface.UiBuilder.Draw += DrawWindows;
             pluginInterface.UiBuilder.OpenMainUi += OpenMainUi;
             framework.Update += OnFrameworkUpdate;
         }
@@ -321,6 +326,18 @@ public sealed class Plugin : IDalamudPlugin
         CharacterName = playerState.CharacterName ?? string.Empty,
         HomeWorldName = playerState.HomeWorld.IsValid ? playerState.HomeWorld.Value.Name.ToString() : string.Empty,
     };
+
+    private void DrawWindows()
+    {
+        try
+        {
+            windows.Draw();
+        }
+        finally
+        {
+            agentBridgeViewportCapture.RenderPendingWindowCapture();
+        }
+    }
 
     private IReadOnlyDictionary<uint, int> CountCachedPlayerItems() =>
         playerInventory.Snapshot(CurrentOwner(), scanner.RequestedPlayerStorageSources()).Bags
@@ -794,8 +811,9 @@ public sealed class Plugin : IDalamudPlugin
         vendorProcurement.Dispose();
         externalUiSuppression.Dispose();
         agentBridge.Dispose();
+        agentBridgeViewportCapture.Dispose();
         framework.Update -= OnFrameworkUpdate;
-        pluginInterface.UiBuilder.Draw -= windows.Draw;
+        pluginInterface.UiBuilder.Draw -= DrawWindows;
         pluginInterface.UiBuilder.OpenMainUi -= OpenMainUi;
         commands.RemoveHandler(Command);
         submissions.OperationChanged -= OnSubmittedOperationChanged;
