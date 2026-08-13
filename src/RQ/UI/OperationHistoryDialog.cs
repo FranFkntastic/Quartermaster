@@ -30,6 +30,10 @@ internal sealed class OperationHistoryDialog(OperationJournal journal)
         {
             if (!ImGui.IsPopupOpen(popup))
             {
+                ImGui.SetNextWindowPos(
+                    ImGui.GetWindowPos() + (ImGui.GetWindowSize() * 0.5f),
+                    ImGuiCond.Appearing,
+                    new Vector2(0.5f, 0.5f));
                 ImGui.SetNextWindowSize(
                     new Vector2(430, Math.Min(620, ImGui.GetMainViewport().WorkSize.Y - 80)),
                     ImGuiCond.Appearing);
