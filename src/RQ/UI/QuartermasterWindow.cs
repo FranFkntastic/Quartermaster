@@ -52,11 +52,11 @@ public sealed class QuartermasterWindow : Window
     private readonly DalamudTableProjection<TransferWorkbenchRow> transferWorkbenchTable;
     private readonly DalamudTableProjection<StowageDraftRow> stowageDraftTable;
     private readonly DalamudTableProjection<TransferReviewRow> transferReviewTable;
-    private readonly DalamudTableProjection<TransferVendorProcurementLine> vendorReviewTable;
     private readonly DalamudTableProjection<OperationLine> operationLineTable;
     private readonly BrowserQueryController queries = new();
     private readonly RootConfirmationDialog confirmationDialog = new();
     private readonly OperationHistoryDialog historyDialog;
+    private readonly VendorProcurementReviewDialog vendorReviewDialog;
     private StockWorkbenchProjection? stockWorkbenchProjection;
     private TransferWorkbenchProjection? transferWorkbenchProjection;
     private long stockSelectionRevision = -1;
@@ -111,14 +111,11 @@ public sealed class QuartermasterWindow : Window
     private bool requestDeleteItemGroup;
     private bool requestTransferReviewOpen;
     private TransferReviewRequest? transferReview;
-    private bool requestVendorReviewOpen;
-    private TransferVendorProcurementReview? vendorReview;
     private string vendorStatus = string.Empty;
     private WorkbenchView? capturePreviousView;
     private TransferReviewRequest? capturePreviousTransferReview;
     private bool capturePreviousTransferReviewOpenRequest;
-    private TransferVendorProcurementReview? capturePreviousVendorReview;
-    private bool capturePreviousVendorReviewOpenRequest;
+    private VendorProcurementReviewDialogState? capturePreviousVendorReviewState;
     private PendingTransferPlanRecovery? pendingTransferPlanRecovery;
     private ListingPlanDraft? listingPlanDraft;
     private bool requestListingPlanEditorOpen;
@@ -159,6 +156,7 @@ public sealed class QuartermasterWindow : Window
         this.saveConfiguration = saveConfiguration;
         this.reviewRegistry = reviewRegistry;
         historyDialog = new(journal);
+        vendorReviewDialog = new(vendorProcurement, reviewRegistry, () => vendorStatus = string.Empty);
         listingGroupTable = new(
         [
             new(
@@ -252,7 +250,6 @@ public sealed class QuartermasterWindow : Window
         transferWorkbenchTable = CreateTransferWorkbenchTable();
         stowageDraftTable = CreateStowageDraftTable();
         transferReviewTable = CreateTransferReviewTable();
-        vendorReviewTable = CreateVendorReviewTable();
         operationLineTable = CreateOperationLineTable();
         captureTransactions = new(
             () => IsOpen,
@@ -557,44 +554,6 @@ public sealed class QuartermasterWindow : Window
             TextColor: row => TransferActionColor(row.Line?.Action)),
     ]);
 
-    private static DalamudTableProjection<TransferVendorProcurementLine> CreateVendorReviewTable() => new(
-    [
-        new(
-            "Item",
-            1.3f,
-            line => $"{line.ItemName} {QualityLabel(line.Quality)}",
-            line => line.ItemName,
-            ImGuiTableColumnFlags.WidthStretch,
-            Draw: line =>
-            {
-                ImGui.TextUnformatted(line.ItemName);
-                ImGui.SameLine();
-                ImGui.TextDisabled(QualityLabel(line.Quality));
-            }),
-        new("Buy", 64, line => line.ApprovedQuantity.ToString("N0"), line => line.ApprovedQuantity),
-        new(
-            "Vendor",
-            1.2f,
-            line => line.SelectedCandidate?.Offer.NpcName ?? "Unavailable",
-            line => line.SelectedCandidate?.Offer.NpcName ?? string.Empty,
-            ImGuiTableColumnFlags.WidthStretch),
-        new(
-            "Unit price",
-            92,
-            line => line.SelectedCandidate is null ? "—" : $"{line.SelectedCandidate.Offer.UnitPriceGil:N0} gil",
-            line => line.SelectedCandidate?.Offer.UnitPriceGil ?? uint.MaxValue),
-        new("Maximum", 96, line => line.IsReady ? $"{line.MaximumGil:N0} gil" : "—", line => line.MaximumGil),
-        new(
-            "Status",
-            1.5f,
-            line => line.Message,
-            line => line.State.ToString(),
-            ImGuiTableColumnFlags.WidthStretch,
-            TextColor: line => line.IsReady
-                ? ImGui.GetStyle().Colors[(int)ImGuiCol.Text]
-                : new Vector4(1f, .55f, .35f, 1f)),
-    ]);
-
     private static DalamudTableProjection<OperationLine> CreateOperationLineTable() => new(
     [
         new("Item", 1f, line => line.ItemName, line => line.ItemName, ImGuiTableColumnFlags.WidthStretch),
@@ -778,8 +737,7 @@ public sealed class QuartermasterWindow : Window
         capturePreviousView = workbench.View;
         capturePreviousTransferReview = transferReview;
         capturePreviousTransferReviewOpenRequest = requestTransferReviewOpen;
-        capturePreviousVendorReview = vendorReview;
-        capturePreviousVendorReviewOpenRequest = requestVendorReviewOpen;
+        capturePreviousVendorReviewState = vendorReviewDialog.CaptureState();
         var target = ActiveCapturePresentationTarget();
         if (target == "activity")
             historyDialog.BeginCapturePresentation();
@@ -805,10 +763,9 @@ public sealed class QuartermasterWindow : Window
         requestTransferReviewOpen = capturePreviousTransferReviewOpenRequest;
         capturePreviousTransferReview = null;
         capturePreviousTransferReviewOpenRequest = false;
-        vendorReview = capturePreviousVendorReview;
-        requestVendorReviewOpen = capturePreviousVendorReviewOpenRequest;
-        capturePreviousVendorReview = null;
-        capturePreviousVendorReviewOpenRequest = false;
+        if (capturePreviousVendorReviewState is { } previousVendorReviewState)
+            vendorReviewDialog.RestoreState(previousVendorReviewState);
+        capturePreviousVendorReviewState = null;
         historyDialog.RestoreCapturePresentation();
     }
 
@@ -875,7 +832,7 @@ public sealed class QuartermasterWindow : Window
         DrawStowageEditorModal(runtime);
         DrawListingPlanEditorModal(runtime);
         DrawTransferReviewModal();
-        DrawVendorProcurementReviewModal();
+        vendorReviewDialog.Draw();
         confirmationDialog.Draw();
     }
 
@@ -3164,8 +3121,7 @@ public sealed class QuartermasterWindow : Window
         CloseRestockEditor();
         CloseStowageEditor();
         CloseListingPlanEditor();
-        vendorReview = null;
-        requestVendorReviewOpen = false;
+        vendorReviewDialog.Clear();
     }
 
     private void DrawStowageWorkspace(QuartermasterRuntimeSnapshot runtime)
@@ -3320,11 +3276,7 @@ public sealed class QuartermasterWindow : Window
             if (!canReviewVendor)
                 ImGui.BeginDisabled();
             if (ImGui.Button($"Review vendor buy ({vendor.ApprovedQuantity:N0})"))
-            {
-                vendorReview = vendor;
-                vendorStatus = string.Empty;
-                requestVendorReviewOpen = true;
-            }
+                vendorReviewDialog.Request(vendor);
             if (!canReviewVendor)
                 ImGui.EndDisabled();
             reviewRegistry.RegisterLastButton(
@@ -3338,9 +3290,7 @@ public sealed class QuartermasterWindow : Window
                     if (currentPlan is null)
                         return;
                     var currentProjection = ResolveTransferWorkbenchProjection(current, currentPlan);
-                    vendorReview = currentProjection.Vendor;
-                    vendorStatus = string.Empty;
-                    requestVendorReviewOpen = true;
+                    vendorReviewDialog.Request(currentProjection.Vendor);
                 },
                 canReviewVendor
                     ? $"{vendor.ApprovedQuantity:N0} units · maximum {vendor.MaximumGil:N0} gil"
@@ -3611,9 +3561,7 @@ public sealed class QuartermasterWindow : Window
         var plan = ResolveSelectedStowagePlan(current.State, current.Owner);
         if (plan is null)
             return;
-        vendorReview = ResolveTransferWorkbenchProjection(current, plan).Vendor;
-        vendorStatus = string.Empty;
-        requestVendorReviewOpen = true;
+        vendorReviewDialog.Request(ResolveTransferWorkbenchProjection(current, plan).Vendor);
     }
 
     private void DrawInlineTransferRoute(
@@ -5121,95 +5069,6 @@ public sealed class QuartermasterWindow : Window
         Overflow = routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
         PreferredRetainerIds = routing?.PreferredRetainerIds.ToList() ?? [],
     };
-
-    private void DrawVendorProcurementReviewModal()
-    {
-        if (vendorReview is not { } review)
-            return;
-        var popup = $"Buy vendor shortfalls for {review.PlanName}##RQVendorReview";
-        if (requestVendorReviewOpen)
-        {
-            ImGui.SetNextWindowSize(
-                new Vector2(Math.Min(900, ImGui.GetMainViewport().WorkSize.X - 80), 520),
-                ImGuiCond.Appearing);
-            ImGui.OpenPopup(popup);
-            requestVendorReviewOpen = false;
-        }
-
-        var open = true;
-        if (!ImGui.BeginPopupModal(popup, ref open, ImGuiWindowFlags.NoScrollbar))
-        {
-            if (!open)
-                vendorReview = null;
-            return;
-        }
-
-        ImGui.TextUnformatted($"{review.ApprovedQuantity:N0} units · {review.Stops.Count:N0} vendor stops · maximum {review.MaximumGil:N0} gil");
-        ImGui.TextDisabled("Only the shortage left after accessible retainer stock is approved. Live inventory, gil, capacity, shop identity, and price are checked again before purchase.");
-        ImGui.Separator();
-        if (vendorReviewTable.Begin(
-                "RQVendorReviewRows",
-                new DalamudTableLayout(
-                    new Vector2(0, Math.Max(280, ImGui.GetContentRegionAvail().Y - 56)),
-                    ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
-                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp)))
-        {
-            vendorReviewTable.DrawClippedRows(
-                review.Lines,
-                (line, _) => vendorReviewTable.DrawRow(line, id: $"vendor-review:{line.RuleId}"));
-            vendorReviewTable.End();
-        }
-
-        if (!string.IsNullOrWhiteSpace(vendorStatus))
-            ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), vendorStatus);
-        if (ImGui.Button("Back##RQVendorReview"))
-        {
-            vendorReview = null;
-            ImGui.CloseCurrentPopup();
-        }
-        var canStart = review.CanStart && !vendorProcurement.HasActiveRun;
-        ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - 150));
-        if (!canStart)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Start vendor buy"))
-        {
-            if (TryStartVendorProcurement(review, out var error))
-            {
-                ImGui.CloseCurrentPopup();
-            }
-            else
-            {
-                vendorStatus = error;
-            }
-        }
-        if (!canStart)
-            ImGui.EndDisabled();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.vendor.start",
-            "Start the reviewed ordinary-gil vendor purchase",
-            canStart,
-            () =>
-            {
-                if (vendorReview is { } current && !TryStartVendorProcurement(current, out var error))
-                    vendorStatus = error;
-            },
-            canStart ? $"Maximum {review.MaximumGil:N0} gil" : "No startable reviewed purchase");
-
-        ImGui.EndPopup();
-        if (!open)
-            vendorReview = null;
-    }
-
-    private bool TryStartVendorProcurement(TransferVendorProcurementReview review, out string error)
-    {
-        if (!vendorProcurement.TryStart(review, out error))
-            return false;
-
-        vendorStatus = string.Empty;
-        vendorReview = null;
-        requestVendorReviewOpen = false;
-        return true;
-    }
 
     private void DrawTransferReviewModal()
     {
