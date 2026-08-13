@@ -52,15 +52,14 @@ public sealed class QuartermasterWindow : Window
     private readonly ListingPlanEditor listingPlanEditor;
     private readonly ListingWorkspace listingWorkspace;
     private readonly TransferReviewDialog transferReviewDialog;
+    private readonly TransferExecutionController transferExecution;
     private readonly VendorProcurementReviewDialog vendorReviewDialog;
     private StockWorkbenchProjection? stockWorkbenchProjection;
     private TransferWorkbenchProjection? transferWorkbenchProjection;
     private long stockSelectionRevision = -1;
     private int stockProjectionBuildCount;
     private int transferProjectionBuildCount;
-    private string transferStatus = "No transfer has run.";
     private WorkbenchView? requestedView;
-    private Task? activeTransferTask;
     private bool clearAgentReviewWindowOverride;
     private int captureCollapseRestoreFramesRemaining;
     private int viewportReopenGuardFramesRemaining;
@@ -92,14 +91,10 @@ public sealed class QuartermasterWindow : Window
     private int bulkRestockNoteMode = -1;
     private bool requestRestockEditorOpen;
     private bool restockEditorVisible;
-    private string inlineTransferError = string.Empty;
-    private OwnerScope? inlineTransferErrorOwner;
-    private Guid? inlineTransferErrorPlanId;
     private string vendorStatus = string.Empty;
     private WorkbenchView? capturePreviousView;
     private TransferReviewDialogState? capturePreviousTransferReviewState;
     private VendorProcurementReviewDialogState? capturePreviousVendorReviewState;
-    private PendingTransferPlanRecovery? pendingTransferPlanRecovery;
 
     public QuartermasterWindow(
         StateRepository state,
@@ -153,12 +148,13 @@ public sealed class QuartermasterWindow : Window
             FocusStockFromListings,
             listingPlanEditor.Open,
             stockSelection.Clear);
+        transferExecution = new(state, runtimeSnapshots, journal, transfers, retainerRefresh);
         transferReviewDialog = new(
             () => runtimeSnapshots.Current,
             ResolveTransferWorkbenchProjection,
             () => transfers.CanStart,
             () => retainerRefresh.IsRefreshing || retainerRefresh.IsQueued,
-            planId => ExecuteTransferPlan(planId),
+            planId => transferExecution.ExecutePlan(planId),
             reviewRegistry);
         vendorReviewDialog = new(vendorProcurement, reviewRegistry, () => vendorStatus = string.Empty);
         stockTable = CreateStockTable();
@@ -1069,7 +1065,7 @@ public sealed class QuartermasterWindow : Window
                 retainerRefresh.Retry();
             ImGui.SameLine();
             if (ImGui.SmallButton("Dismiss##RetainerRefreshRecovery"))
-                DismissRetainerRefreshRecovery();
+                retainerRefresh.DismissRecovery();
         }
         if (retainerRefresh.IsRefreshing || retainerRefresh.HasRecovery ||
             retainerRefresh.Results.Any(result => result.Outcome == "NotAccessible"))
@@ -1256,11 +1252,11 @@ public sealed class QuartermasterWindow : Window
                 ListingPlanCatalog.Link(document, runtime.Owner, transferPlan.Id, listingPlan.Id, demand.ItemId, demand.Quality);
                 return transferPlan.Id;
             });
-            inlineTransferError = string.Empty;
+            transferExecution.ClearInlineError();
         }
         catch (Exception exception)
         {
-            inlineTransferError = exception.Message;
+            transferExecution.ReportInlineError(exception.Message);
         }
     }
 
@@ -1338,11 +1334,11 @@ public sealed class QuartermasterWindow : Window
                 }
                 return StowagePlanCatalog.Apply(document, runtime.Owner, draft).Id;
             });
-            inlineTransferError = string.Empty;
+            transferExecution.ClearInlineError();
         }
         catch (Exception exception)
         {
-            inlineTransferError = exception.Message;
+            transferExecution.ReportInlineError(exception.Message);
         }
     }
 
@@ -1467,12 +1463,12 @@ public sealed class QuartermasterWindow : Window
         if (ImGui.Button($"Retrieve missing ({evaluation.NeededQuantity:N0})"))
         {
             var operation = journal.CreateRestock(owner, selected);
-            StartTransfer(transfers.ExecuteRetrievalAsync(operation.OperationId));
+            transferExecution.Start(transfers.ExecuteRetrievalAsync(operation.OperationId));
         }
         if (!canExecute)
             ImGui.EndDisabled();
         ImGui.SameLine();
-        ImGui.TextDisabled(transferStatus);
+        ImGui.TextDisabled(transferExecution.Status);
 
         var lines = evaluation.Lines.ToDictionary(line => line.PlanItemId);
         var rows = selected.Items
@@ -1946,11 +1942,11 @@ public sealed class QuartermasterWindow : Window
                 row.ListingLink.ListingPlanId,
                 row.ListingLink.ItemId,
                 row.ListingLink.Quality));
-            inlineTransferError = string.Empty;
+            transferExecution.ClearInlineError();
         }
         catch (Exception exception)
         {
-            inlineTransferError = exception.Message;
+            transferExecution.ReportInlineError(exception.Message);
         }
     }
 
@@ -2029,7 +2025,7 @@ public sealed class QuartermasterWindow : Window
 
     private static string StowageDraftOutcome(StowageDraftRow row)
     {
-        var player = PlayerQuantity(row.Runtime.Browser, row.Rule);
+        var player = TransferPlanEvaluation.PlayerQuantity(row.Runtime.Browser, row.Rule);
         return !row.Rule.Enabled
             ? "Off"
             : player < row.Rule.TargetQuantity
@@ -2274,13 +2270,13 @@ public sealed class QuartermasterWindow : Window
         selected = ResolveSelectedStowagePlan(runtime.State, owner);
         if (selected is null)
         {
-            ClearInlineTransferErrorContext();
+            transferExecution.ClearInlineErrorContext();
             ImGui.Spacing();
             ImGui.TextUnformatted("No Transfer Plans yet.");
             ImGui.TextDisabled("Create one, then select stock on the left or add items by name.");
             return;
         }
-        EnsureInlineTransferErrorContext(owner, selected.Id);
+        transferExecution.EnsureInlineErrorContext(owner, selected.Id);
 
         var projection = ResolveTransferWorkbenchProjection(runtime, selected);
         var ownerRules = projection.Rules;
@@ -2388,8 +2384,8 @@ public sealed class QuartermasterWindow : Window
         var planProgress = hasCurrentRecovery && retainerRefresh.IsRefreshing
             ? retainerRefresh.Status
             : string.Empty;
-        var planNotice = !string.IsNullOrWhiteSpace(inlineTransferError)
-            ? inlineTransferError
+        var planNotice = !string.IsNullOrWhiteSpace(transferExecution.InlineError)
+            ? transferExecution.InlineError
             : hasCurrentRecovery && !string.IsNullOrWhiteSpace(recovery!.FailureMessage)
                 ? recovery.FailureMessage
                 : hasCurrentRecovery && !retainerRefresh.IsRefreshing
@@ -2538,14 +2534,14 @@ public sealed class QuartermasterWindow : Window
         else if (hasCurrentRecovery)
         {
             if (ImGui.Button("Retry plan##TransferPlanRecovery"))
-                RetryTransferPlanRecovery(plan);
+                transferExecution.RetryRecovery(plan);
             ImGui.SameLine();
             if (ImGui.Button("Dismiss##TransferPlanRecovery"))
-                DismissTransferPlanRecovery();
+                transferExecution.DismissRecovery();
         }
         else if (ImGui.Button("Dismiss##TransferPlanNotice"))
         {
-            inlineTransferError = string.Empty;
+            transferExecution.ClearInlineError();
         }
         ImGui.EndTable();
     }
@@ -2574,7 +2570,7 @@ public sealed class QuartermasterWindow : Window
             plan.Id);
         var retrieval = BuildTransferRetrievalEvaluation(runtime, effectiveRules);
         var vendor = vendorProcurement.BuildReview(runtime, plan, effectiveRules, retrieval);
-        var deposit = BuildSurplusBatch(runtime, stowage);
+        var deposit = TransferPlanEvaluation.BuildSurplusBatch(runtime, stowage);
         var evaluated = stowage?.Lines.ToDictionary(line => line.RuleId) ?? [];
         var retrievalLines = retrieval.Lines.ToDictionary(line => line.PlanItemId);
         var vendorLines = vendor.Lines.ToDictionary(line => line.RuleId);
@@ -2720,11 +2716,11 @@ public sealed class QuartermasterWindow : Window
                 update(draftRule);
                 return StowagePlanCatalog.Apply(document, owner, draft).Id;
             });
-            inlineTransferError = string.Empty;
+            transferExecution.ClearInlineError();
         }
         catch (Exception exception)
         {
-            inlineTransferError = exception.Message;
+            transferExecution.ReportInlineError(exception.Message);
         }
     }
 
@@ -2738,11 +2734,11 @@ public sealed class QuartermasterWindow : Window
                 draft.Rules.RemoveAll(rule => rule.Id == ruleId);
                 return StowagePlanCatalog.Apply(document, owner, draft).Id;
             });
-            inlineTransferError = string.Empty;
+            transferExecution.ClearInlineError();
         }
         catch (Exception exception)
         {
-            inlineTransferError = exception.Message;
+            transferExecution.ReportInlineError(exception.Message);
         }
     }
 
@@ -3229,218 +3225,6 @@ public sealed class QuartermasterWindow : Window
         _ => "Any quality",
     };
 
-    private StowageDepositBatch BuildSurplusBatch(
-        QuartermasterRuntimeSnapshot runtime,
-        StowageEvaluation? evaluation)
-    {
-        if (evaluation is null)
-            return new(runtime.CapturedAtUtc, []);
-        var requests = new List<StowageDepositRequest>();
-        foreach (var line in evaluation.Lines.Where(line => line.DepositQuantity > 0))
-        {
-            var stock = runtime.Browser.Items.FirstOrDefault(item => item.ItemId == line.ItemId);
-            var nq = stock?.Stacks.Where(stack =>
-                    stack.ScopeKind == BrowserScopeKind.Player &&
-                    stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.NQ)
-                .Sum(stack => stack.Quantity) ?? 0;
-            var hq = stock?.Stacks.Where(stack =>
-                    stack.ScopeKind == BrowserScopeKind.Player &&
-                    stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ)
-                .Sum(stack => stack.Quantity) ?? 0;
-            var remaining = line.DepositQuantity;
-            if (line.Quality != ItemQualityPolicy.HqOnly)
-            {
-                var quantity = Math.Min(remaining, nq);
-                if (quantity > 0)
-                    requests.Add(new(line.PlanId, line.RuleId, line.ItemId, line.ItemName, false, quantity, CopyRouting(line.Routing)));
-                remaining -= quantity;
-            }
-            if (line.Quality != ItemQualityPolicy.NqOnly)
-            {
-                var quantity = Math.Min(remaining, hq);
-                if (quantity > 0)
-                    requests.Add(new(line.PlanId, line.RuleId, line.ItemId, line.ItemName, true, quantity, CopyRouting(line.Routing)));
-            }
-        }
-        return StowageRouter.BuildBatch(
-            requests,
-            runtime.Retainers,
-            runtime.Owner,
-            itemId => ResolveMaxStack(runtime.Browser, itemId),
-            runtime.CapturedAtUtc);
-    }
-
-    private static int ResolveMaxStack(BrowserProjection browser, uint itemId) =>
-        checked((int)Math.Clamp(browser.Items.FirstOrDefault(item => item.ItemId == itemId)?.Definition?.MaxStackSize ?? 999, 1, int.MaxValue));
-
-    private static int PlayerQuantity(BrowserProjection browser, TargetPlanItem rule) =>
-        browser.Items.FirstOrDefault(item => item.ItemId == rule.ItemId)?.Stacks
-            .Where(stack =>
-                stack.ScopeKind == BrowserScopeKind.Player &&
-                (rule.Quality == ItemQualityPolicy.Any ||
-                 rule.Quality == ItemQualityPolicy.HqOnly &&
-                 stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ ||
-                 rule.Quality == ItemQualityPolicy.NqOnly &&
-                 stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.NQ))
-            .Sum(stack => stack.Quantity) ?? 0;
-
-    private static StowageRoutingPolicy CopyRouting(StowageRoutingPolicy? routing) => new()
-    {
-        Mode = routing?.Mode ?? StowageRoutingMode.ConsolidateFirst,
-        Overflow = routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
-        PreferredRetainerIds = routing?.PreferredRetainerIds.ToList() ?? [],
-    };
-
-    private void ExecuteTransferPlan(Guid planId, bool allowCapacityRecovery = true)
-    {
-        var current = runtimeSnapshots.Current;
-        var plan = current.State.StowagePlans.FirstOrDefault(candidate =>
-            candidate.Id == planId && candidate.Owner.Matches(current.Owner));
-        if (plan is null)
-            return;
-        var rules = current.State.PlanItems
-            .Where(rule => rule.StowagePlanId == plan.Id)
-            .ToArray();
-        if (ListingPlanEvaluator.HasUnknownLinkedDemand(current.State, current.Browser, current.Owner, plan.Id))
-        {
-            if (allowCapacityRecovery && retainerRefresh.StartForPlan(out var refreshRunId))
-            {
-                PersistTransferPlanRecovery(plan, refreshRunId);
-                pendingTransferPlanRecovery = new(planId, refreshRunId);
-                transferStatus = "Verifying listing demand before executing the plan.";
-                return;
-            }
-            inlineTransferError = retainerRefresh.Status.Length == 0
-                ? "Listing demand could not be verified."
-                : retainerRefresh.Status;
-            transferStatus = inlineTransferError;
-            return;
-        }
-        rules = ListingPlanEvaluator.ComposeRules(current.State, current.Browser, current.Owner, plan.Id).ToArray();
-        var currentStowage = StowageEvaluator.BuildPlan(
-            current.State,
-            current.Browser,
-            current.Owner,
-            plan.Id);
-        var currentRetrieval = BuildTransferRetrievalEvaluation(current, rules);
-        var currentBatch = BuildSurplusBatch(current, currentStowage);
-        if (allowCapacityRecovery && TransferExecutionPolicy.RequiresCapacityRecovery(currentBatch))
-        {
-            if (retainerRefresh.StartForPlan(out var refreshRunId))
-            {
-                PersistTransferPlanRecovery(plan, refreshRunId);
-                pendingTransferPlanRecovery = new(planId, refreshRunId);
-                transferStatus = "Refreshing retainer capacity before executing the plan.";
-                return;
-            }
-            inlineTransferError = retainerRefresh.Status;
-            return;
-        }
-        if (!allowCapacityRecovery && currentBatch.RequestedQuantity > 0 && currentBatch.PlannedQuantity == 0)
-        {
-            inlineTransferError = "No owner retainer has capacity for the items to stow.";
-            transferStatus = inlineTransferError;
-            return;
-        }
-        var retrievalOperationId = currentRetrieval.NeededQuantity > 0
-            ? journal.CreateTransferRetrieval(current.Owner, plan, rules).OperationId
-            : null;
-        var depositOperationId = currentBatch.PlannedQuantity > 0
-            ? journal.CreateTransferDeposit(current.Owner, plan, currentBatch).OperationId
-            : null;
-        StartTransfer(transfers.ExecutePlanAsync(retrievalOperationId, depositOperationId));
-    }
-
-    public void Tick()
-    {
-        if (pendingTransferPlanRecovery is not { } pending ||
-            !string.Equals(retainerRefresh.LastCompletedRunId, pending.RefreshRunId, StringComparison.Ordinal))
-            return;
-        pendingTransferPlanRecovery = null;
-        if (retainerRefresh.LastRunSucceeded != true)
-        {
-            inlineTransferError = retainerRefresh.Status;
-            transferStatus = retainerRefresh.Status;
-            state.Mutate(StateChangeKind.Recovery, document =>
-            {
-                if (document.TransferPlanRecovery is { } recovery &&
-                    recovery.PlanId == pending.PlanId &&
-                    string.Equals(recovery.RefreshRunId, pending.RefreshRunId, StringComparison.Ordinal))
-                    recovery.FailureMessage = retainerRefresh.Status;
-            });
-            return;
-        }
-        var currentState = state.Snapshot();
-        var recovery = currentState.TransferPlanRecovery;
-        var currentPlan = currentState.StowagePlans.FirstOrDefault(plan =>
-            plan.Id == pending.PlanId && plan.Owner.Matches(runtimeSnapshots.Current.Owner));
-        if (recovery is null || currentPlan is null ||
-            recovery.PlanId != currentPlan.Id ||
-            recovery.PlanRevision != currentPlan.Revision ||
-            !string.Equals(recovery.RefreshRunId, pending.RefreshRunId, StringComparison.Ordinal))
-        {
-            state.Mutate(StateChangeKind.Recovery, document => document.TransferPlanRecovery = null);
-            inlineTransferError = currentPlan is null
-                ? "The pending Transfer Plan no longer exists."
-                : "The Transfer Plan changed while evidence was refreshed; run the current plan when ready.";
-            transferStatus = inlineTransferError;
-            return;
-        }
-        state.Mutate(StateChangeKind.Recovery, document => document.TransferPlanRecovery = null);
-        ExecuteTransferPlan(pending.PlanId, false);
-    }
-
-    private void PersistTransferPlanRecovery(StowagePlan plan, string refreshRunId) =>
-        state.Mutate(StateChangeKind.Recovery, document => document.TransferPlanRecovery = new()
-        {
-            Owner = runtimeSnapshots.Current.Owner with { },
-            PlanId = plan.Id,
-            PlanRevision = plan.Revision,
-            RefreshRunId = refreshRunId,
-            RequestedAtUtc = DateTime.UtcNow,
-        });
-
-    private void DismissRetainerRefreshRecovery()
-    {
-        retainerRefresh.DismissRecovery();
-    }
-
-    private void RetryTransferPlanRecovery(StowagePlan plan)
-    {
-        if (!retainerRefresh.StartForPlan(out var refreshRunId))
-        {
-            inlineTransferError = retainerRefresh.Status;
-            return;
-        }
-        PersistTransferPlanRecovery(plan, refreshRunId);
-        pendingTransferPlanRecovery = new(plan.Id, refreshRunId);
-        inlineTransferError = string.Empty;
-        transferStatus = "Refreshing retainer evidence before retrying the plan.";
-    }
-
-    private void DismissTransferPlanRecovery()
-    {
-        pendingTransferPlanRecovery = null;
-        state.Mutate(StateChangeKind.Recovery, document => document.TransferPlanRecovery = null);
-        inlineTransferError = string.Empty;
-    }
-
-    private void EnsureInlineTransferErrorContext(OwnerScope owner, Guid planId)
-    {
-        if (inlineTransferErrorPlanId == planId && inlineTransferErrorOwner?.Matches(owner) == true)
-            return;
-        inlineTransferError = string.Empty;
-        inlineTransferErrorOwner = owner with { };
-        inlineTransferErrorPlanId = planId;
-    }
-
-    private void ClearInlineTransferErrorContext()
-    {
-        inlineTransferError = string.Empty;
-        inlineTransferErrorOwner = null;
-        inlineTransferErrorPlanId = null;
-    }
-
     private void DrawOperation(OwnerScope owner)
     {
         var operation = journal.Current(owner);
@@ -3459,7 +3243,7 @@ public sealed class QuartermasterWindow : Window
             if (!canExecute)
                 ImGui.BeginDisabled();
             if (ImGui.Button($"Execute this operation##{operation.OperationId}"))
-                StartTransfer(operation.Kind == OperationKinds.Retrieval
+                transferExecution.Start(operation.Kind == OperationKinds.Retrieval
                     ? transfers.ExecuteRetrievalAsync(operation.OperationId)
                     : transfers.ExecuteDepositAsync(operation.OperationId));
             if (!canExecute)
@@ -3529,47 +3313,11 @@ public sealed class QuartermasterWindow : Window
             runtime.Browser);
     }
 
-    private void StartTransfer(Task<TransferExecutionResult> transfer) => _ = ObserveTransferAsync(transfer);
+    public void Tick() => transferExecution.Tick();
 
-    private async Task ObserveTransferAsync(Task<TransferExecutionResult> transfer)
-    {
-        activeTransferTask = transfer;
-        try
-        {
-            var result = await transfer;
-            transferStatus = result.Message;
-        }
-        catch (Exception exception)
-        {
-            transferStatus = $"Transfer failed: {exception.Message}";
-        }
-        finally
-        {
-            if (ReferenceEquals(activeTransferTask, transfer))
-                activeTransferTask = null;
-        }
-    }
+    public void CancelActiveTransfer() => transferExecution.CancelActive();
 
-    public void CancelActiveTransfer()
-    {
-        if (activeTransferTask is not null || transfers.IsRunning)
-        {
-            try { transfers.CancelActive(); }
-            catch { }
-        }
-    }
-
-    public bool CancelAndWaitForActiveTransfer(TimeSpan timeout)
-    {
-        var task = Volatile.Read(ref activeTransferTask);
-        if (task is null && !transfers.IsRunning)
-            return true;
-        try { transfers.CancelActive(); }
-        catch { }
-        if (task is null)
-            return !transfers.IsRunning;
-        try { return task.Wait(timeout); }
-        catch (AggregateException exception) when (exception.InnerExceptions.All(inner => inner is OperationCanceledException)) { return true; }
-    }
+    public bool CancelAndWaitForActiveTransfer(TimeSpan timeout) =>
+        transferExecution.CancelAndWait(timeout);
 
 }
