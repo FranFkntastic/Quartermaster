@@ -51,11 +51,11 @@ public sealed class QuartermasterWindow : Window
     private readonly DalamudTableProjection<RestockPlanItem> restockDraftTable;
     private readonly DalamudTableProjection<TransferWorkbenchRow> transferWorkbenchTable;
     private readonly DalamudTableProjection<StowageDraftRow> stowageDraftTable;
-    private readonly DalamudTableProjection<TransferReviewRow> transferReviewTable;
     private readonly DalamudTableProjection<OperationLine> operationLineTable;
     private readonly BrowserQueryController queries = new();
     private readonly RootConfirmationDialog confirmationDialog = new();
     private readonly OperationHistoryDialog historyDialog;
+    private readonly TransferReviewDialog transferReviewDialog;
     private readonly VendorProcurementReviewDialog vendorReviewDialog;
     private StockWorkbenchProjection? stockWorkbenchProjection;
     private TransferWorkbenchProjection? transferWorkbenchProjection;
@@ -109,12 +109,9 @@ public sealed class QuartermasterWindow : Window
     private Guid? inlineTransferErrorPlanId;
     private string itemGroupWorkspaceStatus = string.Empty;
     private bool requestDeleteItemGroup;
-    private bool requestTransferReviewOpen;
-    private TransferReviewRequest? transferReview;
     private string vendorStatus = string.Empty;
     private WorkbenchView? capturePreviousView;
-    private TransferReviewRequest? capturePreviousTransferReview;
-    private bool capturePreviousTransferReviewOpenRequest;
+    private TransferReviewDialogState? capturePreviousTransferReviewState;
     private VendorProcurementReviewDialogState? capturePreviousVendorReviewState;
     private PendingTransferPlanRecovery? pendingTransferPlanRecovery;
     private ListingPlanDraft? listingPlanDraft;
@@ -156,6 +153,13 @@ public sealed class QuartermasterWindow : Window
         this.saveConfiguration = saveConfiguration;
         this.reviewRegistry = reviewRegistry;
         historyDialog = new(journal);
+        transferReviewDialog = new(
+            () => runtimeSnapshots.Current,
+            ResolveTransferWorkbenchProjection,
+            () => transfers.CanStart,
+            () => retainerRefresh.IsRefreshing || retainerRefresh.IsQueued,
+            planId => ExecuteTransferPlan(planId),
+            reviewRegistry);
         vendorReviewDialog = new(vendorProcurement, reviewRegistry, () => vendorStatus = string.Empty);
         listingGroupTable = new(
         [
@@ -249,7 +253,6 @@ public sealed class QuartermasterWindow : Window
         restockDraftTable = CreateRestockDraftTable();
         transferWorkbenchTable = CreateTransferWorkbenchTable();
         stowageDraftTable = CreateStowageDraftTable();
-        transferReviewTable = CreateTransferReviewTable();
         operationLineTable = CreateOperationLineTable();
         captureTransactions = new(
             () => IsOpen,
@@ -322,7 +325,7 @@ public sealed class QuartermasterWindow : Window
             ImGuiTableColumnFlags.WidthStretch,
             TextColor: row => row.Rule is null
                 ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
-                : TransferActionColor(row.Line?.Action),
+                : TransferPresentation.ActionColor(row.Line?.Action),
             DrawContextMenu: DrawStockRowContextMenu,
             Id: "plan-state"),
     ]);
@@ -477,8 +480,8 @@ public sealed class QuartermasterWindow : Window
         new(
             "Route",
             1.1f,
-            row => RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Owner),
-            row => RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Owner),
+            row => TransferPresentation.RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Owner),
+            row => TransferPresentation.RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Owner),
             ImGuiTableColumnFlags.WidthStretch,
             Draw: row => DrawInlineTransferRoute(row.Owner, row.PlanId, row.Rule, row.Runtime),
             Id: "route"),
@@ -522,36 +525,12 @@ public sealed class QuartermasterWindow : Window
         new(
             "Destination",
             1.1f,
-            row => RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner),
-            row => RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner),
+            row => TransferPresentation.RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner),
+            row => TransferPresentation.RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner),
             ImGuiTableColumnFlags.WidthStretch,
             Draw: row => DrawStowageRouteCombo(row.Rule, row.Runtime)),
-        new("Overflow", 112, row => OverflowLabel(row.Rule.Routing.Overflow), Draw: row => DrawStowageOverflowCombo(row.Rule)),
+        new("Overflow", 112, row => TransferPresentation.OverflowLabel(row.Rule.Routing.Overflow), Draw: row => DrawStowageOverflowCombo(row.Rule)),
         new("", 28, _ => string.Empty, Draw: DrawStowageDraftRemove),
-    ]);
-
-    private DalamudTableProjection<TransferReviewRow> CreateTransferReviewTable() => new(
-    [
-        new(
-            "Item",
-            1.3f,
-            row => row.Rule.ItemName,
-            row => row.Rule.ItemName,
-            ImGuiTableColumnFlags.WidthStretch),
-        new("Player / target", 120, row => row.ListingContribution.IsKnown ? $"{row.PlayerQuantity:N0} / {row.Line?.DesiredPlayerQuantity ?? row.Rule.TargetQuantity:N0}" : $"{row.PlayerQuantity:N0} / —"),
-        new(
-            "Diff",
-            72,
-            row => row.ListingContribution.IsKnown ? SignedQuantity(row.Difference) : "—",
-            row => row.Difference,
-            TextColor: row => TransferActionColor(row.Line?.Action)),
-        new(
-            "Planned movement",
-            1.2f,
-            TransferReviewOutcome,
-            row => TransferReviewOutcome(row),
-            ImGuiTableColumnFlags.WidthStretch,
-            TextColor: row => TransferActionColor(row.Line?.Action)),
     ]);
 
     private static DalamudTableProjection<OperationLine> CreateOperationLineTable() => new(
@@ -735,8 +714,7 @@ public sealed class QuartermasterWindow : Window
     private void BeginCapturePresentation()
     {
         capturePreviousView = workbench.View;
-        capturePreviousTransferReview = transferReview;
-        capturePreviousTransferReviewOpenRequest = requestTransferReviewOpen;
+        capturePreviousTransferReviewState = transferReviewDialog.CaptureState();
         capturePreviousVendorReviewState = vendorReviewDialog.CaptureState();
         var target = ActiveCapturePresentationTarget();
         if (target == "activity")
@@ -759,10 +737,9 @@ public sealed class QuartermasterWindow : Window
         if (capturePreviousView is { } previous)
             requestedView = previous;
         capturePreviousView = null;
-        transferReview = capturePreviousTransferReview;
-        requestTransferReviewOpen = capturePreviousTransferReviewOpenRequest;
-        capturePreviousTransferReview = null;
-        capturePreviousTransferReviewOpenRequest = false;
+        if (capturePreviousTransferReviewState is { } previousTransferReviewState)
+            transferReviewDialog.RestoreState(previousTransferReviewState);
+        capturePreviousTransferReviewState = null;
         if (capturePreviousVendorReviewState is { } previousVendorReviewState)
             vendorReviewDialog.RestoreState(previousVendorReviewState);
         capturePreviousVendorReviewState = null;
@@ -831,7 +808,7 @@ public sealed class QuartermasterWindow : Window
         }
         DrawStowageEditorModal(runtime);
         DrawListingPlanEditorModal(runtime);
-        DrawTransferReviewModal();
+        transferReviewDialog.Draw();
         vendorReviewDialog.Draw();
         confirmationDialog.Draw();
     }
@@ -1508,13 +1485,6 @@ public sealed class QuartermasterWindow : Window
             inlineTransferError = exception.Message;
         }
     }
-
-    private static Vector4 TransferActionColor(StowageAction? action) => action switch
-    {
-        StowageAction.Retrieve => new Vector4(.52f, .79f, .94f, 1f),
-        StowageAction.Deposit => new Vector4(.53f, .83f, .64f, 1f),
-        _ => new Vector4(.69f, .74f, .77f, 1f),
-    };
 
     private void DrawRestockPlan(QuartermasterRuntimeSnapshot runtime)
     {
@@ -2785,11 +2755,6 @@ public sealed class QuartermasterWindow : Window
             activeRestockItemId = restockDraft?.Items.FirstOrDefault()?.Id;
     }
 
-    private static string SignedQuantity(int quantity) =>
-        quantity > 0
-            ? $"+{quantity:N0}"
-            : quantity.ToString("N0", CultureInfo.CurrentCulture);
-
     private static string TransferTargetText(TransferWorkbenchRow row) =>
         TransferWorkbenchPresentation.Target(
             row.Line?.DesiredPlayerQuantity ?? row.Rule.TargetQuantity,
@@ -2812,8 +2777,8 @@ public sealed class QuartermasterWindow : Window
             ImGui.TextColored(new Vector4(1f, .7f, .3f, 1f), "(+?)");
         else
             ImGui.TextColored(
-                TransferActionColor(row.Line?.Action),
-                $"({SignedQuantity(row.Difference)})");
+                TransferPresentation.ActionColor(row.Line?.Action),
+                $"({TransferPresentation.SignedQuantity(row.Difference)})");
         if (targetHovered || ImGui.IsItemHovered())
             ImGui.SetTooltip(row.ListingContribution.IsKnown
                 ? $"Target {row.Rule.TargetQuantity + listingShortfall:N0}: independent {row.Rule.TargetQuantity:N0} + Listing Plan {listingShortfall:N0}; current player stock {row.PlayerQuantity:N0}."
@@ -2882,7 +2847,7 @@ public sealed class QuartermasterWindow : Window
             ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
             : !row.ListingContribution.IsKnown
                 ? new Vector4(1f, .7f, .3f, 1f)
-                : TransferActionColor(row.Line?.Action);
+                : TransferPresentation.ActionColor(row.Line?.Action);
         ImGui.TextColored(primaryColor, outcome.Primary);
         if (string.IsNullOrWhiteSpace(outcome.Constraint))
             return;
@@ -2948,16 +2913,6 @@ public sealed class QuartermasterWindow : Window
         if (activeStowageRuleId == row.Rule.Id)
             activeStowageRuleId = stowageDraft?.Rules.FirstOrDefault()?.Id;
     }
-
-    private static string TransferReviewOutcome(TransferReviewRow row) =>
-        !row.ListingContribution.IsKnown
-            ? "Verify listing demand"
-            : row.Line?.Action switch
-        {
-            StowageAction.Retrieve => $"Retrieve {row.Line.RetrieveQuantity:N0}",
-            StowageAction.Deposit => $"Stow {row.Line.DepositQuantity:N0} · {RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner)}",
-            _ => "On target · skip",
-        };
 
     private static void DrawRestockDraftQuality(RestockPlanItem item)
     {
@@ -3121,6 +3076,7 @@ public sealed class QuartermasterWindow : Window
         CloseRestockEditor();
         CloseStowageEditor();
         CloseListingPlanEditor();
+        transferReviewDialog.Clear();
         vendorReviewDialog.Clear();
     }
 
@@ -3208,10 +3164,7 @@ public sealed class QuartermasterWindow : Window
         if (!canExecute)
             ImGui.BeginDisabled();
         if (ImGui.Button("Execute plan"))
-        {
-            transferReview = new(selected.Id, selected.Name);
-            requestTransferReviewOpen = true;
-        }
+            transferReviewDialog.Request(selected.Id, selected.Name);
         if (!canExecute)
             ImGui.EndDisabled();
         reviewRegistry.RegisterLastButton(
@@ -3223,10 +3176,7 @@ public sealed class QuartermasterWindow : Window
                 var current = runtimeSnapshots.Current;
                 var currentPlan = ResolveSelectedStowagePlan(current.State, current.Owner);
                 if (currentPlan is not null)
-                {
-                    transferReview = new(currentPlan.Id, currentPlan.Name);
-                    requestTransferReviewOpen = true;
-                }
+                    transferReviewDialog.Request(currentPlan.Id, currentPlan.Name);
             },
             canExecute
                 ? projection.HasUnknownListingDemand ? "Listing demand will be verified first" : $"{movements:N0} movements"
@@ -3551,8 +3501,7 @@ public sealed class QuartermasterWindow : Window
         var plan = ResolveSelectedStowagePlan(current.State, current.Owner);
         if (plan is null)
             return;
-        transferReview = new(plan.Id, plan.Name);
-        requestTransferReviewOpen = true;
+        transferReviewDialog.Request(plan.Id, plan.Name);
     }
 
     private void RequestSelectedVendorReview()
@@ -3573,13 +3522,13 @@ public sealed class QuartermasterWindow : Window
         ImGui.SetNextItemWidth(-1);
         if (!ImGui.BeginCombo(
                 $"##inline-route:{rule.Id}",
-                RouteSummary(rule.Routing, runtime.Retainers, owner)))
+                TransferPresentation.RouteSummary(rule.Routing, runtime.Retainers, owner)))
             return;
 
         ImGui.TextDisabled("Placement");
         foreach (var mode in Enum.GetValues<StowageRoutingMode>())
         {
-            if (ImGui.Selectable(RoutingModeLabel(mode), rule.Routing.Mode == mode))
+            if (ImGui.Selectable(TransferPresentation.RoutingModeLabel(mode), rule.Routing.Mode == mode))
                 UpdateTransferRule(owner, planId, rule.Id, draftRule =>
                     draftRule.Routing.Mode = mode);
         }
@@ -3588,7 +3537,7 @@ public sealed class QuartermasterWindow : Window
         ImGui.TextDisabled("Fallback");
         foreach (var overflow in Enum.GetValues<StowageOverflowPolicy>())
         {
-            if (ImGui.Selectable(OverflowLabel(overflow), rule.Routing.Overflow == overflow))
+            if (ImGui.Selectable(TransferPresentation.OverflowLabel(overflow), rule.Routing.Overflow == overflow))
                 UpdateTransferRule(owner, planId, rule.Id, draftRule =>
                     draftRule.Routing.Overflow = overflow);
         }
@@ -3893,11 +3842,11 @@ public sealed class QuartermasterWindow : Window
         ImGui.SameLine();
         ImGui.TextDisabled("Destination");
         ImGui.SameLine();
-        DrawOptionalEnumCombo("##stowagebulkdestination", ref bulkRoutingMode, Enum.GetValues<StowageRoutingMode>(), RoutingModeLabel);
+        DrawOptionalEnumCombo("##stowagebulkdestination", ref bulkRoutingMode, Enum.GetValues<StowageRoutingMode>(), TransferPresentation.RoutingModeLabel);
         ImGui.SameLine();
         ImGui.TextDisabled("Overflow");
         ImGui.SameLine();
-        DrawOptionalEnumCombo("##stowagebulkoverflow", ref bulkOverflow, Enum.GetValues<StowageOverflowPolicy>(), OverflowLabel);
+        DrawOptionalEnumCombo("##stowagebulkoverflow", ref bulkOverflow, Enum.GetValues<StowageOverflowPolicy>(), TransferPresentation.OverflowLabel);
         ImGui.SameLine();
         var canApply = selectedStowageRuleIds.Count > 0 &&
                        (bulkStowageTarget >= 0 || bulkQuality >= 0 || bulkRoutingMode >= 0 || bulkOverflow >= 0);
@@ -4033,12 +3982,12 @@ public sealed class QuartermasterWindow : Window
         ImGui.SetNextItemWidth(-1);
         if (!ImGui.BeginCombo(
                 $"##draftdestination{rule.Id}",
-                RouteSummary(rule.Routing, runtime.Retainers, runtime.Owner)))
+                TransferPresentation.RouteSummary(rule.Routing, runtime.Retainers, runtime.Owner)))
             return;
 
         ImGui.TextDisabled("Placement");
         foreach (var mode in Enum.GetValues<StowageRoutingMode>())
-            if (ImGui.Selectable(RoutingModeLabel(mode), rule.Routing.Mode == mode))
+            if (ImGui.Selectable(TransferPresentation.RoutingModeLabel(mode), rule.Routing.Mode == mode))
                 rule.Routing.Mode = mode;
 
         ImGui.Separator();
@@ -4095,10 +4044,10 @@ public sealed class QuartermasterWindow : Window
     private static void DrawStowageOverflowCombo(TargetPlanItem rule)
     {
         ImGui.SetNextItemWidth(-1);
-        if (!ImGui.BeginCombo($"##draftoverflow{rule.Id}", OverflowLabel(rule.Routing.Overflow)))
+        if (!ImGui.BeginCombo($"##draftoverflow{rule.Id}", TransferPresentation.OverflowLabel(rule.Routing.Overflow)))
             return;
         foreach (var overflow in Enum.GetValues<StowageOverflowPolicy>())
-            if (ImGui.Selectable(OverflowLabel(overflow), rule.Routing.Overflow == overflow))
+            if (ImGui.Selectable(TransferPresentation.OverflowLabel(overflow), rule.Routing.Overflow == overflow))
                 rule.Routing.Overflow = overflow;
         ImGui.EndCombo();
     }
@@ -5070,131 +5019,6 @@ public sealed class QuartermasterWindow : Window
         PreferredRetainerIds = routing?.PreferredRetainerIds.ToList() ?? [],
     };
 
-    private void DrawTransferReviewModal()
-    {
-        if (transferReview is not { } review)
-            return;
-        var popup = $"Execute {review.PlanName}##RQTransferReview";
-        if (requestTransferReviewOpen)
-        {
-            ImGui.SetNextWindowSize(
-                new Vector2(Math.Min(860, ImGui.GetMainViewport().WorkSize.X - 80), 520),
-                ImGuiCond.Appearing);
-            ImGui.OpenPopup(popup);
-            requestTransferReviewOpen = false;
-        }
-
-        var open = true;
-        if (!ImGui.BeginPopupModal(popup, ref open, ImGuiWindowFlags.NoScrollbar))
-        {
-            if (!open)
-                transferReview = null;
-            return;
-        }
-
-        var runtime = runtimeSnapshots.Current;
-        var plan = runtime.State.StowagePlans.FirstOrDefault(candidate =>
-            candidate.Id == review.PlanId && candidate.Owner.Matches(runtime.Owner));
-        if (plan is null)
-        {
-            ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), "This Transfer Plan no longer exists.");
-            if (ImGui.Button("Close"))
-            {
-                transferReview = null;
-                ImGui.CloseCurrentPopup();
-            }
-            ImGui.EndPopup();
-            return;
-        }
-
-        var projection = ResolveTransferWorkbenchProjection(runtime, plan);
-        var rules = projection.Rules;
-        var retrieval = projection.Retrieval;
-        var deposit = projection.Deposit;
-        var movements = projection.Movements;
-        var hasMovement = projection.HasMovement;
-
-        ImGui.TextUnformatted($"{movements:N0} movements");
-        ImGui.SameLine();
-        ImGui.TextDisabled("·");
-        ImGui.SameLine();
-        ImGui.TextColored(new Vector4(.52f, .79f, .94f, 1f), $"Retrieve {retrieval.NeededQuantity:N0}");
-        ImGui.SameLine();
-        ImGui.TextColored(new Vector4(.53f, .83f, .64f, 1f), projection.HasUnknownListingDemand ? "Stow —" : $"Stow {deposit.RequestedQuantity:N0}");
-        ImGui.Separator();
-
-        var reviewRows = projection.Rows
-            .Select(row => new TransferReviewRow(
-                row.Rule,
-                row.Line,
-                row.PlayerQuantity,
-                row.Difference,
-                row.ListingContribution,
-                runtime))
-            .ToArray();
-        if (transferReviewTable.Begin(
-                "RQTransferReviewRows",
-                new DalamudTableLayout(
-                    new Vector2(0, Math.Max(260, ImGui.GetContentRegionAvail().Y - 48)),
-                    ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
-                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp)))
-        {
-            transferReviewTable.DrawClippedRows(
-                reviewRows,
-                (row, _) => transferReviewTable.DrawRow(row, id: $"transfer-review:{row.Rule.Id}"));
-            transferReviewTable.End();
-        }
-
-        if (ImGui.Button("Back"))
-        {
-            transferReview = null;
-            ImGui.CloseCurrentPopup();
-        }
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.transfer.review.back",
-            "Return to the Transfer Plan without executing",
-            true,
-            () => transferReview = null,
-            "No inventory movement");
-        var availability = TransferExecutionPolicy.ForExplicitRun(
-            hasMovement || projection.HasUnknownListingDemand,
-            runtime.Owner.HasStableIdentity,
-            transfers.CanStart,
-            retainerRefresh.IsRefreshing || retainerRefresh.IsQueued);
-        ImGui.SameLine();
-        ImGui.TextDisabled(
-            projection.HasUnknownListingDemand
-                ? "Listing demand will be verified before any movement."
-                : availability.BlockReason ??
-            "Balanced items remain in the plan but require no movement.");
-        var canExecute = availability.CanExecute;
-        ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - 110));
-        if (!canExecute)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Execute plan"))
-        {
-            ExecuteTransferPlan(plan.Id);
-            transferReview = null;
-            ImGui.CloseCurrentPopup();
-        }
-        if (!canExecute)
-            ImGui.EndDisabled();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.transfer.review.execute",
-            "Execute the reviewed Transfer Plan",
-            canExecute,
-            () =>
-            {
-                ExecuteTransferPlan(plan.Id);
-                transferReview = null;
-            },
-            canExecute ? $"{movements:N0} movements" : availability.BlockReason);
-
-        ImGui.EndPopup();
-        if (!open)
-            transferReview = null;
-    }
-
     private void ExecuteTransferPlan(Guid planId, bool allowCapacityRecovery = true)
     {
         var current = runtimeSnapshots.Current;
@@ -5432,36 +5256,6 @@ public sealed class QuartermasterWindow : Window
             runtime.CapturedAtUtc,
             runtime.Browser);
     }
-
-    private static string RouteSummary(
-        StowageRoutingPolicy routing,
-        IReadOnlyDictionary<ulong, CachedRetainer> retainers,
-        OwnerScope owner)
-    {
-        var names = routing.PreferredRetainerIds
-            .Select(id => retainers.TryGetValue(id, out var retainer) && retainer.Owner.Matches(owner)
-                ? retainer.RetainerName
-                : $"Retainer {id}")
-            .ToArray();
-        if (names.Length == 0)
-            return routing.Mode == StowageRoutingMode.ConsolidateFirst ? "Consolidate anywhere" : "Preferred first";
-        var preferred = string.Join(" -> ", names);
-        return routing.Overflow == StowageOverflowPolicy.AnyOwnerRetainer
-            ? $"{preferred} -> any"
-            : preferred;
-    }
-
-    private static string RoutingModeLabel(StowageRoutingMode mode) => mode switch
-    {
-        StowageRoutingMode.HomeFirst => "Preferred retainers first",
-        _ => "Consolidate first",
-    };
-
-    private static string OverflowLabel(StowageOverflowPolicy overflow) => overflow switch
-    {
-        StowageOverflowPolicy.HoldOnPlayer => "Keep on player",
-        _ => "Any retainer",
-    };
 
     private void StartTransfer(Task<TransferExecutionResult> transfer) => _ = ObserveTransferAsync(transfer);
 
