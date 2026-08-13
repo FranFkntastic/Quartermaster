@@ -3426,8 +3426,6 @@ public sealed class QuartermasterWindow : Window
             return;
 
         ImGui.TextUnformatted($"Vendor buy · {run.Phase}");
-        ImGui.SameLine();
-        ImGui.TextDisabled(run.Message);
         if (run.Receipts.Count > 0)
         {
             ImGui.SameLine();
@@ -3457,10 +3455,24 @@ public sealed class QuartermasterWindow : Window
             if (ImGui.SmallButton("Stop##RQVendorRun"))
                 vendorProcurement.Stop();
         }
+
+        if (!string.IsNullOrWhiteSpace(run.Message))
+        {
+            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+            ImGui.TextWrapped(run.Message);
+            ImGui.PopStyleColor();
+        }
         if (!string.IsNullOrWhiteSpace(vendorStatus))
-            ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), vendorStatus);
+            DrawWrappedStatus(vendorStatus, new Vector4(1f, .4f, .4f, 1f));
         if (!string.IsNullOrWhiteSpace(vendorProcurement.CoordinationWarning))
-            ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), vendorProcurement.CoordinationWarning);
+            DrawWrappedStatus(vendorProcurement.CoordinationWarning, new Vector4(1f, .4f, .4f, 1f));
+    }
+
+    private static void DrawWrappedStatus(string message, Vector4 color)
+    {
+        ImGui.PushStyleColor(ImGuiCol.Text, color);
+        ImGui.TextWrapped(message);
+        ImGui.PopStyleColor();
     }
 
     private void DrawTransferPlanNotice(
