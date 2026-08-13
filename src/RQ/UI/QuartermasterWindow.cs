@@ -605,79 +605,60 @@ public sealed class QuartermasterWindow : Window
         new("Remaining", 90, line => Math.Max(0, line.ShortageQuantity - line.TransferredQuantity).ToString("N0"), line => Math.Max(0, line.ShortageQuantity - line.TransferredQuantity)),
     ]);
 
-    public Guid? SelectedRestockPlanId =>
-        SelectedStowagePlanId;
-
-    public string? SelectedRestockPlanName =>
-        SelectedStowagePlanName;
-
     public bool StockBrowserVisible =>
         IsOpen && workbench.View is not (WorkbenchView.Listings or WorkbenchView.Activity);
 
-    public int SelectedRestockNeededQuantity
-    {
-        get
-        {
-            var runtime = runtimeSnapshots.Current;
-            var plan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
-            return plan is null
-                ? 0
-                : StowageEvaluator.BuildPlan(runtime.State, runtime.Browser, runtime.Owner, plan.Id)?.RetrieveQuantity ?? 0;
-        }
-    }
-
-    public string CurrentWorkspace => workbench.View is WorkbenchView.Listings or WorkbenchView.Activity
-        ? workbench.View.ToString().ToLowerInvariant()
-        : "transfer";
-    public string StockFilter => workbench.ItemFilterState.Expression;
-    public int VisibleStockCount { get; private set; }
-    public int RenderedStockRowCount { get; private set; }
-    public int StockProjectionBuildCount => stockProjectionBuildCount;
-    public int StockTableApplyCount => stockTable.ApplyCount;
-    public int TransferProjectionBuildCount => transferProjectionBuildCount;
-    public int RenderedTransferRowCount { get; private set; }
-    public double WindowDrawMilliseconds { get; private set; }
-    public double ContentDrawMilliseconds { get; private set; }
-    public double StockDrawMilliseconds { get; private set; }
-    public double PlanDrawMilliseconds { get; private set; }
-    public double ReviewFinalizeMilliseconds { get; private set; }
-    public string CurrentTransferDirection => "mixed";
-    public bool StowageEditorOpen => stowageDraft is not null && (requestStowageEditorOpen || stowageEditorVisible);
-    public bool RestockEditorOpen => restockDraft is not null && (requestRestockEditorOpen || restockEditorVisible);
-    public bool ItemGroupEditorOpen =>
-        IsOpen && workbench.View == WorkbenchView.ItemGroups && itemGroupDraft is not null;
-    public Guid? SelectedItemGroupId => itemGroupDraft is { IsNew: false } ? itemGroupDraft.GroupId : null;
-    public string? SelectedItemGroupName => itemGroupDraft?.Name;
-    public bool ItemGroupEditorHasUnsavedChanges =>
-        itemGroupDraft is not null && ItemGroupCatalog.HasChanges(state.Snapshot(), itemGroupDraft);
+    private int VisibleStockCount { get; set; }
+    private int RenderedStockRowCount { get; set; }
+    private int RenderedTransferRowCount { get; set; }
+    private double WindowDrawMilliseconds { get; set; }
+    private double ContentDrawMilliseconds { get; set; }
+    private double StockDrawMilliseconds { get; set; }
+    private double PlanDrawMilliseconds { get; set; }
+    private double ReviewFinalizeMilliseconds { get; set; }
     public AgentBridgeCaptureRegion? AgentCaptureRegion { get; private set; }
-    public bool PlanEditorHasUnsavedChanges
+
+    internal QuartermasterUiSnapshot CreateUiSnapshot()
     {
-        get
-        {
-            var snapshot = state.Snapshot();
-            var owner = runtimeSnapshots.Current.Owner;
-            return (restockDraft is not null && RestockPlanCatalog.HasChanges(snapshot, owner, restockDraft)) ||
-                   (stowageDraft is not null && StowagePlanCatalog.HasChanges(snapshot, owner, stowageDraft));
-        }
-    }
+        var runtime = runtimeSnapshots.Current;
+        var document = state.Snapshot();
+        var selectedPlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
+        var selectedEvaluation = selectedPlan is null
+            ? null
+            : StowageEvaluator.BuildPlan(runtime.State, runtime.Browser, runtime.Owner, selectedPlan.Id);
+        var stowageEditorOpen = stowageDraft is not null && (requestStowageEditorOpen || stowageEditorVisible);
+        var restockEditorOpen = restockDraft is not null && (requestRestockEditorOpen || restockEditorVisible);
 
-    public Guid? SelectedStowagePlanId =>
-        ResolveSelectedStowagePlan(runtimeSnapshots.Current.State, runtimeSnapshots.Current.Owner)?.Id;
-
-    public string? SelectedStowagePlanName =>
-        ResolveSelectedStowagePlan(runtimeSnapshots.Current.State, runtimeSnapshots.Current.Owner)?.Name;
-
-    public int SelectedTransferDepositQuantity
-    {
-        get
-        {
-            var runtime = runtimeSnapshots.Current;
-            var plan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
-            return plan is null
-                ? 0
-                : StowageEvaluator.BuildPlan(runtime.State, runtime.Browser, runtime.Owner, plan.Id)?.DepositQuantity ?? 0;
-        }
+        return new QuartermasterUiSnapshot(
+            IsOpen,
+            workbench.View is WorkbenchView.Listings or WorkbenchView.Activity
+                ? workbench.View.ToString().ToLowerInvariant()
+                : "transfer",
+            workbench.ItemFilterState.Expression,
+            VisibleStockCount,
+            RenderedStockRowCount,
+            stockProjectionBuildCount,
+            stockTable.ApplyCount,
+            transferProjectionBuildCount,
+            RenderedTransferRowCount,
+            WindowDrawMilliseconds,
+            ContentDrawMilliseconds,
+            StockDrawMilliseconds,
+            PlanDrawMilliseconds,
+            ReviewFinalizeMilliseconds,
+            "mixed",
+            restockEditorOpen || stowageEditorOpen,
+            (restockDraft is not null && RestockPlanCatalog.HasChanges(document, runtime.Owner, restockDraft)) ||
+            (stowageDraft is not null && StowagePlanCatalog.HasChanges(document, runtime.Owner, stowageDraft)),
+            itemGroupDraft is { IsNew: false } ? itemGroupDraft.GroupId : null,
+            itemGroupDraft?.Name,
+            IsOpen && workbench.View == WorkbenchView.ItemGroups && itemGroupDraft is not null,
+            itemGroupDraft is not null && ItemGroupCatalog.HasChanges(document, itemGroupDraft),
+            selectedPlan?.Id,
+            selectedPlan?.Name,
+            selectedEvaluation?.RetrieveQuantity ?? 0,
+            selectedEvaluation?.DepositQuantity ?? 0,
+            stowageEditorOpen);
     }
 
     public override void Draw()
@@ -1036,7 +1017,7 @@ public sealed class QuartermasterWindow : Window
             BrowserScope.AllKey,
             workbench.ItemFilterState.IsInputActive,
             runtime.Revision);
-        var visibleItems = ApplyStockItemFocus(result.Items, workbench.FocusedStockItemId);
+        var visibleItems = ListingPlanPresentation.ApplyStockItemFocus(result.Items, workbench.FocusedStockItemId);
         VisibleStockCount = visibleItems.Count;
         if (!result.Filter.IsValid)
             ImGui.TextColored(
@@ -4198,13 +4179,6 @@ public sealed class QuartermasterWindow : Window
         workbench.View = WorkbenchView.Stowage;
     }
 
-    internal static IReadOnlyList<StockGroup> ApplyStockItemFocus(
-        IReadOnlyList<StockGroup> items,
-        uint? focusedItemId) =>
-        focusedItemId is { } itemId
-            ? items.Where(item => item.ItemId == itemId).ToArray()
-            : items;
-
     private void OpenListingPlanEditor(QuartermasterRuntimeSnapshot runtime, ListingItemKey? focus)
     {
         listingPlanDraft = ListingPlanCatalog.Draft(state.Snapshot(), runtime.Owner, runtime.Browser);
@@ -4344,7 +4318,7 @@ public sealed class QuartermasterWindow : Window
             }
             ImGui.EndTable();
         }
-        var transitionConflict = ListingCapacityTransitionConflict(draft, runtime.Browser);
+        var transitionConflict = ListingPlanPresentation.CapacityTransitionConflict(draft, runtime.Browser);
         if (transitionConflict is not null)
             ImGui.TextColored(new Vector4(1f, .7f, .3f, 1f), transitionConflict);
         if (!string.IsNullOrWhiteSpace(listingPlanEditorError))
@@ -4408,34 +4382,6 @@ public sealed class QuartermasterWindow : Window
         if (validation.Count != 0)
             ImGui.EndDisabled();
         ImGui.EndPopup();
-    }
-
-    internal static string? ListingCapacityTransitionConflict(ListingPlanDraft draft, BrowserProjection browser)
-    {
-        var plan = new ListingPlan
-        {
-            Owner = draft.Owner,
-            Assignments = draft.Assignments.Select(ListingPlanCatalog.Copy).ToList(),
-        };
-        foreach (var retainer in draft.Assignments.Where(assignment => assignment.Enabled && assignment.RetainerId != 0)
-                     .GroupBy(assignment => assignment.RetainerId))
-        {
-            var scopeKey = BrowserScope.RetainerKey(retainer.Key);
-            if (!browser.RetainerListingsCompleteByScope.GetValueOrDefault(scopeKey))
-                continue;
-            var planned = retainer.Sum(assignment => assignment.ListingCount);
-            var unmanaged = ListingPlanEvaluator.Evaluate(plan, browser, scopeKey).Items
-                .SelectMany(item => item.UnmanagedPhysicalListings)
-                .Count();
-            if (planned + unmanaged > 20)
-            {
-                var retainerName = retainer.Select(assignment => assignment.RetainerName).FirstOrDefault(name => !string.IsNullOrWhiteSpace(name)) ??
-                                   browser.Scopes.FirstOrDefault(scope => scope.Key == scopeKey)?.Label ??
-                                   $"Retainer {retainer.Key}";
-                return $"Current transition: {retainerName} has {planned + unmanaged:N0} occupied ({unmanaged:N0} outside this plan); Save remains available.";
-            }
-        }
-        return null;
     }
 
     private void DrawListingPlanEditorToolbar(ListingPlanDraft draft, QuartermasterRuntimeSnapshot runtime)
@@ -5767,96 +5713,4 @@ public sealed class QuartermasterWindow : Window
         catch (AggregateException exception) when (exception.InnerExceptions.All(inner => inner is OperationCanceledException)) { return true; }
     }
 
-    private sealed record StockWorkbenchRow(
-        StockGroup Item,
-        int AccessibleRetainerQuantity,
-        TargetPlanItem? Rule,
-        StowageEvaluationLine? Line,
-        IReadOnlyList<ListingPlanItemEvaluation> ListingDemand);
-
-    private sealed record StockWorkbenchProjection(
-        long RuntimeRevision,
-        Guid? PlanId,
-        IReadOnlyList<StockGroup> QueryItems,
-        IReadOnlyList<StockWorkbenchRow> Rows);
-
-    private sealed record TransferWorkbenchProjection(
-        long RuntimeRevision,
-        Guid PlanId,
-        IReadOnlyList<TargetPlanItem> Rules,
-        StowageEvaluation? Stowage,
-        RetrievalPlan Retrieval,
-        TransferVendorProcurementReview Vendor,
-        StowageDepositBatch Deposit,
-        int Movements,
-        bool HasMovement,
-        bool HasUnknownListingDemand,
-        IReadOnlyList<TransferWorkbenchRow> Rows);
-
-    private sealed record PendingTransferPlanRecovery(Guid PlanId, string RefreshRunId);
-
-    private sealed record RestockPlanRow(
-        RestockPlanItem Item,
-        PlanLine? Line,
-        Guid PlanId,
-        OwnerScope Owner);
-
-    private sealed record TransferWorkbenchRow(
-        TargetPlanItem Rule,
-        StowageEvaluationLine? Line,
-        PlanLine? RetrievalLine,
-        TransferVendorProcurementLine? VendorLine,
-        int RoutedDepositQuantity,
-        int PlayerQuantity,
-        int AccessibleStorageQuantity,
-        int Difference,
-        FieldEvidence<int> ListingContribution,
-        TransferPlanListingLink? ListingLink,
-        OwnerScope Owner,
-        Guid PlanId,
-        QuartermasterRuntimeSnapshot Runtime);
-
-    private sealed record StowageDraftRow(
-        TargetPlanItem Rule,
-        QuartermasterRuntimeSnapshot Runtime);
-
-    private sealed record TransferReviewRow(
-        TargetPlanItem Rule,
-        StowageEvaluationLine? Line,
-        int PlayerQuantity,
-        int Difference,
-        FieldEvidence<int> ListingContribution,
-        QuartermasterRuntimeSnapshot Runtime);
-
-    private sealed record TransferReviewRequest(Guid PlanId, string PlanName);
-
-    private sealed record ListingGroupView(
-        ListingItemKey Key,
-        uint ItemId,
-        string ItemName,
-        ItemQualityPolicy Quality,
-        int DesiredUnits,
-        Franthropy.Filtering.Evaluation.FieldEvidence<int> ListedUnits,
-        Franthropy.Filtering.Evaluation.FieldEvidence<int> NeedUnits,
-        int PlayerUnits,
-        Franthropy.Filtering.Evaluation.FieldEvidence<int> RetainerUnits,
-        Franthropy.Filtering.Evaluation.FieldEvidence<int> ImmediatelyListableUnits,
-        Franthropy.Filtering.Evaluation.FieldEvidence<int> MovementNeedUnits,
-        Franthropy.Filtering.Evaluation.FieldEvidence<int> OtherRetainerUnits,
-        Franthropy.Filtering.Evaluation.FieldEvidence<int> RetrievableUnits,
-        Franthropy.Filtering.Evaluation.FieldEvidence<int> MissingUnits,
-        ListingCoverageState Coverage,
-        IReadOnlyList<ListingAssignmentEvaluation> Assignments,
-        IReadOnlyList<ListingRow> Listings,
-        IReadOnlyList<ListingRow> UnmanagedListings);
-
-    private sealed record PhysicalListingGroupView(
-        ulong RetainerId,
-        string RetainerName,
-        int Quantity,
-        FfxivItemQuality Quality,
-        FieldEvidence<decimal> UnitPrice,
-        IReadOnlyList<ListingRow> Listings);
-
-    private sealed record ItemChoice(uint ItemId, string Name, string Label);
 }

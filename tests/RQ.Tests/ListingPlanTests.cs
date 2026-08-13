@@ -106,7 +106,7 @@ public sealed class ListingPlanTests
             .Select(_ => Listing(2, "Bow", 10, "Retainer", 1, 200))
             .ToArray();
 
-        var conflict = QuartermasterWindow.ListingCapacityTransitionConflict(
+        var conflict = ListingPlanPresentation.CapacityTransitionConflict(
             draft,
             Projection(unmanaged, inventoryComplete: true, listingsComplete: true));
 
@@ -124,7 +124,7 @@ public sealed class ListingPlanTests
             .Select(_ => Listing(2, "X", 10, "Retainer A", 1, 100))
             .ToArray();
 
-        var conflict = QuartermasterWindow.ListingCapacityTransitionConflict(
+        var conflict = ListingPlanPresentation.CapacityTransitionConflict(
             draft,
             Projection(currentOnA, inventoryComplete: true, listingsComplete: true));
 
@@ -172,7 +172,7 @@ public sealed class ListingPlanTests
                 new(BrowserScope.PlayerKey, BrowserScopeKind.Player, null, "Player", "Bag", 1, 2, "Duplicate Name", 4, FfxivItemQuality.NQ, DateTime.UnixEpoch),
             ]);
 
-        var focused = QuartermasterWindow.ApplyStockItemFocus(projection.GetItems(BrowserScope.AllKey), 2);
+        var focused = ListingPlanPresentation.ApplyStockItemFocus(projection.GetItems(BrowserScope.AllKey), 2);
 
         Assert.Equal((uint)2, Assert.Single(focused).ItemId);
     }
