@@ -41,13 +41,13 @@ public sealed class QuartermasterWindow : Window
     private readonly TableSelectionModel<uint> stockSelection = new();
     private readonly DalamudTableProjection<StockWorkbenchRow> stockTable;
     private readonly DalamudTableProjection<RestockPlanRow> restockPlanTable;
-    private readonly DalamudTableProjection<RestockPlanItem> restockDraftTable;
     private readonly DalamudTableProjection<TransferWorkbenchRow> transferWorkbenchTable;
     private readonly DalamudTableProjection<OperationLine> operationLineTable;
     private readonly BrowserQueryController queries = new();
     private readonly RootConfirmationDialog confirmationDialog = new();
     private readonly OperationHistoryDialog historyDialog;
     private readonly ItemGroupWorkspace itemGroupWorkspace;
+    private readonly RestockPlanEditor restockPlanEditor;
     private readonly TransferPlanEditor transferPlanEditor;
     private readonly ListingPlanEditor listingPlanEditor;
     private readonly ListingWorkspace listingWorkspace;
@@ -64,19 +64,6 @@ public sealed class QuartermasterWindow : Window
     private int captureCollapseRestoreFramesRemaining;
     private int viewportReopenGuardFramesRemaining;
     private bool viewportReopenGuardNeedsRelease;
-    private RestockPlanDraft? restockDraft;
-    private readonly TableSelectionModel<Guid> selectedRestockItemIds = new();
-    private Guid? activeRestockItemId;
-    private Guid? selectedRestockItemGroupId;
-    private string restockItemSearch = string.Empty;
-    private string restockItemFilter = string.Empty;
-    private ItemChoice? selectedRestockChoice;
-    private string restockEditorError = string.Empty;
-    private int bulkRestockQuality = -1;
-    private int bulkRestockTarget = -1;
-    private int bulkRestockNoteMode = -1;
-    private bool requestRestockEditorOpen;
-    private bool restockEditorVisible;
     private string vendorStatus = string.Empty;
     private WorkbenchView? capturePreviousView;
     private TransferReviewDialogState? capturePreviousTransferReviewState;
@@ -107,6 +94,7 @@ public sealed class QuartermasterWindow : Window
         this.saveConfiguration = saveConfiguration;
         this.reviewRegistry = reviewRegistry;
         historyDialog = new(journal);
+        RestockPlanEditor? restockEditor = null;
         TransferPlanEditor? transferEditor = null;
         itemGroupWorkspace = new(
             state,
@@ -116,14 +104,13 @@ public sealed class QuartermasterWindow : Window
             (origin, groupId) =>
             {
                 if (origin == ItemGroupEditorOrigin.Restock)
-                    selectedRestockItemGroupId = groupId;
+                    restockEditor?.SelectItemGroup(groupId);
                 else
                     transferEditor?.SelectItemGroup(groupId);
             },
             groupId =>
             {
-                if (selectedRestockItemGroupId == groupId)
-                    selectedRestockItemGroupId = null;
+                restockEditor?.ClearItemGroup(groupId);
                 transferEditor?.ClearItemGroup(groupId);
             });
         transferPlanEditor = transferEditor = new(
@@ -132,8 +119,16 @@ public sealed class QuartermasterWindow : Window
             itemGroupWorkspace,
             reviewRegistry,
             SearchItems,
-            CloseRestockEditor,
+            () => restockEditor?.Close(),
             () => requestedView = WorkbenchView.Stowage);
+        restockPlanEditor = restockEditor = new(
+            state,
+            workbench,
+            itemGroupWorkspace,
+            reviewRegistry,
+            SearchItems,
+            transferPlanEditor.Close,
+            () => requestedView = WorkbenchView.Restock);
         listingPlanEditor = new(state, dataManager, SearchItems);
         listingWorkspace = new(
             workbench,
@@ -153,7 +148,6 @@ public sealed class QuartermasterWindow : Window
         vendorReviewDialog = new(vendorProcurement, reviewRegistry, () => vendorStatus = string.Empty);
         stockTable = CreateStockTable();
         restockPlanTable = CreateRestockPlanTable();
-        restockDraftTable = CreateRestockDraftTable();
         transferWorkbenchTable = CreateTransferWorkbenchTable();
         operationLineTable = CreateOperationLineTable();
         captureTransactions = new(
@@ -262,35 +256,6 @@ public sealed class QuartermasterWindow : Window
             ImGuiTableColumnFlags.WidthStretch),
     ]);
 
-    private DalamudTableProjection<RestockPlanItem> CreateRestockDraftTable() => new(
-    [
-        new(
-            "Item",
-            1.5f,
-            item => item.ItemName,
-            item => item.ItemName,
-            ImGuiTableColumnFlags.WidthStretch),
-        new("Rule", 52, item => item.Enabled ? "On" : "Off", Draw: item =>
-            item.Enabled = DrawRuleToggle($"restock{item.Id}", item.Enabled)),
-        new("Target", 80, item => item.TargetQuantity.ToString("N0"), Draw: DrawRestockTarget),
-        new("Quality", 112, item => QualityLabel(item.Quality), Draw: DrawRestockDraftQuality),
-        new(
-            "Note",
-            1f,
-            item => item.Notes,
-            item => item.Notes,
-            ImGuiTableColumnFlags.WidthStretch,
-            Draw: DrawRestockNote),
-        new(
-            "Item group",
-            .8f,
-            RestockItemGroups,
-            item => RestockItemGroups(item),
-            ImGuiTableColumnFlags.WidthStretch,
-            TextColor: _ => ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]),
-        new("", 28, _ => string.Empty, Draw: DrawRestockDraftRemove),
-    ]);
-
     private DalamudTableProjection<TransferWorkbenchRow> CreateTransferWorkbenchTable() => new(
     [
         new(
@@ -397,7 +362,7 @@ public sealed class QuartermasterWindow : Window
             ? null
             : StowageEvaluator.BuildPlan(runtime.State, runtime.Browser, runtime.Owner, selectedPlan.Id);
         var transferEditor = transferPlanEditor.Snapshot(document, runtime.Owner);
-        var restockEditorOpen = restockDraft is not null && (requestRestockEditorOpen || restockEditorVisible);
+        var restockEditor = restockPlanEditor.Snapshot(document, runtime.Owner);
 
         var itemGroups = itemGroupWorkspace.Snapshot(
             IsOpen && workbench.View == WorkbenchView.ItemGroups);
@@ -419,8 +384,8 @@ public sealed class QuartermasterWindow : Window
             PlanDrawMilliseconds,
             ReviewFinalizeMilliseconds,
             "mixed",
-            restockEditorOpen || transferEditor.IsOpen,
-            (restockDraft is not null && RestockPlanCatalog.HasChanges(document, runtime.Owner, restockDraft)) ||
+            restockEditor.IsOpen || transferEditor.IsOpen,
+            restockEditor.HasUnsavedChanges ||
             transferEditor.HasUnsavedChanges,
             itemGroups.SelectedGroupId,
             itemGroups.SelectedGroupName,
@@ -594,7 +559,7 @@ public sealed class QuartermasterWindow : Window
             }
             if (requested == WorkbenchView.Listings)
                 transferPlanEditor.Close();
-            CloseRestockEditor();
+            restockPlanEditor.Close();
         }
 
         ImGui.TextUnformatted(runtime.Owner.HasStableIdentity ? $"{runtime.Owner.CharacterName} @ {runtime.Owner.HomeWorldName}" : "Owner scope unavailable");
@@ -641,6 +606,7 @@ public sealed class QuartermasterWindow : Window
             ImGui.EndTabBar();
             requestedView = null;
         }
+        restockPlanEditor.Draw(runtime);
         transferPlanEditor.Draw(runtime);
         listingPlanEditor.Draw(runtime);
         transferReviewDialog.Draw();
@@ -719,7 +685,7 @@ public sealed class QuartermasterWindow : Window
         };
         if (view is WorkbenchView.Listings or WorkbenchView.Activity)
             transferPlanEditor.Close();
-        CloseRestockEditor();
+        restockPlanEditor.Close();
         requestedView = view;
         if (normalizedTarget == "transfer-review")
             RequestSelectedTransferReview();
@@ -1325,7 +1291,7 @@ public sealed class QuartermasterWindow : Window
         if (selected is null)
             ImGui.BeginDisabled();
         if (ImGui.Button("Edit plan") && selected is not null)
-            OpenRestockEditor(RestockPlanCatalog.Draft(state.Snapshot(), owner, selected.Id));
+            restockPlanEditor.Open(RestockPlanCatalog.Draft(state.Snapshot(), owner, selected.Id));
         if (selected is null)
             ImGui.EndDisabled();
         reviewRegistry.RegisterLastButton(
@@ -1337,7 +1303,7 @@ public sealed class QuartermasterWindow : Window
                 var current = runtimeSnapshots.Current;
                 var currentPlan = ResolveSelectedRestockPlan(state.Snapshot(), current.Owner);
                 if (currentPlan is not null)
-                    OpenRestockEditor(RestockPlanCatalog.Draft(state.Snapshot(), current.Owner, currentPlan.Id));
+                    restockPlanEditor.Open(RestockPlanCatalog.Draft(state.Snapshot(), current.Owner, currentPlan.Id));
             },
             selected?.Name ?? "No plan selected");
         ImGui.SameLine();
@@ -1348,14 +1314,14 @@ public sealed class QuartermasterWindow : Window
             if (!owner.HasStableIdentity)
                 ImGui.BeginDisabled();
             if (ImGui.Selectable("New plan"))
-                OpenRestockEditor(RestockPlanCatalog.NewDraft(state.Snapshot(), owner));
+                restockPlanEditor.Open(RestockPlanCatalog.NewDraft(state.Snapshot(), owner));
             if (!owner.HasStableIdentity)
                 ImGui.EndDisabled();
 
             if (selected is null)
                 ImGui.BeginDisabled();
             if (ImGui.Selectable("Duplicate plan") && selected is not null)
-                OpenRestockEditor(RestockPlanCatalog.DuplicateDraft(state.Snapshot(), owner, selected.Id));
+                restockPlanEditor.Open(RestockPlanCatalog.DuplicateDraft(state.Snapshot(), owner, selected.Id));
             if (selected is null)
                 ImGui.EndDisabled();
 
@@ -1364,7 +1330,7 @@ public sealed class QuartermasterWindow : Window
             if (!canCreateFromStowage)
                 ImGui.BeginDisabled();
             if (ImGui.Selectable("Create from Stowage") && canCreateFromStowage)
-                OpenRestockEditor(RestockPlanCatalog.FromStowageDraft(state.Snapshot(), owner));
+                restockPlanEditor.Open(RestockPlanCatalog.FromStowageDraft(state.Snapshot(), owner));
             if (!canCreateFromStowage)
                 ImGui.EndDisabled();
 
@@ -1386,19 +1352,19 @@ public sealed class QuartermasterWindow : Window
             if (!owner.HasStableIdentity)
                 ImGui.BeginDisabled();
             if (ImGui.Button("New Restock Plan"))
-                OpenRestockEditor(RestockPlanCatalog.NewDraft(state.Snapshot(), owner));
+                restockPlanEditor.Open(RestockPlanCatalog.NewDraft(state.Snapshot(), owner));
             reviewRegistry.RegisterLastButton(
                 "quartermaster.restock.new",
                 "Open a new Restock Plan draft",
                 owner.HasStableIdentity,
-                () => OpenRestockEditor(RestockPlanCatalog.NewDraft(state.Snapshot(), runtimeSnapshots.Current.Owner)),
+                () => restockPlanEditor.Open(RestockPlanCatalog.NewDraft(state.Snapshot(), runtimeSnapshots.Current.Owner)),
                 owner.HasStableIdentity ? "Nothing is saved until Apply" : "Owner unavailable");
             ImGui.SameLine();
             var canCreateFromStowage = StowagePlanMigration.OwnerPlan(runtime.State, owner) is not null;
             if (!canCreateFromStowage)
                 ImGui.BeginDisabled();
             if (ImGui.Button("Create from Stowage") && canCreateFromStowage)
-                OpenRestockEditor(RestockPlanCatalog.FromStowageDraft(state.Snapshot(), owner));
+                restockPlanEditor.Open(RestockPlanCatalog.FromStowageDraft(state.Snapshot(), owner));
             if (!canCreateFromStowage)
                 ImGui.EndDisabled();
             if (!owner.HasStableIdentity)
@@ -1451,326 +1417,6 @@ public sealed class QuartermasterWindow : Window
         }
     }
 
-    private void OpenRestockEditor(RestockPlanDraft draft)
-    {
-        transferPlanEditor.Close();
-        itemGroupWorkspace.CloseEditor();
-        restockDraft = draft;
-        selectedRestockItemIds.Clear();
-        activeRestockItemId = draft.Items.FirstOrDefault()?.Id;
-        selectedRestockItemGroupId = null;
-        restockItemSearch = string.Empty;
-        restockItemFilter = string.Empty;
-        selectedRestockChoice = null;
-        restockEditorError = string.Empty;
-        bulkRestockQuality = -1;
-        bulkRestockTarget = -1;
-        bulkRestockNoteMode = -1;
-        requestRestockEditorOpen = true;
-        workbench.View = WorkbenchView.Restock;
-        requestedView = WorkbenchView.Restock;
-    }
-
-    private void DrawRestockEditorModal(QuartermasterRuntimeSnapshot runtime)
-    {
-        const string popup = "Edit Restock Plan##RQRestockEditor";
-        restockEditorVisible = false;
-        if (requestRestockEditorOpen)
-        {
-            ImGui.OpenPopup(popup);
-            requestRestockEditorOpen = false;
-        }
-        if (restockDraft is null)
-            return;
-
-        var available = ImGui.GetMainViewport().WorkSize;
-        ImGui.SetNextWindowSize(
-            new Vector2(Math.Min(1160, available.X - 48), Math.Min(700, available.Y - 48)),
-            ImGuiCond.Appearing);
-        if (!ImGui.BeginPopupModal(popup, ImGuiWindowFlags.NoScrollbar))
-        {
-            CloseRestockEditor();
-            return;
-        }
-        restockEditorVisible = true;
-        if (itemGroupWorkspace.IsEditorOpenFor(ItemGroupEditorOrigin.Restock))
-        {
-            itemGroupWorkspace.DrawEditor(
-                selectedRestockItemIds.Count,
-                groupDraft => ItemGroupCatalog.AddMissing(
-                    groupDraft,
-                    restockDraft?.Items.Where(item => selectedRestockItemIds.IsSelected(item.Id)) ?? []));
-            ImGui.EndPopup();
-            return;
-        }
-
-        var draft = restockDraft;
-        ImGui.TextUnformatted("Edit plan");
-        ImGui.SameLine();
-        ImGui.TextColored(new Vector4(.55f, .8f, .95f, 1f), "<- Restock");
-        ImGui.SameLine();
-        var planName = draft.Name;
-        ImGui.SetNextItemWidth(300);
-        if (ImGui.InputText("##restockdraftname", ref planName, 80))
-            draft.Name = planName;
-        ImGui.SameLine();
-        var planEnabled = draft.Enabled;
-        if (ImGui.Checkbox("Enabled##restockdraft", ref planEnabled))
-            draft.Enabled = planEnabled;
-        ImGui.SameLine();
-        ImGui.TextDisabled($"{selectedRestockItemIds.Count:N0} selected of {draft.Items.Count:N0} items");
-
-        DrawRestockEditorToolbar(draft);
-        DrawRestockEditorBulkBar(draft);
-        if (!string.IsNullOrWhiteSpace(restockEditorError))
-            ImGui.TextColored(new Vector4(1f, .45f, .4f, 1f), restockEditorError);
-
-        if (ImGui.BeginChild("RQRestockItemTable", new Vector2(0, -42), true))
-            DrawRestockDraftItems(draft);
-        ImGui.EndChild();
-
-        var snapshot = state.Snapshot();
-        var canApply = RestockPlanCatalog.CanApply(snapshot, runtime.Owner, draft);
-        ImGui.TextDisabled(draft.IsNew && draft.Items.Count == 0
-            ? "Add at least one item to save this plan."
-            : canApply ? $"{draft.Items.Count:N0} items | changes apply together" : "No unsaved changes.");
-        ImGui.SameLine(ImGui.GetContentRegionAvail().X - 160);
-        if (ImGui.Button("Cancel##restockeditor"))
-        {
-            CloseRestockEditor();
-            ImGui.CloseCurrentPopup();
-        }
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.restock.editor.cancel",
-            "Discard the open Restock Plan draft",
-            true,
-            CloseRestockEditor,
-            "No saved plan changes");
-        ImGui.SameLine();
-        if (!canApply)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Save plan##restockeditor"))
-        {
-            try
-            {
-                var appliedId = state.Mutate(document =>
-                    RestockPlanCatalog.Apply(document, runtime.Owner, draft).Id);
-                workbench.SelectedRestockPlanId = appliedId;
-                CloseRestockEditor();
-                ImGui.CloseCurrentPopup();
-            }
-            catch (InvalidOperationException exception)
-            {
-                restockEditorError = exception.Message;
-            }
-        }
-        if (!canApply)
-            ImGui.EndDisabled();
-        ImGui.EndPopup();
-    }
-
-    private void DrawRestockEditorToolbar(RestockPlanDraft draft)
-    {
-        ImGui.Separator();
-        ImGui.TextDisabled("Add items");
-        ImGui.SameLine();
-        DrawRestockDraftAdd(draft);
-        ImGui.SameLine();
-        ImGui.TextDisabled("or group");
-        ImGui.SameLine();
-        var groups = ItemGroupCatalog.All(state.Snapshot());
-        var selectedGroup = groups.FirstOrDefault(group => group.Id == selectedRestockItemGroupId);
-        ImGui.SetNextItemWidth(185);
-        if (ImGui.BeginCombo("##restockgroup", selectedGroup is null ? "@item group" : $"@{selectedGroup.Name}"))
-        {
-            foreach (var group in groups)
-                if (ImGui.Selectable($"@{group.Name}##restockgroup{group.Id}", selectedGroup?.Id == group.Id))
-                    selectedRestockItemGroupId = group.Id;
-            ImGui.EndCombo();
-        }
-        ImGui.SameLine();
-        if (selectedGroup is null)
-            ImGui.BeginDisabled();
-        if (ImGui.SmallButton("Add group##restock") && selectedGroup is not null)
-        {
-            ItemGroupCatalog.AddMissing(selectedGroup, draft);
-            activeRestockItemId ??= draft.Items.FirstOrDefault()?.Id;
-        }
-        if (selectedGroup is null)
-            ImGui.EndDisabled();
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Manage groups...##restock"))
-            itemGroupWorkspace.OpenEditor(ItemGroupEditorOrigin.Restock, selectedRestockItemGroupId);
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.item-groups.open.restock",
-            "Open Item Groups from the Restock Plan editor",
-            true,
-            () => itemGroupWorkspace.OpenEditor(ItemGroupEditorOrigin.Restock, selectedRestockItemGroupId),
-            "Plan draft remains open");
-
-        ImGui.SetNextItemWidth(210);
-        ImGui.InputTextWithHint("##restockitemfilter", "Filter plan items", ref restockItemFilter, 80);
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Select visible##restock"))
-        {
-            foreach (var item in FilteredRestockDraftItems(draft))
-                selectedRestockItemIds.SetSelected(item.Id, true);
-        }
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Clear selection##restock"))
-            selectedRestockItemIds.Clear();
-        ImGui.SameLine();
-        if (selectedRestockItemIds.Count == 0)
-            ImGui.BeginDisabled();
-        if (ImGui.SmallButton("Save as @group##restock"))
-            itemGroupWorkspace.OpenNewEditor(
-                ItemGroupEditorOrigin.Restock,
-                draft.Items.Where(item => selectedRestockItemIds.IsSelected(item.Id)));
-        if (selectedRestockItemIds.Count == 0)
-            ImGui.EndDisabled();
-    }
-
-    private void DrawRestockDraftAdd(RestockPlanDraft draft)
-    {
-        ImGui.SetNextItemWidth(260);
-        if (ImGui.InputTextWithHint("##RQRestockItemName", "Add item by name", ref restockItemSearch, 96))
-            selectedRestockChoice = null;
-        if (restockItemSearch.Trim().Length >= 2 && selectedRestockChoice is null)
-        {
-            foreach (var choice in SearchItems(restockItemSearch, 5))
-                if (ImGui.Selectable(
-                        $"{choice.Label}##restockchoice{choice.ItemId}",
-                        false,
-                        ImGuiSelectableFlags.DontClosePopups))
-                {
-                    selectedRestockChoice = choice;
-                    restockItemSearch = choice.Name;
-                }
-        }
-        if (selectedRestockChoice is null)
-            return;
-        ImGui.SameLine();
-        if (ImGui.Button("Add item##restockdraft"))
-        {
-            var choice = selectedRestockChoice;
-            var existing = draft.Items.FirstOrDefault(item =>
-                item.ItemId == choice.ItemId && item.Quality == ItemQualityPolicy.Any);
-            if (existing is null)
-            {
-                existing = new RestockPlanItem
-                {
-                    ItemId = choice.ItemId,
-                    ItemName = choice.Name,
-                    TargetQuantity = 1,
-                };
-                draft.Items.Add(existing);
-            }
-            activeRestockItemId = existing.Id;
-            selectedRestockItemIds.Clear();
-            selectedRestockItemIds.SetSelected(existing.Id, true);
-            selectedRestockChoice = null;
-            restockItemSearch = string.Empty;
-        }
-    }
-
-
-
-
-
-
-
-
-
-
-    private void DrawRestockEditorBulkBar(RestockPlanDraft draft)
-    {
-        ImGui.Separator();
-        ImGui.TextUnformatted($"{selectedRestockItemIds.Count:N0} selected");
-        ImGui.SameLine();
-        ImGui.TextDisabled("Target");
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(80);
-        ImGui.InputInt("##restockbulktarget", ref bulkRestockTarget);
-        ImGui.SameLine();
-        ImGui.TextDisabled("Quality");
-        ImGui.SameLine();
-        DrawOptionalEnumCombo("##restockbulkquality", ref bulkRestockQuality, Enum.GetValues<ItemQualityPolicy>(), QualityChoiceLabel);
-        ImGui.SameLine();
-        ImGui.TextDisabled("Note");
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(125);
-        if (ImGui.BeginCombo("##restockbulknote", bulkRestockNoteMode < 0 ? "Leave unchanged" : "Clear notes"))
-        {
-            if (ImGui.Selectable("Leave unchanged", bulkRestockNoteMode < 0))
-                bulkRestockNoteMode = -1;
-            if (ImGui.Selectable("Clear notes", bulkRestockNoteMode == 0))
-                bulkRestockNoteMode = 0;
-            ImGui.EndCombo();
-        }
-        ImGui.SameLine();
-        var canApply = selectedRestockItemIds.Count > 0 &&
-                       (bulkRestockQuality >= 0 || bulkRestockTarget >= 0 || bulkRestockNoteMode >= 0);
-        if (!canApply)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Apply to selected##restockbulk"))
-        {
-            foreach (var item in draft.Items.Where(item => selectedRestockItemIds.IsSelected(item.Id)))
-            {
-                if (bulkRestockQuality >= 0)
-                    item.Quality = (ItemQualityPolicy)bulkRestockQuality;
-                if (bulkRestockTarget >= 0)
-                    item.TargetQuantity = bulkRestockTarget;
-                if (bulkRestockNoteMode == 0)
-                    item.Notes = string.Empty;
-            }
-            bulkRestockQuality = bulkRestockTarget = bulkRestockNoteMode = -1;
-        }
-        if (!canApply)
-            ImGui.EndDisabled();
-        ImGui.SameLine();
-        var hasSelection = selectedRestockItemIds.Count > 0;
-        if (!hasSelection)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Remove selected##restockbulk"))
-        {
-            draft.Items.RemoveAll(item => selectedRestockItemIds.IsSelected(item.Id));
-            selectedRestockItemIds.Clear();
-        }
-        if (!hasSelection)
-            ImGui.EndDisabled();
-    }
-
-    private void DrawRestockDraftItems(RestockPlanDraft draft)
-    {
-        var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY |
-                    ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
-        if (!restockDraftTable.Begin(
-                "RQRestockDraftItems",
-                new DalamudTableLayout(
-                    new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y)),
-                    flags)))
-            return;
-        var filtered = FilteredRestockDraftItems(draft);
-        selectedRestockItemIds.Retain(draft.Items.Select(item => item.Id));
-        if (filtered.Count == 0)
-            restockDraftTable.DrawMessageRow(draft.Items.Count == 0
-                ? "No items yet. Search by name above or add a selected Stock item."
-                : "No items match this filter.");
-        var rowKeys = filtered.Select(item => item.Id).ToArray();
-        for (var index = 0; index < filtered.Count; index++)
-        {
-            var item = filtered[index];
-            restockDraftTable.DrawSelectableRow(
-                item,
-                selectedRestockItemIds,
-                rowKeys,
-                index,
-                $"##selectrestock:{item.Id}");
-        }
-        DalamudTableSelectionRenderer.EndRows(selectedRestockItemIds);
-        restockDraftTable.End();
-    }
-
     private static string StockPlanState(StockWorkbenchRow row) =>
         row.Rule is null
             ? "Not in plan"
@@ -1800,51 +1446,12 @@ public sealed class QuartermasterWindow : Window
     {
         if (ImGui.Selectable($"{row.Item.ItemName}##restockrow{row.Item.Id}"))
         {
-            OpenRestockEditor(RestockPlanCatalog.Draft(state.Snapshot(), row.Owner, row.PlanId));
-            activeRestockItemId = row.Item.Id;
-            selectedRestockItemIds.Clear();
-            selectedRestockItemIds.SetSelected(row.Item.Id, true);
+            restockPlanEditor.Open(RestockPlanCatalog.Draft(state.Snapshot(), row.Owner, row.PlanId));
+            restockPlanEditor.FocusItem(row.Item.Id);
         }
         ImGui.TextDisabled(QualityLabel(row.Item.Quality));
     }
 
-
-    private static void DrawRestockTarget(RestockPlanItem item)
-    {
-        var target = item.TargetQuantity;
-        ImGui.SetNextItemWidth(-1);
-        if (ImGui.InputInt($"##draftrestocktarget{item.Id}", ref target))
-            item.TargetQuantity = Math.Max(0, target);
-    }
-
-    private static void DrawRestockNote(RestockPlanItem item)
-    {
-        var note = item.Notes;
-        ImGui.SetNextItemWidth(-1);
-        if (ImGui.InputText($"##draftrestocknote{item.Id}", ref note, 160))
-            item.Notes = note;
-    }
-
-    private string RestockItemGroups(RestockPlanItem item)
-    {
-        var matchingGroups = ItemGroupCatalog.All(state.Snapshot())
-            .Where(group => group.Items.Any(member =>
-                member.ItemId == item.ItemId && member.Quality == item.Quality))
-            .Select(group => $"@{group.Name}")
-            .Take(2)
-            .ToArray();
-        return matchingGroups.Length == 0 ? "Ungrouped" : string.Join(", ", matchingGroups);
-    }
-
-    private void DrawRestockDraftRemove(RestockPlanItem item)
-    {
-        if (!ImGui.SmallButton($"X##draftrestockremove{item.Id}"))
-            return;
-        restockDraft?.Items.Remove(item);
-        selectedRestockItemIds.SetSelected(item.Id, false);
-        if (activeRestockItemId == item.Id)
-            activeRestockItemId = restockDraft?.Items.FirstOrDefault()?.Id;
-    }
 
     private static string TransferTargetText(TransferWorkbenchRow row) =>
         TransferWorkbenchPresentation.Target(
@@ -1975,63 +1582,6 @@ public sealed class QuartermasterWindow : Window
             ImGui.SetTooltip(line.Message);
     }
 
-    private static void DrawOptionalEnumCombo<T>(
-        string label,
-        ref int selected,
-        IReadOnlyList<T> values,
-        Func<T, string> display)
-        where T : struct, Enum
-    {
-        ImGui.SetNextItemWidth(155);
-        var preview = selected < 0 ? "No change" : display((T)Enum.ToObject(typeof(T), selected));
-        if (!ImGui.BeginCombo(label, preview))
-            return;
-        if (ImGui.Selectable("No change", selected < 0))
-            selected = -1;
-        foreach (var value in values)
-        {
-            var numeric = Convert.ToInt32(value, CultureInfo.InvariantCulture);
-            if (ImGui.Selectable(display(value), selected == numeric))
-                selected = numeric;
-        }
-        ImGui.EndCombo();
-    }
-
-    private static bool DrawRuleToggle(string id, bool enabled)
-    {
-        ImGui.PushStyleColor(
-            ImGuiCol.Button,
-            enabled ? new Vector4(.16f, .34f, .24f, 1f) : new Vector4(.13f, .15f, .17f, 1f));
-        ImGui.PushStyleColor(
-            ImGuiCol.ButtonHovered,
-            enabled ? new Vector4(.2f, .43f, .3f, 1f) : new Vector4(.22f, .25f, .28f, 1f));
-        if (ImGui.SmallButton($"{(enabled ? "On" : "Off")}##rule{id}"))
-            enabled = !enabled;
-        ImGui.PopStyleColor(2);
-        return enabled;
-    }
-
-    private static void DrawRestockDraftQuality(RestockPlanItem item)
-    {
-        ImGui.SetNextItemWidth(-1);
-        if (!ImGui.BeginCombo($"##draftrestockquality{item.Id}", QualityLabel(item.Quality)))
-            return;
-        foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
-            if (ImGui.Selectable(QualityChoiceLabel(quality), item.Quality == quality))
-                item.Quality = quality;
-        ImGui.EndCombo();
-    }
-
-    private IReadOnlyList<RestockPlanItem> FilteredRestockDraftItems(RestockPlanDraft draft)
-    {
-        var filter = restockItemFilter.Trim();
-        return draft.Items
-            .Where(item => filter.Length == 0 || item.ItemName.Contains(filter, StringComparison.OrdinalIgnoreCase))
-            .OrderBy(item => item.ItemName, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(item => item.ItemId)
-            .ToArray();
-    }
-
     private void RequestDeleteRestockPlan(RestockPlan plan, OwnerScope owner)
     {
         var planId = plan.Id;
@@ -2100,9 +1650,8 @@ public sealed class QuartermasterWindow : Window
             item.Enabled = true;
         }
         workbench.SelectedRestockPlanId = selectedPlan?.Id;
-        OpenRestockEditor(draft);
-        activeRestockItemId = item.Id;
-        selectedRestockItemIds.SetSelected(item.Id, true);
+        restockPlanEditor.Open(draft);
+        restockPlanEditor.FocusItem(item.Id);
         workbench.ClearSelection();
     }
 
@@ -2140,22 +1689,9 @@ public sealed class QuartermasterWindow : Window
         workbench.ClearSelection();
     }
 
-    private void CloseRestockEditor()
-    {
-        if (itemGroupWorkspace.IsEditorOpenFor(ItemGroupEditorOrigin.Restock))
-            itemGroupWorkspace.CloseEditor();
-        restockDraft = null;
-        requestRestockEditorOpen = false;
-        restockEditorVisible = false;
-        selectedRestockItemIds.Clear();
-        activeRestockItemId = null;
-        selectedRestockChoice = null;
-        restockEditorError = string.Empty;
-    }
-
     private void ClosePlanEditors()
     {
-        CloseRestockEditor();
+        restockPlanEditor.Close();
         transferPlanEditor.Close();
         listingPlanEditor.Close();
         transferReviewDialog.Clear();
