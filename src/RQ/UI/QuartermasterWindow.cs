@@ -46,8 +46,6 @@ public sealed class QuartermasterWindow : Window
     private readonly DalamudTableProjection<PhysicalListingGroupView> physicalListingTable;
     private readonly DalamudTableProjection<StockWorkbenchRow> stockTable;
     private readonly DalamudTableProjection<RestockPlanRow> restockPlanTable;
-    private readonly DalamudTableProjection<ItemGroupItem> itemGroupWorkspaceTable;
-    private readonly DalamudTableProjection<ItemGroupItem> itemGroupEditorTable;
     private readonly DalamudTableProjection<RestockPlanItem> restockDraftTable;
     private readonly DalamudTableProjection<TransferWorkbenchRow> transferWorkbenchTable;
     private readonly DalamudTableProjection<StowageDraftRow> stowageDraftTable;
@@ -55,6 +53,7 @@ public sealed class QuartermasterWindow : Window
     private readonly BrowserQueryController queries = new();
     private readonly RootConfirmationDialog confirmationDialog = new();
     private readonly OperationHistoryDialog historyDialog;
+    private readonly ItemGroupWorkspace itemGroupWorkspace;
     private readonly TransferReviewDialog transferReviewDialog;
     private readonly VendorProcurementReviewDialog vendorReviewDialog;
     private StockWorkbenchProjection? stockWorkbenchProjection;
@@ -72,7 +71,7 @@ public sealed class QuartermasterWindow : Window
     private StowagePlanDraft? stowageDraft;
     private readonly TableSelectionModel<Guid> selectedStowageRuleIds = new();
     private Guid? activeStowageRuleId;
-    private Guid? selectedItemGroupId;
+    private Guid? selectedStowageItemGroupId;
     private string stowageItemSearch = string.Empty;
     private string stowageRuleFilter = string.Empty;
     private ItemChoice? selectedStowageChoice;
@@ -96,19 +95,9 @@ public sealed class QuartermasterWindow : Window
     private int bulkRestockNoteMode = -1;
     private bool requestRestockEditorOpen;
     private bool restockEditorVisible;
-    private ItemGroupDraft? itemGroupDraft;
-    private WorkbenchView? itemGroupEditorOrigin;
-    private readonly TableSelectionModel<ItemGroupItem> selectedItemGroupItems = new();
-    private string itemGroupFilter = string.Empty;
-    private string itemGroupItemSearch = string.Empty;
-    private ItemChoice? selectedItemGroupChoice;
-    private ItemQualityPolicy itemGroupAddQuality = ItemQualityPolicy.Any;
-    private string itemGroupEditorError = string.Empty;
     private string inlineTransferError = string.Empty;
     private OwnerScope? inlineTransferErrorOwner;
     private Guid? inlineTransferErrorPlanId;
-    private string itemGroupWorkspaceStatus = string.Empty;
-    private bool requestDeleteItemGroup;
     private string vendorStatus = string.Empty;
     private WorkbenchView? capturePreviousView;
     private TransferReviewDialogState? capturePreviousTransferReviewState;
@@ -153,6 +142,25 @@ public sealed class QuartermasterWindow : Window
         this.saveConfiguration = saveConfiguration;
         this.reviewRegistry = reviewRegistry;
         historyDialog = new(journal);
+        itemGroupWorkspace = new(
+            state,
+            reviewRegistry,
+            confirmationDialog,
+            SearchItems,
+            (origin, groupId) =>
+            {
+                if (origin == ItemGroupEditorOrigin.Restock)
+                    selectedRestockItemGroupId = groupId;
+                else
+                    selectedStowageItemGroupId = groupId;
+            },
+            groupId =>
+            {
+                if (selectedRestockItemGroupId == groupId)
+                    selectedRestockItemGroupId = null;
+                if (selectedStowageItemGroupId == groupId)
+                    selectedStowageItemGroupId = null;
+            });
         transferReviewDialog = new(
             () => runtimeSnapshots.Current,
             ResolveTransferWorkbenchProjection,
@@ -248,8 +256,6 @@ public sealed class QuartermasterWindow : Window
         ]);
         stockTable = CreateStockTable();
         restockPlanTable = CreateRestockPlanTable();
-        itemGroupWorkspaceTable = CreateItemGroupWorkspaceTable();
-        itemGroupEditorTable = CreateItemGroupEditorTable();
         restockDraftTable = CreateRestockDraftTable();
         transferWorkbenchTable = CreateTransferWorkbenchTable();
         stowageDraftTable = CreateStowageDraftTable();
@@ -358,42 +364,6 @@ public sealed class QuartermasterWindow : Window
             row => row.Item.Notes,
             row => row.Item.Notes,
             ImGuiTableColumnFlags.WidthStretch),
-    ]);
-
-    private DalamudTableProjection<ItemGroupItem> CreateItemGroupWorkspaceTable() => new(
-    [
-        new(
-            "Item",
-            1.4f,
-            item => item.ItemName,
-            item => item.ItemName,
-            ImGuiTableColumnFlags.WidthStretch),
-        new(
-            "Quality",
-            145,
-            item => QualityChoiceLabel(item.Quality),
-            Draw: DrawItemGroupQuality),
-        new(
-            "##remove",
-            62,
-            _ => string.Empty,
-            Draw: DrawItemGroupWorkspaceRemove),
-    ]);
-
-    private DalamudTableProjection<ItemGroupItem> CreateItemGroupEditorTable() => new(
-    [
-        new(
-            "Item",
-            1.7f,
-            item => item.ItemName,
-            item => item.ItemName,
-            ImGuiTableColumnFlags.WidthStretch),
-        new(
-            "Quality identity",
-            180,
-            item => QualityChoiceLabel(item.Quality),
-            Draw: DrawItemGroupQuality),
-        new("", 28, _ => string.Empty, Draw: DrawItemGroupEditorRemove),
     ]);
 
     private DalamudTableProjection<RestockPlanItem> CreateRestockDraftTable() => new(
@@ -566,6 +536,8 @@ public sealed class QuartermasterWindow : Window
         var stowageEditorOpen = stowageDraft is not null && (requestStowageEditorOpen || stowageEditorVisible);
         var restockEditorOpen = restockDraft is not null && (requestRestockEditorOpen || restockEditorVisible);
 
+        var itemGroups = itemGroupWorkspace.Snapshot(
+            IsOpen && workbench.View == WorkbenchView.ItemGroups);
         return new QuartermasterUiSnapshot(
             IsOpen,
             workbench.View is WorkbenchView.Listings or WorkbenchView.Activity
@@ -587,10 +559,10 @@ public sealed class QuartermasterWindow : Window
             restockEditorOpen || stowageEditorOpen,
             (restockDraft is not null && RestockPlanCatalog.HasChanges(document, runtime.Owner, restockDraft)) ||
             (stowageDraft is not null && StowagePlanCatalog.HasChanges(document, runtime.Owner, stowageDraft)),
-            itemGroupDraft is { IsNew: false } ? itemGroupDraft.GroupId : null,
-            itemGroupDraft?.Name,
-            IsOpen && workbench.View == WorkbenchView.ItemGroups && itemGroupDraft is not null,
-            itemGroupDraft is not null && ItemGroupCatalog.HasChanges(document, itemGroupDraft),
+            itemGroups.SelectedGroupId,
+            itemGroups.SelectedGroupName,
+            itemGroups.WorkspaceEditorOpen,
+            itemGroups.HasUnsavedChanges,
             selectedPlan?.Id,
             selectedPlan?.Name,
             selectedEvaluation?.RetrieveQuantity ?? 0,
@@ -852,7 +824,7 @@ public sealed class QuartermasterWindow : Window
             ImGui.Separator();
             var planStarted = Stopwatch.GetTimestamp();
             if (workbench.View == WorkbenchView.ItemGroups)
-                DrawItemGroupWorkspace(runtime);
+                itemGroupWorkspace.DrawWorkspace(runtime.State);
             else
             {
                 workbench.View = WorkbenchView.Stowage;
@@ -1416,26 +1388,7 @@ public sealed class QuartermasterWindow : Window
             return;
 
         workbench.View = WorkbenchView.ItemGroups;
-        EnsureItemGroupDraft(runtime.State);
-        if (itemGroupDraft is null)
-        {
-            itemGroupDraft = ItemGroupCatalog.NewDraft(runtime.State);
-            itemGroupEditorOrigin = WorkbenchView.ItemGroups;
-        }
-        if (itemGroupDraft is null)
-            return;
-
-        var added = ItemGroupCatalog.AddMissing(
-            itemGroupDraft,
-            items.Select(item => new ItemGroupItem
-            {
-                ItemId = item.ItemId,
-                ItemName = item.ItemName,
-                Quality = ItemQualityPolicy.Any,
-            }));
-        itemGroupWorkspaceStatus = added == 0
-            ? "Selected items are already in this group."
-            : $"Added {added:N0} selected {(added == 1 ? "item" : "items")}.";
+        itemGroupWorkspace.AddStockItems(runtime.State, items);
     }
 
     private void UpsertSelectedStockRules(
@@ -1638,7 +1591,7 @@ public sealed class QuartermasterWindow : Window
     private void OpenRestockEditor(RestockPlanDraft draft)
     {
         CloseStowageEditor();
-        CloseItemGroupEditor();
+        itemGroupWorkspace.CloseEditor();
         restockDraft = draft;
         selectedRestockItemIds.Clear();
         activeRestockItemId = draft.Items.FirstOrDefault()?.Id;
@@ -1677,9 +1630,13 @@ public sealed class QuartermasterWindow : Window
             return;
         }
         restockEditorVisible = true;
-        if (itemGroupDraft is not null && itemGroupEditorOrigin == WorkbenchView.Restock)
+        if (itemGroupWorkspace.IsEditorOpenFor(ItemGroupEditorOrigin.Restock))
         {
-            DrawItemGroupEditor(runtime);
+            itemGroupWorkspace.DrawEditor(
+                selectedRestockItemIds.Count,
+                groupDraft => ItemGroupCatalog.AddMissing(
+                    groupDraft,
+                    restockDraft?.Items.Where(item => selectedRestockItemIds.IsSelected(item.Id)) ?? []));
             ImGui.EndPopup();
             return;
         }
@@ -1780,12 +1737,12 @@ public sealed class QuartermasterWindow : Window
             ImGui.EndDisabled();
         ImGui.SameLine();
         if (ImGui.SmallButton("Manage groups...##restock"))
-            OpenItemGroupEditor(WorkbenchView.Restock);
+            itemGroupWorkspace.OpenEditor(ItemGroupEditorOrigin.Restock, selectedRestockItemGroupId);
         reviewRegistry.RegisterLastButton(
             "quartermaster.item-groups.open.restock",
             "Open Item Groups from the Restock Plan editor",
             true,
-            () => OpenItemGroupEditor(WorkbenchView.Restock),
+            () => itemGroupWorkspace.OpenEditor(ItemGroupEditorOrigin.Restock, selectedRestockItemGroupId),
             "Plan draft remains open");
 
         ImGui.SetNextItemWidth(210);
@@ -1803,7 +1760,9 @@ public sealed class QuartermasterWindow : Window
         if (selectedRestockItemIds.Count == 0)
             ImGui.BeginDisabled();
         if (ImGui.SmallButton("Save as @group##restock"))
-            OpenNewItemGroupFromRestockSelection();
+            itemGroupWorkspace.OpenNewEditor(
+                ItemGroupEditorOrigin.Restock,
+                draft.Items.Where(item => selectedRestockItemIds.IsSelected(item.Id)));
         if (selectedRestockItemIds.Count == 0)
             ImGui.EndDisabled();
     }
@@ -1851,719 +1810,14 @@ public sealed class QuartermasterWindow : Window
         }
     }
 
-    private void DrawItemGroupWorkspace(QuartermasterRuntimeSnapshot runtime)
-    {
-        EnsureItemGroupDraft(runtime.State);
-        var groups = ItemGroupCatalog.All(runtime.State);
-        var flags = ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.Resizable |
-                    ImGuiTableFlags.SizingStretchProp;
-        if (!ImGui.BeginTable(
-                "RQItemGroupWorkspace",
-                2,
-                flags,
-                new Vector2(0, Math.Max(260, ImGui.GetContentRegionAvail().Y))))
-            return;
 
-        ImGui.TableSetupColumn("Groups", ImGuiTableColumnFlags.WidthFixed, 210);
-        ImGui.TableSetupColumn("Members", ImGuiTableColumnFlags.WidthStretch, 1f);
-        ImGui.TableNextRow();
-        ImGui.TableNextColumn();
-        if (ImGui.BeginChild("RQItemGroupList", Vector2.Zero, false))
-        {
-            ImGui.TextUnformatted("Item groups");
-            ImGui.TextDisabled("Reusable item-name shorthands");
-            ImGui.Separator();
-            foreach (var group in groups)
-            {
-                var selected = itemGroupDraft?.GroupId == group.Id;
-                if (ImGui.Selectable(
-                        $"{group.Name}##group-workspace:{group.Id}",
-                        selected,
-                        ImGuiSelectableFlags.None,
-                        new Vector2(0, ImGui.GetTextLineHeightWithSpacing() * 1.8f)))
-                    RequestItemGroupSwitch(group.Id);
-                if (ImGui.IsItemVisible())
-                {
-                    var cursor = ImGui.GetCursorPos();
-                    ImGui.SetCursorPosY(cursor.Y - ImGui.GetTextLineHeightWithSpacing());
-                    ImGui.Indent();
-                    ImGui.TextDisabled($"{group.Items.Count:N0} items");
-                    ImGui.Unindent();
-                }
-            }
-            if (groups.Count == 0)
-                ImGui.TextDisabled("No item groups yet.");
-            ImGui.Separator();
-            if (ImGui.Button("New item group", new Vector2(-1, 0)))
-                OpenNewItemGroupWorkspace();
-            reviewRegistry.RegisterLastButton(
-                "quartermaster.item-groups.new",
-                "Create a new Item Group draft",
-                true,
-                OpenNewItemGroupWorkspace,
-                "Nothing is saved until Save group");
-        }
-        ImGui.EndChild();
 
-        ImGui.TableNextColumn();
-        if (ImGui.BeginChild("RQItemGroupDetail", Vector2.Zero, false))
-        {
-            var draft = itemGroupDraft;
-            if (draft is null)
-            {
-                ImGui.TextUnformatted("Choose an Item Group or create a new one.");
-                ImGui.TextDisabled("Selecting stock on the left can then add several items at once.");
-            }
-            else
-            {
-                DrawItemGroupWorkspaceDetail(draft, runtime);
-            }
-        }
-        ImGui.EndChild();
-        ImGui.EndTable();
-    }
 
-    private void OpenNewItemGroupWorkspace()
-    {
-        itemGroupDraft = ItemGroupCatalog.NewDraft(state.Snapshot());
-        itemGroupEditorOrigin = WorkbenchView.ItemGroups;
-        selectedItemGroupItems.Clear();
-        itemGroupItemSearch = string.Empty;
-        itemGroupWorkspaceStatus = string.Empty;
-    }
 
-    private void DiscardItemGroupWorkspace()
-    {
-        if (itemGroupDraft is not { } draft)
-            return;
-        var snapshot = state.Snapshot();
-        if (draft.IsNew)
-        {
-            itemGroupDraft = ItemGroupCatalog.All(snapshot).FirstOrDefault() is { } first
-                ? ItemGroupCatalog.Draft(snapshot, first.Id)
-                : null;
-            selectedItemGroupId = itemGroupDraft?.GroupId;
-            selectedItemGroupItems.Clear();
-            itemGroupItemSearch = string.Empty;
-        }
-        else
-        {
-            LoadItemGroupDraft(draft.GroupId);
-        }
-        itemGroupWorkspaceStatus = string.Empty;
-        itemGroupEditorError = string.Empty;
-    }
 
-    private void EnsureItemGroupDraft(QuartermasterState snapshot)
-    {
-        if (itemGroupDraft is not null)
-            return;
-        var groups = ItemGroupCatalog.All(snapshot);
-        var selected = selectedItemGroupId is { } selectedId
-            ? groups.FirstOrDefault(group => group.Id == selectedId)
-            : groups.FirstOrDefault();
-        if (selected is null)
-            return;
-        itemGroupDraft = ItemGroupCatalog.Draft(snapshot, selected.Id);
-        itemGroupEditorOrigin = WorkbenchView.ItemGroups;
-        selectedItemGroupId = selected.Id;
-    }
 
-    private void RequestItemGroupSwitch(Guid groupId)
-    {
-        if (itemGroupDraft?.GroupId == groupId)
-            return;
-        if (itemGroupDraft is not null &&
-            ItemGroupCatalog.HasChanges(state.Snapshot(), itemGroupDraft))
-        {
-            confirmationDialog.Request(
-                $"switch-item-group:{groupId}",
-                "Discard unsaved Item Group changes?",
-                "The selected Item Group will open and the current draft will be discarded.",
-                "Discard and switch",
-                () => LoadItemGroupDraft(groupId));
-            return;
-        }
-        LoadItemGroupDraft(groupId);
-    }
 
-    private void LoadItemGroupDraft(Guid groupId)
-    {
-        itemGroupDraft = ItemGroupCatalog.Draft(state.Snapshot(), groupId);
-        itemGroupEditorOrigin = WorkbenchView.ItemGroups;
-        selectedItemGroupId = groupId;
-        selectedItemGroupItems.Clear();
-        itemGroupItemSearch = string.Empty;
-        itemGroupWorkspaceStatus = string.Empty;
-        itemGroupEditorError = string.Empty;
-    }
 
-    private void DrawItemGroupWorkspaceDetail(
-        ItemGroupDraft draft,
-        QuartermasterRuntimeSnapshot runtime)
-    {
-        ImGui.SetNextItemWidth(Math.Max(220, ImGui.GetContentRegionAvail().X - 150));
-        var name = draft.Name;
-        if (ImGui.InputText("##item-group-name", ref name, 80))
-            draft.Name = name;
-        ImGui.SameLine();
-        ImGui.TextDisabled($"{draft.Items.Count:N0} items");
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Delete##item-group-workspace"))
-            RequestDeleteItemGroupWorkspace(draft);
-
-        ImGui.SetNextItemWidth(Math.Max(220, ImGui.GetContentRegionAvail().X - 140));
-        if (ImGui.InputTextWithHint(
-                "##item-group-add",
-                "Add an item by name",
-                ref itemGroupItemSearch,
-                120))
-            selectedItemGroupChoice = null;
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(120);
-        if (ImGui.BeginCombo("##item-group-add-quality", QualityChoiceLabel(itemGroupAddQuality)))
-        {
-            foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
-            {
-                if (ImGui.Selectable(QualityChoiceLabel(quality), itemGroupAddQuality == quality))
-                    itemGroupAddQuality = quality;
-            }
-            ImGui.EndCombo();
-        }
-
-        var matches = SearchItems(itemGroupItemSearch, 6);
-        if (!string.IsNullOrWhiteSpace(itemGroupItemSearch) && matches.Count > 0)
-        {
-            if (ImGui.BeginChild(
-                    "RQItemGroupSearchResults",
-                    new Vector2(0, Math.Min(150, matches.Count * ImGui.GetTextLineHeightWithSpacing() + 8)),
-                    true))
-            {
-                foreach (var choice in matches)
-                {
-                    if (!ImGui.Selectable($"{choice.Label}##group-add:{choice.ItemId}"))
-                        continue;
-                    var added = ItemGroupCatalog.AddMissing(
-                        draft,
-                        [new ItemGroupItem
-                        {
-                            ItemId = choice.ItemId,
-                            ItemName = choice.Name,
-                            Quality = itemGroupAddQuality,
-                        }]);
-                    itemGroupWorkspaceStatus = added == 0
-                        ? $"{choice.Name} is already in this group."
-                        : $"Added {choice.Name}.";
-                    itemGroupItemSearch = string.Empty;
-                    selectedItemGroupChoice = null;
-                    break;
-                }
-            }
-            ImGui.EndChild();
-        }
-
-        ImGui.Separator();
-        var footerHeight = (ImGui.GetFrameHeightWithSpacing() * 2) + 8;
-        if (itemGroupWorkspaceTable.Begin(
-                "RQItemGroupMembersWorkbench",
-                new DalamudTableLayout(
-                    new Vector2(0, Math.Max(130, ImGui.GetContentRegionAvail().Y - footerHeight)),
-                    ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
-                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp)))
-        {
-            foreach (var member in draft.Items.ToArray())
-                itemGroupWorkspaceTable.DrawRow(
-                    member,
-                    id: $"item-group-workspace:{member.ItemId}:{member.GetHashCode()}");
-            itemGroupWorkspaceTable.End();
-        }
-
-        if (!string.IsNullOrWhiteSpace(itemGroupEditorError))
-            ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), itemGroupEditorError);
-        else if (!string.IsNullOrWhiteSpace(itemGroupWorkspaceStatus))
-            ImGui.TextDisabled(itemGroupWorkspaceStatus);
-        else
-            ImGui.TextDisabled("Select stock on the left to add several items at once.");
-
-        var snapshot = state.Snapshot();
-        var canApply = ItemGroupCatalog.CanApply(snapshot, draft);
-        var hasChanges = ItemGroupCatalog.HasChanges(snapshot, draft);
-        ImGui.SameLine();
-        if (!hasChanges)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Discard"))
-            DiscardItemGroupWorkspace();
-        if (!hasChanges)
-            ImGui.EndDisabled();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.item-groups.discard",
-            "Discard changes to the current Item Group",
-            hasChanges,
-            DiscardItemGroupWorkspace,
-            hasChanges ? "Unsaved changes will be discarded" : "No unsaved changes");
-        ImGui.SameLine();
-        if (!canApply)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Save group"))
-            SaveItemGroupWorkspace(draft);
-        if (!canApply)
-            ImGui.EndDisabled();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.item-groups.save",
-            "Save the current Item Group",
-            canApply,
-            () =>
-            {
-                if (itemGroupDraft is not null)
-                    SaveItemGroupWorkspace(itemGroupDraft);
-            },
-            canApply ? "Valid changes" : "No valid changes");
-    }
-
-    private void SaveItemGroupWorkspace(ItemGroupDraft draft)
-    {
-        try
-        {
-            var groupId = state.Mutate(document => ItemGroupCatalog.Apply(document, draft).Id);
-            LoadItemGroupDraft(groupId);
-            itemGroupWorkspaceStatus = "Item Group saved.";
-        }
-        catch (Exception exception)
-        {
-            itemGroupEditorError = exception.Message;
-        }
-    }
-
-    private void RequestDeleteItemGroupWorkspace(ItemGroupDraft draft)
-    {
-        if (draft.IsNew)
-        {
-            itemGroupDraft = ItemGroupCatalog.All(state.Snapshot()).FirstOrDefault() is { } first
-                ? ItemGroupCatalog.Draft(state.Snapshot(), first.Id)
-                : null;
-            return;
-        }
-        confirmationDialog.Request(
-            $"delete-item-group:{draft.GroupId}",
-            $"Delete \"{draft.Name}\"?",
-            "Existing Transfer Plan items will not be changed.",
-            "Delete group",
-            () =>
-            {
-                state.Mutate(document =>
-                    ItemGroupCatalog.Delete(document, draft.GroupId, draft.SourceRevision));
-                itemGroupDraft = null;
-                selectedItemGroupId = null;
-                EnsureItemGroupDraft(state.Snapshot());
-            });
-    }
-
-    private void OpenItemGroupEditor(WorkbenchView origin)
-    {
-        itemGroupEditorOrigin = origin;
-        var snapshot = state.Snapshot();
-        var preferredId = origin == WorkbenchView.Restock
-            ? selectedRestockItemGroupId
-            : selectedItemGroupId;
-        var group = snapshot.ItemGroups.FirstOrDefault(candidate => candidate.Id == preferredId)
-                    ?? ItemGroupCatalog.All(snapshot).FirstOrDefault();
-        itemGroupDraft = group is null
-            ? ItemGroupCatalog.NewDraft(snapshot)
-            : ItemGroupCatalog.Draft(snapshot, group.Id);
-        ResetItemGroupEditorInput();
-    }
-
-    private void OpenNewItemGroupFromRestockSelection()
-    {
-        if (restockDraft is null)
-            return;
-        var selected = restockDraft.Items
-            .Where(item => selectedRestockItemIds.IsSelected(item.Id))
-            .ToArray();
-        itemGroupEditorOrigin = WorkbenchView.Restock;
-        itemGroupDraft = ItemGroupCatalog.NewDraft(state.Snapshot(), "Item group", selected);
-        ResetItemGroupEditorInput();
-    }
-
-    private void OpenNewItemGroupFromStowageSelection()
-    {
-        if (stowageDraft is null)
-            return;
-        var selected = stowageDraft.Rules
-            .Where(rule => selectedStowageRuleIds.IsSelected(rule.Id))
-            .ToArray();
-        itemGroupEditorOrigin = WorkbenchView.Stowage;
-        itemGroupDraft = ItemGroupCatalog.NewDraft(state.Snapshot(), "Item group", selected);
-        ResetItemGroupEditorInput();
-    }
-
-    private void ResetItemGroupEditorInput()
-    {
-        selectedItemGroupItems.Clear();
-        itemGroupFilter = string.Empty;
-        itemGroupItemSearch = string.Empty;
-        selectedItemGroupChoice = null;
-        itemGroupAddQuality = ItemQualityPolicy.Any;
-        itemGroupEditorError = string.Empty;
-        requestDeleteItemGroup = false;
-    }
-
-    private void CloseItemGroupEditor()
-    {
-        itemGroupDraft = null;
-        itemGroupEditorOrigin = null;
-        selectedItemGroupItems.Clear();
-        selectedItemGroupChoice = null;
-        itemGroupEditorError = string.Empty;
-        requestDeleteItemGroup = false;
-    }
-
-    private void DrawItemGroupEditor(QuartermasterRuntimeSnapshot runtime)
-    {
-        var draft = itemGroupDraft;
-        if (draft is null)
-            return;
-        var hasChanges = ItemGroupCatalog.HasChanges(state.Snapshot(), draft);
-
-        if (ImGui.Button("<- Back to plan##itemgroups"))
-        {
-            CloseItemGroupEditor();
-            return;
-        }
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.item-groups.back",
-            "Discard the open Item Group draft and return to the Transfer Plan",
-            true,
-            CloseItemGroupEditor,
-            hasChanges ? "Unsaved Item Group changes will be discarded" : "The Transfer Plan draft remains open");
-        ImGui.SameLine();
-        ImGui.TextUnformatted("Item groups");
-        ImGui.SameLine();
-        ImGui.TextDisabled("Reusable across Transfer Plans");
-        if (hasChanges)
-            ImGui.TextColored(new Vector4(1f, .7f, .3f, 1f), "Returning to the plan will discard unsaved Item Group changes.");
-
-        if (!string.IsNullOrWhiteSpace(itemGroupEditorError))
-            ImGui.TextColored(new Vector4(1f, .45f, .4f, 1f), itemGroupEditorError);
-
-        var bodyHeight = Math.Max(260, ImGui.GetContentRegionAvail().Y - 42);
-        var flags = ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
-        if (ImGui.BeginTable("RQItemGroupEditor", 2, flags, new Vector2(0, bodyHeight)))
-        {
-            ImGui.TableSetupColumn("Groups", ImGuiTableColumnFlags.WidthFixed, 290);
-            ImGui.TableSetupColumn("Members", ImGuiTableColumnFlags.WidthStretch, 1f);
-            ImGui.TableNextRow();
-            ImGui.TableNextColumn();
-            if (ImGui.BeginChild("RQItemGroupList", Vector2.Zero, false))
-                DrawItemGroupList(draft);
-            ImGui.EndChild();
-            ImGui.TableNextColumn();
-            if (ImGui.BeginChild("RQItemGroupMembers", Vector2.Zero, false))
-                DrawItemGroupMembers(draft, runtime);
-            ImGui.EndChild();
-            ImGui.EndTable();
-        }
-
-        var snapshot = state.Snapshot();
-        var canApply = ItemGroupCatalog.CanApply(snapshot, draft);
-        ImGui.TextDisabled(draft.IsNew && draft.Items.Count == 0
-            ? "Add at least one item to save this group."
-            : canApply ? "Unsaved changes - groups remember item and quality; plans own quantities and routing." : "No unsaved changes.");
-        var saveButtonWidth = ImGui.CalcTextSize("Save group").X + (ImGui.GetStyle().FramePadding.X * 2);
-        ImGui.SameLine(Math.Max(
-            ImGui.GetCursorPosX() + ImGui.GetStyle().ItemSpacing.X,
-            ImGui.GetWindowContentRegionMax().X - saveButtonWidth));
-        if (!canApply)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Save group##itemgroupeditor"))
-        {
-            try
-            {
-                var groupId = state.Mutate(document => ItemGroupCatalog.Apply(document, draft).Id);
-                if (itemGroupEditorOrigin == WorkbenchView.Restock)
-                    selectedRestockItemGroupId = groupId;
-                else
-                    selectedItemGroupId = groupId;
-                itemGroupDraft = ItemGroupCatalog.Draft(state.Snapshot(), groupId);
-                selectedItemGroupItems.Clear();
-                itemGroupEditorError = string.Empty;
-            }
-            catch (InvalidOperationException exception)
-            {
-                itemGroupEditorError = exception.Message;
-            }
-        }
-        if (!canApply)
-            ImGui.EndDisabled();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.item-groups.save",
-            "Save the open Item Group draft",
-            canApply,
-            () =>
-            {
-                if (itemGroupDraft is null)
-                    return;
-                var groupId = state.Mutate(document => ItemGroupCatalog.Apply(document, itemGroupDraft).Id);
-                if (itemGroupEditorOrigin == WorkbenchView.Restock)
-                    selectedRestockItemGroupId = groupId;
-                else
-                    selectedItemGroupId = groupId;
-                itemGroupDraft = ItemGroupCatalog.Draft(state.Snapshot(), groupId);
-            },
-            canApply ? "Changes are saved together" : "No valid changes");
-
-        DrawDeleteItemGroupPopup();
-    }
-
-    private void DrawItemGroupList(ItemGroupDraft draft)
-    {
-        ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##itemgroupfilter", "Filter groups", ref itemGroupFilter, 80);
-        ImGui.Separator();
-        var groups = ItemGroupCatalog.All(state.Snapshot())
-            .Where(group => itemGroupFilter.Trim().Length == 0 ||
-                            group.Name.Contains(itemGroupFilter.Trim(), StringComparison.OrdinalIgnoreCase) ||
-                            group.Items.Any(item => item.ItemName.Contains(itemGroupFilter.Trim(), StringComparison.OrdinalIgnoreCase)))
-            .ToArray();
-        foreach (var group in groups)
-        {
-            var preview = string.Join(", ", group.Items.Select(item => item.ItemName).Take(3));
-            if (group.Items.Count > 3)
-                preview += "...";
-            var selected = !draft.IsNew && draft.GroupId == group.Id;
-            if (ImGui.Selectable(
-                    $"@{group.Name}  ({group.Items.Count:N0})##itemgroup{group.Id}",
-                    selected,
-                    ImGuiSelectableFlags.AllowDoubleClick))
-                TrySwitchItemGroup(group.Id);
-            var groupId = group.Id;
-            reviewRegistry.RegisterLastButton(
-                $"quartermaster.item-groups.select.{group.Id}",
-                $"Edit Item Group {group.Name}",
-                true,
-                () => TrySwitchItemGroup(groupId),
-                selected ? "Selected" : $"{group.Items.Count:N0} items");
-            if (!string.IsNullOrWhiteSpace(preview))
-                ImGui.TextDisabled(preview);
-        }
-        ImGui.Separator();
-        if (ImGui.Button("New item group", new Vector2(-1, 0)))
-        {
-            if (ItemGroupCatalog.HasChanges(state.Snapshot(), draft))
-                itemGroupEditorError = "Save or discard this Item Group before creating another.";
-            else
-            {
-                itemGroupDraft = ItemGroupCatalog.NewDraft(state.Snapshot());
-                selectedItemGroupItems.Clear();
-                itemGroupEditorError = string.Empty;
-            }
-        }
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.item-groups.new",
-            "Open a new Item Group draft",
-            true,
-            () =>
-            {
-                if (itemGroupDraft is not null &&
-                    !ItemGroupCatalog.HasChanges(state.Snapshot(), itemGroupDraft))
-                    itemGroupDraft = ItemGroupCatalog.NewDraft(state.Snapshot());
-            },
-            "Nothing is saved until Save group");
-    }
-
-    private void TrySwitchItemGroup(Guid groupId)
-    {
-        if (itemGroupDraft is null || itemGroupDraft.GroupId == groupId)
-            return;
-        if (ItemGroupCatalog.HasChanges(state.Snapshot(), itemGroupDraft))
-        {
-            itemGroupEditorError = "Save or discard this Item Group before switching.";
-            return;
-        }
-        itemGroupDraft = ItemGroupCatalog.Draft(state.Snapshot(), groupId);
-        selectedItemGroupItems.Clear();
-        itemGroupItemSearch = string.Empty;
-        selectedItemGroupChoice = null;
-        itemGroupEditorError = string.Empty;
-    }
-
-    private void DrawItemGroupMembers(ItemGroupDraft draft, QuartermasterRuntimeSnapshot runtime)
-    {
-        ImGui.TextDisabled("Name");
-        ImGui.SameLine();
-        var name = draft.Name;
-        ImGui.SetNextItemWidth(300);
-        if (ImGui.InputText("##itemgroupname", ref name, 80))
-            draft.Name = name;
-        ImGui.SameLine();
-        ImGui.TextDisabled($"{draft.Items.Count:N0} items");
-        ImGui.SameLine(ImGui.GetContentRegionAvail().X - 100);
-        if (draft.IsNew)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Delete group##itemgroup"))
-            requestDeleteItemGroup = true;
-        if (draft.IsNew)
-            ImGui.EndDisabled();
-
-        ImGui.Separator();
-        ImGui.TextDisabled("Add member");
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(260);
-        if (ImGui.InputTextWithHint("##itemgroupitemsearch", "Search by item name", ref itemGroupItemSearch, 96))
-            selectedItemGroupChoice = null;
-        if (itemGroupItemSearch.Trim().Length >= 2 && selectedItemGroupChoice is null)
-        {
-            foreach (var match in SearchItems(itemGroupItemSearch, 5))
-                if (ImGui.Selectable(
-                        $"{match.Label}##itemgroupchoice{match.ItemId}",
-                        false,
-                        ImGuiSelectableFlags.DontClosePopups))
-                {
-                    selectedItemGroupChoice = match;
-                    itemGroupItemSearch = match.Name;
-                }
-        }
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(130);
-        if (ImGui.BeginCombo("##itemgroupaddquality", QualityChoiceLabel(itemGroupAddQuality)))
-        {
-            foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
-                if (ImGui.Selectable(QualityChoiceLabel(quality), itemGroupAddQuality == quality))
-                    itemGroupAddQuality = quality;
-            ImGui.EndCombo();
-        }
-        ImGui.SameLine();
-        var canAddItem = selectedItemGroupChoice is not null;
-        if (!canAddItem)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Add item##itemgroup") && selectedItemGroupChoice is { } choice)
-        {
-            ItemGroupCatalog.AddMissing(draft,
-            [
-                new ItemGroupItem
-                {
-                    ItemId = choice.ItemId,
-                    ItemName = choice.Name,
-                    Quality = itemGroupAddQuality,
-                },
-            ]);
-            selectedItemGroupChoice = null;
-            itemGroupItemSearch = string.Empty;
-        }
-        if (!canAddItem)
-            ImGui.EndDisabled();
-
-        var planSelectionCount = ItemGroupPlanSelectionCount();
-        ImGui.SameLine();
-        if (planSelectionCount == 0)
-            ImGui.BeginDisabled();
-        if (ImGui.Button($"Add {planSelectionCount:N0} selected from plan##itemgroup"))
-            AddPlanSelectionToItemGroup(draft);
-        if (planSelectionCount == 0)
-            ImGui.EndDisabled();
-
-        var hasSelectedMembers = selectedItemGroupItems.Count > 0;
-        if (!hasSelectedMembers)
-            ImGui.BeginDisabled();
-        if (ImGui.Button($"Remove selected ({selectedItemGroupItems.Count:N0})##itemgroup"))
-        {
-            draft.Items.RemoveAll(selectedItemGroupItems.IsSelected);
-            selectedItemGroupItems.Clear();
-        }
-        if (!hasSelectedMembers)
-            ImGui.EndDisabled();
-
-        var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY |
-                    ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
-        if (!itemGroupEditorTable.Begin(
-                "RQItemGroupMembersTable",
-                new DalamudTableLayout(
-                    new Vector2(0, Math.Max(180, ImGui.GetContentRegionAvail().Y)),
-                    flags)))
-            return;
-        var items = draft.Items.ToArray();
-        selectedItemGroupItems.Retain(items);
-        for (var index = 0; index < items.Length; index++)
-        {
-            var item = items[index];
-            itemGroupEditorTable.DrawSelectableRow(
-                item,
-                selectedItemGroupItems,
-                items,
-                index,
-                $"##selectgroupitem:{item.ItemId}:{item.GetHashCode()}");
-        }
-        DalamudTableSelectionRenderer.EndRows(selectedItemGroupItems);
-        itemGroupEditorTable.End();
-    }
-
-    private int ItemGroupPlanSelectionCount() =>
-        itemGroupEditorOrigin switch
-        {
-            WorkbenchView.Restock when restockDraft is not null =>
-                restockDraft.Items.Count(item => selectedRestockItemIds.IsSelected(item.Id)),
-            WorkbenchView.Stowage when stowageDraft is not null =>
-                stowageDraft.Rules.Count(rule => selectedStowageRuleIds.IsSelected(rule.Id)),
-            _ => 0,
-        };
-
-    private void AddPlanSelectionToItemGroup(ItemGroupDraft draft)
-    {
-        if (itemGroupEditorOrigin == WorkbenchView.Restock && restockDraft is not null)
-            ItemGroupCatalog.AddMissing(
-                draft,
-                restockDraft.Items.Where(item => selectedRestockItemIds.IsSelected(item.Id)));
-        else if (itemGroupEditorOrigin == WorkbenchView.Stowage && stowageDraft is not null)
-            ItemGroupCatalog.AddMissing(
-                draft,
-                stowageDraft.Rules.Where(rule => selectedStowageRuleIds.IsSelected(rule.Id)));
-    }
-
-    private void DrawDeleteItemGroupPopup()
-    {
-        if (requestDeleteItemGroup)
-        {
-            ImGui.OpenPopup("Delete Item Group##RQ");
-            requestDeleteItemGroup = false;
-        }
-        if (!ImGui.BeginPopupModal("Delete Item Group##RQ", ImGuiWindowFlags.AlwaysAutoResize))
-            return;
-        var draft = itemGroupDraft;
-        if (draft is null || draft.IsNew)
-        {
-            ImGui.CloseCurrentPopup();
-            ImGui.EndPopup();
-            return;
-        }
-        ImGui.TextUnformatted($"Delete \"@{draft.Name}\"?");
-        ImGui.TextDisabled("Existing plan items are not changed.");
-        if (ImGui.Button("Delete##itemgroupconfirm"))
-        {
-            try
-            {
-                state.Mutate(document => ItemGroupCatalog.Delete(document, draft.GroupId, draft.SourceRevision));
-                if (selectedRestockItemGroupId == draft.GroupId)
-                    selectedRestockItemGroupId = null;
-                if (selectedItemGroupId == draft.GroupId)
-                    selectedItemGroupId = null;
-                var next = ItemGroupCatalog.All(state.Snapshot()).FirstOrDefault();
-                itemGroupDraft = next is null
-                    ? ItemGroupCatalog.NewDraft(state.Snapshot())
-                    : ItemGroupCatalog.Draft(state.Snapshot(), next.Id);
-                selectedItemGroupItems.Clear();
-                itemGroupEditorError = string.Empty;
-                ImGui.CloseCurrentPopup();
-            }
-            catch (InvalidOperationException exception)
-            {
-                itemGroupEditorError = exception.Message;
-            }
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("Cancel##itemgroupdelete"))
-            ImGui.CloseCurrentPopup();
-        ImGui.EndPopup();
-    }
 
     private void DrawRestockEditorBulkBar(RestockPlanDraft draft)
     {
@@ -2691,32 +1945,6 @@ public sealed class QuartermasterWindow : Window
         ImGui.TextDisabled(QualityLabel(row.Item.Quality));
     }
 
-    private static void DrawItemGroupQuality(ItemGroupItem item)
-    {
-        ImGui.SetNextItemWidth(-1);
-        if (!ImGui.BeginCombo(
-                $"##group-quality:{item.ItemId}:{item.GetHashCode()}",
-                QualityChoiceLabel(item.Quality)))
-            return;
-        foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
-            if (ImGui.Selectable(QualityChoiceLabel(quality), item.Quality == quality))
-                item.Quality = quality;
-        ImGui.EndCombo();
-    }
-
-    private void DrawItemGroupWorkspaceRemove(ItemGroupItem item)
-    {
-        if (ImGui.SmallButton($"Remove##group-member:{item.ItemId}:{item.GetHashCode()}"))
-            itemGroupDraft?.Items.Remove(item);
-    }
-
-    private void DrawItemGroupEditorRemove(ItemGroupItem item)
-    {
-        if (!ImGui.SmallButton($"X##removegroupitem{item.GetHashCode()}"))
-            return;
-        itemGroupDraft?.Items.Remove(item);
-        selectedItemGroupItems.SetSelected(item, false);
-    }
 
     private static void DrawRestockTarget(RestockPlanItem item)
     {
@@ -3047,8 +2275,8 @@ public sealed class QuartermasterWindow : Window
 
     private void CloseRestockEditor()
     {
-        if (itemGroupEditorOrigin == WorkbenchView.Restock)
-            CloseItemGroupEditor();
+        if (itemGroupWorkspace.IsEditorOpenFor(ItemGroupEditorOrigin.Restock))
+            itemGroupWorkspace.CloseEditor();
         restockDraft = null;
         requestRestockEditorOpen = false;
         restockEditorVisible = false;
@@ -3060,8 +2288,8 @@ public sealed class QuartermasterWindow : Window
 
     private void CloseStowageEditor()
     {
-        if (itemGroupEditorOrigin == WorkbenchView.Stowage)
-            CloseItemGroupEditor();
+        if (itemGroupWorkspace.IsEditorOpenFor(ItemGroupEditorOrigin.Stowage))
+            itemGroupWorkspace.CloseEditor();
         stowageDraft = null;
         requestStowageEditorOpen = false;
         stowageEditorVisible = false;
@@ -3617,11 +2845,11 @@ public sealed class QuartermasterWindow : Window
     private void OpenStowageEditor(StowagePlanDraft draft)
     {
         CloseRestockEditor();
-        CloseItemGroupEditor();
+        itemGroupWorkspace.CloseEditor();
         stowageDraft = draft;
         selectedStowageRuleIds.Clear();
         activeStowageRuleId = stowageDraft.Rules.FirstOrDefault()?.Id;
-        selectedItemGroupId = null;
+        selectedStowageItemGroupId = null;
         stowageItemSearch = string.Empty;
         stowageRuleFilter = string.Empty;
         selectedStowageChoice = null;
@@ -3657,9 +2885,13 @@ public sealed class QuartermasterWindow : Window
             return;
         }
         stowageEditorVisible = true;
-        if (itemGroupDraft is not null && itemGroupEditorOrigin == WorkbenchView.Stowage)
+        if (itemGroupWorkspace.IsEditorOpenFor(ItemGroupEditorOrigin.Stowage))
         {
-            DrawItemGroupEditor(runtime);
+            itemGroupWorkspace.DrawEditor(
+                selectedStowageRuleIds.Count,
+                groupDraft => ItemGroupCatalog.AddMissing(
+                    groupDraft,
+                    stowageDraft?.Rules.Where(rule => selectedStowageRuleIds.IsSelected(rule.Id)) ?? []));
             ImGui.EndPopup();
             return;
         }
@@ -3733,13 +2965,13 @@ public sealed class QuartermasterWindow : Window
         ImGui.SameLine();
         var snapshot = state.Snapshot();
         var groups = ItemGroupCatalog.All(snapshot);
-        var selectedGroup = groups.FirstOrDefault(group => group.Id == selectedItemGroupId);
+        var selectedGroup = groups.FirstOrDefault(group => group.Id == selectedStowageItemGroupId);
         ImGui.SetNextItemWidth(185);
         if (ImGui.BeginCombo("##stowagegroup", selectedGroup is null ? "@item group" : $"@{selectedGroup.Name}"))
         {
             foreach (var group in groups)
                 if (ImGui.Selectable($"@{group.Name}##group{group.Id}", selectedGroup?.Id == group.Id))
-                    selectedItemGroupId = group.Id;
+                    selectedStowageItemGroupId = group.Id;
             ImGui.EndCombo();
         }
         ImGui.SameLine();
@@ -3754,12 +2986,12 @@ public sealed class QuartermasterWindow : Window
             ImGui.EndDisabled();
         ImGui.SameLine();
         if (ImGui.SmallButton("Manage groups...##stowage"))
-            OpenItemGroupEditor(WorkbenchView.Stowage);
+            itemGroupWorkspace.OpenEditor(ItemGroupEditorOrigin.Stowage, selectedStowageItemGroupId);
         reviewRegistry.RegisterLastButton(
             "quartermaster.item-groups.open.transfer",
             "Open Item Groups from the Transfer Plan editor",
             true,
-            () => OpenItemGroupEditor(WorkbenchView.Stowage),
+            () => itemGroupWorkspace.OpenEditor(ItemGroupEditorOrigin.Stowage, selectedStowageItemGroupId),
             "Plan draft remains open");
 
         ImGui.SetNextItemWidth(210);
@@ -3777,7 +3009,9 @@ public sealed class QuartermasterWindow : Window
         if (selectedStowageRuleIds.Count == 0)
             ImGui.BeginDisabled();
         if (ImGui.SmallButton("Save as @group"))
-            OpenNewItemGroupFromStowageSelection();
+            itemGroupWorkspace.OpenNewEditor(
+                ItemGroupEditorOrigin.Stowage,
+                draft.Rules.Where(rule => selectedStowageRuleIds.IsSelected(rule.Id)));
         if (selectedStowageRuleIds.Count == 0)
             ImGui.EndDisabled();
     }
