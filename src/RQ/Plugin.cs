@@ -17,7 +17,6 @@ using RQ.Domain;
 using RQ.Interop;
 using RQ.Inventory;
 using RQ.Operations;
-using RQ.Observations;
 using RQ.Persistence;
 using RQ.Planning;
 using RQ.Runtime;
@@ -60,8 +59,8 @@ public sealed class Plugin : IDalamudPlugin
     private readonly RQ.AgentBridge.AgentBridgeHost agentBridge;
     private readonly AgentBridgeViewportCaptureService agentBridgeViewportCapture;
     private readonly AgentBridgeUiReviewRegistry agentReviewRegistry = new();
-    private readonly DalamudSharedObservationHost observationHost;
-    private readonly QuartermasterObservationConsumer observationConsumer;
+    private readonly DalamudSharedObservationHost? observationHost;
+    private readonly DalamudSharedObservationClient observationClient;
     private readonly WindowSystem windows = new("RQ");
     private readonly QuartermasterWindow window;
     private readonly RuntimeReconciliationQueue reconciliation = new();
@@ -126,9 +125,11 @@ public sealed class Plugin : IDalamudPlugin
             log.Error(exception, "Quartermaster could not persist its latest retainer listings; the in-memory projection remains current.");
         state = new(new QuartermasterStateStore(statePath));
         workQueue = new();
-        try
-        {
-            observationHost = new DalamudSharedObservationHost(new DalamudSharedObservationHostOptions
+        var observationPaths = SharedObservationPaths.FromPluginConfigDirectory(configDirectory);
+        var captureSessions = new ObservationCaptureSessionRegistry(observationPaths.CaptureSessionsPath);
+        var observationRuntime = SharedObservationRuntime.Create(
+            captureSessions,
+            () => new DalamudSharedObservationHost(new DalamudSharedObservationHostOptions
             {
                 PluginConfigDirectory = configDirectory,
                 PluginName = "Quartermaster",
@@ -144,24 +145,29 @@ public sealed class Plugin : IDalamudPlugin
                     else
                         log.Error(exception, message);
                 },
-            });
-            observationConsumer = new(
-                configDirectory,
-                CurrentOwner,
-                DeliverInventoryObservationAsync,
-                (message, exception) =>
-                {
-                    if (exception is null)
-                        log.Warning(message);
-                    else
-                        log.Error(exception, message);
-                });
-        }
-        catch (Exception exception)
+            }),
+            exception => log.Warning(exception, "Quartermaster cannot host the shared collector on this game build; it will consume Franthropy observations from another eligible plugin."));
+        observationHost = observationRuntime.Host;
+        captureSessions = observationRuntime.CaptureSessions;
+        observationClient = new(new DalamudSharedObservationClientOptions
         {
-            log.Error(exception, "Quartermaster shared inventory observations are unavailable.");
-            throw;
-        }
+            PluginConfigDirectory = configDirectory,
+            CurrentOwner = () =>
+            {
+                var current = CurrentOwner();
+                return current.HasStableIdentity
+                    ? new ObservationOwner(current.LocalContentId!.Value, current.HomeWorldId!.Value)
+                    : null;
+            },
+            Deliver = DeliverInventoryObservationAsync,
+            Diagnostic = (message, exception) =>
+            {
+                if (exception is null)
+                    log.Warning(message);
+                else
+                    log.Error(exception, message);
+            },
+        });
         StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
         TransferPlanMigration.EnsureOwnerPlans(state, CurrentOwner());
         var automation = new AutomationLease();
@@ -170,7 +176,7 @@ public sealed class Plugin : IDalamudPlugin
         var retainerSession = new DalamudRetainerAutomationSession(
             framework, gameGui, dataManager, log, objects, targets, sigScanner, gameInventory);
         var autoRetainerIpc = new DalamudAutoRetainerIpc(pluginInterface);
-        retainerRefresh = new(framework, log, cache, state, retainerSession, observationHost.CaptureSessions, autoRetainerIpc, automation, CurrentOwner);
+        retainerRefresh = new(framework, log, cache, state, retainerSession, captureSessions, autoRetainerIpc, automation, CurrentOwner);
         journal = new OperationJournal(state);
         RetainerStockMutationPersistence.RecoverPending(journal, cache);
         journal.ReconcileInterruptedOperations();
@@ -187,7 +193,7 @@ public sealed class Plugin : IDalamudPlugin
             autoRetainerIpc,
             automation,
             cache,
-            observationHost.CaptureSessions,
+            captureSessions,
             CurrentOwner,
             autoRetainerSuppression);
         transfers = new TransferCoordinator(
@@ -305,8 +311,8 @@ public sealed class Plugin : IDalamudPlugin
             playerInventory.Changed += OnPlayerInventoryChanged;
             cache.Changed += OnCacheChanged;
             cache.ListingCaptured += OnListingCaptured;
-            observationHost.Start();
-            observationConsumer.Start();
+            observationHost?.Start();
+            observationClient.Start();
             journal.OperationChanged += OnOperationChanged;
             submissions.OperationChanged += OnSubmittedOperationChanged;
             deposits.OperationChanged += OnSubmittedOperationChanged;
@@ -599,7 +605,7 @@ public sealed class Plugin : IDalamudPlugin
             vendorRun?.Receipts.Aggregate(0UL, (sum, receipt) => checked(sum + receipt.SpentGil)) ?? 0);
     }
 
-    private void ApplyInventoryObservation(QuartermasterObservationDelivery delivery)
+    private void ApplyInventoryObservation(SharedObservationDelivery delivery)
     {
         var owner = CurrentOwner();
         if (!owner.HasStableIdentity ||
@@ -787,7 +793,7 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     private async ValueTask DeliverInventoryObservationAsync(
-        QuartermasterObservationDelivery delivery,
+        SharedObservationDelivery delivery,
         CancellationToken cancellationToken)
     {
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -831,10 +837,10 @@ public sealed class Plugin : IDalamudPlugin
         cache.Changed -= OnCacheChanged;
         cache.ListingCaptured -= OnListingCaptured;
         journal.OperationChanged -= OnOperationChanged;
-        observationConsumer.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        observationClient.DisposeAsync().AsTask().GetAwaiter().GetResult();
         ipc.Dispose();
         retainerRefresh.Dispose();
-        observationHost.Dispose();
+        observationHost?.Dispose();
         cache.Dispose();
         windows.RemoveAllWindows();
     }

@@ -12,12 +12,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repository = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'Resolve-PinnedFranthropyRoot.ps1')
 $project = Join-Path $repository 'src\RQ\RQ.csproj'
 $source = Join-Path $repository "src\RQ\bin\$Configuration"
 $targetPath = [System.IO.Path]::GetFullPath($Target)
 
 if (-not $SkipBuild) {
-    & dotnet build $project -c $Configuration
+    $franthropyRoot = Resolve-PinnedFranthropyRoot -QuartermasterRepoRoot $repository
+    & dotnet build $project -c $Configuration "-p:FranthropyRoot=$franthropyRoot"
     if ($LASTEXITCODE -ne 0) {
         throw "Quartermaster $Configuration build failed with exit code $LASTEXITCODE."
     }
