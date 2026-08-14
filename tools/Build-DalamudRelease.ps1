@@ -13,6 +13,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+. (Join-Path $PSScriptRoot 'Resolve-PinnedFranthropyRoot.ps1')
+$franthropyRoot = Resolve-PinnedFranthropyRoot -QuartermasterRepoRoot $repoRoot
 $projectDir = Join-Path $repoRoot "src\RQ"
 $projectPath = Join-Path $projectDir "RQ.csproj"
 $pluginName = "RQ"
@@ -33,7 +35,7 @@ $zipPath = Join-Path $OutputDirectory "latest.zip"
 $repoJsonPath = Join-Path $OutputDirectory "repo.json"
 
 if (-not $SkipBuild) {
-    dotnet build $projectPath -c $Configuration -p:UseSharedCompilation=false
+    dotnet build $projectPath -c $Configuration -p:UseSharedCompilation=false "-p:FranthropyRoot=$franthropyRoot"
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }

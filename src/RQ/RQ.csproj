@@ -15,9 +15,10 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
-    <FranthropyDalamudProject Condition="'$(FranthropyDalamudProject)' == ''">..\..\..\Franthropy\src\Franthropy.Dalamud\Franthropy.Dalamud.csproj</FranthropyDalamudProject>
-    <FranthropyFfxivProject Condition="'$(FranthropyFfxivProject)' == ''">..\..\..\Franthropy\src\Franthropy.FFXIV\Franthropy.FFXIV.csproj</FranthropyFfxivProject>
-    <FranthropyObservationsProject Condition="'$(FranthropyObservationsProject)' == ''">..\..\..\Franthropy\src\Franthropy.Observations\Franthropy.Observations.csproj</FranthropyObservationsProject>
+    <FranthropyRoot Condition="'$(FranthropyRoot)' == ''">..\..\..\Franthropy</FranthropyRoot>
+    <FranthropyDalamudProject Condition="'$(FranthropyDalamudProject)' == ''">$(FranthropyRoot)\src\Franthropy.Dalamud\Franthropy.Dalamud.csproj</FranthropyDalamudProject>
+    <FranthropyFfxivProject Condition="'$(FranthropyFfxivProject)' == ''">$(FranthropyRoot)\src\Franthropy.FFXIV\Franthropy.FFXIV.csproj</FranthropyFfxivProject>
+    <FranthropyObservationsProject Condition="'$(FranthropyObservationsProject)' == ''">$(FranthropyRoot)\src\Franthropy.Observations\Franthropy.Observations.csproj</FranthropyObservationsProject>
   </PropertyGroup>
 
   <ItemGroup>
