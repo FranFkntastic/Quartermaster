@@ -427,7 +427,10 @@ public sealed class Plugin : IDalamudPlugin
             snapshots.Refresh(runtime);
         nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
         foreach (var notice in batch.Notices)
-            ipc.PublishChanged(snapshots.CreateChanged(notice.Kind, notice.OperationId, CurrentOwner()));
+        {
+            if (RuntimeChangeNotificationPolicy.TryGetPublishedKind(notice, out var kind))
+                ipc.PublishChanged(snapshots.CreateChanged(kind, notice.OperationId, CurrentOwner()));
+        }
     }
 
     private void FlushPlayerInventoryIfDue()

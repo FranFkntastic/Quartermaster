@@ -6,6 +6,28 @@ namespace RQ.Tests;
 
 public sealed class RuntimeReconciliationQueueTests
 {
+    [Theory]
+    [InlineData(RuntimeDomain.PlayerInventory, "player_inventory", RuntimeChangeNotificationPolicy.RetainerManagement)]
+    [InlineData(RuntimeDomain.RetainerStock, "cache", RuntimeChangeNotificationPolicy.RetainerManagement)]
+    [InlineData(RuntimeDomain.Plans, "state", RuntimeChangeNotificationPolicy.RetainerManagement)]
+    [InlineData(RuntimeDomain.Listings, "cache", RuntimeChangeNotificationPolicy.RetainerListings)]
+    [InlineData(RuntimeDomain.Operations, "state", RuntimeChangeNotificationPolicy.Operation)]
+    [InlineData(RuntimeDomain.All, "owner_transition", RuntimeChangeNotificationPolicy.Owner)]
+    public void PublishedKindsDescribeConsumerVisibleDomains(RuntimeDomain domain, string sourceKind, string expected)
+    {
+        Assert.True(RuntimeChangeNotificationPolicy.TryGetPublishedKind(new(domain, sourceKind, null), out var kind));
+        Assert.Equal(expected, kind);
+    }
+
+    [Theory]
+    [InlineData("periodic")]
+    [InlineData("opened")]
+    public void RefreshOnlyReconciliationDoesNotPublishAChange(string sourceKind)
+    {
+        Assert.False(RuntimeChangeNotificationPolicy.TryGetPublishedKind(new(RuntimeDomain.All, sourceKind, null), out var kind));
+        Assert.Empty(kind);
+    }
+
     [Fact]
     public void RepeatedRequests_CoalesceByDomainAndNoticeIdentity()
     {

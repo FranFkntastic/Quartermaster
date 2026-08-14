@@ -17,6 +17,51 @@ public enum RuntimeDomain
 
 public sealed record RuntimeChangeNotice(RuntimeDomain Domain, string Kind, string? OperationId);
 
+public static class RuntimeChangeNotificationPolicy
+{
+    public const string RetainerManagement = "retainer_management";
+    public const string RetainerListings = "retainer_listings";
+    public const string Operation = "operation";
+    public const string Owner = "owner";
+
+    public static bool TryGetPublishedKind(RuntimeChangeNotice notice, out string kind)
+    {
+        ArgumentNullException.ThrowIfNull(notice);
+        if (notice.Kind is "periodic" or "opened")
+        {
+            kind = string.Empty;
+            return false;
+        }
+
+        if (notice.Kind == "owner_transition")
+        {
+            kind = Owner;
+            return true;
+        }
+
+        if ((notice.Domain & (RuntimeDomain.PlayerInventory | RuntimeDomain.RetainerStock | RuntimeDomain.Plans)) != 0)
+        {
+            kind = RetainerManagement;
+            return true;
+        }
+
+        if ((notice.Domain & RuntimeDomain.Listings) != 0)
+        {
+            kind = RetainerListings;
+            return true;
+        }
+
+        if ((notice.Domain & RuntimeDomain.Operations) != 0)
+        {
+            kind = Operation;
+            return true;
+        }
+
+        kind = string.Empty;
+        return false;
+    }
+}
+
 public sealed record RuntimeReconciliationBatch(
     RuntimeDomain Domains,
     PlayerInventoryCacheChange? PlayerInventoryChange,
