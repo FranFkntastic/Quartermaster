@@ -288,7 +288,8 @@ public sealed class Plugin : IDalamudPlugin
             dataManager,
             configuration,
             SaveConfiguration,
-            agentReviewRegistry);
+            agentReviewRegistry,
+            () => vendorCatalogSource.Current);
         agentBridgeViewportCapture = new(
             configDirectory,
             configuration.PluginInstanceId,

@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Franthropy.Dalamud.AgentBridge;
+using Franthropy.Dalamud.Automation.Vendors;
 using Franthropy.Dalamud.UI.Tables;
 using RQ.Domain;
 using RQ.Persistence;
@@ -24,6 +25,7 @@ internal sealed class TransferPlanEditor
     private readonly Func<string, int, IReadOnlyList<ItemChoice>> searchItems;
     private readonly Action closeRestockEditor;
     private readonly Action requestStowageView;
+    private readonly Func<GilVendorCatalog>? vendorCatalogSource;
     private readonly DalamudTableProjection<StowageDraftRow> stowageDraftTable;
     private StowagePlanDraft? stowageDraft;
     private readonly TableSelectionModel<Guid> selectedStowageRuleIds = new();
@@ -47,7 +49,8 @@ internal sealed class TransferPlanEditor
         AgentBridgeUiReviewRegistry reviewRegistry,
         Func<string, int, IReadOnlyList<ItemChoice>> searchItems,
         Action closeRestockEditor,
-        Action requestStowageView)
+        Action requestStowageView,
+        Func<GilVendorCatalog>? vendorCatalogSource = null)
     {
         this.state = state;
         this.workbench = workbench;
@@ -56,6 +59,7 @@ internal sealed class TransferPlanEditor
         this.searchItems = searchItems;
         this.closeRestockEditor = closeRestockEditor;
         this.requestStowageView = requestStowageView;
+        this.vendorCatalogSource = vendorCatalogSource;
         stowageDraftTable = CreateDraftTable();
     }
 
@@ -434,13 +438,53 @@ internal sealed class TransferPlanEditor
             ImGui.BeginDisabled();
         var allowed = rule.AllowVendorPurchase;
         if (ImGui.Checkbox($"##vendor-purchase:{rule.Id}", ref allowed))
+        {
             rule.AllowVendorPurchase = allowed;
+            if (!allowed)
+                rule.PreferredVendorNpcId = null;
+        }
         if (!supported)
             ImGui.EndDisabled();
         if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
             ImGui.SetTooltip(supported
                 ? "Allow an ordinary-gil vendor to cover the shortage left after accessible retainer stock. Every run is reviewed first."
                 : "Vendor purchasing currently requires Any quality so live reconciliation cannot count the wrong quality.");
+    }
+
+    private void DrawVendorPurchaseCell(StowageDraftRow row)
+    {
+        var rule = row.Rule;
+        DrawVendorPurchaseToggle(rule);
+        if (!rule.AllowVendorPurchase)
+            return;
+        ImGui.SameLine();
+        var offers = vendorCatalogSource?.Invoke().FindOffers(rule.ItemId) ?? [];
+        if (offers.Count == 0)
+        {
+            ImGui.TextDisabled("no vendor known yet");
+            return;
+        }
+        ImGui.SetNextItemWidth(-1);
+        var selected = offers.FirstOrDefault(offer => offer.NpcId == rule.PreferredVendorNpcId);
+        var preview = selected is null
+            ? "Cheapest reachable"
+            : $"{selected.NpcName} · {selected.UnitPriceGil:N0} ea";
+        ImGui.PushID($"vendor-pick:{rule.Id}");
+        if (!ImGui.BeginCombo("##vendor-pick", preview))
+        {
+            ImGui.PopID();
+            return;
+        }
+        if (ImGui.Selectable("Cheapest reachable", selected is null))
+            rule.PreferredVendorNpcId = null;
+        foreach (var offer in offers)
+        {
+            var label = $"{offer.NpcName} · {offer.UnitPriceGil:N0} ea";
+            if (ImGui.Selectable(label, selected?.NpcId == offer.NpcId))
+                rule.PreferredVendorNpcId = offer.NpcId;
+        }
+        ImGui.EndCombo();
+        ImGui.PopID();
     }
 
     private static bool DrawRuleToggle(string id, bool enabled)
@@ -565,7 +609,7 @@ internal sealed class TransferPlanEditor
             row.Rule.Enabled = DrawRuleToggle($"stowage{row.Rule.Id}", row.Rule.Enabled)),
         new("Player target", 92, row => row.Rule.TargetQuantity.ToString("N0"), Draw: DrawStowageTarget),
         new("Quality", 112, row => QualityLabel(row.Rule.Quality), Draw: row => DrawDraftQuality(row.Rule)),
-        new("Vendor", 72, row => row.Rule.AllowVendorPurchase ? "Allowed" : "Off", Draw: row => DrawVendorPurchaseToggle(row.Rule)),
+        new("Vendor", 72, row => row.Rule.AllowVendorPurchase ? "Allowed" : "Off", Draw: DrawVendorPurchaseCell),
         new("Now", 92, StowageDraftOutcome, TextColor: _ => ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]),
         new("Destination", 1.1f, row => TransferPresentation.RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner), row => TransferPresentation.RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner), ImGuiTableColumnFlags.WidthStretch, Draw: row => DrawStowageRouteCombo(row.Rule, row.Runtime)),
         new("Overflow", 112, row => TransferPresentation.OverflowLabel(row.Rule.Routing.Overflow), Draw: row => DrawStowageOverflowCombo(row.Rule)),

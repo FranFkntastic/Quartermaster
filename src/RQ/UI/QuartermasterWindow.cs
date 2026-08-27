@@ -7,6 +7,7 @@ using Dalamud.Interface.Windowing;
 using Dalamud.Plugin.Services;
 using Dalamud.Utility;
 using Franthropy.Dalamud.AgentBridge;
+using Franthropy.Dalamud.Automation.Vendors;
 using Franthropy.Dalamud.Automation.Vendors.Coordination;
 using Lumina.Excel.Sheets;
 using RQ.Automation;
@@ -60,7 +61,8 @@ public sealed class QuartermasterWindow : Window
         IDataManager dataManager,
         PluginConfiguration configuration,
         System.Action saveConfiguration,
-        AgentBridgeUiReviewRegistry reviewRegistry)
+        AgentBridgeUiReviewRegistry reviewRegistry,
+        Func<GilVendorCatalog>? vendorCatalogSource = null)
         : base(MainWindowName, ImGuiWindowFlags.NoScrollbar)
     {
         this.state = state;
@@ -94,7 +96,8 @@ public sealed class QuartermasterWindow : Window
             reviewRegistry,
             SearchItems,
             () => restockEditor?.Close(),
-            () => requestedView = WorkbenchView.Stowage);
+            () => requestedView = WorkbenchView.Stowage,
+            vendorCatalogSource);
         restockPlanEditor = restockEditor = new(
             state,
             workbench,

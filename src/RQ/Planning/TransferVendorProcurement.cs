@@ -198,14 +198,25 @@ public sealed class TransferVendorProcurementPlanner
                 null);
         }
 
-        var candidates = catalogSource().FindOffers(rule.ItemId)
+        var allCandidates = catalogSource().FindOffers(rule.ItemId)
             .Select(offer => new TransferVendorCandidate(offer, assessAccess(offer)))
-            .OrderByDescending(candidate => candidate.Access.State == GilVendorAccessState.Verified)
-            .ThenByDescending(candidate => candidate.Access.State == GilVendorAccessState.Probeable)
-            .ThenBy(candidate => candidate.Offer.UnitPriceGil)
-            .ThenBy(candidate => candidate.Offer.NpcName, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(candidate => candidate.Offer.NpcId)
             .ToArray();
+        var candidates = rule.PreferredVendorNpcId is { } preferredNpcId && allCandidates.Any(c => c.Offer.NpcId == preferredNpcId)
+            ? allCandidates
+                .OrderByDescending(c => c.Offer.NpcId == preferredNpcId)
+                .ThenByDescending(c => c.Access.State == GilVendorAccessState.Verified)
+                .ThenByDescending(c => c.Access.State == GilVendorAccessState.Probeable)
+                .ThenBy(c => c.Offer.UnitPriceGil)
+                .ThenBy(c => c.Offer.NpcName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(c => c.Offer.NpcId)
+                .ToArray()
+            : allCandidates
+                .OrderByDescending(c => c.Access.State == GilVendorAccessState.Verified)
+                .ThenByDescending(c => c.Access.State == GilVendorAccessState.Probeable)
+                .ThenBy(c => c.Offer.UnitPriceGil)
+                .ThenBy(c => c.Offer.NpcName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(c => c.Offer.NpcId)
+                .ToArray();
         if (candidates.Length == 0)
         {
             return new(

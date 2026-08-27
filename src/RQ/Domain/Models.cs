@@ -133,6 +133,8 @@ public sealed class TargetPlanItem
     public ItemQualityPolicy Quality { get; set; } = ItemQualityPolicy.Any;
     public StowageRoutingPolicy Routing { get; set; } = new();
     public bool AllowVendorPurchase { get; set; }
+    /// <summary>Preferred vendor NPC for purchases; null means cheapest reachable.</summary>
+    public uint? PreferredVendorNpcId { get; set; }
     public string Notes { get; set; } = string.Empty;
     public bool Enabled { get; set; } = true;
 }
