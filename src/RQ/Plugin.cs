@@ -49,6 +49,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly TransferCoordinator transfers;
     private readonly ListingNavigationCoordinator listingNavigation;
     private readonly TransferVendorProcurementService vendorProcurement;
+    private readonly VendorCatalogLocationObserver vendorCatalogObserver;
     private readonly DalamudExternalUiAutomationSuppression externalUiSuppression;
     private readonly AutomaticRetrievalQueue automaticRetrievals;
     private readonly QuartermasterRuntimeSnapshotSource runtimeSnapshots;
@@ -211,9 +212,19 @@ public sealed class Plugin : IDalamudPlugin
             playerState,
             objects,
             aetheryteList);
+        var vendorLocationObserver = new DalamudVendorLocationObserver();
+        var vendorCatalogSource = new MutableVendorCatalogSource(
+            DalamudGilVendorCatalogBuilder.Build(dataManager));
         var vendorPlanner = new TransferVendorProcurementPlanner(
-            DalamudGilVendorCatalogBuilder.Build(dataManager),
+            () => vendorCatalogSource.Current,
             vendorAccess.Assess);
+        vendorCatalogObserver = new VendorCatalogLocationObserver(
+            objects,
+            clientState,
+            vendorCatalogSource,
+            vendorLocationObserver,
+            dataManager,
+            log);
         externalUiSuppression = new(pluginInterface, log, "Quartermaster");
         var vendorOwnership = new VendorAutomationOwnership(
             automation,
@@ -391,6 +402,7 @@ public sealed class Plugin : IDalamudPlugin
         workQueue.Drain();
         playerInventoryReconciler.ReconcileIfDue(DateTime.UtcNow);
         automaticRetrievals.Tick();
+        vendorCatalogObserver.Tick();
         vendorProcurement.Tick();
         retainerRefresh.TickRosterDiscovery(window.StockBrowserVisible);
         agentBridge.Tick();

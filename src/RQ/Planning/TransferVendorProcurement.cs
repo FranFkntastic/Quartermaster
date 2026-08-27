@@ -91,14 +91,25 @@ public sealed record TransferVendorProcurementReview(
 
 public sealed class TransferVendorProcurementPlanner
 {
-    private readonly GilVendorCatalog catalog;
+    private readonly Func<GilVendorCatalog> catalogSource;
     private readonly Func<GilVendorOffer, GilVendorAccessAssessment> assessAccess;
 
     public TransferVendorProcurementPlanner(
         GilVendorCatalog catalog,
         Func<GilVendorOffer, GilVendorAccessAssessment> assessAccess)
+        : this(() => catalog, assessAccess)
     {
-        this.catalog = catalog ?? throw new ArgumentNullException(nameof(catalog));
+    }
+
+    /// <summary>
+    /// Catalog source variant: lets the caller hot-swap the catalog when live
+    /// observations promote pending vendors into executable offers.
+    /// </summary>
+    public TransferVendorProcurementPlanner(
+        Func<GilVendorCatalog> catalogSource,
+        Func<GilVendorOffer, GilVendorAccessAssessment> assessAccess)
+    {
+        this.catalogSource = catalogSource ?? throw new ArgumentNullException(nameof(catalogSource));
         this.assessAccess = assessAccess ?? throw new ArgumentNullException(nameof(assessAccess));
     }
 
@@ -187,7 +198,7 @@ public sealed class TransferVendorProcurementPlanner
                 null);
         }
 
-        var candidates = catalog.FindOffers(rule.ItemId)
+        var candidates = catalogSource().FindOffers(rule.ItemId)
             .Select(offer => new TransferVendorCandidate(offer, assessAccess(offer)))
             .OrderByDescending(candidate => candidate.Access.State == GilVendorAccessState.Verified)
             .ThenByDescending(candidate => candidate.Access.State == GilVendorAccessState.Probeable)

@@ -214,11 +214,23 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             }
 
             var transferred = 0;
-            await driver.RequireRetainerListAsync(token).ConfigureAwait(false);
-            retainerSessionOpen = true;
-            token.ThrowIfCancellationRequested();
+            var retainerLegMessage = default(string);
             foreach (var candidate in candidates)
             {
+                if (!retainerSessionOpen)
+                {
+                    try
+                    {
+                        await driver.RequireRetainerListAsync(token).ConfigureAwait(false);
+                        retainerSessionOpen = true;
+                    }
+                    catch (InvalidOperationException failure) when (!movementAttempted && IsBellUnavailable(failure.Message))
+                    {
+                        retainerLegMessage = failure.Message;
+                        break;
+                    }
+                }
+                token.ThrowIfCancellationRequested();
                 await driver.OpenRetainerAsync(candidate.Route, token).ConfigureAwait(false);
                 token.ThrowIfCancellationRequested();
                 retainerOpen = true;
@@ -302,13 +314,23 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             await driver.CloseRetainerListAsync(token).ConfigureAwait(false);
             retainerSessionOpen = false;
             var missing = remaining.Values.Where(quantity => quantity > 0).Sum();
+            var bypassedRetainerLeg = retainerLegMessage is not null;
+            if (bypassedRetainerLeg)
+            {
+                journal.RecordWarning(
+                    operationId,
+                    "RetrievalSkippedBellUnavailable",
+                    $"Retainer retrieval could not start: {retainerLegMessage} Vendor procurement may still cover the shortfall.");
+            }
             journal.Transition(
                 operationId,
-                missing == 0 ? OperationStatuses.Succeeded : transferred > 0 ? OperationStatuses.PartiallySucceeded : OperationStatuses.Failed,
-                missing == 0 ? "RetrievalComplete" : transferred > 0 ? "RetrievalPartial" : "NoLiveStock",
+                missing == 0 ? OperationStatuses.Succeeded : bypassedRetainerLeg ? OperationStatuses.Failed : transferred > 0 ? OperationStatuses.PartiallySucceeded : OperationStatuses.Failed,
+                missing == 0 ? "RetrievalComplete" : bypassedRetainerLeg ? "RetrievalLegUnavailable" : transferred > 0 ? "RetrievalPartial" : "NoLiveStock",
                 missing == 0
                     ? $"Retrieved {transferred:N0} units and satisfied every target."
-                    : $"Retrieved {transferred:N0} units; {missing:N0} units remain missing.");
+                    : bypassedRetainerLeg
+                        ? $"Retainer retrieval could not start ({retainerLegMessage}); remaining units are left for vendor procurement."
+                        : $"Retrieved {transferred:N0} units; {missing:N0} units remain missing.");
             return new(true, missing == 0 ? "Retrieval completed." : "Retrieval completed with missing units.");
         }
         catch (OperationCanceledException)
@@ -754,6 +776,18 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
 
     private static string RetrievalKey(uint itemId, ItemQualityPolicy quality) =>
         $"{itemId}:{quality}";
+
+    /// <summary>
+    /// True when the retainer list could not be opened because no summoning bell is
+    /// reachable. This makes the retainer-retrieval leg unavailable without implying
+    /// anything about the other legs of the plan (stowage, vendor procurement).
+    /// </summary>
+    private static bool IsBellUnavailable(string message) =>
+        message.StartsWith("NoNearbySummoningBell", StringComparison.Ordinal) ||
+        message.StartsWith("NoInteractableSummoningBell", StringComparison.Ordinal) ||
+        message.StartsWith("BellNavigationUnavailable", StringComparison.Ordinal) ||
+        message.StartsWith("BellRouteTimedOut", StringComparison.Ordinal) ||
+        message.StartsWith("SummoningBellInteractionFailed", StringComparison.Ordinal);
 
     /// <summary>
     /// Serializes live movement with AutoRetainer: waits a bounded time for it to
