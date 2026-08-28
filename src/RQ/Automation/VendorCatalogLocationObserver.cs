@@ -91,7 +91,14 @@ public sealed class VendorCatalogLocationObserver : IDisposable
                 continue;
 
             observer.Observe(npcId, territoryId, obj.Position);
-            promoted |= Promote(catalog, npcId, territoryId, obj.Position);
+            if (Promote(catalog, npcId, territoryId, obj.Position))
+            {
+                promoted = true;
+                // Each promotion returns a new immutable catalog. Carry it
+                // forward so multiple vendor NPCs observed in the same scan
+                // compose instead of replacing one another.
+                catalog = catalogSource.Current;
+            }
         }
 
         if (promoted)
