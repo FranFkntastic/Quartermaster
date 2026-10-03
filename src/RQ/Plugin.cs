@@ -135,7 +135,7 @@ public sealed class Plugin : IDalamudPlugin
                 PluginConfigDirectory = configDirectory,
                 PluginName = "Quartermaster",
                 PluginInstanceId = providerInstanceId,
-                GameBuild = GamePatchCompatibilityGate.ReadCurrentGameVersion(),
+                GameBuild = GameClientVersion.ReadCurrentGameVersion(),
                 GameInventory = gameInventory,
                 PlayerState = playerState,
                 AddonLifecycle = addonLifecycle,
