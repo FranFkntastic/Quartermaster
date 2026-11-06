@@ -15,29 +15,23 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
-    <FranthropyRoot Condition="'$(FranthropyRoot)' == ''">..\..\..\Franthropy</FranthropyRoot>
-    <FranthropyDalamudProject Condition="'$(FranthropyDalamudProject)' == ''">$(FranthropyRoot)\src\Franthropy.Dalamud\Franthropy.Dalamud.csproj</FranthropyDalamudProject>
-    <FranthropyFfxivProject Condition="'$(FranthropyFfxivProject)' == ''">$(FranthropyRoot)\src\Franthropy.FFXIV\Franthropy.FFXIV.csproj</FranthropyFfxivProject>
-    <FranthropyObservationsProject Condition="'$(FranthropyObservationsProject)' == ''">$(FranthropyRoot)\src\Franthropy.Observations\Franthropy.Observations.csproj</FranthropyObservationsProject>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.10" />
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.5" />
-    <ProjectReference Include="$(FranthropyDalamudProject)" SetConfiguration="Configuration=$(Configuration)" />
-    <ProjectReference Include="$(FranthropyFfxivProject)" SetConfiguration="Configuration=$(Configuration)" />
-    <ProjectReference Include="$(FranthropyObservationsProject)" SetConfiguration="Configuration=$(Configuration)" />
+    <PackageReference Include="Franthropy.Dalamud" Version="[$(FranthropyPackageVersion)]" Condition="'$(FranthropySource)' == 'Package'" />
+    <ProjectReference Include="$(FranthropyRoot)/src/Franthropy.Dalamud/Franthropy.Dalamud.csproj" Condition="'$(FranthropySource)' == 'Local'" />
+    <PackageReference Include="Franthropy.FFXIV" Version="[$(FranthropyPackageVersion)]" Condition="'$(FranthropySource)' == 'Package'" />
+    <ProjectReference Include="$(FranthropyRoot)/src/Franthropy.FFXIV/Franthropy.FFXIV.csproj" Condition="'$(FranthropySource)' == 'Local'" />
+    <PackageReference Include="Franthropy.Observations" Version="[$(FranthropyPackageVersion)]" Condition="'$(FranthropySource)' == 'Package'" />
+    <ProjectReference Include="$(FranthropyRoot)/src/Franthropy.Observations/Franthropy.Observations.csproj" Condition="'$(FranthropySource)' == 'Local'" />
   </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="RQ.Tests" />
   </ItemGroup>
 
-  <Target Name="ValidateFranthropyProjects" BeforeTargets="PrepareForBuild">
-    <Error Condition="!Exists('$(FranthropyDalamudProject)')" Text="Franthropy.Dalamud was not found at '$(FranthropyDalamudProject)'. Clone Franthropy beside Quartermaster or set FranthropyDalamudProject." />
-    <Error Condition="!Exists('$(FranthropyFfxivProject)')" Text="Franthropy.FFXIV was not found at '$(FranthropyFfxivProject)'. Clone Franthropy beside Quartermaster or set FranthropyFfxivProject." />
-    <Error Condition="!Exists('$(FranthropyObservationsProject)')" Text="Franthropy.Observations was not found at '$(FranthropyObservationsProject)'. Clone Franthropy beside Quartermaster or set FranthropyObservationsProject." />
-  </Target>
 
   <Target Name="RejectDebugProjectReferencesInRelease" AfterTargets="ResolveProjectReferences" Condition="'$(Configuration)' == 'Release'">
     <ItemGroup>
