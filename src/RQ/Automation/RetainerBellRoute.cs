@@ -2,12 +2,15 @@ using System.Numerics;
 using Dalamud.Plugin.Services;
 using Franthropy.Dalamud.Automation.Retainers;
 using Franthropy.Dalamud.Travel;
+using Franthropy.Dalamud.Diagnostics;
+using FFXIVClientStructs.FFXIV.Client.Game.Event;
+using NativeGameObject = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject;
 
 namespace RQ.Automation;
 
 internal interface IRetainerBellRoute
 {
-    Task<RetainerBellRouteResult> EnsureBellInRangeAsync(CancellationToken cancellationToken);
+    Task<RetainerBellRouteResult> EnsureBellInRangeAsync(CancellationToken cancellationToken, bool closer = false);
 
     void Cancel();
 }
@@ -30,7 +33,11 @@ internal interface IRetainerBellRoutePort
     bool SubmitAutomaticRetainerTravel();
 
     bool TryStopNavigation();
+
+    BellReadiness ObserveReadiness(ulong bellId);
 }
+
+internal sealed record BellReadiness(bool Available, bool InRange, Vector3 PlayerPosition, string Message);
 
 internal enum RetainerBellRouteStepState
 {
@@ -48,7 +55,8 @@ internal sealed class RetainerBellRouteState
 {
     private static readonly TimeSpan RouteBudget = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan PathStartBudget = TimeSpan.FromSeconds(2);
-    private const float ArrivalMargin = 0.75f;
+    private static readonly TimeSpan StopBudget = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan SettleTime = TimeSpan.FromMilliseconds(350);
 
     private readonly IRetainerBellRoutePort port;
     private readonly Func<DateTime> utcNow;
@@ -58,14 +66,20 @@ internal sealed class RetainerBellRouteState
     private bool bellPathObservedRunning;
     private bool ownsNavigation;
     private DateTime bellPathSubmittedAt;
+    private readonly bool closer;
+    private DateTime? stopStarted;
+    private DateTime? stationarySince;
+    private Vector3? lastPosition;
 
     public RetainerBellRouteState(
         IRetainerBellRoutePort port,
-        Func<DateTime>? utcNow = null)
+        Func<DateTime>? utcNow = null,
+        bool closer = false)
     {
         this.port = port;
         this.utcNow = utcNow ?? (() => DateTime.UtcNow);
         deadline = this.utcNow().Add(RouteBudget);
+        this.closer = closer;
     }
 
     public RetainerBellRouteStep Advance()
@@ -76,17 +90,37 @@ internal sealed class RetainerBellRouteState
 
         var bell = port.ObserveBell();
         var navigation = port.ObserveNavigation();
-        if (bell.Available && bell.Distance < bell.OrdinaryInteractionDistance)
+        if (navigation.State == VNavmeshLifecycleState.IpcFailure)
+            return Fail("BellNavigationIpcFailure", navigation.Message);
+        var readiness = bell.Available ? port.ObserveReadiness(bell.BellGameObjectId) : null;
+        if (readiness is { Available: false })
+            return Fail("BellNativeCapabilityUnavailable", readiness.Message);
+        if (readiness is { InRange: true } && (!closer ||
+            (bellPathSubmitted && !navigation.IsRunning && !navigation.IsTransient &&
+             (bellPathObservedRunning || now >= bellPathSubmittedAt.Add(PathStartBudget)))))
         {
             if (automaticTravelSubmitted && navigation.IsRunning && !ownsNavigation)
                 return Wait("AutomaticTravelFinishing", "Waiting for automatic retainer travel to finish at the loaded bell.");
 
-            StopOwnedNavigation();
-            return Succeed($"Summoning bell {bell.BellGameObjectId:X} is within interaction range.");
+            stopStarted ??= now;
+            if (now >= stopStarted.Value.Add(StopBudget))
+                return Fail("BellMovementStopTimedOut", "Movement did not settle before bell interaction.");
+            if (ownsNavigation)
+            {
+                if (!port.TryStopNavigation())
+                    return Fail("BellNavigationStopFailed", "vnavmesh did not accept the owned stop request.");
+                ownsNavigation = false;
+                return Wait("BellStopping", "Waiting for the owned navigation stop to complete.");
+            }
+            if (navigation.IsRunning || navigation.IsTransient ||
+                lastPosition is null || Vector3.DistanceSquared(lastPosition.Value, readiness.PlayerPosition) > 0.000001f)
+                stationarySince = now;
+            lastPosition = readiness.PlayerPosition;
+            if (navigation.IsRunning || navigation.IsTransient || now - stationarySince < SettleTime)
+                return Wait("BellSettling", "Waiting for a stationary bell approach.");
+            return Succeed($"Bell {bell.BellGameObjectId:X}: distance={bell.Distance:F3}, nativeRange=true, movementSettled=true.");
         }
 
-        if (navigation.State == VNavmeshLifecycleState.IpcFailure)
-            return Fail("BellNavigationIpcFailure", navigation.Message);
         if (navigation.State == VNavmeshLifecycleState.Unavailable)
             return Fail("BellNavigationUnavailable", "vnavmesh is required to reach a summoning bell.");
 
@@ -118,7 +152,7 @@ internal sealed class RetainerBellRouteState
             return Fail("BellPathEndedEarly", "The path to the summoning bell ended before reaching interaction range.");
         }
 
-        var range = MathF.Max(1f, bell.OrdinaryInteractionDistance - ArrivalMargin);
+        var range = closer ? 0.5f : 1f;
         var submission = port.TryMoveCloseTo(bell.Position, range);
         if (submission.Retryable)
             return Wait("BellNavigationLoading", submission.Message);
@@ -181,15 +215,17 @@ internal sealed class RetainerBellRoute : IRetainerBellRoute, IDisposable
     private readonly IFramework framework;
     private readonly IRetainerBellRoutePort port;
     private readonly object gate = new();
+    private readonly IPluginLog log;
     private CancellationTokenSource? activeCancellation;
 
-    public RetainerBellRoute(IFramework framework, IRetainerBellRoutePort port)
+    public RetainerBellRoute(IFramework framework, IRetainerBellRoutePort port, IPluginLog log)
     {
         this.framework = framework;
         this.port = port;
+        this.log = log;
     }
 
-    public async Task<RetainerBellRouteResult> EnsureBellInRangeAsync(CancellationToken cancellationToken)
+    public async Task<RetainerBellRouteResult> EnsureBellInRangeAsync(CancellationToken cancellationToken, bool closer = false)
     {
         using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         lock (gate)
@@ -199,7 +235,8 @@ internal sealed class RetainerBellRoute : IRetainerBellRoute, IDisposable
             activeCancellation = linkedCancellation;
         }
 
-        var state = new RetainerBellRouteState(port);
+        var state = new RetainerBellRouteState(port, closer: closer);
+        string? lastCode = null;
         try
         {
             while (true)
@@ -208,6 +245,11 @@ internal sealed class RetainerBellRoute : IRetainerBellRoute, IDisposable
                 var step = await framework.RunOnTick(
                     state.Advance,
                     cancellationToken: linkedCancellation.Token).ConfigureAwait(false);
+                if (lastCode != step.Code)
+                {
+                    log.Information("[BellRoute] {Code}: {Message}", step.Code, step.Message);
+                    lastCode = step.Code;
+                }
                 if (step.State == RetainerBellRouteStepState.Succeeded)
                     return RetainerBellRouteResult.Succeeded(step.Message);
                 if (step.State == RetainerBellRouteStepState.Failed)
@@ -216,7 +258,7 @@ internal sealed class RetainerBellRoute : IRetainerBellRoute, IDisposable
         }
         finally
         {
-            state.StopOwnedNavigation();
+            await framework.RunOnTick(state.StopOwnedNavigation).ConfigureAwait(false);
             lock (gate)
             {
                 if (ReferenceEquals(activeCancellation, linkedCancellation))
@@ -244,15 +286,18 @@ internal sealed class DalamudRetainerBellRoutePort : IRetainerBellRoutePort, IDi
     private readonly DalamudSummoningBellInteractor bellInteractor;
     private readonly DalamudVNavmeshTravel navigation;
     private readonly ICommandManager commands;
+    private readonly IObjectTable objects;
 
     public DalamudRetainerBellRoutePort(
         DalamudSummoningBellInteractor bellInteractor,
         DalamudVNavmeshTravel navigation,
-        ICommandManager commands)
+        ICommandManager commands,
+        IObjectTable objects)
     {
         this.bellInteractor = bellInteractor;
         this.navigation = navigation;
         this.commands = commands;
+        this.objects = objects;
     }
 
     public SummoningBellNavigationTargetObservation ObserveBell() => bellInteractor.ObserveNavigationTarget();
@@ -265,6 +310,27 @@ internal sealed class DalamudRetainerBellRoutePort : IRetainerBellRoutePort, IDi
     public bool SubmitAutomaticRetainerTravel() => commands.ProcessCommand("/li auto");
 
     public bool TryStopNavigation() => navigation.TryStop();
+
+    public unsafe BellReadiness ObserveReadiness(ulong bellId)
+    {
+        try
+        {
+            NativeCapabilityGuard.RequireAddress(EventFramework.Addresses.CheckInteractRange.Value, "Bell interaction range");
+            NativeCapabilityGuard.RequireAddress(EventFramework.Addresses.Instance.Value, "Event framework");
+            var player = objects.LocalPlayer;
+            var bell = objects.FirstOrDefault(value => value.GameObjectId == bellId);
+            var events = EventFramework.Instance();
+            if (player is null || bell is null || events == null || player.Address == 0 || bell.Address == 0)
+                return new(false, false, default, "Player, bell, or event framework unavailable.");
+            // Ordinary object interaction uses mode 1; suppress user-facing range errors.
+            var inRange = events->CheckInteractRange((NativeGameObject*)player.Address, (NativeGameObject*)bell.Address, 1, false);
+            return new(true, inRange, player.Position, $"nativeRange={inRange}, bell={bellId:X}");
+        }
+        catch (NativeCapabilityUnavailableException exception)
+        {
+            return new(false, false, default, exception.Message);
+        }
+    }
 
     public void Dispose() => bellInteractor.Dispose();
 }

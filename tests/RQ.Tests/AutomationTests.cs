@@ -156,34 +156,43 @@ public sealed class AutomationTests
     [Fact]
     public void RetainerBellRouteState_PathsToLoadedBellAndStopsOwnedPathOnArrival()
     {
+        var now = DateTime.UtcNow;
         var port = new RecordingBellRoutePort
         {
             Bell = BellAt(distance: 12, interactionDistance: 4.75f),
             Navigation = Navigation(VNavmeshLifecycleState.Ready),
         };
-        var state = new RetainerBellRouteState(port);
+        var state = new RetainerBellRouteState(port, () => now);
 
         Assert.Equal("BellPathSubmitted", state.Advance().Code);
         port.Navigation = Navigation(VNavmeshLifecycleState.Running);
         Assert.Equal("ApproachingBell", state.Advance().Code);
-        port.Bell = BellAt(distance: 3, interactionDistance: 4.75f);
+        port.Bell = BellAt(distance: 1.7f, interactionDistance: 4.75f);
 
+        Assert.Equal("BellStopping", state.Advance().Code);
+        Assert.Equal("BellSettling", state.Advance().Code);
+        port.Navigation = Navigation(VNavmeshLifecycleState.Ready);
+        now = now.AddMilliseconds(400);
         Assert.Equal(RetainerBellRouteStepState.Succeeded, state.Advance().State);
         Assert.Equal(1, port.PathSubmissions);
         Assert.Equal(1, port.StopCalls);
-        Assert.Equal(4f, port.LastRange);
+        Assert.Equal(1f, port.LastRange);
     }
 
     [Fact]
     public void RetainerBellRouteState_DoesNotRequireVnavmeshWhenBellIsAlreadyInRange()
     {
+        var now = DateTime.UtcNow;
         var port = new RecordingBellRoutePort
         {
-            Bell = BellAt(distance: 3, interactionDistance: 4.75f),
+            Bell = BellAt(distance: 1.7f, interactionDistance: 4.75f),
             Navigation = Navigation(VNavmeshLifecycleState.Unavailable),
         };
 
-        var step = new RetainerBellRouteState(port).Advance();
+        var state = new RetainerBellRouteState(port, () => now);
+        Assert.Equal("BellSettling", state.Advance().Code);
+        now = now.AddMilliseconds(400);
+        var step = state.Advance();
 
         Assert.Equal(RetainerBellRouteStepState.Succeeded, step.State);
         Assert.Equal(0, port.AutomaticTravelSubmissions);
@@ -477,7 +486,7 @@ public sealed class AutomationTests
 
         public int Calls { get; private set; }
 
-        public Task<RetainerBellRouteResult> EnsureBellInRangeAsync(CancellationToken cancellationToken)
+        public Task<RetainerBellRouteResult> EnsureBellInRangeAsync(CancellationToken cancellationToken, bool closer = false)
         {
             Calls++;
             return Task.FromResult(result);
@@ -497,6 +506,8 @@ public sealed class AutomationTests
         public bool AcceptAutomaticTravel { get; set; } = true;
 
         public SummoningBellNavigationTargetObservation ObserveBell() => Bell;
+
+        public BellReadiness ObserveReadiness(ulong bellId) => new(true, Bell.Distance < 2, default, "Native range fixture.");
         public VNavmeshLifecycleObservation ObserveNavigation() => Navigation;
         public VNavmeshPathSubmissionResult TryMoveCloseTo(Vector3 destination, float range)
         {

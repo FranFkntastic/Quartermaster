@@ -186,8 +186,8 @@ public sealed class Plugin : IDalamudPlugin
             new DalamudRetainerBellRoutePort(
                 new DalamudSummoningBellInteractor(objects, targets, dataManager),
                 new DalamudVNavmeshTravel(pluginInterface),
-                commands));
-        var driver = new RetainerLiveDriver(retainerSession, retainerBellRoute);
+                commands, objects), log);
+        var driver = new RetainerLiveDriver(retainerSession, retainerBellRoute, log);
         var autoRetainerSuppression = new AutoRetainerSuppression(autoRetainerIpc);
         listingNavigation = new(
             retainerSession,
