@@ -30,6 +30,7 @@ public sealed class RetainerLiveDriver : IRetainerTransferDriver
 {
     private readonly IRetainerAutomationSession session;
     private readonly IRetainerBellRoute? bellRoute;
+    private readonly IPluginLog? log;
 
     public RetainerLiveDriver(
         IFramework framework,
@@ -43,10 +44,11 @@ public sealed class RetainerLiveDriver : IRetainerTransferDriver
     {
     }
 
-    internal RetainerLiveDriver(IRetainerAutomationSession session, IRetainerBellRoute? bellRoute = null)
+    internal RetainerLiveDriver(IRetainerAutomationSession session, IRetainerBellRoute? bellRoute = null, IPluginLog? log = null)
     {
         this.session = session;
         this.bellRoute = bellRoute;
+        this.log = log;
     }
 
     public async Task RequireRetainerListAsync(CancellationToken cancellationToken)
@@ -64,7 +66,26 @@ public sealed class RetainerLiveDriver : IRetainerTransferDriver
         if (!route.Success)
             throw new InvalidOperationException($"{route.Code}: {route.Message}");
 
-        RequireSuccess(await session.EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false));
+        result = await session.EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);
+        log?.Information("[BellRoute] Interact outcome: {Code}: {Message}", result.Code, result.Message);
+        if (!result.Success && (result.Code == "RetainerListTimeout" || RequiresBellRoute(result.Code)))
+        {
+            using var retryDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            retryDeadline.CancelAfter(TimeSpan.FromSeconds(20));
+            try
+            {
+                route = await bellRoute.EnsureBellInRangeAsync(retryDeadline.Token, closer: true).ConfigureAwait(false);
+                if (!route.Success)
+                    throw new InvalidOperationException($"{route.Code}: {route.Message}");
+                result = await session.EnsureRetainerListAsync(retryDeadline.Token).ConfigureAwait(false);
+                log?.Information("[BellRoute] Retry interact outcome: {Code}: {Message}", result.Code, result.Message);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                throw new InvalidOperationException("BellReapproachTimedOut: The single bell re-approach exceeded its deadline.");
+            }
+        }
+        RequireSuccess(result);
     }
 
     public async Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken cancellationToken) =>
@@ -149,6 +170,7 @@ public sealed class RetainerLiveDriver : IRetainerTransferDriver
     }
 
     private static bool RequiresBellRoute(string code) =>
+        string.Equals(code, "RetainerListTimeout", StringComparison.Ordinal) ||
         string.Equals(code, "NoNearbySummoningBell", StringComparison.Ordinal) ||
         string.Equals(code, "NoInteractableSummoningBell", StringComparison.Ordinal);
 
