@@ -697,7 +697,7 @@ public sealed class OperationTests
     }
 
     [Fact]
-    public async Task DepositClamp_ZeroesLiveCandidateCapacityAndFinishesPartial()
+    public async Task DepositClamp_RetriesLaterStacksAndFinishesPartialWhenCapacityEnds()
     {
         using var directory = new TemporaryDirectory();
         var repository = TestData.Repository(directory.Path);
@@ -724,7 +724,10 @@ public sealed class OperationTests
             ],
             RetainerStacks = [new DalamudInventoryStack(InventoryType.RetainerPage1, 0, 4, 1)],
         };
+        // A clamp no longer zeroes the candidate: a later stack may still merge into remaining
+        // compatible capacity, so it is retried and only live "no capacity" ends the run partial.
         driver.DepositBehavior.Enqueue((_, _) => new RetainerDepositResult(true, 1, "TransferVerified", "Clamped to 1."));
+        driver.DepositBehavior.Enqueue((_, _) => new RetainerDepositResult(false, 0, "NoCapacity", "Retainer is full."));
         var coordinator = new TransferCoordinator(
             journal,
             driver,
@@ -738,12 +741,10 @@ public sealed class OperationTests
         Assert.Equal(OperationStatuses.PartiallySucceeded, completed.Status);
         Assert.Equal(1, Assert.Single(completed.Lines).TransferredQuantity);
         Assert.Contains("9,998 remain", completed.Message);
-        Assert.Single(driver.DepositAttempts);
-        Assert.Contains(
-            repository.FullSnapshot().Receipts,
-            receipt => receipt.OperationId == operation.OperationId &&
-                       receipt.Code == "DepositCapacityClamped" &&
-                       receipt.Message.Contains("Skor"));
+        Assert.Equal([(4u, 9999), (4u, 9998)], driver.DepositAttempts);
+        var receipts = repository.FullSnapshot().Receipts.Where(receipt => receipt.OperationId == operation.OperationId).ToArray();
+        Assert.Contains(receipts, receipt => receipt.Code == "DepositCapacityClamped" && receipt.Message.Contains("Skor"));
+        Assert.Contains(receipts, receipt => receipt.Code == "DepositSkippedNoCapacity" && receipt.Message.Contains("Skor"));
     }
 
     [Fact]
