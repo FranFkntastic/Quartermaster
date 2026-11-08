@@ -1,0 +1,49 @@
+name: Listing plan checks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  listing-plans:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: quartermaster
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: Resolve exact shared-library source
+        id: pin
+        shell: pwsh
+        run: |
+          [xml]$pin = Get-Content quartermaster/eng/Franthropy.Version.props
+          $version = [string]$pin.Project.PropertyGroup.FranthropyPackageVersion
+          if ($version -cnotmatch '^0\.1\.0-commit\.([0-9a-f]{40})$') { throw 'Invalid Franthropy pin.' }
+          "commit=$($Matches[1])" >> $env:GITHUB_OUTPUT
+      - uses: actions/checkout@v6
+        with:
+          repository: FranFkntastic/Franthropy
+          ref: ${{ steps.pin.outputs.commit }}
+          path: franthropy
+      - name: Download Dalamud SDK assemblies
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://goatcorp.github.io/dalamud-distrib/latest.zip -OutFile "$env:RUNNER_TEMP/dalamud.zip"
+          Expand-Archive "$env:RUNNER_TEMP/dalamud.zip" "$env:APPDATA/XIVLauncher/addon/Hooks/dev"
+      - name: Build and test listing journeys
+        working-directory: quartermaster
+        shell: pwsh
+        run: |
+          # CI pairs exact source because commit packages live in a private local feed.
+          # Deployment separately verifies the immutable package-mode build.
+          dotnet test tests/RQ.Tests -c Release -p:FranthropySource=Local "-p:FranthropyRoot=$env:GITHUB_WORKSPACE/franthropy" --filter "FullyQualifiedName~ListingPlanTests|FullyQualifiedName~ListingInlineTests"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
