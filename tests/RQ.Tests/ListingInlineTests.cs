@@ -71,6 +71,39 @@ public sealed class ListingInlineTests
     }
 
     [Fact]
+    public void OtherRetainersOwnDemandIsReservedBeforeOfferingItsStock()
+    {
+        var draft = Draft(A(quantity: 10), A(quantity: 10, retainer: 11));
+        var browser = Browser(stock: [S(10)]);
+        var rows = ListingRetainerProjection.Build(draft, browser, new HashSet<ulong> { 10, 11 }, _ => 999, _ => true);
+        Assert.Equal("List 1", rows[0].PlanRows.Single().State.Text);
+        Assert.Equal("Missing 10", rows[1].PlanRows.Single().State.Text);
+        var full = ListingPlanEvaluator.Evaluate(new ListingPlan { Owner = Owner, Assignments = draft.Assignments }, browser);
+        Assert.Equal(full.Items.Single().MissingUnits.Value, rows.Sum(r => r.PlanRows.Where(p => p.State.Rank == 1).Sum(p => p.State.Amount)));
+    }
+
+    [Theory]
+    [InlineData(10, "Missing 10")]
+    [InlineData(20, "Move 20 from player")]
+    public void PlayerStockIsNotPromisedIndependentlyToTwoRetainers(int units, string expected)
+    {
+        var player = S(units) with { ScopeKey = BrowserScope.PlayerKey, ScopeKind = BrowserScopeKind.Player, RetainerId = null };
+        var rows = ListingRetainerProjection.Build(Draft(A(quantity: 10), A(quantity: 10, retainer: 11)),
+            Browser(stock: [player]), new HashSet<ulong> { 10, 11 }, _ => 999, _ => true);
+        Assert.Equal(expected, rows[0].PlanRows.Single().State.Text);
+        Assert.Equal("1 unlisted", rows[1].PlanRows.Single().State.Text);
+    }
+
+    [Fact]
+    public void SurplusAfterLocalDemandCanStillBeRetrieved()
+    {
+        var rows = ListingRetainerProjection.Build(Draft(A(quantity: 10), A(quantity: 10, retainer: 11)),
+            Browser(stock: [S(20)]), new HashSet<ulong> { 10, 11 }, _ => 999, _ => true);
+        Assert.Equal("List 1", rows[0].PlanRows.Single().State.Text);
+        Assert.Equal("Retrieve 10", rows[1].PlanRows.Single().State.Text);
+    }
+
+    [Fact]
     public void UndersizedListingShowsMissingUnitsAndShapeEvidence()
     {
         var row = View(Draft(A(quantity: 99)), Browser([L()]));

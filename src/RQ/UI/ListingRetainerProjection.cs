@@ -11,7 +11,7 @@ internal enum ListingStateTone { Dim, Amber, Green, Info }
 internal enum ListingStateAction { None, FocusStock }
 internal sealed record ListingStateView(string Text, ListingStateTone Tone, int Rank,
     ListingStateAction Action = ListingStateAction.None, int Amount = 0);
-internal sealed record ListingPlanRowView(ListingPlanAssignment Assignment, ListingStateView State, int MaxStack);
+internal sealed record ListingPlanRowView(ListingPlanAssignment Assignment, ListingStateView State, int MaxStack, int UnlistedCount);
 internal sealed record ListingObservedGroupView(ListingMatchKind Kind, Guid? AssignmentId, uint ItemId,
     string ItemName, ItemQualityPolicy Quality, int Quantity, FieldEvidence<decimal> UnitPrice,
     IReadOnlyList<ListingRow> Listings, ListingStateView State);
@@ -34,8 +34,61 @@ internal static class ListingRetainerProjection
         foreach (var a in draft.Assignments)
             if (known.Add(a.RetainerId)) scopes.Add(new(BrowserScope.RetainerKey(a.RetainerId), a.RetainerName, BrowserScopeKind.Retainer, a.RetainerId));
         var destinations = browser.Items.Select(i => i.ItemId).Concat(savedDemandItemIds ?? new HashSet<uint>()).ToHashSet();
-        return scopes.Select(scope => BuildRetainer(draft, browser, scope, currentRetainerIds.Contains(scope.RetainerId!.Value),
+        var rows = scopes.Select(scope => BuildRetainer(draft, browser, scope, currentRetainerIds.Contains(scope.RetainerId!.Value),
             resolveMaxStack, listability, destinations)).ToArray();
+        ApplySharedCoverage(rows, draft, browser, currentRetainerIds, listability);
+        return rows;
+    }
+
+    private static void ApplySharedCoverage(ListingRetainerRow[] rows, ListingPlanDraft draft, BrowserProjection browser,
+        IReadOnlySet<ulong> currentRetainerIds, Func<uint, bool?> listability)
+    {
+        var enabled = draft.Assignments.Where(a => a.Enabled && Complete(a) &&
+            currentRetainerIds.Contains(a.RetainerId) && listability(a.ItemId) is not false).ToList();
+        var shared = enabled.GroupBy(a => new ListingItemKey(a.ItemId, a.Quality))
+            .Where(g => g.Select(a => a.RetainerId).Distinct().Skip(1).Any()).Select(g => g.Key).ToHashSet();
+        if (shared.Count == 0) return;
+        var coverage = ListingPlanEvaluator.Evaluate(new ListingPlan { Owner = draft.Owner, Assignments = enabled }, browser);
+        var carried = new HashSet<ListingItemKey>();
+        for (var i = 0; i < rows.Length; i++)
+        {
+            var row = rows[i];
+            var plans = row.PlanRows.Select(p =>
+            {
+                var key = new ListingItemKey(p.Assignment.ItemId, p.Assignment.Quality);
+                if (!shared.Contains(key) || p.State.Rank is < 1 or > 4) return p;
+                var item = coverage.Find(key.ItemId, key.Quality)!;
+                ListingStateView state;
+                // Local matching and stock already held on the destination remain local.
+                // Movement/shortage is one full-draft fact, never a second claim on shared stock.
+                if (carried.Add(key))
+                {
+                    var rank = item.Coverage switch
+                    {
+                        ListingCoverageState.Missing => 1, ListingCoverageState.Retrievable => 2,
+                        ListingCoverageState.ReadyOnPlayer => 3, ListingCoverageState.Unknown => 4, _ => 7,
+                    };
+                    var amount = rank switch
+                    {
+                        1 => item.MissingUnits.Value, 2 => item.RetrievableUnits.Value,
+                        3 => item.MovementNeedUnits.Value, _ => item.NeedUnits.IsKnown ? item.NeedUnits.Value : p.State.Amount,
+                    };
+                    state = rank == 7 ? ObservedState(ListingMatchKind.ShapeDiffers) :
+                        new(AmountText(rank, amount), ListingStateTone.Amber, rank, p.State.Action, amount);
+                }
+                else state = p.UnlistedCount > 0
+                    ? new($"{p.UnlistedCount:N0} unlisted", ListingStateTone.Dim, 11)
+                    : row.ObservedGroups.Where(g => g.AssignmentId == p.Assignment.Id).Select(g => g.State)
+                        .OrderBy(s => s.Rank).FirstOrDefault() ?? ObservedState(ListingMatchKind.ShapeDiffers);
+                return p with { State = state };
+            }).ToArray();
+            rows[i] = row with
+            {
+                PlanRows = plans,
+                State = row.Available && row.ListingsObserved
+                    ? Summary(plans.Select(p => p.State).Concat(row.ObservedGroups.Select(g => g.State))) : row.State,
+            };
+        }
     }
 
     private static ListingRetainerRow BuildRetainer(ListingPlanDraft draft, BrowserProjection browser, BrowserScope scope,
@@ -73,7 +126,7 @@ internal static class ListingRetainerProjection
             var siblings = enabled.Where(b => b.ItemId == a.ItemId && b.Quality == a.Quality).ToArray();
             var coverageRow = siblings.FirstOrDefault(b => (item?.Assignments.FirstOrDefault(e => e.Assignment.Id == b.Id)?.ExactListings ?? 0) < b.ListingCount) ?? siblings.FirstOrDefault();
             var state = State(a, available, observed, listability(a.ItemId), item, e, coverageRow?.Id == a.Id, siblings, browser, destinations);
-            planRows.Add(new(a, state, maxStack(a.ItemId)));
+            planRows.Add(new(a, state, maxStack(a.ItemId), e is null ? a.ListingCount : Remaining(e)));
             if (!a.Enabled) continue;
             var exact = e?.ExactListings ?? 0;
             var differs = (e?.UnknownPriceListings ?? 0) + (e?.WrongPriceListings ?? 0) + (e?.WrongShapeListings ?? 0);
