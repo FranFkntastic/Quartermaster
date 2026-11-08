@@ -272,4 +272,90 @@ public sealed class ListingInlineTests
         f.Session.SetEnabled(a.Id, true, Browser()); Assert.Equal(1, a.QuantityPerListing); Assert.Equal(999999999, a.UnitPrice);
         Assert.False(f.Session.CanAdopt([L()], new HashSet<ulong>()));
     }
+
+    [Fact]
+    public void PriceEchoRequiresCompletedNonzeroEditAndOnlyChangesEligibleSiblings()
+    {
+        using var f = new Fixture(); var a = f.Add();
+        var b = f.Session.Add(11, "Retainer 11", 1, "Item 1", ItemQualityPolicy.NqOnly, Browser());
+        f.Session.SetListingCount(b.Id, "1"); f.Session.SetUnitPrice(b.Id, "100");
+        f.Session.SetUnitPrice(a.Id, "");
+        f.Session.EndUnitPriceEdit(a.Id, 100);
+        Assert.Null(f.Session.PriceEchoAssignmentId);
+        f.Session.SetUnitPrice(a.Id, "200");
+        Assert.Null(f.Session.PriceEchoAssignmentId);
+        f.Session.EndUnitPriceEdit(a.Id, 0);
+        Assert.Equal(a.Id, f.Session.PriceEchoAssignmentId);
+        f.Session.ApplyPriceToSiblings(a.Id, new HashSet<ulong> { 10, 11 });
+        Assert.Equal(200, b.UnitPrice);
+        Assert.Null(f.Session.PriceEchoAssignmentId);
+    }
+
+    [Fact]
+    public void CleanDraftReloadsExternalRevisionButDirtyDraftKeepsIntent()
+    {
+        using var f = new Fixture(); var a = f.Add(); f.Session.Save(f.Runtime());
+        f.Repository.Mutate(s => { s.ListingPlans[0].Assignments[0].UnitPrice = 150; s.ListingPlans[0].Revision++; });
+        f.Session.Ensure(f.Runtime());
+        Assert.Equal(150, f.Session.Draft!.Assignments[0].UnitPrice);
+        f.Session.SetUnitPrice(a.Id, "200");
+        f.Repository.Mutate(s => { s.ListingPlans[0].Assignments[0].UnitPrice = 300; s.ListingPlans[0].Revision++; });
+        f.Session.Ensure(f.Runtime());
+        Assert.Equal(200, f.Session.Draft.Assignments[0].UnitPrice);
+        Assert.Equal(150, f.Session.Draft.BaselineAssignments[0].UnitPrice);
+    }
+
+    [Fact]
+    public void UnavailableAssignmentCanBeDisabledToUnblockSave()
+    {
+        using var f = new Fixture(); var a = f.Add();
+        var runtime = f.Runtime() with { Retainers = new Dictionary<ulong, CachedRetainer>() };
+        Assert.Contains("retainer unavailable", f.Session.SaveBlockedTooltip(runtime));
+        f.Session.SetEnabled(a.Id, false, runtime.Browser);
+        Assert.Empty(f.Session.Issues(runtime));
+        f.Session.Save(runtime);
+        Assert.Null(f.Session.Error);
+        Assert.False(f.Repository.Snapshot().ListingPlans[0].Assignments[0].Enabled);
+    }
+
+    [Fact]
+    public void StockIncludesSavedDemandButNeverDraftOnlyDemand()
+    {
+        using var f = new Fixture(); f.Add();
+        Assert.Empty(StockWorkspace.StockItemsWithListingDemand(f.Runtime(), BrowserScope.AllKey));
+        f.Session.Save(f.Runtime());
+        Assert.Equal(1u, Assert.Single(StockWorkspace.StockItemsWithListingDemand(f.Runtime(), BrowserScope.AllKey)).ItemId);
+    }
+
+    [Fact]
+    public void UnknownPriceAdoptionRemovesTheSecondAdoptAction()
+    {
+        using var f = new Fixture(); var browser = Browser([L(price: null)]);
+        f.Session.Ensure(f.Runtime(browser));
+        Assert.False(f.Session.IsDirty);
+        f.Session.Adopt(browser.Listings, new HashSet<ulong> { 10, 11 });
+        Assert.Single(f.Session.Draft!.Assignments);
+        Assert.Empty(View(f.Session.Draft, browser).ObservedGroups);
+        f.Session.SetUnitPrice(f.Session.Draft.Assignments[0].Id, "200");
+        Assert.Equal("Price unknown", View(f.Session.Draft, browser).PlanRows.Single().State.Text);
+        Assert.DoesNotContain(View(f.Session.Draft, browser).ObservedGroups, g => g.Kind == ListingMatchKind.Unplanned);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void UnmergedValidationFailureCarriesNoRebasePayload(bool existing)
+    {
+        var plan = new ListingPlan { Owner = Owner, Assignments = [A()] };
+        var document = new QuartermasterState();
+        if (existing) document.ListingPlans.Add(plan);
+        var draft = ListingPlanCatalog.Draft(document, Owner, Browser());
+        if (!existing) draft.Assignments.Add(A());
+        draft.Assignments[0].UnitPrice = 0;
+        var error = Assert.Throws<ListingPlanValidationException>(() =>
+            ListingPlanCatalog.Apply(document, Owner, draft, _ => 999, new HashSet<ulong> { 10, 11 }, DateTime.UtcNow));
+        Assert.Null(error.Candidate); Assert.Null(error.CanonicalAssignments); Assert.Equal(0, error.CanonicalRevision);
+        Assert.Equal(existing ? 1 : 0, document.ListingPlans.Count);
+        if (existing) Assert.Equal(100, document.ListingPlans[0].Assignments[0].UnitPrice);
+    }
 }
