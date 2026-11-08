@@ -16,19 +16,27 @@ public sealed class ListingPlanDraft
 
 public sealed record ListingPlanValidationIssue(Guid? AssignmentId, string Field, string Message);
 
-public sealed class ListingPlanValidationException(IReadOnlyList<ListingPlanValidationIssue> issues)
+public sealed class ListingPlanValidationException(IReadOnlyList<ListingPlanValidationIssue> issues,
+    IReadOnlyList<ListingPlanAssignment>? candidate = null,
+    IReadOnlyList<ListingPlanAssignment>? canonicalAssignments = null, long canonicalRevision = 0)
     : InvalidOperationException(issues.FirstOrDefault()?.Message ?? "The Listing Plan is invalid.")
 {
     public IReadOnlyList<ListingPlanValidationIssue> Issues { get; } = issues;
+    public IReadOnlyList<ListingPlanAssignment>? Candidate { get; } = candidate;
+    public IReadOnlyList<ListingPlanAssignment>? CanonicalAssignments { get; } = canonicalAssignments;
+    public long CanonicalRevision { get; } = canonicalRevision;
 }
 
 public sealed class ListingPlanConflictException(
     IReadOnlyList<ListingPlanValidationIssue> conflicts,
-    IReadOnlyList<ListingPlanAssignment> rebasedAssignments)
+    IReadOnlyList<ListingPlanAssignment> rebasedAssignments,
+    IReadOnlyList<ListingPlanAssignment> canonicalAssignments, long canonicalRevision)
     : InvalidOperationException("The Listing Plan changed while this draft was open. Conflicting fields remain in the draft for review.")
 {
     public IReadOnlyList<ListingPlanValidationIssue> Conflicts { get; } = conflicts;
     public IReadOnlyList<ListingPlanAssignment> RebasedAssignments { get; } = rebasedAssignments;
+    public IReadOnlyList<ListingPlanAssignment> CanonicalAssignments { get; } = canonicalAssignments;
+    public long CanonicalRevision { get; } = canonicalRevision;
 }
 
 public static class ListingPlanCatalog
@@ -63,45 +71,14 @@ public static class ListingPlanCatalog
             };
         }
 
-        var seeded = projection.Listings
-            .Where(listing => projection.RetainerListingsCompleteByScope.GetValueOrDefault(listing.ScopeKey))
-            .GroupBy(listing => new
-            {
-                listing.ItemId,
-                listing.ItemName,
-                listing.Quality,
-                listing.RetainerId,
-                listing.RetainerName,
-                listing.Quantity,
-                UnitPrice = listing.UnitPrice.IsKnown ? checked((int)listing.UnitPrice.Value) : 0,
-            })
-            .Select(group => new ListingPlanAssignment
-            {
-                ItemId = group.Key.ItemId,
-                ItemName = group.Key.ItemName,
-                Quality = group.Key.Quality == FfxivItemQuality.HQ
-                    ? ItemQualityPolicy.HqOnly
-                    : ItemQualityPolicy.NqOnly,
-                RetainerId = group.Key.RetainerId,
-                RetainerName = group.Key.RetainerName,
-                ListingCount = group.Count(),
-                QuantityPerListing = group.Key.Quantity,
-                UnitPrice = group.Key.UnitPrice,
-            })
-            .OrderBy(assignment => assignment.ItemName, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(assignment => assignment.RetainerName, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(assignment => assignment.Quality)
-            .ThenBy(assignment => assignment.QuantityPerListing)
-            .ThenBy(assignment => assignment.UnitPrice)
-            .ToList();
         return new ListingPlanDraft
         {
             PlanId = Guid.NewGuid(),
             IsNew = true,
             Owner = owner with { },
-            Assignments = seeded,
+            Assignments = [],
             BaselineAssignments = [],
-            IncompleteListingRetainerIds = incomplete,
+            IncompleteListingRetainerIds = [],
         };
     }
 
@@ -118,6 +95,7 @@ public static class ListingPlanCatalog
 
         ListingPlan plan;
         IReadOnlyList<ListingPlanAssignment> candidate;
+        var didMerge = false;
         if (draft.IsNew)
         {
             if (state.ListingPlans.Any(existing => existing.Owner.Matches(owner) || existing.Id == draft.PlanId))
@@ -128,14 +106,18 @@ public static class ListingPlanCatalog
         else
         {
             plan = state.ListingPlans.Single(existing => existing.Id == draft.PlanId && existing.Owner.Matches(owner));
+            didMerge = plan.Revision != draft.SourceRevision;
             candidate = plan.Revision == draft.SourceRevision
                 ? draft.Assignments.Select(Copy).ToArray()
-                : MergeAssignments(draft.BaselineAssignments, draft.Assignments, plan.Assignments);
+                : MergeAssignments(draft.BaselineAssignments, draft.Assignments, plan.Assignments, plan.Revision);
         }
 
         var issues = Validate(candidate, resolveMaxStack, ownerRetainerIds);
         if (issues.Count != 0)
-            throw new ListingPlanValidationException(issues);
+            throw new ListingPlanValidationException(issues,
+                didMerge ? candidate.Select(Copy).ToArray() : null,
+                didMerge ? plan.Assignments.Select(Copy).ToArray() : null,
+                didMerge ? plan.Revision : 0);
         plan.Assignments = candidate.Select(Copy).ToList();
         plan.UpdatedAtUtc = nowUtc;
         if (draft.IsNew)
@@ -232,6 +214,25 @@ public static class ListingPlanCatalog
             link.ItemId == itemId && link.Quality == quality) > 0;
     }
 
+    public static ListingPlanAssignment AssignmentFromListings(IReadOnlyList<ListingRow> listings)
+    {
+        if (listings.Count == 0) throw new ArgumentException("At least one listing is required.", nameof(listings));
+        var first = listings[0];
+        if (listings.Any(row => row.RetainerId != first.RetainerId || row.ItemId != first.ItemId ||
+            row.Quality != first.Quality || row.Quantity != first.Quantity ||
+            row.UnitPrice.IsKnown != first.UnitPrice.IsKnown ||
+            (row.UnitPrice.IsKnown && row.UnitPrice.Value != first.UnitPrice.Value)))
+            throw new ArgumentException("Listings must share item, quality, retainer, shape and price evidence.", nameof(listings));
+        return new ListingPlanAssignment
+        {
+            ItemId = first.ItemId, ItemName = first.ItemName,
+            Quality = first.Quality == FfxivItemQuality.HQ ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly,
+            RetainerId = first.RetainerId, RetainerName = first.RetainerName,
+            ListingCount = listings.Count, QuantityPerListing = first.Quantity,
+            UnitPrice = first.UnitPrice.IsKnown ? checked((int)first.UnitPrice.Value) : 0,
+        };
+    }
+
     public static ListingPlanAssignment Copy(ListingPlanAssignment source) => new()
     {
         Id = source.Id,
@@ -249,7 +250,7 @@ public static class ListingPlanCatalog
     private static IReadOnlyList<ListingPlanAssignment> MergeAssignments(
         IReadOnlyList<ListingPlanAssignment> baseline,
         IReadOnlyList<ListingPlanAssignment> draft,
-        IReadOnlyList<ListingPlanAssignment> current)
+        IReadOnlyList<ListingPlanAssignment> current, long canonicalRevision)
     {
         var baselineById = baseline.ToDictionary(assignment => assignment.Id);
         var draftById = draft.ToDictionary(assignment => assignment.Id);
@@ -301,7 +302,8 @@ public static class ListingPlanCatalog
             merged.Add(result);
         }
         if (conflicts.Count != 0)
-            throw new ListingPlanConflictException(conflicts, merged.Select(Copy).ToArray());
+            throw new ListingPlanConflictException(conflicts, merged.Select(Copy).ToArray(),
+                current.Select(Copy).ToArray(), canonicalRevision);
         return merged;
     }
 
@@ -322,7 +324,7 @@ public static class ListingPlanCatalog
         return draft;
     }
 
-    private static bool AssignmentEquals(ListingPlanAssignment left, ListingPlanAssignment right) =>
+    public static bool AssignmentEquals(ListingPlanAssignment left, ListingPlanAssignment right) =>
         left.Id == right.Id && left.ItemId == right.ItemId && left.ItemName == right.ItemName &&
         left.Quality == right.Quality && left.RetainerId == right.RetainerId &&
         left.RetainerName == right.RetainerName && left.ListingCount == right.ListingCount &&

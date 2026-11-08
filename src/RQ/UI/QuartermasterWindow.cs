@@ -36,12 +36,14 @@ public sealed class QuartermasterWindow : Window
     private readonly StockWorkspace stockWorkspace;
     private readonly TransferPlanEditor transferPlanEditor;
     private readonly TransferPlanWorkspace transferPlanWorkspace;
-    private readonly ListingPlanEditor listingPlanEditor;
+    private readonly ListingPlanDraftSession listingSession;
+    private readonly Dictionary<uint, bool?> listability = [];
     private readonly ListingWorkspace listingWorkspace;
     private readonly TransferReviewDialog transferReviewDialog;
     private readonly TransferExecutionController transferExecution;
     private readonly VendorProcurementReviewDialog vendorReviewDialog;
     private WorkbenchView? requestedView;
+    private WorkbenchView? deferredView;
     private bool clearAgentReviewWindowOverride;
     private int captureCollapseRestoreFramesRemaining;
     private int viewportReopenGuardFramesRemaining;
@@ -106,7 +108,7 @@ public sealed class QuartermasterWindow : Window
             SearchItems,
             transferPlanEditor.Close,
             () => requestedView = WorkbenchView.Restock);
-        listingPlanEditor = new(state, dataManager, SearchItems);
+        listingSession = new(state, ResolveListingMaxStack, id => dataManager.GetExcelSheet<Item>().GetRowOrDefault(id)?.CanBeHq == true);
         transferExecution = new(state, runtimeSnapshots, journal, transfers, retainerRefresh);
         stockWorkspace = new(
             state,
@@ -118,16 +120,19 @@ public sealed class QuartermasterWindow : Window
             workbench,
             itemGroupWorkspace,
             transferPlanEditor,
-            listingPlanEditor,
+            listingSession,
+            (runtime, key) => { listingWorkspace!.Focus(runtime, key); deferredView = WorkbenchView.Listings; },
             reviewRegistry,
-            () => requestedView = WorkbenchView.Stock);
+            () => deferredView = WorkbenchView.Stock);
         listingWorkspace = new(
             workbench,
             listingNavigation,
             reviewRegistry,
-            stockWorkspace.FocusFromListings,
-            listingPlanEditor.Open,
-            stockWorkspace.ClearSelection);
+            listingSession,
+            SearchListableItems,
+            Listability,
+            (runtime, key) => { stockWorkspace.FocusFromListings(runtime, key); deferredView = WorkbenchView.Stock; },
+            retainerRefresh);
         TransferReviewDialog? transferReview = null;
         VendorProcurementReviewDialog? vendorReview = null;
         transferPlanWorkspace = new(
@@ -384,6 +389,8 @@ public sealed class QuartermasterWindow : Window
 
     private void DrawContent()
     {
+        requestedView ??= deferredView;
+        deferredView = null;
         var runtime = runtimeSnapshots.Current;
         workbench.EnsureScope(runtime.Browser);
         if (requestedView is { } requested)
@@ -411,6 +418,9 @@ public sealed class QuartermasterWindow : Window
             "Recent Quartermaster operations");
         historyDialog.Draw(runtime.Owner);
 
+        listingSession.Ensure(runtime);
+        var showSave = runtime.Owner.HasStableIdentity && (listingSession.IsDirty || listingSession.ConflictCount > 0 || listingSession.MergedElsewhere || listingSession.Error is not null);
+        var stripHeight = showSave ? ImGui.GetFrameHeightWithSpacing() + ImGui.GetStyle().ItemSpacing.Y : 0;
         if (ImGui.BeginTabBar("RQViews"))
         {
             var plansRequested = requestedView is WorkbenchView.Stock or WorkbenchView.Restock or WorkbenchView.Stowage or WorkbenchView.ItemGroups;
@@ -428,7 +438,8 @@ public sealed class QuartermasterWindow : Window
                 else if (requestedView is WorkbenchView.Stock or WorkbenchView.Restock or WorkbenchView.Stowage ||
                          workbench.View is WorkbenchView.Listings or WorkbenchView.Activity)
                     workbench.View = WorkbenchView.Stowage;
-                DrawStockAndPlans(runtime);
+                if (ImGui.BeginChild("RQStockViewBody", new Vector2(0, -stripHeight), false)) DrawStockAndPlans(runtime);
+                ImGui.EndChild();
                 ImGui.EndTabItem();
             }
             var listingsOpen = ImGui.BeginTabItem($"Listings ({runtime.Browser.Listings.Count:N0})", requestedView == WorkbenchView.Listings ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None);
@@ -436,7 +447,8 @@ public sealed class QuartermasterWindow : Window
             if (listingsOpen)
             {
                 workbench.View = WorkbenchView.Listings;
-                listingWorkspace.Draw(runtime);
+                if (ImGui.BeginChild("RQListingsViewBody", new Vector2(0, -stripHeight), false)) listingWorkspace.Draw(runtime);
+                ImGui.EndChild();
                 ImGui.EndTabItem();
             }
             ImGui.EndTabBar();
@@ -444,7 +456,7 @@ public sealed class QuartermasterWindow : Window
         }
         restockPlanEditor.Draw(runtime);
         transferPlanEditor.Draw(runtime);
-        listingPlanEditor.Draw(runtime);
+        if (showSave) DrawListingSaveStrip(runtime);
         transferReviewDialog.Draw();
         vendorReviewDialog.Draw();
         confirmationDialog.Draw();
@@ -590,7 +602,6 @@ public sealed class QuartermasterWindow : Window
     {
         restockPlanEditor.Close();
         transferPlanEditor.Close();
-        listingPlanEditor.Close();
         transferReviewDialog.Clear();
         vendorReviewDialog.Clear();
     }
@@ -601,6 +612,69 @@ public sealed class QuartermasterWindow : Window
 
 
 
+
+    private void DrawListingSaveStrip(QuartermasterRuntimeSnapshot runtime)
+    {
+        ImGui.Separator();
+        var count = listingSession.ChangeCount;
+        ImGui.TextUnformatted($"{count} unsaved Listing Plan change{(count == 1 ? string.Empty : "s")}");
+        var message = listingSession.Error ?? (listingSession.ConflictCount > 0
+            ? $"Listing Plan changed elsewhere · {listingSession.ConflictCount} conflicts resolved using your draft"
+            : listingSession.MergedElsewhere ? "Listing Plan changed elsewhere · merged into your draft" : null);
+        var buttonWidth = ImGui.CalcTextSize("DiscardSave Listing Plan").X + ImGui.GetStyle().FramePadding.X * 4 + ImGui.GetStyle().ItemSpacing.X;
+        var buttonX = ImGui.GetContentRegionMax().X - buttonWidth;
+        if (message is not null)
+        {
+            ImGui.SameLine();
+            var available = Math.Max(0, buttonX - ImGui.GetCursorPosX() - ImGui.GetStyle().ItemSpacing.X);
+            var display = message;
+            while (display.Length > 0 && ImGui.CalcTextSize(display + "…").X > available) display = display[..^1];
+            if (display.Length < message.Length) display += "…";
+            ImGui.TextColored(ListingWorkspace.Color(ListingStateTone.Amber), display);
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(message);
+        }
+        ImGui.SameLine(buttonX);
+        if (ImGui.SmallButton("Discard")) listingSession.Discard(runtime);
+        reviewRegistry.RegisterLastButton("quartermaster.listings.discard", "Discard the Listing Plan draft", true,
+            () => listingSession.Discard(runtimeSnapshots.Current), "Discard unsaved changes");
+        ImGui.SameLine();
+        var canSave = listingSession.Issues(runtime).Count == 0;
+        ImGui.BeginDisabled(!canSave);
+        if (ImGui.SmallButton("Save Listing Plan")) listingSession.Save(runtime);
+        ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton("quartermaster.listings.save", "Save the Listing Plan draft", canSave,
+            () => listingSession.Save(runtimeSnapshots.Current), canSave ? "Ready" : listingSession.SaveBlockedTooltip(runtime));
+        if (!canSave && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) ImGui.SetTooltip(listingSession.SaveBlockedTooltip(runtime));
+    }
+
+    private int ResolveListingMaxStack(BrowserProjection browser, uint itemId)
+    {
+        var observed = browser.Items.FirstOrDefault(item => item.ItemId == itemId)?.Definition?.MaxStackSize;
+        if (observed is > 0) return checked((int)Math.Min(observed.Value, int.MaxValue));
+        var item = dataManager.GetExcelSheet<Item>().GetRowOrDefault(itemId);
+        return item is { } value && value.StackSize > 0 ? checked((int)value.StackSize) : 1;
+    }
+
+    private bool? Listability(uint itemId)
+    {
+        if (listability.TryGetValue(itemId, out var result)) return result;
+        var row = dataManager.GetExcelSheet<Item>().GetRowOrDefault(itemId);
+        return listability[itemId] = row is { } item ? !item.IsUntradable && item.ItemSearchCategory.RowId > 0 : null;
+    }
+
+    private IReadOnlyList<ItemChoice> SearchListableItems(string search, int limit)
+    {
+        var needle = search.Trim();
+        var id = needle.StartsWith('#') && uint.TryParse(needle.AsSpan(1), out var parsed) ? parsed : (uint?)null;
+        return dataManager.GetExcelSheet<Item>().Where(row => !row.IsUntradable && row.ItemSearchCategory.RowId > 0)
+            .Select(row => new { row.RowId, Name = row.Name.ExtractText() })
+            .Where(i => !string.IsNullOrWhiteSpace(i.Name) && (id.HasValue ? i.RowId == id.Value : i.Name.Contains(needle, StringComparison.OrdinalIgnoreCase)))
+            .OrderBy(i => i.Name.StartsWith(needle, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+            .ThenBy(i => i.Name, StringComparer.OrdinalIgnoreCase).ThenBy(i => i.RowId)
+            .GroupBy(i => i.Name, StringComparer.OrdinalIgnoreCase)
+            .SelectMany(g => g.Select(i => new ItemChoice(i.RowId, i.Name, g.Count() > 1 ? $"{i.Name} · #{i.RowId}" : i.Name)))
+            .Take(limit).ToArray();
+    }
 
     private IReadOnlyList<ItemChoice> SearchItems(string search, int limit)
     {

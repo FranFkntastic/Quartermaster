@@ -288,7 +288,19 @@ public sealed class AgentBridgeHost : IDisposable
                 true),
             new(
                 "quartermaster.listings.open-first",
-                "Open the focused retainer's listings",
+                "Open the selected retainer's listings",
+                "listings",
+                AgentBridgeUiControlKind.Button,
+                true),
+            new(
+                "quartermaster.listings.save",
+                "Save the Listing Plan draft",
+                "listings",
+                AgentBridgeUiControlKind.Button,
+                true),
+            new(
+                "quartermaster.listings.discard",
+                "Discard the Listing Plan draft",
                 "listings",
                 AgentBridgeUiControlKind.Button,
                 true),
