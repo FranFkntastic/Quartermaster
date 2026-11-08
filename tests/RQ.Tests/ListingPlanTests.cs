@@ -21,7 +21,7 @@ public sealed class ListingPlanTests
     };
 
     [Fact]
-    public void FirstDraft_SeedsOnlyListingCompleteRetainersWithoutPersisting()
+    public void FirstDraft_IsEmptyEvenWithObservedListingsWithoutPersisting()
     {
         var state = new QuartermasterState();
         var projection = Projection(
@@ -36,9 +36,9 @@ public sealed class ListingPlanTests
         var draft = ListingPlanCatalog.Draft(state, Owner, projection);
 
         Assert.True(draft.IsNew);
-        Assert.Single(draft.Assignments);
-        Assert.Equal((uint)1, draft.Assignments[0].ItemId);
-        Assert.Equal([11UL], draft.IncompleteListingRetainerIds);
+        Assert.Empty(draft.Assignments);
+        Assert.Empty(draft.BaselineAssignments);
+        Assert.Empty(draft.IncompleteListingRetainerIds);
         Assert.Empty(state.ListingPlans);
     }
 
@@ -106,12 +106,15 @@ public sealed class ListingPlanTests
             .Select(_ => Listing(2, "Bow", 10, "Retainer", 1, 200))
             .ToArray();
 
-        var conflict = ListingPlanPresentation.CapacityTransitionConflict(
+        var rows = ListingRetainerProjection.Build(
             draft,
-            Projection(unmanaged, inventoryComplete: true, listingsComplete: true));
+            Projection(unmanaged, inventoryComplete: true, listingsComplete: true),
+            new HashSet<ulong> { 10 }, _ => 99, _ => true);
 
-        Assert.Contains("39 occupied", conflict);
-        Assert.Contains("20 outside this plan", conflict);
+        var row = Assert.Single(rows);
+        Assert.Equal(39, row.PlannedSlots + row.UnplannedSlots);
+        Assert.Equal(20, row.UnplannedSlots);
+        Assert.Equal(20, row.Cells.Count);
     }
 
     [Fact]
@@ -124,12 +127,14 @@ public sealed class ListingPlanTests
             .Select(_ => Listing(2, "X", 10, "Retainer A", 1, 100))
             .ToArray();
 
-        var conflict = ListingPlanPresentation.CapacityTransitionConflict(
+        var rows = ListingRetainerProjection.Build(
             draft,
-            Projection(currentOnA, inventoryComplete: true, listingsComplete: true));
+            Projection(currentOnA, inventoryComplete: true, listingsComplete: true),
+            new HashSet<ulong> { 10, 11 }, _ => 99, _ => true);
 
-        Assert.Contains("Retainer A has 40 occupied", conflict);
-        Assert.Contains("20 outside this plan", conflict);
+        var row = rows.Single(r => r.RetainerId == 10);
+        Assert.Equal(40, row.PlannedSlots + row.UnplannedSlots);
+        Assert.Equal(20, row.UnplannedSlots);
     }
 
     [Fact]

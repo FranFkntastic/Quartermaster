@@ -70,32 +70,4 @@ internal sealed record TransferReviewRow(
 
 internal sealed record TransferReviewRequest(Guid PlanId, string PlanName);
 
-internal sealed record ListingGroupView(
-    ListingItemKey Key,
-    uint ItemId,
-    string ItemName,
-    ItemQualityPolicy Quality,
-    int DesiredUnits,
-    FieldEvidence<int> ListedUnits,
-    FieldEvidence<int> NeedUnits,
-    int PlayerUnits,
-    FieldEvidence<int> RetainerUnits,
-    FieldEvidence<int> ImmediatelyListableUnits,
-    FieldEvidence<int> MovementNeedUnits,
-    FieldEvidence<int> OtherRetainerUnits,
-    FieldEvidence<int> RetrievableUnits,
-    FieldEvidence<int> MissingUnits,
-    ListingCoverageState Coverage,
-    IReadOnlyList<ListingAssignmentEvaluation> Assignments,
-    IReadOnlyList<ListingRow> Listings,
-    IReadOnlyList<ListingRow> UnmanagedListings);
-
-internal sealed record PhysicalListingGroupView(
-    ulong RetainerId,
-    string RetainerName,
-    int Quantity,
-    FfxivItemQuality Quality,
-    FieldEvidence<decimal> UnitPrice,
-    IReadOnlyList<ListingRow> Listings);
-
 internal sealed record ItemChoice(uint ItemId, string Name, string Label);

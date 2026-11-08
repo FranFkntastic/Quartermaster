@@ -4,6 +4,10 @@ using RQ.Domain;
 
 namespace RQ.Planning;
 
+public enum ListingMatchKind { Exact, UnknownPrice, PriceDiffers, ShapeDiffers, WrongRetainer, Unplanned }
+
+public sealed record ListingMatch(ListingRow Listing, Guid? AssignmentId, ListingMatchKind Kind);
+
 public enum ListingCoverageState
 {
     Satisfied,
@@ -41,7 +45,8 @@ public sealed record ListingPlanItemEvaluation(
     ListingCoverageState Coverage,
     IReadOnlyList<ListingAssignmentEvaluation> Assignments,
     IReadOnlyList<ListingRow> PhysicalListings,
-    IReadOnlyList<ListingRow> UnmanagedPhysicalListings)
+    IReadOnlyList<ListingRow> UnmanagedPhysicalListings,
+    IReadOnlyList<ListingMatch> Matches)
 {
     public bool IsPlanned => Assignments.Count != 0;
     public int PriceExceptions => Assignments.Sum(assignment => assignment.WrongPriceListings);
@@ -281,18 +286,21 @@ public static class ListingPlanEvaluator
             coverage,
             matches.Assignments,
             physical,
-            matches.UnmanagedListings);
+            matches.UnmanagedListings,
+            matches.Matches);
     }
 
     private sealed record ListingMatchResult(
         IReadOnlyList<ListingAssignmentEvaluation> Assignments,
-        IReadOnlyList<ListingRow> UnmanagedListings);
+        IReadOnlyList<ListingRow> UnmanagedListings,
+        IReadOnlyList<ListingMatch> Matches);
 
     private static ListingMatchResult MatchAssignments(
         IReadOnlyList<ListingPlanAssignment> assignments,
         IReadOnlyList<ListingRow> physical)
     {
         var consumed = new bool[physical.Count];
+        var matches = physical.Select(row => new ListingMatch(row, null, ListingMatchKind.Unplanned)).ToArray();
         var exact = new int[assignments.Count];
         var unknownPrice = new int[assignments.Count];
         var wrongPrice = new int[assignments.Count];
@@ -308,7 +316,7 @@ public static class ListingPlanEvaluator
             exact[index] = Consume(assignment.ListingCount, physical, consumed, listing =>
                 listing.RetainerId == assignment.RetainerId &&
                 listing.Quantity == assignment.QuantityPerListing &&
-                listing.UnitPrice.IsKnown && listing.UnitPrice.Value == assignment.UnitPrice);
+                listing.UnitPrice.IsKnown && listing.UnitPrice.Value == assignment.UnitPrice, matches, assignment.Id, ListingMatchKind.Exact);
         }
         for (var index = 0; index < assignments.Count; index++)
         {
@@ -316,7 +324,7 @@ public static class ListingPlanEvaluator
             unknownPrice[index] = Consume(assignment.ListingCount - exact[index], physical, consumed, listing =>
                 listing.RetainerId == assignment.RetainerId &&
                 listing.Quantity == assignment.QuantityPerListing &&
-                !listing.UnitPrice.IsKnown);
+                !listing.UnitPrice.IsKnown, matches, assignment.Id, ListingMatchKind.UnknownPrice);
         }
         for (var index = 0; index < assignments.Count; index++)
         {
@@ -324,13 +332,13 @@ public static class ListingPlanEvaluator
             wrongPrice[index] = Consume(assignment.ListingCount - exact[index] - unknownPrice[index], physical, consumed, listing =>
                 listing.RetainerId == assignment.RetainerId &&
                 listing.Quantity == assignment.QuantityPerListing &&
-                listing.UnitPrice.IsKnown);
+                listing.UnitPrice.IsKnown, matches, assignment.Id, ListingMatchKind.PriceDiffers);
         }
         for (var index = 0; index < assignments.Count; index++)
         {
             var assignment = assignments[index];
             wrongShape[index] = Consume(assignment.ListingCount - exact[index] - unknownPrice[index] - wrongPrice[index], physical, consumed, listing =>
-                listing.RetainerId == assignment.RetainerId);
+                listing.RetainerId == assignment.RetainerId, matches, assignment.Id, ListingMatchKind.ShapeDiffers);
         }
         for (var index = 0; index < assignments.Count; index++)
         {
@@ -339,7 +347,7 @@ public static class ListingPlanEvaluator
                 assignment.ListingCount - exact[index] - unknownPrice[index] - wrongPrice[index] - wrongShape[index],
                 physical,
                 consumed,
-                listing => listing.RetainerId != assignment.RetainerId);
+                listing => listing.RetainerId != assignment.RetainerId, matches, assignment.Id, ListingMatchKind.WrongRetainer);
         }
         var evaluations = assignments.Select((assignment, index) => new ListingAssignmentEvaluation(
             assignment,
@@ -349,14 +357,15 @@ public static class ListingPlanEvaluator
             wrongShape[index],
             wrongRetainer[index])).ToArray();
         var unmanaged = physical.Where((_, index) => !consumed[index]).ToArray();
-        return new(evaluations, unmanaged);
+        return new(evaluations, unmanaged, matches);
     }
 
     private static int Consume(
         int limit,
         IReadOnlyList<ListingRow> rows,
         bool[] consumed,
-        Func<ListingRow, bool> predicate)
+        Func<ListingRow, bool> predicate,
+        ListingMatch[] matches, Guid assignmentId, ListingMatchKind kind)
     {
         var count = 0;
         for (var index = 0; index < rows.Count && count < limit; index++)
@@ -364,6 +373,7 @@ public static class ListingPlanEvaluator
             if (consumed[index] || !predicate(rows[index]))
                 continue;
             consumed[index] = true;
+            matches[index] = new(rows[index], assignmentId, kind);
             count++;
         }
         return count;

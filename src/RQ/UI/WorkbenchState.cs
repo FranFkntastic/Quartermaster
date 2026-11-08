@@ -15,9 +15,10 @@ public sealed class WorkbenchState
     public string ScopeKey { get; set; } = BrowserScope.AllKey;
     public DalamudFilterAutocompleteState ItemFilterState { get; } = new();
     public DalamudFilterAutocompleteState ListingFilterState { get; } = new();
-    public string ListingSort { get; set; } = "Item";
-    public bool ListingSortDescending { get; set; }
-    public ListingItemKey? SelectedListingItem { get; set; }
+    public ulong? SelectedListingRetainerId { get; set; }
+    public ListingItemKey? HighlightedListingItem { get; set; }
+    public bool ScrollToListingRetainer { get; set; }
+    public ListingItemKey? ScrollToListingDetail { get; set; }
     public ItemQualityPolicy SelectedStockListingQuality { get; set; } = ItemQualityPolicy.NqOnly;
     public uint? FocusedStockItemId { get; set; }
     public StockGroup? SelectedStock { get; private set; }

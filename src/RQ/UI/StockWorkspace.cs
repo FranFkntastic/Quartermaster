@@ -35,7 +35,8 @@ internal sealed class StockWorkspace
     private readonly WorkbenchState workbench;
     private readonly ItemGroupWorkspace itemGroupWorkspace;
     private readonly TransferPlanEditor transferPlanEditor;
-    private readonly ListingPlanEditor listingPlanEditor;
+    private readonly ListingPlanDraftSession listingSession;
+    private readonly Action<QuartermasterRuntimeSnapshot, ListingItemKey> showInListings;
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
     private readonly Action requestStockView;
     private readonly BrowserQueryController queries = new();
@@ -58,7 +59,8 @@ internal sealed class StockWorkspace
         WorkbenchState workbench,
         ItemGroupWorkspace itemGroupWorkspace,
         TransferPlanEditor transferPlanEditor,
-        ListingPlanEditor listingPlanEditor,
+        ListingPlanDraftSession listingSession,
+        Action<QuartermasterRuntimeSnapshot, ListingItemKey> showInListings,
         AgentBridgeUiReviewRegistry reviewRegistry,
         Action requestStockView)
     {
@@ -71,7 +73,8 @@ internal sealed class StockWorkspace
         this.workbench = workbench;
         this.itemGroupWorkspace = itemGroupWorkspace;
         this.transferPlanEditor = transferPlanEditor;
-        this.listingPlanEditor = listingPlanEditor;
+        this.listingSession = listingSession;
+        this.showInListings = showInListings;
         this.reviewRegistry = reviewRegistry;
         this.requestStockView = requestStockView;
         stockTable = CreateTable();
@@ -223,7 +226,7 @@ internal sealed class StockWorkspace
         stockDrawMilliseconds = Stopwatch.GetElapsedTime(drawStarted).TotalMilliseconds;
     }
 
-    private static IReadOnlyList<StockGroup> StockItemsWithListingDemand(QuartermasterRuntimeSnapshot runtime, string scopeKey)
+    internal static IReadOnlyList<StockGroup> StockItemsWithListingDemand(QuartermasterRuntimeSnapshot runtime, string scopeKey)
     {
         var stock = runtime.Browser.GetItems(scopeKey);
         var plan = ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner);
@@ -496,6 +499,17 @@ internal sealed class StockWorkspace
 
         if (selected.Length == 1)
         {
+            var itemId = selected[0].ItemId;
+            var navigationQualities = (listingSession.Draft?.Assignments.Where(a => a.ItemId == itemId).Select(a => a.Quality) ?? [])
+                .Concat(runtime.Browser.Listings.Where(l => l.ItemId == itemId).Select(ListingRetainerProjection.Quality))
+                .Distinct().OrderBy(q => q).ToArray();
+            void DrawListingsNavigation()
+            {
+                if (navigationQualities.Length == 0) return;
+                var quality = navigationQualities.Contains(workbench.SelectedStockListingQuality)
+                    ? workbench.SelectedStockListingQuality : navigationQualities[0];
+                if (ImGui.SmallButton("Show in Listings")) showInListings(runtime, new(itemId, quality));
+            }
             var listingPlan = ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner);
             var demand = ListingPlanEvaluator.Evaluate(listingPlan, runtime.Browser).Items
                 .Where(item => item.ItemId == selected[0].ItemId && item.IsPlanned)
@@ -517,9 +531,8 @@ internal sealed class StockWorkspace
                 }
                 var selectedDemand = demand.Single(item => item.Quality == workbench.SelectedStockListingQuality);
                 ImGui.TextDisabled(StockListingShortfall([selectedDemand]));
-                if (ImGui.SmallButton("Edit assignments##stock"))
-                    listingPlanEditor.Open(runtime, new(selectedDemand.ItemId, selectedDemand.Quality));
-                ImGui.SameLine();
+                DrawListingsNavigation();
+                if (navigationQualities.Length > 0) ImGui.SameLine();
                 var transferPlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
                 var linked = transferPlan is not null && runtime.State.TransferPlanListingLinks.Any(link =>
                     link.StowagePlanId == transferPlan.Id && link.ListingPlanId == listingPlan.Id &&
@@ -532,6 +545,12 @@ internal sealed class StockWorkspace
                     if (ImGui.SmallButton($"Include in {destination}"))
                         SetListingDemandLink(runtime, listingPlan, transferPlan, selectedDemand, linked: true);
                 }
+            }
+            else if (navigationQualities.Length > 0)
+            {
+                ImGui.Separator();
+                ImGui.TextUnformatted(selected[0].ItemName);
+                DrawListingsNavigation();
             }
         }
     }
@@ -707,7 +726,7 @@ internal sealed class StockWorkspace
     }
 
 
-    public void FocusFromListings(QuartermasterRuntimeSnapshot runtime, ListingGroupView group)
+    public void FocusFromListings(QuartermasterRuntimeSnapshot runtime, ListingItemKey group)
     {
         stockSelection.Clear();
         stockSelection.SetSelected(group.ItemId, true);
