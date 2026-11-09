@@ -174,7 +174,7 @@ internal sealed class TransferPlanEditor
         reviewRegistry.RegisterLastButton("quartermaster.transfer.editor.cancel", "Discard the Transfer Plan draft", true,
             () => session.Discard(runtime.Owner), "Saved plan remains unchanged");
         ImGui.SameLine();
-        var canApply = StowagePlanCatalog.CanApply(state.Snapshot(), runtime.Owner, draft);
+        var canApply = session.CanSave(runtime.Owner);
         ImGui.BeginDisabled(!canApply);
         if (ImGui.SmallButton("Save transfer plan")) Save(runtime.Owner);
         ImGui.EndDisabled();

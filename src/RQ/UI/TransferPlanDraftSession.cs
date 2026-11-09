@@ -27,6 +27,11 @@ internal sealed class TransferPlanDraftSession(StateRepository repository)
     public bool HasChanges => Draft is { } draft && drafts.TryGetValue(draft.PlanId, out var entry) &&
         (entry.RemovedLinks.Count > 0 || (entry.Baseline is null ? draft.Rules.Count > 0 || draft.Name != "Transfer plan" : !Equal(draft, entry.Baseline)));
 
+    public bool CanSave(OwnerScope currentOwner) =>
+        owner is not null && currentOwner.HasStableIdentity && owner.Matches(currentOwner) &&
+        Draft is { } draft && !string.IsNullOrWhiteSpace(draft.Name) &&
+        (!draft.IsNew || draft.Rules.Any(rule => rule.ItemId > 0)) && HasChanges;
+
     public void Ensure(OwnerScope currentOwner, Guid? selected)
     {
         if (!currentOwner.HasStableIdentity) return;

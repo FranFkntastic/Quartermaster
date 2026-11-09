@@ -48,6 +48,38 @@ public sealed class TransferPlanDraftSessionTests
     }
 
     [Fact]
+    public void LinkOnlyRemovalCanSaveAndDiscardWithoutUnrelatedEdits()
+    {
+        using var f = new Fixture(); var planId = f.SaveInitial();
+        var linkId = f.Repository.Mutate(s =>
+        {
+            var listing = new ListingPlan { Owner = Owner };
+            s.ListingPlans.Add(listing);
+            var link = new TransferPlanListingLink { StowagePlanId = planId, ListingPlanId = listing.Id, ItemId = 1 };
+            s.TransferPlanListingLinks.Add(link);
+            return link.Id;
+        });
+        Assert.False(f.Session.CanSave(Owner));
+        f.Session.Unlink(linkId);
+        Assert.True(f.Session.CanSave(Owner));
+        Assert.False(f.Session.CanSave(Other));
+        Assert.Single(f.Repository.Snapshot().TransferPlanListingLinks);
+        f.Session.Discard(Owner);
+        Assert.False(f.Session.CanSave(Owner));
+        Assert.Single(f.Repository.Snapshot().TransferPlanListingLinks);
+        f.Session.Unlink(linkId);
+        var savedName = f.Session.Draft!.Name;
+        f.Session.Draft!.Name = " ";
+        Assert.False(f.Session.CanSave(Owner));
+        f.Session.Draft.Name = savedName;
+        Assert.True(f.Session.Save(Owner), f.Session.Error);
+        var reloaded = new StateRepository(new QuartermasterStateStore(f.PathToState));
+        Assert.Empty(reloaded.Snapshot().TransferPlanListingLinks);
+        Assert.Equal(30, Assert.Single(reloaded.Snapshot().PlanItems).TargetQuantity);
+        Assert.False(f.Session.CanSave(Owner));
+    }
+
+    [Fact]
     public void AddSaveReloadAndDiscardAreTransactional()
     {
         using var f = new Fixture();

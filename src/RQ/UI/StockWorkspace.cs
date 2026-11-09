@@ -267,6 +267,7 @@ internal sealed class StockWorkspace
         var draft = transferPlanEditor.Draft;
         var signature = new HashCode();
         signature.Add(draft?.PlanId);
+        signature.Add(transferPlanEditor.HasChanges);
         foreach (var rule in draft?.Rules ?? [])
         { signature.Add(rule.Id); signature.Add(rule.TargetQuantity); signature.Add(rule.Quality); signature.Add(rule.Enabled); }
         var draftSignature = signature.ToHashCode();
