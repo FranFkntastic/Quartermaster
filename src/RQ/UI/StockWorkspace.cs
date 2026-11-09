@@ -43,6 +43,7 @@ internal sealed class StockWorkspace
     private readonly TableSelectionModel<uint> stockSelection = new();
     private readonly DalamudTableProjection<StockWorkbenchRow> stockTable;
     private StockWorkbenchProjection? stockWorkbenchProjection;
+    private int projectedDraftSignature;
     private long stockSelectionRevision = -1;
     private int stockProjectionBuildCount;
     private int visibleStockCount;
@@ -263,19 +264,22 @@ internal sealed class StockWorkspace
         IReadOnlyList<StockGroup> queryItems,
         StowagePlan? selectedPlan)
     {
+        var draft = transferPlanEditor.Draft;
+        var signature = new HashCode();
+        signature.Add(draft?.PlanId);
+        foreach (var rule in draft?.Rules ?? [])
+        { signature.Add(rule.Id); signature.Add(rule.TargetQuantity); signature.Add(rule.Quality); signature.Add(rule.Enabled); }
+        var draftSignature = signature.ToHashCode();
         if (stockWorkbenchProjection is { } cached &&
-            cached.RuntimeRevision == runtime.Revision &&
+            projectedDraftSignature == draftSignature && cached.RuntimeRevision == runtime.Revision &&
             cached.PlanId == selectedPlan?.Id &&
             cached.QueryItems.Select(item => item.ItemId).SequenceEqual(queryItems.Select(item => item.ItemId)))
             return cached.Rows;
 
-        var rules = selectedPlan is null
-            ? new Dictionary<uint, TargetPlanItem>()
-            : runtime.State.PlanItems
-                .Where(rule => rule.StowagePlanId == selectedPlan.Id)
-                .GroupBy(rule => rule.ItemId)
-                .ToDictionary(group => group.Key, group => group.First());
-        var evaluated = selectedPlan is null
+        projectedDraftSignature = draftSignature;
+        var rules = (draft?.Rules ?? []).GroupBy(rule => rule.ItemId)
+            .ToDictionary(group => group.Key, group => group.First());
+        var evaluated = selectedPlan is null || transferPlanEditor.HasChanges
             ? new Dictionary<Guid, StowageEvaluationLine>()
             : runtime.Stowage
                 .FirstOrDefault(plan => plan.PlanId == selectedPlan.Id)?
@@ -541,9 +545,9 @@ internal sealed class StockWorkspace
                     ImGui.TextDisabled($"Linked to {transferPlan!.Name}");
                 else
                 {
-                    var destination = transferPlan?.Name ?? "new Transfer Plan";
-                    if (ImGui.SmallButton($"Include in {destination}"))
-                        SetListingDemandLink(runtime, listingPlan, transferPlan, selectedDemand, linked: true);
+                    var destination = transferPlanEditor.Draft?.Name ?? "Transfer plan";
+                    if (ImGui.SmallButton($"Prepare target in {destination}"))
+                        transferPlanEditor.Prepare(runtime, selectedDemand);
                 }
             }
             else if (navigationQualities.Length > 0)
@@ -571,50 +575,6 @@ internal sealed class StockWorkspace
             true,
             table.RequestColumnMenu,
             "Available");
-    }
-
-    private void SetListingDemandLink(
-        QuartermasterRuntimeSnapshot runtime,
-        ListingPlan listingPlan,
-        StowagePlan? selectedTransferPlan,
-        ListingPlanItemEvaluation demand,
-        bool linked)
-    {
-        try
-        {
-            workbench.SelectedStowagePlanId = state.Mutate(document =>
-            {
-                var transferPlan = selectedTransferPlan is null
-                    ? StowagePlanCatalog.Create(document, runtime.Owner, "Transfer plan")
-                    : document.StowagePlans.Single(plan => plan.Id == selectedTransferPlan.Id && plan.Owner.Matches(runtime.Owner));
-                if (!linked)
-                {
-                    ListingPlanCatalog.Unlink(document, runtime.Owner, transferPlan.Id, listingPlan.Id, demand.ItemId, demand.Quality);
-                    return transferPlan.Id;
-                }
-                if (document.PlanItems.Any(rule => rule.StowagePlanId == transferPlan.Id && rule.ItemId == demand.ItemId &&
-                                                   rule.Quality == ItemQualityPolicy.Any && rule.Enabled))
-                    throw new InvalidOperationException($"{demand.ItemName} has an Any-quality Transfer Plan target. Choose NQ or HQ there before linking exact listing demand.");
-                if (document.PlanItems.All(rule => rule.StowagePlanId != transferPlan.Id || rule.ItemId != demand.ItemId || rule.Quality != demand.Quality))
-                {
-                    document.PlanItems.Add(new TargetPlanItem
-                    {
-                        StowagePlanId = transferPlan.Id,
-                        ItemId = demand.ItemId,
-                        ItemName = demand.ItemName,
-                        Quality = demand.Quality,
-                        TargetQuantity = 0,
-                    });
-                }
-                ListingPlanCatalog.Link(document, runtime.Owner, transferPlan.Id, listingPlan.Id, demand.ItemId, demand.Quality);
-                return transferPlan.Id;
-            });
-            transferExecution.ClearInlineError();
-        }
-        catch (Exception exception)
-        {
-            transferExecution.ReportInlineError(exception.Message);
-        }
     }
 
     private void DrawStockRowContextMenu(StockWorkbenchRow row)
@@ -658,54 +618,15 @@ internal sealed class StockWorkspace
     {
         if (!runtime.Owner.HasStableIdentity || items.Count == 0)
             return;
-        try
-        {
-            workbench.SelectedStowagePlanId = state.Mutate(document =>
-            {
-                var plan = ResolveSelectedStowagePlan(document, runtime.Owner)
-                           ?? StowagePlanCatalog.Create(document, runtime.Owner, "Transfer plan");
-                var draft = StowagePlanCatalog.Draft(document, runtime.Owner, plan.Id);
-                foreach (var item in items)
-                {
-                    var rule = draft.Rules.FirstOrDefault(candidate =>
-                        candidate.ItemId == item.ItemId &&
-                        candidate.Quality == ItemQualityPolicy.Any);
-                    if (rule is null)
-                    {
-                        draft.Rules.Add(new TargetPlanItem
-                        {
-                            StowagePlanId = plan.Id,
-                            ItemId = item.ItemId,
-                            ItemName = item.ItemName,
-                            TargetQuantity = stowCarried ? 0 : item.PlayerQuantity,
-                            Quality = ItemQualityPolicy.Any,
-                            Enabled = true,
-                        });
-                    }
-                    else
-                    {
-                        rule.Enabled = true;
-                        if (stowCarried)
-                            rule.TargetQuantity = 0;
-                    }
-                }
-                return StowagePlanCatalog.Apply(document, runtime.Owner, draft).Id;
-            });
-            transferExecution.ClearInlineError();
-        }
-        catch (Exception exception)
-        {
-            transferExecution.ReportInlineError(exception.Message);
-        }
+        transferPlanEditor.AddStock(runtime, items, stowCarried);
     }
-
 
     private static string StockPlanState(StockWorkbenchRow row) =>
         row.Rule is null
             ? "Not in plan"
             : !row.Rule.Enabled
                 ? "Off"
-                : row.Line?.Action switch
+                : row.Line is null ? "Draft target" : row.Line.Action switch
                 {
                     StowageAction.Retrieve => $"Retrieve {row.Line.RetrieveQuantity:N0}",
                     StowageAction.Deposit => $"Stow {row.Line.DepositQuantity:N0}",

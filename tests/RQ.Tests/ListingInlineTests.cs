@@ -51,6 +51,14 @@ public sealed class ListingInlineTests
         Assert.Equal(1, row.Cells.Count(c => c.Kind == SlotCellKind.Planned));
         Assert.Equal(2, row.PlannedSlots + row.UnplannedSlots);
         Assert.Equal("Price differs", row.ObservedGroups.Single().State.Text);
+        Assert.Equal(1, row.PlanRows.Single().ListedCount);
+    }
+
+    [Fact]
+    public void UnobservedListingCountIsUnknownRatherThanZero()
+    {
+        Assert.Null(View(Draft(A(20)), Browser(observed: false)).PlanRows.Single().ListedCount);
+        Assert.Equal(0, View(Draft(A(20)), Browser()).PlanRows.Single().ListedCount);
     }
 
     [Theory]

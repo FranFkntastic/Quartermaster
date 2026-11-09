@@ -4,6 +4,7 @@ using Dalamud.Bindings.ImGui;
 using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.Automation.Vendors;
 using Franthropy.Dalamud.UI.Tables;
+using Franthropy.Dalamud.UI.Inputs;
 using RQ.Domain;
 using RQ.Persistence;
 using RQ.Planning;
@@ -14,7 +15,7 @@ namespace RQ.UI;
 internal sealed record TransferPlanEditorSnapshot(bool IsOpen, bool HasUnsavedChanges);
 
 /// <summary>
-/// Owns the Transfer Plan draft, member selection, bulk controls, and modal lifecycle.
+/// Owns inline transfer editing; its session is shared by both source views.
 /// </summary>
 internal sealed class TransferPlanEditor
 {
@@ -24,23 +25,24 @@ internal sealed class TransferPlanEditor
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
     private readonly Func<string, int, IReadOnlyList<ItemChoice>> searchItems;
     private readonly Action closeRestockEditor;
-    private readonly Action requestStowageView;
     private readonly Func<GilVendorCatalog>? vendorCatalogSource;
     private readonly DalamudTableProjection<StowageDraftRow> stowageDraftTable;
-    private StowagePlanDraft? stowageDraft;
+    private readonly TransferPlanDraftSession session;
+    private StowagePlanDraft? stowageDraft => session.Draft;
+    private readonly DalamudSuggestionInputState addInput = new();
+    private string addQuery = "\0";
+    private IReadOnlyList<DalamudSuggestion<ItemChoice>> addChoices = [];
     private readonly TableSelectionModel<Guid> selectedStowageRuleIds = new();
     private Guid? activeStowageRuleId;
     private Guid? selectedStowageItemGroupId;
-    private string stowageItemSearch = string.Empty;
     private string stowageRuleFilter = string.Empty;
-    private ItemChoice? selectedStowageChoice;
     private string stowageEditorError = string.Empty;
     private int bulkQuality = -1;
     private int bulkRoutingMode = -1;
     private int bulkOverflow = -1;
     private int bulkStowageTarget = -1;
-    private bool requestStowageEditorOpen;
-    private bool stowageEditorVisible;
+    private IReadOnlyList<TransferPlanListingContribution> contributions = [];
+    public int RenderedRowCount { get; private set; }
 
     public TransferPlanEditor(
         StateRepository state,
@@ -53,12 +55,12 @@ internal sealed class TransferPlanEditor
         Func<GilVendorCatalog>? vendorCatalogSource = null)
     {
         this.state = state;
+        session = new(state);
         this.workbench = workbench;
         this.itemGroupWorkspace = itemGroupWorkspace;
         this.reviewRegistry = reviewRegistry;
         this.searchItems = searchItems;
         this.closeRestockEditor = closeRestockEditor;
-        this.requestStowageView = requestStowageView;
         this.vendorCatalogSource = vendorCatalogSource;
         stowageDraftTable = CreateDraftTable();
     }
@@ -70,27 +72,57 @@ internal sealed class TransferPlanEditor
     {
         closeRestockEditor();
         itemGroupWorkspace.CloseEditor();
-        stowageDraft = draft;
+        session.Adopt(draft);
         selectedStowageRuleIds.Clear();
-        activeStowageRuleId = stowageDraft.Rules.FirstOrDefault()?.Id;
+        activeStowageRuleId = draft.Rules.FirstOrDefault()?.Id;
         selectedStowageItemGroupId = null;
-        stowageItemSearch = string.Empty;
         stowageRuleFilter = string.Empty;
-        selectedStowageChoice = null;
         stowageEditorError = string.Empty;
         bulkQuality = -1;
         bulkRoutingMode = -1;
         bulkOverflow = -1;
         bulkStowageTarget = -1;
-        requestStowageEditorOpen = true;
-        workbench.View = WorkbenchView.Stowage;
-        requestStowageView();
+        workbench.SelectedStowagePlanId = draft.PlanId;
     }
 
     public TransferPlanEditorSnapshot Snapshot(QuartermasterState document, OwnerScope owner) =>
-        new(
-            stowageDraft is not null && (requestStowageEditorOpen || stowageEditorVisible),
-            stowageDraft is not null && StowagePlanCatalog.HasChanges(document, owner, stowageDraft));
+        new(stowageDraft is not null && owner.HasStableIdentity, session.HasChanges);
+    public StowagePlanDraft? Draft => session.Draft;
+    public IReadOnlyList<StowagePlanDraft> Drafts => session.Drafts;
+    public void Duplicate()
+    {
+        if (Draft is not { } draft) return;
+        var id = Guid.NewGuid();
+        Open(new StowagePlanDraft { PlanId = id, IsNew = true, Name = draft.Name + " copy", Enabled = false,
+            Rules = draft.Rules.Select(r => StowagePlanCatalog.CopyRule(r, id, true)).ToList() });
+    }
+    public bool HasChanges => session.HasChanges;
+    public void Forget(Guid id) => session.Forget(id);
+    public void Ensure(QuartermasterRuntimeSnapshot runtime)
+    {
+        session.Ensure(runtime.Owner, workbench.SelectedStowagePlanId);
+        if (runtime.Owner.HasStableIdentity && session.Draft is { } draft)
+            workbench.SelectedStowagePlanId = draft.PlanId;
+    }
+    public bool Save(OwnerScope owner)
+    {
+        var saved = session.Save(owner);
+        if (saved) workbench.SelectedStowagePlanId = session.Draft?.PlanId;
+        return saved;
+    }
+    public void AddStock(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, bool stow)
+    {
+        Ensure(runtime);
+        if (!runtime.Owner.HasStableIdentity) return;
+        foreach (var item in items)
+            session.Add(item.ItemId, item.ItemName, ItemQualityPolicy.Any, stow ? 0 : item.PlayerQuantity, stow);
+    }
+    public void Prepare(QuartermasterRuntimeSnapshot runtime, ListingPlanItemEvaluation demand, Guid? destination = null)
+    {
+        if (destination.HasValue) workbench.SelectedStowagePlanId = destination;
+        Ensure(runtime);
+        if (runtime.Owner.HasStableIdentity) session.Prepare(demand, runtime.State);
+    }
 
     public void SelectItemGroup(Guid groupId) => selectedStowageItemGroupId = groupId;
 
@@ -100,221 +132,115 @@ internal sealed class TransferPlanEditor
             selectedStowageItemGroupId = null;
     }
 
-    public void Close()
-    {
-        if (itemGroupWorkspace.IsEditorOpenFor(ItemGroupEditorOrigin.Stowage))
-            itemGroupWorkspace.CloseEditor();
-        stowageDraft = null;
-        requestStowageEditorOpen = false;
-        stowageEditorVisible = false;
-        selectedStowageRuleIds.Clear();
-        activeStowageRuleId = null;
-        selectedStowageChoice = null;
-        stowageEditorError = string.Empty;
-    }
+    // Closing the window or switching the source view must not discard the shared draft.
+    public void Close() => itemGroupWorkspace.CloseEditor();
 
     public void Draw(QuartermasterRuntimeSnapshot runtime)
     {
-        const string popup = "Edit Transfer Plan##RQStowageEditor";
-        stowageEditorVisible = false;
-        if (requestStowageEditorOpen)
-        {
-            ImGui.OpenPopup(popup);
-            requestStowageEditorOpen = false;
-        }
-        if (stowageDraft is null)
-            return;
-
-        var available = ImGui.GetMainViewport().WorkSize;
-        ImGui.SetNextWindowSize(
-            new Vector2(Math.Min(1220, available.X - 48), Math.Min(720, available.Y - 48)),
-            ImGuiCond.Appearing);
-        if (!ImGui.BeginPopupModal(popup, ImGuiWindowFlags.NoScrollbar))
-        {
-            Close();
-            return;
-        }
-        stowageEditorVisible = true;
-        if (itemGroupWorkspace.IsEditorOpenFor(ItemGroupEditorOrigin.Stowage))
-        {
-            itemGroupWorkspace.DrawEditor(
-                selectedStowageRuleIds.Count,
-                groupDraft => ItemGroupCatalog.AddMissing(
-                    groupDraft,
-                    stowageDraft?.Rules.Where(rule => selectedStowageRuleIds.IsSelected(rule.Id)) ?? []));
-            ImGui.EndPopup();
-            return;
-        }
-
-        var draft = stowageDraft;
-        ImGui.TextUnformatted("Edit Transfer Plan");
+        Ensure(runtime);
+        if (!runtime.Owner.HasStableIdentity || stowageDraft is not { } draft)
+        { ImGui.TextDisabled("Transfer plan unavailable while owner identity is unknown."); return; }
+        contributions = ListingPlanEvaluator.Contributions(runtime.State, draft.PlanId,
+            ListingPlanEvaluator.Evaluate(ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner), runtime.Browser))
+            .Where(c => !session.RemovedLinks.Contains(c.Link.Id)).ToArray();
+        ImGui.TextUnformatted("Transfer plan");
         ImGui.SameLine();
         var planName = draft.Name;
-        ImGui.SetNextItemWidth(300);
-        if (ImGui.InputText("##stowagedraftname", ref planName, 80))
-            draft.Name = planName;
-        ImGui.SameLine();
-        ImGui.TextDisabled($"{selectedStowageRuleIds.Count:N0} selected of {draft.Rules.Count:N0} rules");
-
+        ImGui.SetNextItemWidth(Math.Max(120, ImGui.GetContentRegionAvail().X));
+        if (ImGui.InputText("##stowagedraftname", ref planName, 80)) draft.Name = planName;
+        ImGui.TextDisabled("Player targets · changes apply together");
         DrawStowageEditorToolbar(draft);
-        DrawStowageEditorBulkBar(draft);
-        if (!string.IsNullOrWhiteSpace(stowageEditorError))
-            ImGui.TextColored(new Vector4(1f, .45f, .4f, 1f), stowageEditorError);
-
-        if (ImGui.BeginChild("RQStowageRuleTable", new Vector2(0, -42), true))
+        if (selectedStowageRuleIds.Count > 0)
+        {
+            ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(.20f, .18f, .12f, 1));
+            if (ImGui.BeginChild("RQTransferBulk", new Vector2(0, ImGui.GetFrameHeightWithSpacing() * 4), true))
+                DrawStowageEditorBulkBar(draft);
+            ImGui.EndChild();
+            ImGui.PopStyleColor();
+        }
+        var error = session.Error ?? stowageEditorError;
+        if (!string.IsNullOrWhiteSpace(error)) ImGui.TextWrapped(error);
+        var footerHeight = ImGui.GetFrameHeightWithSpacing() * 2;
+        if (ImGui.BeginChild("RQStowageRuleTable", new Vector2(0, -footerHeight), false))
+        {
             DrawStowageDraftRules(draft, runtime);
+            DrawStowageDraftAdd(draft);
+            DrawGroupEntry(draft);
+        }
         ImGui.EndChild();
-
-        var canApply = StowagePlanCatalog.CanApply(state.Snapshot(), runtime.Owner, draft);
-        ImGui.TextDisabled(draft.IsNew && draft.Rules.Count == 0
-            ? "Add at least one item to save this plan."
-            : canApply ? $"{draft.Rules.Count:N0} rules | changes apply together" : "No unsaved changes.");
-        ImGui.SameLine(ImGui.GetContentRegionAvail().X - 160);
-        if (ImGui.Button("Cancel##stowageeditor"))
-        {
-            Close();
-            ImGui.CloseCurrentPopup();
-        }
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.transfer.editor.cancel",
-            "Discard the open Transfer Plan draft",
-            true,
-            Close,
-            "No saved plan changes");
+        ImGui.Separator();
+        ImGui.TextDisabled(session.HasChanges ? "Unsaved transfer changes" : "No unsaved transfer changes");
+        if (ImGui.SmallButton("Discard##stowageeditor")) session.Discard(runtime.Owner);
+        reviewRegistry.RegisterLastButton("quartermaster.transfer.editor.cancel", "Discard the Transfer Plan draft", true,
+            () => session.Discard(runtime.Owner), "Saved plan remains unchanged");
         ImGui.SameLine();
-        if (!canApply)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Save plan##stowageeditor"))
-        {
-            try
-            {
-                var appliedId = state.Mutate(document =>
-                    StowagePlanCatalog.Apply(document, runtime.Owner, draft).Id);
-                workbench.SelectedStowagePlanId = appliedId;
-                Close();
-                ImGui.CloseCurrentPopup();
-            }
-            catch (InvalidOperationException exception)
-            {
-                stowageEditorError = exception.Message;
-            }
-        }
-        if (!canApply)
-            ImGui.EndDisabled();
+        var canApply = StowagePlanCatalog.CanApply(state.Snapshot(), runtime.Owner, draft);
+        ImGui.BeginDisabled(!canApply);
+        if (ImGui.SmallButton("Save transfer plan")) Save(runtime.Owner);
+        ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton("quartermaster.transfer.editor.save", "Save the Transfer Plan draft", canApply,
+            () => Save(runtime.Owner), canApply ? "Save all transfer edits" : "No changes or a name/item is required");
+    }
+
+    public void DrawDialogs()
+    {
+        if (!itemGroupWorkspace.IsEditorOpenFor(ItemGroupEditorOrigin.Stowage) || Draft is not { } draft) return;
+        const string popup = "Item groups##RQTransferGroups";
+        if (!ImGui.IsPopupOpen(popup)) ImGui.OpenPopup(popup);
+        ImGui.SetNextWindowSize(new Vector2(850, 520), ImGuiCond.Appearing);
+        if (!ImGui.BeginPopupModal(popup)) return;
+        itemGroupWorkspace.DrawEditor(selectedStowageRuleIds.Count,
+            groupDraft => ItemGroupCatalog.AddMissing(groupDraft, draft.Rules.Where(r => selectedStowageRuleIds.IsSelected(r.Id))));
+        if (!itemGroupWorkspace.IsEditorOpenFor(ItemGroupEditorOrigin.Stowage)) ImGui.CloseCurrentPopup();
+        ImGui.EndPopup();
+    }
+
+    private void DrawGroupEntry(StowagePlanDraft draft)
+    {
+        if (ImGui.SmallButton("Add group...")) ImGui.OpenPopup("RQTransferAddGroup");
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Manage groups..."))
+            itemGroupWorkspace.OpenEditor(ItemGroupEditorOrigin.Stowage, selectedStowageItemGroupId);
+        if (!ImGui.BeginPopup("RQTransferAddGroup")) return;
+        foreach (var group in ItemGroupCatalog.All(state.Snapshot()))
+            if (ImGui.Selectable("@" + group.Name))
+            { ItemGroupCatalog.AddMissing(group, draft); selectedStowageItemGroupId = group.Id; }
         ImGui.EndPopup();
     }
 
     private void DrawStowageEditorToolbar(StowagePlanDraft draft)
     {
-        ImGui.Separator();
-        ImGui.TextDisabled("Add items");
-        ImGui.SameLine();
-        DrawStowageDraftAdd(draft);
-        ImGui.SameLine();
-        ImGui.TextDisabled("or group");
-        ImGui.SameLine();
-        var snapshot = state.Snapshot();
-        var groups = ItemGroupCatalog.All(snapshot);
-        var selectedGroup = groups.FirstOrDefault(group => group.Id == selectedStowageItemGroupId);
-        ImGui.SetNextItemWidth(185);
-        if (ImGui.BeginCombo("##stowagegroup", selectedGroup is null ? "@item group" : $"@{selectedGroup.Name}"))
-        {
-            foreach (var group in groups)
-                if (ImGui.Selectable($"@{group.Name}##group{group.Id}", selectedGroup?.Id == group.Id))
-                    selectedStowageItemGroupId = group.Id;
-            ImGui.EndCombo();
-        }
-        ImGui.SameLine();
-        if (selectedGroup is null)
-            ImGui.BeginDisabled();
-        if (ImGui.SmallButton("Add group") && selectedGroup is not null)
-        {
-            ItemGroupCatalog.AddMissing(selectedGroup, draft);
-            activeStowageRuleId ??= draft.Rules.FirstOrDefault()?.Id;
-        }
-        if (selectedGroup is null)
-            ImGui.EndDisabled();
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Manage groups...##stowage"))
-            itemGroupWorkspace.OpenEditor(ItemGroupEditorOrigin.Stowage, selectedStowageItemGroupId);
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.item-groups.open.transfer",
-            "Open Item Groups from the Transfer Plan editor",
-            true,
-            () => itemGroupWorkspace.OpenEditor(ItemGroupEditorOrigin.Stowage, selectedStowageItemGroupId),
-            "Plan draft remains open");
-
-        ImGui.SetNextItemWidth(210);
+        ImGui.SetNextItemWidth(Math.Max(100, ImGui.GetContentRegionAvail().X - 100));
         ImGui.InputTextWithHint("##stowagerulefilter", "Filter plan items", ref stowageRuleFilter, 80);
         ImGui.SameLine();
         if (ImGui.SmallButton("Select visible"))
-        {
-            foreach (var rule in FilteredDraftRules(draft))
-                selectedStowageRuleIds.SetSelected(rule.Id, true);
-        }
-        ImGui.SameLine();
-        if (ImGui.SmallButton("Clear selection"))
-            selectedStowageRuleIds.Clear();
-        ImGui.SameLine();
-        if (selectedStowageRuleIds.Count == 0)
-            ImGui.BeginDisabled();
-        if (ImGui.SmallButton("Save as @group"))
-            itemGroupWorkspace.OpenNewEditor(
-                ItemGroupEditorOrigin.Stowage,
-                draft.Rules.Where(rule => selectedStowageRuleIds.IsSelected(rule.Id)));
-        if (selectedStowageRuleIds.Count == 0)
-            ImGui.EndDisabled();
+            foreach (var rule in FilteredDraftRules(draft)) selectedStowageRuleIds.SetSelected(rule.Id, true);
     }
 
     private void DrawStowageDraftAdd(StowagePlanDraft draft)
     {
-        ImGui.SetNextItemWidth(260);
-        if (ImGui.InputTextWithHint("##RQStowageItemName", "Add item by name", ref stowageItemSearch, 96))
-            selectedStowageChoice = null;
-        if (stowageItemSearch.Trim().Length >= 2 && selectedStowageChoice is null)
+        if (addQuery != addInput.Text)
         {
-            foreach (var choice in SearchItems(stowageItemSearch, 5))
-                if (ImGui.Selectable(
-                        $"{choice.Label}##stowagechoice{choice.ItemId}",
-                        false,
-                        ImGuiSelectableFlags.DontClosePopups))
-                {
-                    selectedStowageChoice = choice;
-                    stowageItemSearch = choice.Name;
-                }
+            addQuery = addInput.Text;
+            addChoices = addQuery.Trim().Length < 2 ? [] :
+                SearchItems(addQuery, 64).Select(c => new DalamudSuggestion<ItemChoice>(c, c.Label)).ToArray();
         }
-        if (selectedStowageChoice is null)
-            return;
-        ImGui.SameLine();
-        if (ImGui.Button("Add item##stowagedraft"))
+        if (DalamudSuggestionInputRenderer.Draw("RQTransferAdd", addInput, addChoices,
+            Math.Max(160, ImGui.GetContentRegionAvail().X), "Add item by name", 8, out var picked) && picked is not null)
         {
-            var choice = selectedStowageChoice;
-            var existing = draft.Rules.FirstOrDefault(rule =>
-                rule.ItemId == choice.ItemId && rule.Quality == ItemQualityPolicy.Any);
-            if (existing is null)
-            {
-                existing = new TargetPlanItem
-                {
-                    StowagePlanId = draft.PlanId,
-                    ItemId = choice.ItemId,
-                    ItemName = choice.Name,
-                    TargetQuantity = 0,
-                };
-                draft.Rules.Add(existing);
-            }
-            activeStowageRuleId = existing.Id;
-            selectedStowageRuleIds.Clear();
-            selectedStowageRuleIds.SetSelected(existing.Id, true);
-            selectedStowageChoice = null;
-            stowageItemSearch = string.Empty;
+            var rule = session.Add(picked.ItemId, picked.Name, ItemQualityPolicy.Any, 1);
+            activeStowageRuleId = rule.Id;
+            stowageRuleFilter = string.Empty;
         }
     }
 
     private void DrawStowageEditorBulkBar(StowagePlanDraft draft)
     {
-        ImGui.Separator();
         ImGui.TextUnformatted($"{selectedStowageRuleIds.Count:N0} selected");
         ImGui.SameLine();
+        if (ImGui.SmallButton("Clear selection")) selectedStowageRuleIds.Clear();
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Save as @group")) itemGroupWorkspace.OpenNewEditor(ItemGroupEditorOrigin.Stowage, draft.Rules.Where(r => selectedStowageRuleIds.IsSelected(r.Id)));
         ImGui.TextDisabled("Player target");
         ImGui.SameLine();
         ImGui.SetNextItemWidth(80);
@@ -323,7 +249,6 @@ internal sealed class TransferPlanEditor
         ImGui.TextDisabled("Quality");
         ImGui.SameLine();
         DrawOptionalEnumCombo("##stowagebulkquality", ref bulkQuality, Enum.GetValues<ItemQualityPolicy>(), QualityChoiceLabel);
-        ImGui.SameLine();
         ImGui.TextDisabled("Destination");
         ImGui.SameLine();
         DrawOptionalEnumCombo("##stowagebulkdestination", ref bulkRoutingMode, Enum.GetValues<StowageRoutingMode>(), TransferPresentation.RoutingModeLabel);
@@ -331,7 +256,6 @@ internal sealed class TransferPlanEditor
         ImGui.TextDisabled("Overflow");
         ImGui.SameLine();
         DrawOptionalEnumCombo("##stowagebulkoverflow", ref bulkOverflow, Enum.GetValues<StowageOverflowPolicy>(), TransferPresentation.OverflowLabel);
-        ImGui.SameLine();
         var canApply = selectedStowageRuleIds.Count > 0 &&
                        (bulkStowageTarget >= 0 || bulkQuality >= 0 || bulkRoutingMode >= 0 || bulkOverflow >= 0);
         if (!canApply)
@@ -373,7 +297,7 @@ internal sealed class TransferPlanEditor
         Func<T, string> display)
         where T : struct, Enum
     {
-        ImGui.SetNextItemWidth(155);
+        ImGui.SetNextItemWidth(110);
         var preview = selected < 0 ? "No change" : display((T)Enum.ToObject(typeof(T), selected));
         if (!ImGui.BeginCombo(label, preview))
             return;
@@ -390,21 +314,24 @@ internal sealed class TransferPlanEditor
 
     private void DrawStowageDraftRules(StowagePlanDraft draft, QuartermasterRuntimeSnapshot runtime)
     {
+        stowageDraftTable.DrawColumnMenuButton("RQTransferDraftColumns");
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY |
-                    ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
+                    ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.Hideable;
         if (!stowageDraftTable.Begin(
                 "RQStowageDraftRules",
                 new DalamudTableLayout(
-                    new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y)),
+                    new Vector2(0, Math.Min(Math.Max(80, ImGui.GetContentRegionAvail().Y - ImGui.GetFrameHeightWithSpacing() * 3),
+                        (FilteredDraftRules(draft).Count + 2) * ImGui.GetFrameHeightWithSpacing())),
                     flags)))
             return;
         var filtered = FilteredDraftRules(draft);
         selectedStowageRuleIds.Retain(draft.Rules.Select(rule => rule.Id));
         if (filtered.Count == 0)
             stowageDraftTable.DrawMessageRow(draft.Rules.Count == 0
-                ? "No rules yet. Search by name above or add a selected Stock item."
+                ? "No rules yet. Search by name below or add a selected Stock item."
                 : "No rules match this filter.");
         var rows = filtered.Select(rule => new StowageDraftRow(rule, runtime)).ToArray();
+        RenderedRowCount = rows.Length;
         var rowKeys = rows.Select(row => row.Rule.Id).ToArray();
         for (var index = 0; index < rows.Length; index++)
         {
@@ -605,34 +532,45 @@ internal sealed class TransferPlanEditor
     private DalamudTableProjection<StowageDraftRow> CreateDraftTable() => new(
     [
         new("Item", 1.5f, row => row.Rule.ItemName, row => row.Rule.ItemName, ImGuiTableColumnFlags.WidthStretch),
-        new("Rule", 52, row => row.Rule.Enabled ? "On" : "Off", Draw: row =>
+        new("Rule", 38, row => row.Rule.Enabled ? "On" : "Off", Draw: row =>
             row.Rule.Enabled = DrawRuleToggle($"stowage{row.Rule.Id}", row.Rule.Enabled)),
-        new("Player target", 92, row => row.Rule.TargetQuantity.ToString("N0"), Draw: DrawStowageTarget),
-        new("Quality", 112, row => QualityLabel(row.Rule.Quality), Draw: row => DrawDraftQuality(row.Rule)),
-        new("Vendor", 72, row => row.Rule.AllowVendorPurchase ? "Allowed" : "Off", Draw: DrawVendorPurchaseCell),
-        new("Now", 92, StowageDraftOutcome, TextColor: _ => ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]),
+        new("Player target", 76, row => row.Rule.TargetQuantity.ToString("N0"), Draw: DrawStowageTarget),
+        new("Quality", 62, row => QualityLabel(row.Rule.Quality), Draw: row => DrawDraftQuality(row.Rule)),
+        new("Vendor", 72, row => row.Rule.AllowVendorPurchase ? "Allowed" : "Off", Flags: ImGuiTableColumnFlags.DefaultHide, Draw: DrawVendorPurchaseCell),
+        new("Target delta", 92, StowageDraftOutcome, TextColor: _ => ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled],
+            HeaderTooltip: "Draft target minus carried stock. Review moves verifies available stock and capacity before execution."),
         new("Destination", 1.1f, row => TransferPresentation.RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner), row => TransferPresentation.RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner), ImGuiTableColumnFlags.WidthStretch, Draw: row => DrawStowageRouteCombo(row.Rule, row.Runtime)),
-        new("Overflow", 112, row => TransferPresentation.OverflowLabel(row.Rule.Routing.Overflow), Draw: row => DrawStowageOverflowCombo(row.Rule)),
+        new("Overflow", 112, row => TransferPresentation.OverflowLabel(row.Rule.Routing.Overflow), Flags: ImGuiTableColumnFlags.DefaultHide, Draw: row => DrawStowageOverflowCombo(row.Rule)),
         new("", 28, _ => string.Empty, Draw: DrawStowageDraftRemove),
     ]);
 
-    private static void DrawStowageTarget(StowageDraftRow row)
+    private void DrawStowageTarget(StowageDraftRow row)
     {
-        var target = row.Rule.TargetQuantity;
+        var contribution = contributions.FirstOrDefault(c => c.Link.ItemId == row.Rule.ItemId && c.Link.Quality == row.Rule.Quality);
+        var extra = contribution?.Quantity.IsKnown == true ? contribution.Quantity.Value : 0;
+        var target = checked(row.Rule.TargetQuantity + extra);
         ImGui.SetNextItemWidth(-1);
         if (ImGui.InputInt($"##drafttarget{row.Rule.Id}", ref target))
-            row.Rule.TargetQuantity = Math.Max(0, target);
+            row.Rule.TargetQuantity = Math.Max(0, target - extra);
+        if (contribution is not null)
+        {
+            ImGui.TextDisabled(contribution.Quantity.IsKnown ? $"Linked +{extra}" : "Linked +?");
+            if (ImGui.SmallButton($"Unlink##{row.Rule.Id}")) session.Unlink(contribution.Link.Id);
+        }
     }
 
-    private static string StowageDraftOutcome(StowageDraftRow row)
+    private string StowageDraftOutcome(StowageDraftRow row)
     {
+        var contribution = contributions.FirstOrDefault(c => c.Link.ItemId == row.Rule.ItemId && c.Link.Quality == row.Rule.Quality);
+        if (contribution is not null && !contribution.Quantity.IsKnown) return "Verify listing demand";
+        var target = checked(row.Rule.TargetQuantity + (contribution?.Quantity.Value ?? 0));
         var player = TransferPlanEvaluation.PlayerQuantity(row.Runtime.Browser, row.Rule);
         return !row.Rule.Enabled
             ? "Off"
-            : player < row.Rule.TargetQuantity
-                ? $"Retrieve {row.Rule.TargetQuantity - player:N0}"
-                : player > row.Rule.TargetQuantity
-                    ? $"Stow {player - row.Rule.TargetQuantity:N0}"
+            : player < target
+                ? $"Retrieve {target - player:N0}"
+                : player > target
+                    ? $"Stow {player - target:N0}"
                     : "Balanced";
     }
 

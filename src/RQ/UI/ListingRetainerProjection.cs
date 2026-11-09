@@ -11,7 +11,7 @@ internal enum ListingStateTone { Dim, Amber, Green, Info }
 internal enum ListingStateAction { None, FocusStock }
 internal sealed record ListingStateView(string Text, ListingStateTone Tone, int Rank,
     ListingStateAction Action = ListingStateAction.None, int Amount = 0);
-internal sealed record ListingPlanRowView(ListingPlanAssignment Assignment, ListingStateView State, int MaxStack, int UnlistedCount);
+internal sealed record ListingPlanRowView(ListingPlanAssignment Assignment, ListingStateView State, int MaxStack, int UnlistedCount, int? ListedCount = null);
 internal sealed record ListingObservedGroupView(ListingMatchKind Kind, Guid? AssignmentId, uint ItemId,
     string ItemName, ItemQualityPolicy Quality, int Quantity, FieldEvidence<decimal> UnitPrice,
     IReadOnlyList<ListingRow> Listings, ListingStateView State);
@@ -126,7 +126,9 @@ internal static class ListingRetainerProjection
             var siblings = enabled.Where(b => b.ItemId == a.ItemId && b.Quality == a.Quality).ToArray();
             var coverageRow = siblings.FirstOrDefault(b => (item?.Assignments.FirstOrDefault(e => e.Assignment.Id == b.Id)?.ExactListings ?? 0) < b.ListingCount) ?? siblings.FirstOrDefault();
             var state = State(a, available, observed, listability(a.ItemId), item, e, coverageRow?.Id == a.Id, siblings, browser, destinations);
-            planRows.Add(new(a, state, maxStack(a.ItemId), e is null ? a.ListingCount : Remaining(e)));
+            planRows.Add(new(a, state, maxStack(a.ItemId), e is null ? a.ListingCount : Remaining(e),
+                !observed ? null : e is null ? reservationCounts.GetValueOrDefault(a.Id) :
+                e.ExactListings + e.UnknownPriceListings + e.WrongPriceListings + e.WrongShapeListings));
             if (!a.Enabled) continue;
             var exact = e?.ExactListings ?? 0;
             var differs = (e?.UnknownPriceListings ?? 0) + (e?.WrongPriceListings ?? 0) + (e?.WrongShapeListings ?? 0);
