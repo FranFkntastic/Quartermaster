@@ -370,6 +370,155 @@ public sealed class ListingInlineTests
     }
 
     [Fact]
+    public void ReplanReplacesFullRetainerIncludingDisabledAssignmentsAndPreservesOthersAndReserves()
+    {
+        using var f = new Fixture(); f.Add(20);
+        var disabled = A(item: 2); disabled.Enabled = false;
+        var other = A(retainer: 11);
+        f.Session.Draft!.Assignments.AddRange([disabled, other]);
+        var reserve = f.Session.AddReserve(2, "Item 2", ItemQualityPolicy.NqOnly);
+        var browser = Browser([L(item: 3)]);
+        var current = f.Session.CurrentRetainerIds(f.Runtime(browser));
+        var version = f.Session.Version;
+
+        Assert.True(f.Session.CanReplan(10, browser, current));
+        f.Session.Replan(10, browser, current);
+
+        var replacement = Assert.Single(f.Session.Draft.Assignments, a => a.RetainerId == 10);
+        Assert.Equal(3u, replacement.ItemId);
+        Assert.Same(other, Assert.Single(f.Session.Draft.Assignments, a => a.RetainerId == 11));
+        Assert.Same(reserve, Assert.Single(f.Session.Draft.Reserves));
+        Assert.Equal(version + 1, f.Session.Version);
+        Assert.True(f.Session.IsDirty);
+    }
+
+    [Fact]
+    public void ReplanGroupsIdenticalListingsAndSeparatesShapePriceQualityAndItem()
+    {
+        using var f = new Fixture(); f.Session.Ensure(f.Runtime());
+        var browser = Browser([
+            L(quantity: 5, price: 200, item: 2, slot: 5) with { Quality = FfxivItemQuality.HQ },
+            L(quantity: 5, price: 200, item: 2, slot: 1) with { Quality = FfxivItemQuality.HQ },
+            L(quantity: 6, price: 200, item: 2, slot: 2) with { Quality = FfxivItemQuality.HQ },
+            L(quantity: 5, price: 201, item: 2, slot: 3) with { Quality = FfxivItemQuality.HQ },
+            L(quantity: 5, price: 200, item: 2, slot: 4),
+            L(quantity: 5, price: 200, item: 3, slot: 6)]);
+
+        f.Session.Replan(10, browser, new HashSet<ulong> { 10, 11 });
+
+        Assert.Equal(5, f.Session.Draft!.Assignments.Count);
+        var first = f.Session.Draft.Assignments[0];
+        Assert.Equal(2, first.ListingCount); Assert.Equal(5, first.QuantityPerListing);
+        Assert.Equal(200, first.UnitPrice); Assert.Equal(ItemQualityPolicy.HqOnly, first.Quality);
+        Assert.Equal(6, f.Session.Draft.Assignments[1].QuantityPerListing);
+        Assert.Equal(201, f.Session.Draft.Assignments[2].UnitPrice);
+        Assert.Equal(ItemQualityPolicy.NqOnly, f.Session.Draft.Assignments[3].Quality);
+        Assert.Equal(3u, f.Session.Draft.Assignments[4].ItemId);
+    }
+
+    [Fact]
+    public void ReplanOrdersKnownSlotsThenUnknownSlotsInObservationOrder()
+    {
+        using var f = new Fixture(); f.Session.Ensure(f.Runtime());
+        var browser = Browser([L(item: 4) with { SlotIndex = null }, L(item: 2, slot: 7),
+            L(item: 5) with { SlotIndex = null }, L(item: 3, slot: 2), L(item: 4) with { SlotIndex = null }]);
+
+        f.Session.Replan(10, browser, new HashSet<ulong> { 10 });
+
+        Assert.Equal(new uint[] { 3, 2, 4, 5 }, f.Session.Draft!.Assignments.Select(a => a.ItemId));
+        Assert.Equal(2, f.Session.Draft.Assignments[2].ListingCount);
+    }
+
+    [Fact]
+    public void ReplanUnknownPriceMatchesAdoptionAndRemainsInvalidUntilPriced()
+    {
+        using var f = new Fixture(); f.Session.Ensure(f.Runtime());
+        var browser = Browser([L(price: null), L(price: null, slot: 1), L(slot: 2)]);
+
+        f.Session.Replan(10, browser, new HashSet<ulong> { 10 });
+
+        Assert.Equal(2, f.Session.Draft!.Assignments.Count);
+        var unknown = f.Session.Draft.Assignments[0];
+        Assert.Equal(2, unknown.ListingCount); Assert.Equal(0, unknown.UnitPrice);
+        Assert.Equal(ListingPlanCatalog.AssignmentFromListings(browser.Listings.Take(2).ToArray()).UnitPrice, unknown.UnitPrice);
+        Assert.Contains(f.Session.Issues(f.Runtime(browser)), i => i.AssignmentId == unknown.Id && i.Field == "UnitPrice");
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public void ReplanRefusesUnobservedOrNoncurrentRetainersWithoutChangingDraft(bool observed, bool current)
+    {
+        using var f = new Fixture(); var original = f.Add();
+        var browser = Browser([L(item: 2)], observed: observed);
+        var ids = current ? new HashSet<ulong> { 10 } : [];
+        var version = f.Session.Version;
+
+        Assert.False(f.Session.CanReplan(10, browser, ids));
+        Assert.False(f.Session.CanReplanAll(browser, ids));
+        f.Session.Replan(10, browser, ids); f.Session.ReplanAll(browser, ids);
+
+        Assert.Same(original, Assert.Single(f.Session.Draft!.Assignments));
+        Assert.Equal(version, f.Session.Version);
+    }
+
+    [Fact]
+    public void ReplanRequiresAnOpenDraft()
+    {
+        using var f = new Fixture(); var browser = Browser([L()]);
+        var ids = new HashSet<ulong> { 10 };
+        Assert.False(f.Session.CanReplan(10, browser, ids));
+        Assert.False(f.Session.CanReplanAll(browser, ids));
+        f.Session.Replan(10, browser, ids); f.Session.ReplanAll(browser, ids);
+        Assert.Null(f.Session.Draft); Assert.Equal(0, f.Session.Version);
+    }
+
+    [Fact]
+    public void ReplanObservedEmptyRetainerClearsAssignmentsAndSupportsDiscardAndSave()
+    {
+        using var f = new Fixture(); var original = f.Add(); f.Session.Save(f.Runtime());
+        var browser = Browser(); var ids = new HashSet<ulong> { 10, 11 };
+
+        Assert.True(f.Session.CanReplan(10, browser, ids));
+        f.Session.Replan(10, browser, ids);
+        Assert.Empty(f.Session.Draft!.Assignments); Assert.True(f.Session.IsDirty);
+        Assert.Single(f.Repository.Snapshot().ListingPlans.Single().Assignments);
+        f.Session.Discard(f.Runtime(browser));
+        Assert.Equal(original.Id, Assert.Single(f.Session.Draft.Assignments).Id);
+        Assert.False(f.Session.IsDirty);
+        f.Session.Replan(10, browser, ids); f.Session.Save(f.Runtime(browser));
+        Assert.Empty(f.Repository.Snapshot().ListingPlans.Single().Assignments);
+        Assert.False(f.Session.IsDirty);
+    }
+
+    [Fact]
+    public void ReplanAllReplacesOnlyObservedCurrentRetainersWithOneDraftChangeAndPreservesReserves()
+    {
+        using var f = new Fixture(); f.Add();
+        var unobserved = A(retainer: 11); var unavailable = A(retainer: 13);
+        f.Session.Draft!.Assignments.AddRange([unobserved, A(retainer: 12), unavailable]);
+        var reserve = f.Session.AddReserve(2, "Item 2", ItemQualityPolicy.NqOnly);
+        var browser = Browser([L(item: 2), L(item: 3, retainer: 11), L(item: 4, retainer: 13)]);
+        var completeness = (Dictionary<string, bool>)browser.RetainerListingsCompleteByScope;
+        completeness[BrowserScope.RetainerKey(11)] = false;
+        completeness[BrowserScope.RetainerKey(12)] = true;
+        completeness[BrowserScope.RetainerKey(13)] = true;
+        var ids = new HashSet<ulong> { 10, 11, 12 };
+        var version = f.Session.Version;
+
+        Assert.True(f.Session.CanReplanAll(browser, ids));
+        f.Session.ReplanAll(browser, ids);
+
+        Assert.Equal(version + 1, f.Session.Version); Assert.True(f.Session.IsDirty);
+        Assert.Equal(3, f.Session.Draft.Assignments.Count);
+        Assert.Equal(2u, Assert.Single(f.Session.Draft.Assignments, a => a.RetainerId == 10).ItemId);
+        Assert.Same(unobserved, Assert.Single(f.Session.Draft.Assignments, a => a.RetainerId == 11));
+        Assert.DoesNotContain(f.Session.Draft.Assignments, a => a.RetainerId == 12);
+        Assert.Same(unavailable, Assert.Single(f.Session.Draft.Assignments, a => a.RetainerId == 13));
+        Assert.Same(reserve, Assert.Single(f.Session.Draft.Reserves));
+    }
+
+    [Fact]
     public void PriceEchoRequiresCompletedNonzeroEditAndOnlyChangesEligibleSiblings()
     {
         using var f = new Fixture(); var a = f.Add();
