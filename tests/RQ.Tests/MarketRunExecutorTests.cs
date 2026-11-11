@@ -250,6 +250,41 @@ public sealed class MarketRunExecutorTests
         Assert.False(executor.Result!.ListingSummaryComplete);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task AuthorityLostWhileRepricePending_PreservesUnknownWithoutRecoveryScan(bool unload)
+    {
+        var plan = Plan(); var current = plan; var fake = new Driver();
+        fake.Live[10] = [new(0, 1, 2, false, 10)];
+        var pending = new TaskCompletionSource<MarketMutationOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        fake.PendingReprice = pending.Task;
+        var executor = new MarketRunExecutor(fake, new(), () => current, _ => { });
+        var run = executor.RunAsync(plan, Evaluation(plan));
+        var scansAtReprice = fake.ListingScans;
+        if (unload) executor.CancelAndWait(TimeSpan.Zero);
+        else current = new ListingPlan { Owner = plan.Owner with { LocalContentId = 999 } };
+        pending.SetResult(MarketMutationOutcome.Indeterminate);
+        await run;
+        Assert.Equal(scansAtReprice, fake.ListingScans);
+        Assert.Equal(MarketMutationOutcome.Indeterminate, Assert.Single(executor.Result!.Mutations).Outcome);
+        Assert.Contains(10ul, executor.Result.NeedsCheck);
+        Assert.Equal(0, fake.Returns); Assert.Equal(0, fake.Closes);
+    }
+
+    [Fact]
+    public async Task OwnerChangesDuringRepriceRecovery_ResultIsNotAccepted()
+    {
+        var plan = Plan(); var current = plan; var fake = new Driver { Outcome = MarketMutationOutcome.Indeterminate };
+        fake.Live[10] = [new(0, 1, 2, false, 10)];
+        fake.OnReprice = () => fake.OnListings = () => current = new ListingPlan { Owner = plan.Owner with { LocalContentId = 999 } };
+        var executor = new MarketRunExecutor(fake, new(), () => current, _ => { });
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Equal(MarketMutationOutcome.Indeterminate, Assert.Single(executor.Result!.Mutations).Outcome);
+        Assert.Contains(10ul, executor.Result.NeedsCheck);
+        Assert.Equal(0, fake.Returns); Assert.Equal(0, fake.Closes);
+    }
+
     [Fact]
     public async Task UnloadAtIntentPersistence_StopsBeforeSend()
     {
@@ -557,6 +592,10 @@ public sealed class MarketRunExecutorTests
     [InlineData("lost")]
     [InlineData("changed")]
     [InlineData("deadline")]
+    [InlineData("unload")]
+    [InlineData("owner")]
+    [InlineData("scanowner")]
+    [InlineData("scanunload")]
     public async Task Gather_UsesJournalAndBorrowedLease_RetrievesOnlyShortfall(string mode)
     {
         var directory = Path.Combine(Path.GetTempPath(), "rq-market-gather-" + Guid.NewGuid().ToString("N"));
@@ -578,18 +617,30 @@ public sealed class MarketRunExecutorTests
             var sources = split ? new List<DalamudInventoryStack> { source with { Quantity = 4 }, source with { SlotIndex = 1, Quantity = 16 } } : [source];
             var transferred = 0;
             var cancel = false;
+            var authority = true;
+            var currentOwner = plan.Owner;
+            var callsAfterAuthorityLoss = 0;
+            var closes = 0;
             var sourceReads = 0;
             IDisposable? lease = null;
             var automation = new AutomationLease();
             var session = DispatchProxy.Create<IRetainerAutomationSession, SessionProxy>();
             ((SessionProxy)(object)session).Handler = (method, args) =>
             {
+                if (!authority || !currentOwner.Matches(plan.Owner) || !automation.IsHeld) callsAfterAuthorityLoss++;
+                if (method.Name == nameof(IRetainerAutomationSession.CloseRetainerAsync)) closes++;
                 if (mode != "lost" || transferred == 0) Assert.True(automation.IsHeld);
                 switch (method.Name)
                 {
                     case nameof(IRetainerAutomationSession.ScanPlayerInventoryAsync):
                         return Task.FromResult<IReadOnlyList<DalamudInventoryStack>>(player.ToArray());
                     case nameof(IRetainerAutomationSession.ScanRetainerAsync):
+                        if (mode is "scanowner" or "scanunload")
+                        {
+                            if (mode == "scanowner") currentOwner = plan.Owner with { LocalContentId = 999 };
+                            else authority = false;
+                            return Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([source with { Quantity = 19 }]);
+                        }
                         if (mode == "changed" && ++sourceReads == 2) sources[0] = sources[0] with { Quantity = 19 };
                         return Task.FromResult<IReadOnlyList<DalamudInventoryStack>>(sources.Where(s => s.Quantity > 0).ToArray());
                     case nameof(IRetainerAutomationSession.RetrieveAsync):
@@ -603,6 +654,8 @@ public sealed class MarketRunExecutorTests
                         if (mode == "partial") player.AddRange(Enumerable.Range(1, 139).Select(i => new DalamudInventoryStack((InventoryType)(i / 35), i % 35, 2, 1)));
                         if (mode == "cancel") cancel = true;
                         if (mode == "lost") lease!.Dispose();
+                        if (mode == "unload") authority = false;
+                        if (mode == "owner") currentOwner = plan.Owner with { LocalContentId = 999 };
                         return Task.FromResult(new RetainerRetrievalResult(true, quantity, "Retrieved", "Verified"));
                     default:
                         if (mode == "deadline") return Task.FromCanceled<RetainerAutomationResult>(new CancellationToken(true));
@@ -610,13 +663,13 @@ public sealed class MarketRunExecutorTests
                 }
             };
             var adapter = new MarketRunLiveDriver(session, new RetainerLiveDriver(session), journal, cache, playerCache, automation,
-                () => plan.Owner, _ => "Hull");
+                () => currentOwner, _ => "Hull");
             if (mode == "partial")
             {
                 var fake = new Driver { Stock = player };
-                fake.GatherOverride = async (_, borrowed, check, token) =>
+                fake.GatherOverride = async (_, borrowed, check, hasAuthority, token) =>
                 {
-                    var reports = await adapter.GatherAsync([new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], borrowed, check, token);
+                    var reports = await adapter.GatherAsync([new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], borrowed, check, hasAuthority, token);
                     fake.GatherInventoryBlockedUnits = adapter.GatherInventoryBlockedUnits;
                     return reports;
                 };
@@ -634,9 +687,27 @@ public sealed class MarketRunExecutorTests
             using (lease)
             {
                 IReadOnlyList<string> reports = [];
-                Task Gather() => adapter.GatherAsync([new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], lease!, () => { if (cancel) throw new OperationCanceledException(); }, CancellationToken.None);
+                if (mode is "scanowner" or "scanunload")
+                {
+                    await Assert.ThrowsAsync<InvalidOperationException>(() => adapter.GatherAsync(
+                        [new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], lease!, () => { }, () => authority, CancellationToken.None));
+                    Assert.Equal(0, callsAfterAuthorityLoss);
+                    Assert.Equal(0, closes);
+                    Assert.Equal(20u, cache.Snapshot()[10].Bags.SelectMany(b => b.Items).Single(i => i.ItemId == 1).Quantity);
+                    return;
+                }
+                if (mode is "unload" or "owner" or "lost")
+                {
+                    await Assert.ThrowsAsync<MarketGatherIndeterminateException>(() => adapter.GatherAsync(
+                        [new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], lease!, () => { }, () => authority, CancellationToken.None));
+                    Assert.Equal(0, callsAfterAuthorityLoss);
+                    Assert.Equal(0, closes);
+                    Assert.Equal(OperationStatuses.Indeterminate, Assert.Single(journal.History(plan.Owner, 10)).Status);
+                    return;
+                }
+                Task Gather() => adapter.GatherAsync([new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], lease!, () => { if (cancel) throw new OperationCanceledException(); }, () => true, CancellationToken.None);
                 if (mode == "cancel") await Assert.ThrowsAnyAsync<OperationCanceledException>(Gather);
-                else reports = await adapter.GatherAsync([new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], lease!, () => { }, CancellationToken.None);
+                else reports = await adapter.GatherAsync([new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], lease!, () => { }, () => true, CancellationToken.None);
                 Assert.Equal(mode != "lost", automation.IsHeld);
                 Assert.Equal(mode is "full" or "changed" or "deadline" ? 0 : split ? 4 : 7, transferred);
                 var operation = Assert.Single(journal.History(plan.Owner, 10));
@@ -644,6 +715,7 @@ public sealed class MarketRunExecutorTests
                 Assert.Equal(transferred, Assert.Single(operation.Lines).TransferredQuantity);
                 if (mode is "full" or "partial") Assert.Contains(reports, r => r.Contains("inventory space"));
                 if (mode == "normal") Assert.Equal(13u, cache.Snapshot()[10].Bags.SelectMany(b => b.Items).Single(i => i.ItemId == 1).Quantity);
+                if (mode == "cancel") Assert.True(closes > 0);
             }
             Assert.False(automation.IsHeld);
         }
@@ -681,7 +753,7 @@ public sealed class MarketRunExecutorTests
     private sealed class Driver : IMarketRunDriver
     {
         public int GatherInventoryBlockedUnits { get; set; }
-        public Func<IReadOnlyList<MarketGatherTarget>, IDisposable, Action, CancellationToken, Task<IReadOnlyList<string>>>? GatherOverride;
+        public Func<IReadOnlyList<MarketGatherTarget>, IDisposable, Action, Func<bool>, CancellationToken, Task<IReadOnlyList<string>>>? GatherOverride;
         public Dictionary<ulong, List<RetainerMarketListingTarget>> Live = new() { [10] = [], [11] = [] };
         public List<DalamudInventoryStack> Stock = [new(InventoryType.Inventory1, 0, 1, 10)];
         public List<ulong> Posts = [];
@@ -695,6 +767,7 @@ public sealed class MarketRunExecutorTests
         public bool FailClose;
         public bool Compact, ThrowPull, ThrowReprice;
         public Task<MarketMutationOutcome>? PendingPost;
+        public Task<MarketMutationOutcome>? PendingReprice;
         public int FreeSlots = 100;
         public bool ThrowBeforeSend, ThrowAfterSend;
         public bool ApplyReprice = true, FailReturn;
@@ -714,7 +787,8 @@ public sealed class MarketRunExecutorTests
         }
         public Task<MarketPlayerInventory> PlayerAsync(CancellationToken t) { OnPlayer?.Invoke(); return Task.FromResult(new MarketPlayerInventory(Stock.ToArray(), FreeSlots)); }
         public Task<MarketMutationOutcome> RepriceAsync(RetainerMarketListingTarget listing, uint price, CancellationToken t)
-        { OnReprice?.Invoke(); if (ThrowReprice) throw new RetainerMarketMutationIndeterminateException("Unknown", "After send", null, new OperationCanceledException(), t);
+        { OnReprice?.Invoke(); if (PendingReprice is not null) return PendingReprice;
+            if (ThrowReprice) throw new RetainerMarketMutationIndeterminateException("Unknown", "After send", null, new OperationCanceledException(), t);
             if (ApplyReprice) Live[active][Live[active].IndexOf(listing)] = listing with { UnitPrice = price }; return Task.FromResult(Outcome); }
         public Task<MarketMutationOutcome> PullAsync(RetainerMarketListingTarget listing, CancellationToken t)
         {
@@ -746,7 +820,7 @@ public sealed class MarketRunExecutorTests
             Closes++; OnClose?.Invoke();
             return FailClose ? Task.FromException(new InvalidOperationException("Close failed")) : PendingClose ?? Task.CompletedTask;
         }
-        public Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, CancellationToken t)
-        { OnGather?.Invoke(); check(); return GatherOverride?.Invoke(targets, lease, check, t) ?? Task.FromResult<IReadOnlyList<string>>([]); }
+        public Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken t)
+        { OnGather?.Invoke(); check(); return GatherOverride?.Invoke(targets, lease, check, hasAuthority, t) ?? Task.FromResult<IReadOnlyList<string>>([]); }
     }
 }

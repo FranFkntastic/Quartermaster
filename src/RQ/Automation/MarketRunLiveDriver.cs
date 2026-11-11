@@ -20,25 +20,35 @@ internal sealed class MarketRunLiveDriver(
     private string retainerName = string.Empty;
     private OwnerScope owner = new();
     private IDisposable? gatherLease;
+    private Func<bool> runAuthority = () => false;
     public int GatherInventoryBlockedUnits { get; private set; }
     private bool OwnsGatherLease() => gatherLease is not null && automation.Owns(gatherLease);
+    private bool HasSessionAuthority() => runAuthority() && OwnsGatherLease() &&
+        owner.HasStableIdentity && currentOwner() is { HasStableIdentity: true } current && owner.Matches(current);
+    private void RequireSessionAuthority()
+    {
+        if (!HasSessionAuthority()) throw new InvalidOperationException("Market run session authority lost.");
+    }
     public string ItemName(uint id) => itemName(id);
 
     public async Task RequireRetainerListAsync(CancellationToken token)
     {
-        owner = currentOwner();
-        if (!owner.HasStableIdentity) throw new InvalidOperationException("Stable character identity required.");
+        RequireSessionAuthority();
         await transferDriver.RequireRetainerListAsync(token).ConfigureAwait(false);
     }
     public async Task OpenAsync(ulong id, string name, CancellationToken token)
     {
+        RequireSessionAuthority();
         Require(await session.OpenRetainerAsync(new(id, name), token).ConfigureAwait(false));
+        RequireSessionAuthority();
         retainerId = id; retainerName = name;
         Require(await session.OpenSellingListAsync(token).ConfigureAwait(false));
     }
     public async Task<IReadOnlyList<RetainerMarketListingTarget>> ListingsAsync(CancellationToken token)
     {
+        RequireSessionAuthority();
         var scan = await session.ScanMarketListingsAsync(token).ConfigureAwait(false);
+        RequireSessionAuthority();
         if (!scan.Success) throw new InvalidOperationException($"{scan.Code}: {scan.Message}");
         cache.ReplaceListings(new(retainerId, retainerName, owner, DateTime.UtcNow, scan.Listings.Select(l => new CachedMarketListing
         {
@@ -49,7 +59,9 @@ internal sealed class MarketRunLiveDriver(
     }
     public async Task<MarketPlayerInventory> PlayerAsync(CancellationToken token)
     {
+        RequireSessionAuthority();
         var stacks = await session.ScanPlayerInventoryAsync(null, token).ConfigureAwait(false);
+        RequireSessionAuthority();
         var names = Bags.Select(b => b.ToString()).ToArray();
         playerCache.Observe(owner, new(Bags.Select(b => new InventoryBag
         {
@@ -59,24 +71,36 @@ internal sealed class MarketRunLiveDriver(
         }).ToArray(), names, names), DateTime.UtcNow);
         return new(stacks, Math.Max(0, 140 - stacks.Select(s => (s.Container, s.SlotIndex)).Distinct().Count()));
     }
-    public async Task<MarketMutationOutcome> RepriceAsync(RetainerMarketListingTarget listing, uint price, CancellationToken token) =>
-        ClassifyReprice(await session.UpdateSellingListingPriceAsync(listing, price, token).ConfigureAwait(false));
+    public async Task<MarketMutationOutcome> RepriceAsync(RetainerMarketListingTarget listing, uint price, CancellationToken token)
+    {
+        RequireSessionAuthority();
+        return ClassifyReprice(await session.UpdateSellingListingPriceAsync(listing, price, token).ConfigureAwait(false));
+    }
     internal static MarketMutationOutcome ClassifyReprice(RetainerAutomationResult result) => result.Success
         ? MarketMutationOutcome.Committed : result.Code is "InvalidObservedMarketUnitPrice" or "InvalidMarketUnitPrice" or
             "MarketUnitPriceUnchanged" or "InvalidMarketListing" or "RetainerSellingListingTimeout" or
             "RetainerSellingListTimeout" or "RetainerIdentityMismatch" or "RetainerMarketUnavailable" or "RetainerMarketListingChanged"
             ? MarketMutationOutcome.FailedBeforeSend : MarketMutationOutcome.Indeterminate;
-    public async Task<MarketMutationOutcome> PullAsync(RetainerMarketListingTarget listing, CancellationToken token) =>
-        (MarketMutationOutcome)(int)(await session.RemoveMarketListingToPlayerInventoryAsync(listing, token).ConfigureAwait(false)).Outcome;
-    public async Task<MarketMutationOutcome> PostAsync(DalamudInventoryStack source, int quantity, uint price, CancellationToken token) =>
-        (MarketMutationOutcome)(int)(await session.PostMarketListingAsync(source, quantity, price, token).ConfigureAwait(false)).Outcome;
-    public async Task ReturnAsync(CancellationToken token) => Require(await session.ReturnToRetainerListAsync(token).ConfigureAwait(false));
-    public async Task CloseListAsync(CancellationToken token) => Require(await session.CloseRetainerListAsync(token).ConfigureAwait(false));
+    public async Task<MarketMutationOutcome> PullAsync(RetainerMarketListingTarget listing, CancellationToken token)
+    {
+        RequireSessionAuthority();
+        return (MarketMutationOutcome)(int)(await session.RemoveMarketListingToPlayerInventoryAsync(listing, token).ConfigureAwait(false)).Outcome;
+    }
+    public async Task<MarketMutationOutcome> PostAsync(DalamudInventoryStack source, int quantity, uint price, CancellationToken token)
+    {
+        RequireSessionAuthority();
+        return (MarketMutationOutcome)(int)(await session.PostMarketListingAsync(source, quantity, price, token).ConfigureAwait(false)).Outcome;
+    }
+    public async Task ReturnAsync(CancellationToken token)
+    { RequireSessionAuthority(); Require(await session.ReturnToRetainerListAsync(token).ConfigureAwait(false)); }
+    public async Task CloseListAsync(CancellationToken token)
+    { RequireSessionAuthority(); Require(await session.CloseRetainerListAsync(token).ConfigureAwait(false)); }
 
-    public async Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, CancellationToken token)
+    public async Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token)
     {
         var reports = new List<string>();
         gatherLease = lease;
+        runAuthority = hasAuthority;
         GatherInventoryBlockedUnits = 0;
         owner = currentOwner();
         if (!owner.HasStableIdentity) throw new InvalidOperationException("Stable character identity required.");
@@ -143,11 +167,19 @@ internal sealed class MarketRunLiveDriver(
         public Task OpenInventoryAsync(CancellationToken token) { check(); return Step(inner.OpenInventoryAsync); }
         public async Task<IReadOnlyList<DalamudInventoryStack>> ScanRetainerAsync(IReadOnlySet<uint> ids, CancellationToken token)
         {
+            market.RequireSessionAuthority();
             var stacks = await deadline.RunAsync(t => inner.ScanRetainerAsync(ids, t)).ConfigureAwait(false);
+            market.RequireSessionAuthority();
             market.ObserveGather(currentRetainer, target, stacks);
             return stacks;
         }
-        public Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerInventoryAsync(IReadOnlySet<uint> ids, CancellationToken token) => deadline.RunAsync(t => inner.ScanPlayerInventoryAsync(ids, t));
+        public async Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerInventoryAsync(IReadOnlySet<uint> ids, CancellationToken token)
+        {
+            market.RequireSessionAuthority();
+            var stacks = await deadline.RunAsync(t => inner.ScanPlayerInventoryAsync(ids, t)).ConfigureAwait(false);
+            market.RequireSessionAuthority();
+            return stacks;
+        }
         public Task<RetrievalResult> RetrieveAsync(DalamudInventoryStack stack, int quantity, CancellationToken token) => RetrieveAsync(stack, quantity, 0, token);
         public async Task<RetrievalResult> RetrieveAsync(DalamudInventoryStack stack, int quantity, int before, CancellationToken token)
         {
@@ -178,7 +210,8 @@ internal sealed class MarketRunLiveDriver(
             catch (Exception e) when (!dispatched)
             { return new(false, 0, "GatherStoppedBeforeSend", e.Message); }
         }
-        public Task CloseRetainerAsync(CancellationToken token) => Step(inner.CloseRetainerAsync);
+        public Task CloseRetainerAsync(CancellationToken token) => market.HasSessionAuthority() && !MarketRunDeadline.HasUnsettled
+            ? Step(inner.CloseRetainerAsync) : Task.CompletedTask;
         // Keep the list open for the listing pass under the same lease.
         public Task CloseRetainerListAsync(CancellationToken token) => Task.CompletedTask;
         public Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerCrystalsAsync(IReadOnlySet<uint> ids, CancellationToken token) => throw new NotSupportedException();

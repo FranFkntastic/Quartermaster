@@ -35,7 +35,7 @@ public interface IMarketRunDriver
     Task<MarketMutationOutcome> PostAsync(DalamudInventoryStack source, int quantity, uint price, CancellationToken token);
     Task ReturnAsync(CancellationToken token);
     Task CloseListAsync(CancellationToken token);
-    Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, CancellationToken token);
+    Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token);
 }
 
 public interface IMarketRunDeadline
@@ -201,7 +201,7 @@ public sealed class MarketRunExecutor(
                 var targets = evaluation.Items.Where(i => i.RefillUnits.Value > 0)
                     .Select(i => new MarketGatherTarget(i.ItemId, i.ItemName, i.Quality, i.RefillUnits.Value)).ToArray();
                 // Gather owns per-call deadlines, not a single deadline for a multi-retainer route.
-                record.Results.AddRange(await driver.GatherAsync(targets, lease!, () => Check(record), CancellationToken.None).ConfigureAwait(false));
+                record.Results.AddRange(await driver.GatherAsync(targets, lease!, () => Check(record), () => HasSessionAuthority(record), CancellationToken.None).ConfigureAwait(false));
                 record.GatherBlockedUnits += driver.GatherInventoryBlockedUnits;
                 Check(record);
                 await routeDeadline.RunAsync(async t => { await driver.RequireRetainerListAsync(t).ConfigureAwait(false); return true; }).ConfigureAwait(false);
@@ -432,7 +432,9 @@ public sealed class MarketRunExecutor(
         {
             try
             {
+                if (!CanCleanUp(record)) throw new RunStoppedException("Reprice outcome unknown; run authority lost.");
                 var live = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
+                if (!CanCleanUp(record)) throw new RunStoppedException("Reprice outcome unknown; run authority lost.");
                 receipt.Outcome = live.Contains(intent.Listing! with { UnitPrice = intent.Price }) ? MarketMutationOutcome.Committed :
                     receipt.Outcome == MarketMutationOutcome.FailedBeforeSend && live.Contains(intent.Listing!) ? MarketMutationOutcome.Unchanged : MarketMutationOutcome.Indeterminate;
             }
@@ -453,10 +455,11 @@ public sealed class MarketRunExecutor(
     }
 
     private Task<bool> Step(Func<CancellationToken, Task> action) => deadline.RunAsync(async t => { await action(t).ConfigureAwait(false); return true; });
-    private bool CanCleanUp(MarketRunRecord record) => !Volatile.Read(ref disposed) &&
-        !driverUnsettled && !MarketRunDeadline.HasUnsettled &&
+    private bool HasSessionAuthority(MarketRunRecord record) => !Volatile.Read(ref disposed) &&
         runLease is not null && automation.Owns(runLease) &&
         currentPlan() is { Owner.HasStableIdentity: true } plan && plan.Owner.Matches(record.Owner);
+    private bool CanCleanUp(MarketRunRecord record) => HasSessionAuthority(record) &&
+        !driverUnsettled && !MarketRunDeadline.HasUnsettled;
     private void Check(MarketRunRecord record)
     {
         if (Volatile.Read(ref cancelled) != 0 || Volatile.Read(ref disposed)) throw new OperationCanceledException();
