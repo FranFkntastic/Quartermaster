@@ -198,7 +198,7 @@ internal sealed class StockWorkspace
         var tableHeight = Math.Max(180, ImGui.GetContentRegionAvail().Y);
         renderedStockRowCount = 0;
         if (stockTable.Begin(
-                "RQStockWorkbenchV4",
+                "RQStockWorkbenchV5",
                 new DalamudTableLayout(
                     new Vector2(0, tableHeight),
                     flags,

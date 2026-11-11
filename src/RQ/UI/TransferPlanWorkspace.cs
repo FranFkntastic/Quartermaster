@@ -475,7 +475,7 @@ internal sealed class TransferPlanWorkspace
         IReadOnlyList<TransferWorkbenchRow> transferRows = projection.Rows;
         renderedTransferRowCount = 0;
         if (transferWorkbenchTable.Begin(
-                "RQTransferWorkbenchV2",
+                "RQTransferWorkbenchV3",
                 new DalamudTableLayout(
                     new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y - footerHeight)),
                     flags)))
