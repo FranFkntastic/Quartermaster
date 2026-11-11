@@ -566,7 +566,7 @@ internal sealed class TransferPlanWorkspace
                 vendorProcurement.Stop();
         }
 
-        if (!string.IsNullOrWhiteSpace(run.Message))
+        if (ShowVendorMessage(run.Phase, run.Message))
         {
             ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
             ImGui.TextWrapped(run.Message);
@@ -577,6 +577,10 @@ internal sealed class TransferPlanWorkspace
         if (!string.IsNullOrWhiteSpace(vendorProcurement.CoordinationWarning))
             DrawWrappedStatus(vendorProcurement.CoordinationWarning, ListingWorkspace.Color(ListingStateTone.Info));
     }
+
+    internal static bool ShowVendorMessage(GilVendorBuyPhase phase, string? message) =>
+        !string.IsNullOrWhiteSpace(message) &&
+        !(phase == GilVendorBuyPhase.Completed && string.Equals(message.Trim(), "Vendor buy completed.", StringComparison.OrdinalIgnoreCase));
 
     private static void DrawWrappedStatus(string message, Vector4 color)
     {

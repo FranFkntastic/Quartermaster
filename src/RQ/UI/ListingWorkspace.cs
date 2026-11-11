@@ -220,6 +220,12 @@ internal sealed class ListingWorkspace
                 () => _ = navigation.OpenRetainerListingsAsync(new(retainer.RetainerId, retainer.RetainerName)), navigation.IsRunning ? navigation.Status : "Ready");
         }
         DrawNavigationStatus();
+        var runRetainer = runPane.Retainer(runtime, session, retainer.RetainerId);
+        if (runRetainer is not null)
+        {
+            var capacity = MarketRunPresentation.Capacity(runRetainer.PullListings, runRetainer.BlockedBySlotsListings);
+            if (capacity.Length > 0) ImGui.TextUnformatted(capacity[3..]);
+        }
         var detailLeft = ImGui.GetCursorScreenPos().X;
         var detailRight = detailLeft + ImGui.GetContentRegionAvail().X;
         if (ImGui.BeginTable("RQInlineListingAssignments", 6, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.SizingStretchProp))
@@ -274,6 +280,17 @@ internal sealed class ListingWorkspace
                 ImGui.PopID();
             }
             var groupIndex = 0;
+            foreach (var pull in runRetainer?.ListingsToPull ?? [])
+            {
+                BeginItemRow(new(pull.Listing.ItemId, pull.Listing.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ
+                    ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly));
+                ImGui.TableNextColumn(); ImGui.TableNextColumn();
+                ImGui.TextDisabled(MarketRunPresentation.PullLabel(pull));
+                ImGui.TableNextColumn(); ImGui.TableNextColumn();
+                ImGui.TextDisabled(pull.Listing.Quantity.ToString("N0"));
+                ImGui.TableNextColumn(); ImGui.TextDisabled(MarketRunPresentation.PullPrice(pull));
+                ImGui.TableNextColumn();
+            }
             foreach (var g in retainer.ObservedGroups.Where(g => g.Kind == ListingMatchKind.Unplanned))
             {
                 ImGui.PushID($"observed:{groupIndex++}");
