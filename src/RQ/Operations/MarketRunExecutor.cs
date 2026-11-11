@@ -2,6 +2,7 @@ using Franthropy.Dalamud.Automation.Inventory;
 using Franthropy.Dalamud.Automation.Retainers;
 using Franthropy.FFXIV.Filtering;
 using Franthropy.Filtering.Evaluation;
+using System.Collections.Concurrent;
 using RQ.Automation;
 using RQ.Domain;
 using RQ.Persistence;
@@ -12,12 +13,18 @@ namespace RQ.Operations;
 public enum MarketMutationOutcome { FailedBeforeSend, Committed, Indeterminate, Unchanged }
 public sealed record MarketPlayerInventory(IReadOnlyList<DalamudInventoryStack> Stacks, int FreeSlots);
 public sealed record MarketGatherTarget(uint ItemId, string ItemName, ItemQualityPolicy Quality, int Units);
+internal sealed class MarketGatherIndeterminateException(ulong retainerId, string retainerName, string message) : Exception(message)
+{
+    public ulong RetainerId { get; } = retainerId;
+    public string RetainerName { get; } = retainerName;
+}
 public sealed record MarketMutationIntent(string Kind, ulong RetainerId, string ItemName,
     RetainerMarketListingTarget? Listing, DalamudInventoryStack? Source, int Quantity, uint Price);
 
 /// <summary>All reads are live. Implementations must not retry mutations.</summary>
 public interface IMarketRunDriver
 {
+    int GatherInventoryBlockedUnits => 0;
     string ItemName(uint itemId);
     Task RequireRetainerListAsync(CancellationToken token);
     Task OpenAsync(ulong retainerId, string name, CancellationToken token);
@@ -37,12 +44,16 @@ public interface IMarketRunDeadline
 
 public sealed class MarketRunDeadline(TimeSpan timeout) : IMarketRunDeadline
 {
+    internal static readonly AsyncLocal<ConcurrentBag<Task>?> Calls = new();
+    internal static bool HasUnsettled => Calls.Value?.Any(t => !t.IsCompleted) == true;
     public async Task<T> RunAsync<T>(Func<CancellationToken, Task<T>> action)
     {
         using var deadline = new CancellationTokenSource(timeout);
         // Give the primitive time to classify a cancellation after dispatch. A driver
         // ignoring cancellation cannot leave this executor waiting indefinitely.
-        return await action(deadline.Token).WaitAsync(timeout + TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+        var task = action(deadline.Token);
+        Calls.Value?.Add(task);
+        return await task.WaitAsync(timeout + TimeSpan.FromSeconds(2)).ConfigureAwait(false);
     }
 }
 
@@ -58,6 +69,13 @@ public sealed class MarketRunRecord
     public List<MarketMutationReceipt> Mutations { get; set; } = [];
     public List<string> Results { get; set; } = [];
     public List<ulong> NeedsCheck { get; set; } = [];
+    public Dictionary<ulong, string> NeedsCheckNames { get; set; } = [];
+    public int StillShort { get; set; }
+    public int NoSlot { get; set; }
+    public int NoInventorySpace { get; set; }
+    public int SplitStacks { get; set; }
+    public bool RequiresAcknowledgement => State == "Interrupted" || NeedsCheck.Count > 0 ||
+        Mutations.Any(m => m.Outcome is null or MarketMutationOutcome.Indeterminate);
 }
 
 public sealed class MarketMutationReceipt
@@ -86,41 +104,74 @@ public sealed class MarketRunStore(string path)
         return record;
     }
     public void Save(MarketRunRecord record) => store.Save(record);
+    public void Clear() { if (File.Exists(path)) File.Delete(path); }
 }
 
 /// <summary>Owns one immutable plan snapshot and one lease across gather and listing passes.</summary>
 public sealed class MarketRunExecutor(
     IMarketRunDriver driver, AutomationLease automation, Func<ListingPlan?> currentPlan,
     Action<MarketRunRecord> persist, AutoRetainerSuppression? suppression = null,
-    IMarketRunDeadline? deadlines = null)
+    IMarketRunDeadline? deadlines = null, Action? clear = null)
 {
     private readonly IMarketRunDeadline deadline = deadlines ?? new MarketRunDeadline(TimeSpan.FromSeconds(15));
     private int running;
     private int cancelled;
     private bool driverUnsettled;
+    private bool persistenceFailed;
+    private IDisposable? runLease;
+    private readonly object persistenceGate = new();
     public bool IsRunning => Volatile.Read(ref running) != 0;
-    public bool CanStart => !IsRunning && !automation.IsHeld;
+    private bool disposed;
+    public Task? ActiveTask { get; private set; }
+    public bool CanStart => !disposed && !IsRunning && !automation.IsHeld && Result?.RequiresAcknowledgement != true;
+    public void Clear()
+    {
+        lock (persistenceGate)
+        {
+            if (disposed || IsRunning || automation.IsHeld) return;
+            try { clear?.Invoke(); Result = null; }
+            catch (Exception e) { if (Result is { } result) result.Reason = $"Could not clear result: {e.Message}"; }
+        }
+    }
+    public void CancelAndWait(TimeSpan timeout)
+    {
+        lock (persistenceGate) disposed = true;
+        Cancel();
+        try { ActiveTask?.Wait(timeout); } catch (AggregateException) { }
+    }
     public string Status { get; private set; } = string.Empty;
     public MarketRunRecord? Result { get; private set; }
     public void Restore(MarketRunRecord? record) => Result = record;
     public void Cancel() => Interlocked.Exchange(ref cancelled, 1);
 
-    public async Task RunAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty = false)
+    public Task RunAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty = false)
+    {
+        lock (persistenceGate)
+        {
+            if (!CanStart) return Task.CompletedTask;
+            return ActiveTask = RunCoreAsync(plan, evaluation, draftDirty);
+        }
+    }
+
+    private async Task RunCoreAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty)
     {
         if (draftDirty || !evaluation.IsComplete || evaluation.PlanId != plan.Id || evaluation.PlanRevision != plan.Revision ||
             !evaluation.Retainers.Any(r => r.Assignments.Any(a => a.ShortListings.Value > 0 || a.RepriceListings.Value > 0))) return;
         if (!automation.TryAcquire("market run", out var lease)) return;
-        using (lease)
         {
-            if (Interlocked.CompareExchange(ref running, 1, 0) != 0) return;
+            if (Interlocked.CompareExchange(ref running, 1, 0) != 0) { lease!.Dispose(); return; }
+            var calls = new ConcurrentBag<Task>();
+            MarketRunDeadline.Calls.Value = calls;
             Interlocked.Exchange(ref cancelled, 0);
+            runLease = lease;
             driverUnsettled = false;
+            persistenceFailed = false;
             var record = new MarketRunRecord { PlanId = plan.Id, PlanRevision = plan.Revision, Owner = plan.Owner with { },
                 Assignments = plan.Assignments.Where(a => a.Enabled).Select(ListingPlanCatalog.Copy).ToList() };
             AutoRetainerSuppression.Scope? scope = null;
             try
             {
-                persist(record);
+                Persist(record);
                 Check(record);
                 if (suppression is not null)
                 {
@@ -139,6 +190,7 @@ public sealed class MarketRunExecutor(
                     .Select(i => new MarketGatherTarget(i.ItemId, i.ItemName, i.Quality, i.RefillUnits.Value)).ToArray();
                 // Gather owns per-call deadlines, not a single deadline for a multi-retainer route.
                 record.Results.AddRange(await driver.GatherAsync(targets, lease!, () => Check(record), CancellationToken.None).ConfigureAwait(false));
+                record.NoInventorySpace += driver.GatherInventoryBlockedUnits;
                 Check(record);
                 await Step(driver.RequireRetainerListAsync).ConfigureAwait(false);
                 foreach (var retainer in record.Assignments.GroupBy(a => (a.RetainerId, a.RetainerName))
@@ -156,43 +208,63 @@ public sealed class MarketRunExecutor(
                         await ListRetainer(record, id, retainer.Key.RetainerName, assignments).ConfigureAwait(false);
                     }
                     catch (RetainerStoppedException) { }
+                    catch (OperationCanceledException) { throw; }
+                    catch (RunStoppedException) { throw; }
+                    catch (Exception e) when (!persistenceFailed && !driverUnsettled && !MarketRunDeadline.HasUnsettled)
+                    { Add(record, $"{retainer.Key.RetainerName}: {e.Message}"); }
                     finally
                     {
                         // A best-effort final scan is also required for an indeterminate mutation.
                         try
                         {
-                            if (opened && !driverUnsettled)
+                            if (opened && !driverUnsettled && !MarketRunDeadline.HasUnsettled)
                             {
                                 var final = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
                                 var matches = ListingPlanEvaluator.MatchListings(assignments, Rows(id, retainer.Key.RetainerName, final));
                                 foreach (var a in assignments)
                                 {
                                     var present = matches.Count(m => m.AssignmentId == a.Id && m.Kind is ListingMatchKind.Exact or ListingMatchKind.PriceDiffers or ListingMatchKind.UnknownPrice);
-                                    if (present < a.ListingCount) Add(record, $"{retainer.Key.RetainerName} / {a.ItemName}: final short {a.ListingCount - present}");
+                                    record.StillShort += Math.Max(0, a.ListingCount - present);
                                 }
                             }
                         }
                         catch (Exception e)
                         {
-                            if (!record.NeedsCheck.Contains(id)) record.NeedsCheck.Add(id);
                             Add(record, $"{retainer.Key.RetainerName}: final scan unavailable ({e.Message})");
                         }
+                        if (!driverUnsettled && !MarketRunDeadline.HasUnsettled)
+                            await Step(driver.ReturnAsync).ConfigureAwait(false);
                     }
-                    await Step(driver.ReturnAsync).ConfigureAwait(false);
+                    Check(record);
                 }
-                record.State = "Completed";
+                record.State = record.NeedsCheck.Count > 0 ? "Stopped" : "Completed";
+                if (record.NeedsCheck.Count > 0) record.Reason = "Needs a check: reprice outcome unknown.";
             }
             catch (OperationCanceledException) when (Volatile.Read(ref cancelled) != 0)
             { record.State = "Cancelled"; record.Reason = "Cancelled between steps."; }
+            catch (MarketGatherIndeterminateException e)
+            { record.State = "Stopped"; record.Reason = e.Message; record.NeedsCheck.Add(e.RetainerId); record.NeedsCheckNames[e.RetainerId] = e.RetainerName; }
             catch (Exception e) { record.State = "Stopped"; record.Reason = e.Message; }
             finally
             {
-                scope?.Dispose();
-                if (scope?.RestoreFailure is { } failure) Add(record, $"AutoRetainer restore: {failure}");
-                Status = record.State + (record.Reason.Length == 0 ? string.Empty : $": {record.Reason}");
-                Result = record;
-                try { persist(record); }
-                finally { Volatile.Write(ref running, 0); }
+                try
+                {
+                    Status = record.State + (record.Reason.Length == 0 ? string.Empty : $": {record.Reason}");
+                    Result = record;
+                    Persist(record);
+                }
+                finally
+                {
+                    var pending = calls.Where(t => !t.IsCompleted).ToArray();
+                    void Release() { try { scope?.Dispose(); } finally { lease!.Dispose(); } }
+                    try
+                    {
+                        if (pending.Length == 0) Release();
+                        else _ = Task.WhenAll(pending).ContinueWith(t => { _ = t.Exception; Release(); },
+                            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                    }
+                    finally { MarketRunDeadline.Calls.Value = null; Volatile.Write(ref running, 0); }
+                }
             }
         }
     }
@@ -200,15 +272,18 @@ public sealed class MarketRunExecutor(
     private async Task ListRetainer(MarketRunRecord record, ulong id, string name, ListingPlanAssignment[] assignments)
     {
         var listings = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
-        var rows = Rows(id, name, listings);
-        foreach (var match in ListingPlanEvaluator.MatchListings(assignments, rows))
+        var repriced = new HashSet<int>();
+        while (true)
         {
             Check(record);
-            if (match.Kind == ListingMatchKind.UnknownPrice) { Add(record, $"{match.Listing.ItemName}: unknown price; left alone"); continue; }
-            if (match.Kind != ListingMatchKind.PriceDiffers) continue;
+            listings = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
+            var match = ListingPlanEvaluator.MatchListings(assignments, Rows(id, name, listings))
+                .FirstOrDefault(m => m.Kind == ListingMatchKind.PriceDiffers && m.Listing.SlotIndex is { } slot && !repriced.Contains(slot));
+            if (match is null) break;
             var assignment = assignments.Single(a => a.Id == match.AssignmentId);
-            var listing = listings.Single(l => l.SlotIndex == match.Listing.SlotIndex);
-            if (!await StillPresent(listing).ConfigureAwait(false)) { Add(record, $"{assignment.ItemName}: listing changed; not repriced"); continue; }
+            var listing = listings.FirstOrDefault(l => l.SlotIndex == match.Listing.SlotIndex);
+            if (listing is null) { Add(record, $"{assignment.ItemName}: no longer present"); break; }
+            repriced.Add(listing.SlotIndex);
             await Mutate(record, new("Reprice", id, assignment.ItemName, listing, null, listing.Quantity, (uint)assignment.UnitPrice),
                 t => driver.RepriceAsync(listing, (uint)assignment.UnitPrice, t)).ConfigureAwait(false);
         }
@@ -217,31 +292,54 @@ public sealed class MarketRunExecutor(
         var matches = ListingPlanEvaluator.MatchListings(assignments, Rows(id, name, listings));
         var player = await deadline.RunAsync(driver.PlayerAsync).ConfigureAwait(false);
         var allocations = new List<(ListingPlanAssignment Assignment, int Count)>();
-        var remaining = player.Stacks.GroupBy(s => (s.ItemId, s.IsHighQuality)).ToDictionary(g => g.Key, g => g.Sum(s => s.Quantity));
+        var remaining = player.Stacks.ToDictionary(s => (s.Container, s.SlotIndex), s => s.Quantity);
         foreach (var a in assignments)
         {
             var held = matches.Count(m => m.AssignmentId == a.Id && m.Kind is ListingMatchKind.Exact or ListingMatchKind.PriceDiffers or ListingMatchKind.UnknownPrice);
             var missing = Math.Max(0, a.ListingCount - held);
-            var key = (a.ItemId, a.Quality == ItemQualityPolicy.HqOnly);
-            var backed = Math.Min(missing, remaining.GetValueOrDefault(key) / a.QuantityPerListing);
-            remaining[key] = remaining.GetValueOrDefault(key) - backed * a.QuantityPerListing;
+            var stock = player.Stacks.Where(s => s.ItemId == a.ItemId && s.IsHighQuality == (a.Quality == ItemQualityPolicy.HqOnly)).ToArray();
+            var availableUnits = stock.Sum(s => remaining[(s.Container, s.SlotIndex)]);
+            var backed = 0;
+            foreach (var s in stock)
+            {
+                var key = (s.Container, s.SlotIndex);
+                var take = Math.Min(missing - backed, remaining[key] / a.QuantityPerListing);
+                remaining[key] -= take * a.QuantityPerListing;
+                backed += take;
+            }
             allocations.Add((a, backed));
-            if (missing > backed) Add(record, $"{a.ItemName}: still short {missing - backed} (stock or gather inventory space)");
+            var split = Math.Min(missing, availableUnits / a.QuantityPerListing) - backed;
+            if (split > 0) { record.SplitStacks += split; Add(record, $"{a.ItemName}: split across stacks {split}"); }
         }
-        var count = allocations.Sum(a => a.Count);
-        var pulls = MarketRunPlanner.SelectListingsToPull(Rows(id, name, listings), assignments, count);
-        foreach (var pull in pulls)
+        while (true)
         {
             Check(record);
             player = await deadline.RunAsync(driver.PlayerAsync).ConfigureAwait(false);
-            if (player.FreeSlots == 0) { Add(record, $"{name}: blocked by inventory space {Math.Max(0, count - (20 - listings.Count))}"); break; }
-            var target = listings.Single(l => l.SlotIndex == pull.Listing.SlotIndex);
-            if (!await StillPresent(target).ConfigureAwait(false)) { Add(record, $"{pull.Listing.ItemName}: pull source changed"); break; }
-            // Re-select with the same planner policy immediately before dispatch.
-            var live = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
-            if (!live.Contains(target) || !MarketRunPlanner.SelectListingsToPull(Rows(id, name, live), assignments, count)
-                .Any(p => p.Listing.SlotIndex == target.SlotIndex)) break;
-            await Mutate(record, new("Pull", id, pull.Listing.ItemName, target, null, target.Quantity, 0),
+            listings = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
+            var liveMatches = ListingPlanEvaluator.MatchListings(assignments, Rows(id, name, listings));
+            var available = player.Stacks.ToDictionary(s => (s.Container, s.SlotIndex), s => s.Quantity);
+            var backed = 0;
+            foreach (var (a, allocated) in allocations)
+            {
+                var held = liveMatches.Count(m => m.AssignmentId == a.Id && m.Kind is ListingMatchKind.Exact or ListingMatchKind.PriceDiffers or ListingMatchKind.UnknownPrice);
+                var needed = Math.Min(allocated, Math.Max(0, a.ListingCount - held));
+                foreach (var s in player.Stacks.Where(s => s.ItemId == a.ItemId && s.IsHighQuality == (a.Quality == ItemQualityPolicy.HqOnly)))
+                {
+                    var key = (s.Container, s.SlotIndex);
+                    var take = Math.Min(needed, available[key] / a.QuantityPerListing);
+                    available[key] -= take * a.QuantityPerListing;
+                    backed += take;
+                    needed -= take;
+                }
+            }
+            var room = Math.Max(0, backed - (MarketRunPlanner.ListingCapacity - listings.Count));
+            if (room == 0) break;
+            if (player.FreeSlots == 0) { record.NoInventorySpace += room; Add(record, $"{name}: blocked by inventory space {room}"); break; }
+            var pull = MarketRunPlanner.SelectListingsToPull(Rows(id, name, listings), assignments, backed).FirstOrDefault();
+            if (pull is null) break;
+            var target = listings.FirstOrDefault(l => l.SlotIndex == pull.Listing.SlotIndex);
+            if (target is null) { Add(record, "Pull: no longer present"); break; }
+            await Mutate(record, new("Pull", id, driver.ItemName(target.ItemId), target, null, target.Quantity, target.UnitPrice ?? 0),
                 t => driver.PullAsync(target, t)).ConfigureAwait(false);
             listings = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
         }
@@ -254,12 +352,13 @@ public sealed class MarketRunExecutor(
                 var held = ListingPlanEvaluator.MatchListings(assignments, Rows(id, name, listings))
                     .Count(m => m.AssignmentId == a.Id && m.Kind is ListingMatchKind.Exact or ListingMatchKind.PriceDiffers or ListingMatchKind.UnknownPrice);
                 if (held >= a.ListingCount) break;
-                if (listings.Count >= MarketRunPlanner.ListingCapacity) { Add(record, $"{a.ItemName}: blocked by slots {refill - n}"); break; }
+                if (listings.Count >= MarketRunPlanner.ListingCapacity) { record.NoSlot += refill - n; break; }
                 player = await deadline.RunAsync(driver.PlayerAsync).ConfigureAwait(false);
                 var stock = player.Stacks.Where(s => s.ItemId == a.ItemId && s.IsHighQuality == (a.Quality == ItemQualityPolicy.HqOnly)).ToArray();
                 var source = stock.FirstOrDefault(s => s.Quantity >= a.QuantityPerListing);
                 if (source is null)
                 {
+                    if (stock.Sum(s => s.Quantity) >= a.QuantityPerListing) record.SplitStacks += refill - n;
                     Add(record, $"{a.ItemName}: {(stock.Sum(s => s.Quantity) >= a.QuantityPerListing ? "split across stacks" : "still short for stock")} {refill - n}");
                     break;
                 }
@@ -277,60 +376,76 @@ public sealed class MarketRunExecutor(
         Check(record);
         var receipt = new MarketMutationReceipt { Intent = intent };
         record.Mutations.Add(receipt);
-        persist(record); // A persistence failure must prevent dispatch.
+        try { Persist(record); Check(record); } // No dispatch without durable intent and current authority.
+        catch (Exception e)
+        {
+            receipt.Outcome = MarketMutationOutcome.FailedBeforeSend;
+            if (e is OperationCanceledException) throw;
+            throw new RunStoppedException(e.Message);
+        }
         try { receipt.Outcome = await deadline.RunAsync(action).ConfigureAwait(false); }
         catch (RetainerMarketMutationIndeterminateException) { receipt.Outcome = MarketMutationOutcome.Indeterminate; }
-        catch (OperationCanceledException) { receipt.Outcome = intent.Kind == "Reprice" ? MarketMutationOutcome.Indeterminate : MarketMutationOutcome.FailedBeforeSend; }
+        catch (OperationCanceledException) { receipt.Outcome = MarketMutationOutcome.FailedBeforeSend; }
         catch (TimeoutException)
         {
             driverUnsettled = true;
             receipt.Outcome = MarketMutationOutcome.Indeterminate;
             record.NeedsCheck.Add(intent.RetainerId);
-            persist(record);
+            Persist(record);
             throw new InvalidOperationException("Mutation deadline expired without a settled driver; stopped to prevent overlapping requests.");
         }
         catch
         {
             receipt.Outcome = MarketMutationOutcome.Indeterminate;
-            record.NeedsCheck.Add(intent.RetainerId);
-            persist(record);
-            throw;
         }
         // A failed reprice has no three-way primitive outcome; verify the exact
         // expected after-state before classifying it, without ever sending again.
-        persist(record);
+        if (intent.Kind != "Reprice" && receipt.Outcome == MarketMutationOutcome.Indeterminate && !record.NeedsCheck.Contains(intent.RetainerId))
+            record.NeedsCheck.Add(intent.RetainerId);
+        Persist(record);
         if (intent.Kind == "Reprice" && receipt.Outcome != MarketMutationOutcome.Committed)
         {
             try
             {
                 var live = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
                 receipt.Outcome = live.Contains(intent.Listing! with { UnitPrice = intent.Price }) ? MarketMutationOutcome.Committed :
-                    live.Contains(intent.Listing!) ? MarketMutationOutcome.Unchanged : MarketMutationOutcome.Indeterminate;
+                    receipt.Outcome == MarketMutationOutcome.FailedBeforeSend && live.Contains(intent.Listing!) ? MarketMutationOutcome.Unchanged : MarketMutationOutcome.Indeterminate;
             }
             catch
             {
                 receipt.Outcome = MarketMutationOutcome.Indeterminate;
                 record.NeedsCheck.Add(intent.RetainerId);
-                persist(record);
+                Persist(record);
                 throw;
             }
         }
-        if (receipt.Outcome == MarketMutationOutcome.Indeterminate) record.NeedsCheck.Add(intent.RetainerId);
-        persist(record);
-        await deadline.RunAsync(driver.PlayerAsync).ConfigureAwait(false);
+        if (receipt.Outcome == MarketMutationOutcome.Indeterminate && !record.NeedsCheck.Contains(intent.RetainerId)) record.NeedsCheck.Add(intent.RetainerId);
+        Persist(record);
         Add(record, $"{intent.Kind} {intent.ItemName} × {intent.Quantity}: {receipt.Outcome}{(intent.Kind == "Pull" && receipt.Outcome == MarketMutationOutcome.Committed ? " (player inventory)" : string.Empty)}");
+        if (receipt.Outcome == MarketMutationOutcome.Indeterminate && intent.Kind != "Reprice")
+            throw new RunStoppedException("Needs a check: inventory mutation outcome unknown.");
         if (receipt.Outcome != MarketMutationOutcome.Committed) throw new RetainerStoppedException();
     }
 
-    private async Task<bool> StillPresent(RetainerMarketListingTarget target) =>
-        (await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false)).Contains(target);
     private Task<bool> Step(Func<CancellationToken, Task> action) => deadline.RunAsync(async t => { await action(t).ConfigureAwait(false); return true; });
     private void Check(MarketRunRecord record)
     {
         if (Volatile.Read(ref cancelled) != 0) throw new OperationCanceledException();
+        if (runLease is null || !automation.Owns(runLease)) throw new RunStoppedException("Automation lease lost.");
         var plan = currentPlan();
-        if (plan is null || plan.Id != record.PlanId || plan.Revision != record.PlanRevision || !plan.Owner.Matches(record.Owner))
-            throw new InvalidOperationException("Listing Plan changed; run stopped before the next mutation.");
+        if (plan is null) throw new RunStoppedException("No Listing Plan or character still loading.");
+        if (!plan.Owner.HasStableIdentity) throw new RunStoppedException("Character identity is unstable.");
+        if (plan.Id != record.PlanId || plan.Revision != record.PlanRevision || !plan.Owner.Matches(record.Owner))
+            throw new RunStoppedException("Listing Plan changed; run stopped before the next mutation.");
+    }
+    private void Persist(MarketRunRecord record)
+    {
+        lock (persistenceGate)
+        {
+            if (disposed) return;
+            try { persist(record); }
+            catch { persistenceFailed = true; throw; }
+        }
     }
     private static void Add(MarketRunRecord record, string message) => record.Results.Add(message);
     private ListingRow[] Rows(ulong id, string name, IReadOnlyList<RetainerMarketListingTarget> listings) => listings.Select(l =>
@@ -339,4 +454,5 @@ public sealed class MarketRunExecutor(
             l.UnitPrice is { } p ? Evidence.Known((decimal)p) : Evidence.Unknown<decimal>("Price unknown"),
             l.UnitPrice is { } total ? Evidence.Known((decimal)total * l.Quantity) : Evidence.Unknown<decimal>("Price unknown"), DateTime.UtcNow)).ToArray();
     private sealed class RetainerStoppedException : Exception;
+    private sealed class RunStoppedException(string message) : Exception(message);
 }

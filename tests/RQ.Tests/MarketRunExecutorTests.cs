@@ -46,7 +46,7 @@ public sealed class MarketRunExecutorTests
         var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
         Assert.Equal(reprices, executor.Result!.Mutations.Count(m => m.Intent.Kind == "Reprice"));
         Assert.DoesNotContain(executor.Result.Mutations, m => m.Intent.Kind == "Post");
-        if (price is null) Assert.Contains(executor.Result.Results, s => s.Contains("unknown price"));
+        if (price is null) Assert.Contains(executor.Result.Results, s => s.Contains("Invalid market price"));
         else Assert.Equal(50u, fake.Live[10][0].UnitPrice);
     }
 
@@ -69,8 +69,9 @@ public sealed class MarketRunExecutorTests
         var plan = Plan(2); plan.Assignments.Add(new() { ItemId = 1, ItemName = "Hull", RetainerId = 11, RetainerName = "Beta", QuantityPerListing = 2, UnitPrice = 50 });
         var fake = new Driver { Outcome = outcome }; fake.Stock = [new(InventoryType.Inventory1, 0, 1, 10)];
         var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Equal([10ul, 11ul], fake.Posts);
-        Assert.Equal(outcome == MarketMutationOutcome.Indeterminate ? 2 : 0, executor.Result!.NeedsCheck.Count);
+        Assert.Equal(outcome == MarketMutationOutcome.Indeterminate ? [10ul] : new[] { 10ul, 11ul }, fake.Posts);
+        Assert.Equal(outcome == MarketMutationOutcome.Indeterminate ? 1 : 0, executor.Result!.NeedsCheck.Count);
+        Assert.Equal(outcome == MarketMutationOutcome.Indeterminate ? "Stopped" : "Completed", executor.Result.State);
     }
 
     [Theory]
@@ -114,7 +115,7 @@ public sealed class MarketRunExecutorTests
     }
 
     [Theory]
-    [InlineData(false, MarketMutationOutcome.Unchanged)]
+    [InlineData(false, MarketMutationOutcome.Indeterminate)]
     [InlineData(true, MarketMutationOutcome.Committed)]
     public async Task FailedReprice_IsClassifiedByLiveRescan_NotResent(bool applied, MarketMutationOutcome expected)
     {
@@ -122,7 +123,7 @@ public sealed class MarketRunExecutorTests
         fake.Live[10] = [new(0, 1, 2, false, 10)];
         var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
         Assert.Equal(expected, Assert.Single(executor.Result!.Mutations).Outcome);
-        Assert.Empty(executor.Result.NeedsCheck);
+        Assert.Equal(!applied, executor.Result.NeedsCheck.Contains(10));
     }
 
     [Fact]
@@ -171,6 +172,7 @@ public sealed class MarketRunExecutorTests
             var executor = new MarketRunExecutor(fake, new(), () => plan, store.Save);
             await executor.RunAsync(plan, Evaluation(plan));
             Assert.Equal("Completed", store.Load()!.State);
+            store.Clear(); Assert.Null(store.Load());
         }
         finally { Directory.Delete(directory, true); }
     }
@@ -191,7 +193,210 @@ public sealed class MarketRunExecutorTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task Gather_UsesJournalAndBorrowedLease_RetrievesOnlyShortfall(bool full)
+    public async Task SeveralPulls_ReSelectLiveSlots_ProtectPlannedListings(bool compact)
+    {
+        var plan = Plan(4); var fake = new Driver { Compact = compact };
+        fake.Live[10] = [new(0, 1, 2, false, 50), .. Enumerable.Range(1, 19).Select(i => new RetainerMarketListingTarget(i, 2, 1, false, (uint)i))];
+        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
+        var pulls = executor.Result!.Mutations.Where(m => m.Intent.Kind == "Pull").ToArray();
+        Assert.Equal(3, pulls.Length);
+        Assert.All(pulls, p => { Assert.Equal(2u, p.Intent.Listing!.ItemId); Assert.Equal("Bow", p.Intent.ItemName); });
+        Assert.Equal(4, fake.Live[10].Count(l => l.ItemId == 1));
+    }
+
+    [Fact]
+    public async Task FullRetainer_SplitStacks_NeverPulls()
+    {
+        var plan = Plan(); var fake = new Driver { Stock = [new(InventoryType.Inventory1, 0, 1, 1), new(InventoryType.Inventory1, 1, 1, 1)] };
+        fake.Live[10] = Enumerable.Range(0, 20).Select(i => new RetainerMarketListingTarget(i, 2, 1, false, 10)).ToList();
+        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Empty(executor.Result!.Mutations); Assert.Equal(1, executor.Result.SplitStacks);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PullIndeterminate_StopsRun_NoNextRetainer(bool exception)
+    {
+        var plan = Plan(); plan.Assignments.Add(new() { ItemId = 1, ItemName = "Hull", RetainerId = 11, RetainerName = "Beta", QuantityPerListing = 2, UnitPrice = 50 });
+        var fake = new Driver { Outcome = MarketMutationOutcome.Indeterminate, ThrowPull = exception };
+        fake.Live[10] = Enumerable.Range(0, 20).Select(i => new RetainerMarketListingTarget(i, 2, 1, false, 10)).ToList();
+        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Equal("Stopped", executor.Result!.State); Assert.Equal([10ul], fake.Visited);
+        Assert.Single(executor.Result.Mutations); Assert.Contains(10ul, executor.Result.NeedsCheck);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RepriceBeforeSendOrIndeterminateException(bool exception)
+    {
+        var plan = Plan(); var fake = new Driver { ApplyReprice = false, ThrowReprice = exception, Outcome = MarketMutationOutcome.FailedBeforeSend };
+        fake.Live[10] = [new(0, 1, 2, false, 10)];
+        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Equal(exception ? MarketMutationOutcome.Indeterminate : MarketMutationOutcome.Unchanged, Assert.Single(executor.Result!.Mutations).Outcome);
+        Assert.Equal(exception, executor.Result.NeedsCheck.Contains(10));
+    }
+
+    [Fact]
+    public async Task InvalidPrice_WholeScanFails_NextRetainerStillProcessed()
+    {
+        var plan = Plan(); plan.Assignments.Add(new() { ItemId = 1, ItemName = "Hull", RetainerId = 11, RetainerName = "Beta", QuantityPerListing = 2, UnitPrice = 50 });
+        var fake = new Driver(); fake.Live[10] = [new(0, 1, 2, false, null)];
+        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Equal([11ul], fake.Posts); Assert.Contains(executor.Result!.Results, s => s.Contains("Invalid market price"));
+    }
+
+    [Fact]
+    public async Task CancelGather_NoMutation_AndCancelRetainerReturns()
+    {
+        var plan = Plan(); var fake = new Driver(); var executor = Create(plan, fake);
+        fake.OnGather = executor.Cancel;
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Equal("Cancelled", executor.Result!.State); Assert.Empty(executor.Result.Mutations);
+        fake.OnGather = null; fake.OnPost = executor.Cancel;
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Equal("Cancelled", executor.Result!.State); Assert.Equal(1, fake.Returns);
+    }
+
+    [Theory]
+    [InlineData("Interrupted")]
+    [InlineData("NeedsCheck")]
+    [InlineData("Unknown")]
+    public async Task StartRequiresAcknowledgement(string kind)
+    {
+        var plan = Plan(); var fake = new Driver(); var executor = Create(plan, fake);
+        var record = new MarketRunRecord { State = kind == "Interrupted" ? kind : "Stopped" };
+        if (kind == "NeedsCheck") record.NeedsCheck.Add(10);
+        if (kind == "Unknown") record.Mutations.Add(new() { Intent = new("Post", 10, "Hull", null, null, 2, 50) });
+        executor.Restore(record); Assert.False(executor.CanStart);
+        await executor.RunAsync(plan, Evaluation(plan)); Assert.Same(record, executor.Result);
+        executor.Clear(); Assert.True(executor.CanStart);
+        await executor.RunAsync(plan, Evaluation(plan)); Assert.Single(fake.Posts);
+    }
+
+    [Fact]
+    public async Task PersistenceFailure_PreventsDispatch_AndReleasesLease()
+    {
+        var plan = Plan(); var fake = new Driver(); var automation = new AutomationLease();
+        var executor = new MarketRunExecutor(fake, automation, () => plan, r => { if (r.Mutations.Count > 0) throw new IOException("disk"); });
+        await Assert.ThrowsAsync<IOException>(() => executor.RunAsync(plan, Evaluation(plan)));
+        Assert.Empty(fake.Posts); Assert.False(automation.IsHeld); Assert.False(executor.IsRunning);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UnsettledCall_HoldsLeaseUntilCompletion(bool cleanupThrows)
+    {
+        var plan = Plan(); var fake = new Driver(); var automation = new AutomationLease();
+        var pending = new TaskCompletionSource<MarketMutationOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        fake.PendingPost = pending.Task;
+        var ipc = new AutoRetainer();
+        var executor = new MarketRunExecutor(fake, automation, () => plan, r => { if (cleanupThrows && r.State != "Running") throw new IOException("cleanup"); }, new AutoRetainerSuppression(ipc), deadlines: new MarketRunDeadline(TimeSpan.FromMilliseconds(5)));
+        if (cleanupThrows) await Assert.ThrowsAsync<IOException>(() => executor.RunAsync(plan, Evaluation(plan)));
+        else await executor.RunAsync(plan, Evaluation(plan));
+        Assert.True(automation.IsHeld); Assert.True(ipc.IsSuppressed); Assert.Equal("Stopped", executor.Result!.State);
+        pending.SetResult(MarketMutationOutcome.Committed);
+        for (var n = 0; n < 100 && automation.IsHeld; n++) await Task.Delay(5);
+        Assert.False(automation.IsHeld);
+        Assert.False(ipc.IsSuppressed);
+    }
+
+    [Fact]
+    public async Task AutoRetainerBusy_WaitsBeforeAnyGatherOrGameCall()
+    {
+        var plan = Plan(); var fake = new Driver(); var ipc = new AutoRetainer { IsBusy = true };
+        var gathered = false; fake.OnGather = () => { gathered = true; Assert.True(ipc.IsSuppressed); };
+        var executor = new MarketRunExecutor(fake, new(), () => plan, _ => { }, new AutoRetainerSuppression(ipc));
+        var run = executor.RunAsync(plan, Evaluation(plan));
+        Assert.False(gathered); Assert.Empty(fake.Visited);
+        ipc.IsBusy = false; await run;
+        Assert.True(gathered); Assert.False(ipc.IsSuppressed);
+    }
+
+    [Theory]
+    [InlineData("InvalidMarketUnitPrice", MarketMutationOutcome.FailedBeforeSend)]
+    [InlineData("RetainerMarketPriceUpdateIndeterminate", MarketMutationOutcome.Indeterminate)]
+    [InlineData("UnexpectedRetainerMarketConfirmation", MarketMutationOutcome.Indeterminate)]
+    [InlineData("UnknownFutureCode", MarketMutationOutcome.Indeterminate)]
+    public void PrimitiveRepriceCodes(string code, MarketMutationOutcome expected) =>
+        Assert.Equal(expected, MarketRunLiveDriver.ClassifyReprice(RetainerAutomationResult.Failed(code, code)));
+
+    [Fact]
+    public async Task QualityIsNeverMixed()
+    {
+        var plan = Plan(); var fake = new Driver { Stock = [new(InventoryType.Inventory1, 0, 1, 10, true)] };
+        fake.Live[10] = [new(0, 1, 2, true, 10)];
+        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Empty(executor.Result!.Mutations); Assert.Equal(10u, fake.Live[10][0].UnitPrice);
+    }
+
+    [Theory]
+    [InlineData("Reprice")]
+    [InlineData("Pull")]
+    [InlineData("Gather")]
+    public async Task PlanRevisionChangeAtEveryBoundary_PreventsNextMutation(string boundary)
+    {
+        var plan = Plan(2); var fake = new Driver();
+        if (boundary == "Reprice") { fake.Live[10] = [new(0, 1, 2, false, 10)]; fake.OnReprice = () => plan.Revision++; }
+        if (boundary == "Pull")
+        {
+            fake.Live[10] = Enumerable.Range(0, 20).Select(i => new RetainerMarketListingTarget(i, 2, 1, false, 10)).ToList();
+            fake.OnPull = () => plan.Revision++;
+        }
+        if (boundary == "Gather") fake.OnGather = () => plan.Revision++;
+        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Equal("Stopped", executor.Result!.State);
+        Assert.Equal(boundary == "Gather" ? 0 : 1, executor.Result.Mutations.Count);
+        Assert.Empty(fake.Posts);
+    }
+
+    [Fact]
+    public async Task DisposedExecutor_CannotOverwriteNewRunRecord()
+    {
+        var plan = Plan(); var fake = new Driver(); var writes = 0;
+        var pending = new TaskCompletionSource<MarketMutationOutcome>(); fake.PendingPost = pending.Task;
+        var executor = new MarketRunExecutor(fake, new(), () => plan, _ => writes++);
+        var run = executor.RunAsync(plan, Evaluation(plan));
+        executor.CancelAndWait(TimeSpan.Zero);
+        var atDispose = writes;
+        pending.SetResult(MarketMutationOutcome.Committed);
+        await run;
+        Assert.Equal(atDispose, writes); Assert.False(executor.CanStart);
+    }
+
+    [Fact]
+    public async Task BorrowedLease_RefusesForeignAndDisposedLease()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "rq-market-lease-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var journal = new OperationJournal(new StateRepository(new QuartermasterStateStore(Path.Combine(directory, "state.json"))));
+            using var cache = new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory, "cache.json")));
+            var automation = new AutomationLease(); var foreign = new AutomationLease();
+            var session = DispatchProxy.Create<IRetainerAutomationSession, SessionProxy>();
+            ((SessionProxy)(object)session).Handler = (_, _) => throw new Exception("Must not call the game");
+            var coordinator = new TransferCoordinator(journal, new RetainerLiveDriver(session), cache, () => Plan().Owner, () => new Dictionary<uint, int>(), automation);
+            Assert.True(foreign.TryAcquire("foreign", out var other));
+            using (other) await Assert.ThrowsAsync<InvalidOperationException>(() => coordinator.ExecuteRetrievalUnderLeaseAsync("unused", other!, CancellationToken.None));
+            Assert.True(automation.TryAcquire("disposed", out var disposed)); disposed!.Dispose();
+            await Assert.ThrowsAsync<InvalidOperationException>(() => coordinator.ExecuteRetrievalUnderLeaseAsync("unused", disposed, CancellationToken.None));
+            Assert.False(automation.IsHeld);
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    [Theory]
+    [InlineData("normal")]
+    [InlineData("full")]
+    [InlineData("partial")]
+    [InlineData("cancel")]
+    [InlineData("lost")]
+    [InlineData("changed")]
+    [InlineData("deadline")]
+    public async Task Gather_UsesJournalAndBorrowedLease_RetrievesOnlyShortfall(string mode)
     {
         var directory = Path.Combine(Path.GetTempPath(), "rq-market-gather-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
@@ -206,43 +411,77 @@ public sealed class MarketRunExecutorTests
                     Items = [new() { ItemId = 1, ItemName = "Hull", Quantity = 20 }] }] });
             var playerCache = new PlayerInventoryCacheRepository(new PlayerInventoryCacheStore(Path.Combine(directory, "player.json")));
             var player = new List<DalamudInventoryStack> { new(InventoryType.Inventory1, 0, 1, 3) };
-            if (full) player.AddRange(Enumerable.Range(1, 139).Select(i => new DalamudInventoryStack((InventoryType)(i / 35), i % 35, 2, 1)));
+            if (mode == "full") player.AddRange(Enumerable.Range(1, 139).Select(i => new DalamudInventoryStack((InventoryType)(i / 35), i % 35, 2, 1)));
             var source = new DalamudInventoryStack(InventoryType.RetainerPage1, 0, 1, 20);
+            var split = mode is "partial" or "cancel" or "lost";
+            var sources = split ? new List<DalamudInventoryStack> { source with { Quantity = 4 }, source with { SlotIndex = 1, Quantity = 16 } } : [source];
             var transferred = 0;
+            var cancel = false;
+            var sourceReads = 0;
+            IDisposable? lease = null;
             var automation = new AutomationLease();
             var session = DispatchProxy.Create<IRetainerAutomationSession, SessionProxy>();
             ((SessionProxy)(object)session).Handler = (method, args) =>
             {
-                Assert.True(automation.IsHeld);
+                if (mode != "lost" || transferred == 0) Assert.True(automation.IsHeld);
                 switch (method.Name)
                 {
                     case nameof(IRetainerAutomationSession.ScanPlayerInventoryAsync):
                         return Task.FromResult<IReadOnlyList<DalamudInventoryStack>>(player.ToArray());
                     case nameof(IRetainerAutomationSession.ScanRetainerAsync):
-                        return Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([source]);
+                        if (mode == "changed" && ++sourceReads == 2) sources[0] = sources[0] with { Quantity = 19 };
+                        return Task.FromResult<IReadOnlyList<DalamudInventoryStack>>(sources.Where(s => s.Quantity > 0).ToArray());
                     case nameof(IRetainerAutomationSession.RetrieveAsync):
                         var quantity = (int)args![1]!;
                         transferred += quantity;
                         source = source with { Quantity = source.Quantity - quantity };
+                        var selected = (DalamudInventoryStack)args[0]!;
+                        var index = sources.FindIndex(s => s.SlotIndex == selected.SlotIndex);
+                        sources[index] = sources[index] with { Quantity = sources[index].Quantity - quantity };
                         player[0] = player[0] with { Quantity = player[0].Quantity + quantity };
+                        if (mode == "partial") player.AddRange(Enumerable.Range(1, 139).Select(i => new DalamudInventoryStack((InventoryType)(i / 35), i % 35, 2, 1)));
+                        if (mode == "cancel") cancel = true;
+                        if (mode == "lost") lease!.Dispose();
                         return Task.FromResult(new RetainerRetrievalResult(true, quantity, "Retrieved", "Verified"));
                     default:
+                        if (mode == "deadline") return Task.FromCanceled<RetainerAutomationResult>(new CancellationToken(true));
                         return Task.FromResult(RetainerAutomationResult.Succeeded("Ready", "Ready"));
                 }
             };
             var adapter = new MarketRunLiveDriver(session, new RetainerLiveDriver(session), journal, cache, playerCache, automation,
                 () => plan.Owner, _ => "Hull");
-            Assert.True(automation.TryAcquire("market test", out var lease));
+            if (mode == "partial")
+            {
+                var fake = new Driver { Stock = player };
+                fake.GatherOverride = async (_, borrowed, check, token) =>
+                {
+                    var reports = await adapter.GatherAsync([new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], borrowed, check, token);
+                    fake.GatherInventoryBlockedUnits = adapter.GatherInventoryBlockedUnits;
+                    return reports;
+                };
+                var executor = new MarketRunExecutor(fake, automation, () => plan, _ => { });
+                await executor.RunAsync(plan, Evaluation(plan));
+                Assert.Equal("Completed", executor.Result!.State);
+                Assert.Single(fake.Posts); Assert.Equal(4, transferred);
+                Assert.Equal(3, executor.Result.NoInventorySpace);
+                Assert.Equal(OperationStatuses.PartiallySucceeded, Assert.Single(journal.History(plan.Owner, 10)).Status);
+                Assert.False(automation.IsHeld);
+                return;
+            }
+            Assert.True(automation.TryAcquire("market test", out lease));
             using (lease)
             {
-                var reports = await adapter.GatherAsync([new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], lease!, () => { }, CancellationToken.None);
-                Assert.True(automation.IsHeld);
-                Assert.Equal(full ? 0 : 7, transferred);
+                IReadOnlyList<string> reports = [];
+                Task Gather() => adapter.GatherAsync([new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], lease!, () => { if (cancel) throw new OperationCanceledException(); }, CancellationToken.None);
+                if (mode == "cancel") await Assert.ThrowsAnyAsync<OperationCanceledException>(Gather);
+                else reports = await adapter.GatherAsync([new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], lease!, () => { }, CancellationToken.None);
+                Assert.Equal(mode != "lost", automation.IsHeld);
+                Assert.Equal(mode is "full" or "changed" or "deadline" ? 0 : split ? 4 : 7, transferred);
                 var operation = Assert.Single(journal.History(plan.Owner, 10));
-                Assert.Equal(full ? OperationStatuses.Failed : OperationStatuses.Succeeded, operation.Status);
-                Assert.Equal(full ? 0 : 7, Assert.Single(operation.Lines).TransferredQuantity);
-                if (full) Assert.Contains(reports, r => r.Contains("inventory space"));
-                else Assert.Equal(13u, cache.Snapshot()[10].Bags.SelectMany(b => b.Items).Single(i => i.ItemId == 1).Quantity);
+                Assert.Equal(mode is "cancel" or "deadline" ? OperationStatuses.Cancelled : mode is "full" or "lost" or "changed" ? OperationStatuses.Failed : mode == "partial" ? OperationStatuses.PartiallySucceeded : OperationStatuses.Succeeded, operation.Status);
+                Assert.Equal(transferred, Assert.Single(operation.Lines).TransferredQuantity);
+                if (mode is "full" or "partial") Assert.Contains(reports, r => r.Contains("inventory space"));
+                if (mode == "normal") Assert.Equal(13u, cache.Snapshot()[10].Bags.SelectMany(b => b.Items).Single(i => i.ItemId == 1).Quantity);
             }
             Assert.False(automation.IsHeld);
         }
@@ -265,29 +504,60 @@ public sealed class MarketRunExecutorTests
         public Func<MethodInfo, object?[]?, object?> Handler { get; set; } = null!;
         protected override object? Invoke(MethodInfo? targetMethod, object?[]? args) => Handler(targetMethod!, args);
     }
+    private sealed class AutoRetainer : IAutoRetainerIpc
+    {
+        public bool IsAvailable => true;
+        public bool IsBusy { get; set; }
+        public bool IsSuppressed { get; private set; }
+        public void SetSuppressed(bool value) => IsSuppressed = value;
+        public void Register(AutoRetainerIpcCallbacks callbacks) { }
+        public void QueueRetainerListTask(string consumer) { }
+        public void RequestPostprocess(string consumer) { }
+        public void FinishPostprocess() { }
+        public void Dispose() { }
+    }
     private sealed class Driver : IMarketRunDriver
     {
+        public int GatherInventoryBlockedUnits { get; set; }
+        public Func<IReadOnlyList<MarketGatherTarget>, IDisposable, Action, CancellationToken, Task<IReadOnlyList<string>>>? GatherOverride;
         public Dictionary<ulong, List<RetainerMarketListingTarget>> Live = new() { [10] = [], [11] = [] };
         public List<DalamudInventoryStack> Stock = [new(InventoryType.Inventory1, 0, 1, 10)];
         public List<ulong> Posts = [];
+        public List<ulong> Visited = [];
+        public int Returns;
+        public bool Compact, ThrowPull, ThrowReprice;
+        public Task<MarketMutationOutcome>? PendingPost;
         public int FreeSlots = 100;
         public bool ThrowBeforeSend, ThrowAfterSend;
         public bool ApplyReprice = true, FailReturn;
-        public Action? OnPost, OnGather, OnPlayer;
+        public Action? OnPost, OnGather, OnPlayer, OnPull, OnReprice;
         public MarketMutationOutcome Outcome = MarketMutationOutcome.Committed;
         private ulong active;
         public string ItemName(uint id) => id == 1 ? "Hull" : "Bow";
         public Task RequireRetainerListAsync(CancellationToken t) => Task.CompletedTask;
-        public Task OpenAsync(ulong id, string name, CancellationToken t) { active = id; return Task.CompletedTask; }
-        public Task<IReadOnlyList<RetainerMarketListingTarget>> ListingsAsync(CancellationToken t) => Task.FromResult<IReadOnlyList<RetainerMarketListingTarget>>(Live[active].ToArray());
+        public Task OpenAsync(ulong id, string name, CancellationToken t) { active = id; Visited.Add(id); return Task.CompletedTask; }
+        public Task<IReadOnlyList<RetainerMarketListingTarget>> ListingsAsync(CancellationToken t) => Live[active].Any(l => l.UnitPrice is null or 0 or > 999999999)
+            ? Task.FromException<IReadOnlyList<RetainerMarketListingTarget>>(new InvalidOperationException("Invalid market price"))
+            : Task.FromResult<IReadOnlyList<RetainerMarketListingTarget>>(Live[active].ToArray());
         public Task<MarketPlayerInventory> PlayerAsync(CancellationToken t) { OnPlayer?.Invoke(); return Task.FromResult(new MarketPlayerInventory(Stock.ToArray(), FreeSlots)); }
         public Task<MarketMutationOutcome> RepriceAsync(RetainerMarketListingTarget listing, uint price, CancellationToken t)
-        { if (ApplyReprice) Live[active][Live[active].IndexOf(listing)] = listing with { UnitPrice = price }; return Task.FromResult(Outcome); }
+        { OnReprice?.Invoke(); if (ThrowReprice) throw new RetainerMarketMutationIndeterminateException("Unknown", "After send", null, new OperationCanceledException(), t);
+            if (ApplyReprice) Live[active][Live[active].IndexOf(listing)] = listing with { UnitPrice = price }; return Task.FromResult(Outcome); }
         public Task<MarketMutationOutcome> PullAsync(RetainerMarketListingTarget listing, CancellationToken t)
-        { Live[active].Remove(listing); return Task.FromResult(Outcome); }
+        {
+            OnPull?.Invoke();
+            if (ThrowPull) throw new RetainerMarketMutationIndeterminateException("Unknown", "After send", null, new OperationCanceledException(), t);
+            if (Outcome == MarketMutationOutcome.Committed)
+            {
+                Live[active].Remove(listing);
+                if (Compact) Live[active] = Live[active].Select((l, i) => l with { SlotIndex = i }).ToList();
+            }
+            return Task.FromResult(Outcome);
+        }
         public Task<MarketMutationOutcome> PostAsync(DalamudInventoryStack source, int quantity, uint price, CancellationToken t)
         {
             Posts.Add(active); OnPost?.Invoke();
+            if (PendingPost is not null) return PendingPost;
             if (ThrowBeforeSend) throw new OperationCanceledException();
             if (ThrowAfterSend) throw new RetainerMarketMutationIndeterminateException("Deadline", "After send", null, new OperationCanceledException(), t);
             if (Outcome == MarketMutationOutcome.Committed)
@@ -297,8 +567,8 @@ public sealed class MarketRunExecutorTests
             }
             return Task.FromResult(Outcome);
         }
-        public Task ReturnAsync(CancellationToken t) => FailReturn ? Task.FromException(new InvalidOperationException("List unreachable")) : Task.CompletedTask;
+        public Task ReturnAsync(CancellationToken t) { Returns++; return FailReturn ? Task.FromException(new InvalidOperationException("List unreachable")) : Task.CompletedTask; }
         public Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, CancellationToken t)
-        { OnGather?.Invoke(); check(); return Task.FromResult<IReadOnlyList<string>>([]); }
+        { OnGather?.Invoke(); check(); return GatherOverride?.Invoke(targets, lease, check, t) ?? Task.FromResult<IReadOnlyList<string>>([]); }
     }
 }

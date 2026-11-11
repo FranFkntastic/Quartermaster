@@ -6,8 +6,8 @@ namespace RQ.Planning;
 
 /// <summary>
 /// One enabled assignment as the market run sees it. Listings with the planned shape but a
-/// different or unobserved price already hold the right stock, so they are counted as
-/// <see cref="RepriceListings"/> rather than short.
+/// different or unobserved price already hold the right stock, so they are not short.
+/// Only a known different price is actionable repricing work.
 /// </summary>
 public sealed record MarketRunAssignment(
     ListingPlanAssignment Assignment,
@@ -292,9 +292,9 @@ public static class MarketRunPlanner
             return (unknown, unknown, unknown);
         }
         var exact = match?.ExactListings ?? 0;
-        var reprice = (match?.UnknownPriceListings ?? 0) + (match?.WrongPriceListings ?? 0);
+        var reprice = match?.WrongPriceListings ?? 0;
         return (Evidence.Known(exact), Evidence.Known(reprice),
-            Evidence.Known(Math.Max(0, assignment.ListingCount - exact - reprice)));
+            Evidence.Known(Math.Max(0, assignment.ListingCount - exact - reprice - (match?.UnknownPriceListings ?? 0))));
     }
 
     // Same accessible stock ListingPlanEvaluator counts: player bags plus retainer inventories

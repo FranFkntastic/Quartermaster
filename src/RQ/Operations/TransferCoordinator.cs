@@ -273,6 +273,9 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         stockMutations,
                         async mutationToken =>
                         {
+                            if (borrowedLease is not null && !automation.Owns(borrowedLease))
+                                return VerifiedMutationAttempt<RetrievalResult, RetainerVariantObservation>.Unchanged(
+                                    new(false, 0, "LeaseLost", "The caller no longer owns the automation lease."));
                             movementAttempted = true;
                             var result = await driver.RetrieveAsync(
                                 stack,
@@ -301,6 +304,16 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                                         attempt.Evidence != VerifiedMutationEvidence.Unchanged;
                     if (!result.Success)
                     {
+                        if (borrowedLease is not null && !result.MovementMayHaveOccurred)
+                        {
+                            movementAttempted = false;
+                            if (result.Code == "GatherCancelled") throw new OperationCanceledException();
+                            if (result.Code is "InventoryFull" or "SourceSlotChanged")
+                            {
+                                journal.RecordWarning(operationId, result.Code, result.Message);
+                                continue;
+                            }
+                        }
                         throw new InvalidOperationException(result.Message);
                     }
                     remaining[key] -= result.Transferred;
@@ -314,6 +327,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         result.Transferred,
                         result.Code,
                         result.Message);
+                    if (borrowedLease is not null) movementAttempted = false;
                 }
                 await driver.CloseRetainerAsync(token).ConfigureAwait(false);
                 retainerOpen = false;
@@ -345,17 +359,19 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         catch (OperationCanceledException)
         {
             Exception? releaseFailure = null;
-            if (retainerOpen)
+            if (retainerOpen && !MarketRunDeadline.HasUnsettled)
             {
                 try { await driver.CloseRetainerAsync(CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure = closeException; }
             }
-            if (retainerSessionOpen)
+            if (retainerSessionOpen && !MarketRunDeadline.HasUnsettled)
             {
                 try { await driver.CloseRetainerListAsync(CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure ??= closeException; }
             }
-            MarkCancelled(operationId);
+            if (borrowedLease is not null && !movementAttempted && journal.Get(operationId)?.Status == OperationStatuses.Running)
+                journal.Transition(operationId, OperationStatuses.Cancelled, "CancelledBeforeMovement", "Gather cancelled with no unresolved movement.");
+            else MarkCancelled(operationId);
             return new(
                 true,
                 releaseFailure is null
@@ -365,12 +381,12 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         catch (Exception exception)
         {
             Exception? releaseFailure = null;
-            if (retainerOpen)
+            if (retainerOpen && !MarketRunDeadline.HasUnsettled)
             {
                 try { await driver.CloseRetainerAsync(CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure = closeException; }
             }
-            if (retainerSessionOpen)
+            if (retainerSessionOpen && !MarketRunDeadline.HasUnsettled)
             {
                 try { await driver.CloseRetainerListAsync(CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure ??= closeException; }
