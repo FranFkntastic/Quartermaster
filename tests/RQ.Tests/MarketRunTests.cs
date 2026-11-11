@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Franthropy.FFXIV.Filtering;
 using Franthropy.Filtering.Evaluation;
 using RQ.Domain;
@@ -188,6 +189,47 @@ public sealed class MarketRunTests
 
         Assert.Empty(run.Retainers);
         Assert.Empty(run.Items);
+    }
+
+    [Fact]
+    public void CraftExport_WritesSavedJobShapeAndSeparatesLinesWithoutWorkshopProject()
+    {
+        MarketRunCraftLine[] lines =
+        [
+            new(1, "Bow", ItemQualityPolicy.NqOnly, 3),
+            new(2, "Potion", ItemQualityPolicy.NqOnly, 4),
+            new(3, "Hull", ItemQualityPolicy.HqOnly, 2),
+            new(4, "Rudder", ItemQualityPolicy.NqOnly, 12_000),
+        ];
+        var projects = new Dictionary<uint, uint> { [1] = 501, [3] = 503, [4] = 504 };
+
+        var result = MarketRunCraftExport.Export("  " + new string('x', 140) + "  ", lines,
+            id => projects.TryGetValue(id, out var project) ? project : null, new DateTime(2026, 11, 10, 0, 0, 0, DateTimeKind.Utc));
+
+        Assert.Equal([(uint)2, (uint)3], result.WithoutWorkshopProject.Select(line => line.ItemId));
+        Assert.Equal([(uint)4], result.Capped.Select(line => line.ItemId));
+        using var document = JsonDocument.Parse(result.Json!);
+        var root = document.RootElement;
+        Assert.Equal("marketmafioso.workshop-saved-job", root.GetProperty("format").GetString());
+        Assert.Equal(1, root.GetProperty("version").GetInt32());
+        Assert.Equal(128, root.GetProperty("name").GetString()!.Length);
+        Assert.Equal(new DateTime(2026, 11, 10, 0, 0, 0, DateTimeKind.Utc), root.GetProperty("exportedAt").GetDateTime());
+        var items = root.GetProperty("items").EnumerateArray().ToArray();
+        Assert.Equal([501u, 504u], items.Select(item => item.GetProperty("workshopItemId").GetUInt32()));
+        Assert.Equal(["Bow", "Rudder"], items.Select(item => item.GetProperty("name").GetString()));
+        Assert.Equal([3, 9999], items.Select(item => item.GetProperty("quantity").GetInt32()));
+    }
+
+    [Fact]
+    public void CraftExport_WithNoWorkshopLines_HasNoJsonAndDefaultsTheName()
+    {
+        var none = MarketRunCraftExport.Export("job", [new(2, "Potion", ItemQualityPolicy.NqOnly, 4)], _ => null, DateTime.UnixEpoch);
+        Assert.Null(none.Json);
+        Assert.Single(none.WithoutWorkshopProject);
+
+        var named = MarketRunCraftExport.Export("   ", [new(1, "Bow", ItemQualityPolicy.NqOnly, 1)], _ => 7, DateTime.UnixEpoch);
+        using var document = JsonDocument.Parse(named.Json!);
+        Assert.Equal(MarketRunCraftExport.DefaultJobName, document.RootElement.GetProperty("name").GetString());
     }
 
     private static ListingPlan Plan(IReadOnlyList<ListingPlanAssignment> assignments, IReadOnlyList<ListingReserveRule>? reserves = null) => new()
