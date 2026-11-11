@@ -68,7 +68,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
                 var label = Label(item.ItemName, item.Quality);
                 var open = ImGui.TreeNodeEx(label + "###item", ImGuiTreeNodeFlags.NoTreePushOnOpen | ImGuiTreeNodeFlags.SpanAvailWidth);
                 if (ImGui.IsItemHovered()) ImGui.SetTooltip(label);
-                if (listed) { ImGui.TableNextColumn(); ImGui.TextUnformatted($"{MarketRunPresentation.Number(item.ListedUnits)} / {item.PlannedUnits:N0}"); }
+                if (listed) { ImGui.TableNextColumn(); ImGui.TextUnformatted($"{MarketRunPresentation.InPlace(run, item)} / {item.PlannedUnits:N0}"); }
                 if (full) { ImGui.TableNextColumn(); ImGui.TextUnformatted(MarketRunPresentation.Number(item.SpareUnits)); }
                 ImGui.TableNextColumn();
                 var reserve = draft.Reserves.FirstOrDefault(r => r.ItemId == item.ItemId && r.Quality == item.Quality);
@@ -86,20 +86,26 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
                     ImGui.TableNextRow(); ImGui.TableSetColumnIndex(0);
                     // Span columns without escaping the run pane's scrolling clip rectangle.
                     ImGui.PushClipRect(paneClipMin, paneClipMax, false);
-                    if (ImGui.BeginChild("detail", new Vector2(width - 8, ImGui.GetFrameHeightWithSpacing() * (reserve is null ? 2 : 6)), false))
+                    if (ImGui.BeginChild("detail", new Vector2(width - 8, ImGui.GetFrameHeightWithSpacing() * (reserve is null ? 2 : 4) + (listed ? 0 : ImGui.GetTextLineHeightWithSpacing()) + (full ? 0 : ImGui.GetTextLineHeightWithSpacing())), false))
                     {
-                        if (!listed) ImGui.TextUnformatted($"Listed {MarketRunPresentation.Number(item.ListedUnits)} / {item.PlannedUnits:N0}");
+                        if (!listed) ImGui.TextUnformatted($"Listed {MarketRunPresentation.InPlace(run, item)} / {item.PlannedUnits:N0}");
                         if (!full) ImGui.TextUnformatted($"Spare {MarketRunPresentation.Number(item.SpareUnits)} · After run {MarketRunPresentation.Number(item.ReserveAfterRun)}");
-                        if (reserve is not null)
+                        // The location is editable before a level is typed; changing it creates the rule.
+                        var current = reserve?.Location ?? new StowageRoutingPolicy();
+                        var location = ListingPlanCatalog.CopyLocation(current);
+                        RoutingPolicyEditor.DrawDestination(location, runtime);
+                        RoutingPolicyEditor.DrawOverflow(location);
+                        if (location.Mode != current.Mode || location.Overflow != current.Overflow ||
+                            !location.PreferredRetainerIds.SequenceEqual(current.PreferredRetainerIds))
                         {
-                            var location = ListingPlanCatalog.CopyLocation(reserve.Location);
+                            reserve ??= session.AddReserve(item.ItemId, item.ItemName, item.Quality);
+                            session.SetReserveLocation(reserve.Id, location);
+                        }
+                        else if (reserve is not null)
+                        {
                             var enabled = reserve.Enabled;
                             if (ImGui.Checkbox("Reserve enabled", ref enabled)) session.SetReserveEnabled(reserve.Id, enabled);
-                            RoutingPolicyEditor.DrawDestination(location, runtime);
-                            RoutingPolicyEditor.DrawOverflow(location);
-                            if (location.Mode != reserve.Location.Mode || location.Overflow != reserve.Location.Overflow ||
-                                !location.PreferredRetainerIds.SequenceEqual(reserve.Location.PreferredRetainerIds))
-                                session.SetReserveLocation(reserve.Id, location);
+                            ImGui.SameLine();
                             if (ImGui.SmallButton("Remove reserve rule")) session.RemoveReserve(reserve.Id);
                         }
                     }

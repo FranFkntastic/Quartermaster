@@ -22,6 +22,18 @@ internal static class MarketRunPresentation
     };
 
     internal static string Number(FieldEvidence<int> value) => value.IsKnown ? value.Value.ToString("N0") : "—";
+    // Units already listed where the plan wants them; listings on other retainers do not count.
+    internal static string InPlace(MarketRunEvaluation run, MarketRunItem item)
+    {
+        long units = 0;
+        foreach (var row in run.Retainers.SelectMany(r => r.Assignments)
+                     .Where(a => a.Assignment.ItemId == item.ItemId && a.Assignment.Quality == item.Quality))
+        {
+            if (!row.ShortListings.IsKnown) return "—";
+            units += (long)(row.PlannedListings - row.ShortListings.Value) * Math.Max(0, row.Assignment.QuantityPerListing);
+        }
+        return units.ToString("N0");
+    }
     internal static string Header(MarketRunEvaluation run)
     {
         if (!run.IsComplete)
