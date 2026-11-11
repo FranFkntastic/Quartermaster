@@ -181,7 +181,22 @@ public sealed class ListingPlan
     public long Revision { get; set; } = 1;
     public OwnerScope Owner { get; set; } = new();
     public List<ListingPlanAssignment> Assignments { get; set; } = [];
+    public List<ListingReserveRule> Reserves { get; set; } = [];
     public DateTime UpdatedAtUtc { get; set; }
+}
+
+/// <summary>Spare stock of one exact-quality item the market run keeps on hand beyond its listings.</summary>
+public sealed class ListingReserveRule
+{
+    public const int MaxReserveUnits = 999_999;
+
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public uint ItemId { get; set; }
+    public string ItemName { get; set; } = string.Empty;
+    public ItemQualityPolicy Quality { get; set; } = ItemQualityPolicy.NqOnly;
+    public int ReserveUnits { get; set; }
+    public StowageRoutingPolicy Location { get; set; } = new();
+    public bool Enabled { get; set; } = true;
 }
 
 public sealed class ListingPlanAssignment
