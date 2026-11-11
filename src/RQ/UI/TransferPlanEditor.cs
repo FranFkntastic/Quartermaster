@@ -234,10 +234,10 @@ internal sealed class TransferPlanEditor
                 if (session.Save(runtime.Owner))
                 {
                     workbench.SelectedStowagePlanId = session.Draft!.PlanId;
+                    Close();
+                    ImGui.CloseCurrentPopup();
                 }
-                else { stowageEditorError = session.Error ?? string.Empty; ImGui.EndDisabled(); ImGui.EndPopup(); return; }
-                Close();
-                ImGui.CloseCurrentPopup();
+                else stowageEditorError = session.Error ?? string.Empty;
             }
             catch (InvalidOperationException exception)
             {
