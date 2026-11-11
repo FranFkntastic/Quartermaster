@@ -36,6 +36,8 @@ internal sealed class TransferPlanWorkspace
     private TransferWorkbenchProjection? transferWorkbenchProjection;
     private int transferProjectionBuildCount;
     private string vendorStatus = string.Empty;
+    private bool renameRequested;
+    private object? dismissedVendorRun;
 
     public TransferPlanWorkspace(
         StateRepository state,
@@ -126,12 +128,22 @@ internal sealed class TransferPlanWorkspace
         {
             if (selected is null)
                 ImGui.BeginDisabled();
-            if (ImGui.Selectable("Rename or edit details") && selected is not null)
-                transferPlanEditor.Open(selected.Id, owner);
+            if (ImGui.Selectable("Rename")) renameRequested = true;
             if (ImGui.Selectable("Delete plan") && selected is not null)
                 requestDeletePlan(selected, owner);
             if (selected is null)
                 ImGui.EndDisabled();
+            ImGui.EndPopup();
+        }
+        if (renameRequested) { ImGui.OpenPopup("Rename plan"); renameRequested = false; }
+        if (ImGui.BeginPopup("Rename plan"))
+        {
+            if (transferPlanEditor.Draft is { } draft)
+            {
+                var name = draft.Name;
+                if (ImGui.InputText("Name", ref name, 80)) draft.Name = name;
+                if (ImGui.Button("Done")) ImGui.CloseCurrentPopup();
+            }
             ImGui.EndPopup();
         }
 
@@ -199,9 +211,7 @@ internal sealed class TransferPlanWorkspace
             recovery.PlanId == selected.Id &&
             recovery.PlanRevision == selected.Revision;
 
-        ImGui.TextDisabled(projection.HasUnknownListingDemand
-            ? "Saved plan · listing demand needs verification"
-            : $"Saved plan · retrieve {retrieval.NeededQuantity:N0} · stow {surplusBatch.RequestedQuantity:N0}");
+        transferPlanEditor.Draw(runtime, projection, () => {
         var shortfall = Math.Max(0, retrieval.MissingQuantity - vendor.ApprovedQuantity);
         if (!projection.HasUnknownListingDemand && (shortfall > 0 || surplusBatch.RemainingQuantity > 0))
             ImGui.TextWrapped($"Saved plan constraints: {shortfall:N0} short · no room for {surplusBatch.RemainingQuantity:N0}");
@@ -252,16 +262,21 @@ internal sealed class TransferPlanWorkspace
                     : string.Empty;
         DrawTransferPlanNotice(selected, hasCurrentRecovery, planProgress, planNotice);
         DrawVendorRunStatus();
-        transferPlanEditor.Draw(runtime);
+        });
     }
 
     private void DrawVendorRunStatus()
     {
         var run = vendorProcurement.ActiveRun;
-        if (run is null)
+        if (run is null || ReferenceEquals(run, dismissedVendorRun))
             return;
 
         ImGui.TextUnformatted($"Vendor buy · {run.Phase}");
+        if (!vendorProcurement.IsRunning && run.Phase != GilVendorBuyPhase.Paused)
+        {
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Dismiss##vendor-result")) dismissedVendorRun = run;
+        }
         if (run.Receipts.Count > 0)
         {
             ImGui.SameLine();
@@ -299,9 +314,9 @@ internal sealed class TransferPlanWorkspace
             ImGui.PopStyleColor();
         }
         if (!string.IsNullOrWhiteSpace(vendorStatus))
-            DrawWrappedStatus(vendorStatus, new Vector4(1f, .4f, .4f, 1f));
+            DrawWrappedStatus(vendorStatus, ListingWorkspace.Color(ListingStateTone.Info));
         if (!string.IsNullOrWhiteSpace(vendorProcurement.CoordinationWarning))
-            DrawWrappedStatus(vendorProcurement.CoordinationWarning, new Vector4(1f, .4f, .4f, 1f));
+            DrawWrappedStatus(vendorProcurement.CoordinationWarning, ListingWorkspace.Color(ListingStateTone.Info));
     }
 
     private static void DrawWrappedStatus(string message, Vector4 color)
@@ -333,10 +348,10 @@ internal sealed class TransferPlanWorkspace
                 : notice;
         var accent = isProgress
             ? new Vector4(.52f, .79f, .94f, 1f)
-            : new Vector4(1f, .4f, .4f, 1f);
+            : ListingWorkspace.Color(ListingStateTone.Info);
         var background = isProgress
             ? new Vector4(.06f, .13f, .17f, .92f)
-            : new Vector4(.16f, .07f, .08f, .92f);
+            : new Vector4(.07f, .11f, .16f, .92f);
 
         var flags = ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.BordersInnerV;
         if (!ImGui.BeginTable("RQTransferPlanNotice", 2, flags))
