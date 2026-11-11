@@ -110,6 +110,21 @@ public sealed class MarketRunTests
     }
 
     [Fact]
+    public void Capacity_PulledUnitsCountTowardThatItemsStockAfterTheRun()
+    {
+        var observed = Enumerable.Range(0, 19).Select(i => Listing(1, "Hull", 10, "Alpha", 1, 100))
+            .Append(Listing(3, "Prow", 10, "Alpha", 5, 1)).ToArray();
+        var plan = Plan([Assignment(1, "Hull", 10, "Alpha", 19, 1, 100), Assignment(2, "Bow", 10, "Alpha", 1, 1, 100)],
+            [Reserve(3, "Prow", 7)]);
+        var run = MarketRunPlanner.Evaluate(plan, Projection(observed, [Player(2, "Bow", 1)]));
+        Assert.Single(Assert.Single(run.Retainers).ListingsToPull);
+        var prow = run.Find(3, ItemQualityPolicy.NqOnly)!;
+        Assert.Equal(5, prow.ReserveAfterRun.Value);
+        Assert.Equal(2, prow.CraftUnits.Value);
+        Assert.Equal(2, Assert.Single(run.CraftQueue).Quantity);
+    }
+
+    [Fact]
     public void Capacity_FullOfPlannedListings_BlocksTheRefillAndPullsNothing()
     {
         var observed = Enumerable.Range(0, 20).Select(i => Listing(1, "Hull", 10, "Alpha", 1, 100)).ToArray();

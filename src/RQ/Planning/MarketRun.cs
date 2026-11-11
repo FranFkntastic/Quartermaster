@@ -176,6 +176,17 @@ public static class MarketRunPlanner
             refills[assignment.Id] = (Evidence.Known(refill), Evidence.Known(shortListings - stockBacked),
                 Evidence.Known(stockBacked - refill));
         }
+        // Pulls are settled before item totals: a pulled listing lands in the player's inventory,
+        // so its units count toward that item's stock after the run.
+        var pullsByRetainer = assignments.GroupBy(assignment => assignment.RetainerId).ToDictionary(group => group.Key, group =>
+        {
+            var refillTotal = Sum(group.Select(assignment => refills[assignment.Id].Refill));
+            var blockedTotal = Sum(group.Select(assignment => refills[assignment.Id].Blocked));
+            return ListingsComplete(projection, group.Key) && refillTotal.IsKnown && blockedTotal.IsKnown
+                ? SelectListingsToPull(projection.Listings.Where(l => l.RetainerId == group.Key).ToArray(), group.ToArray(),
+                    refillTotal.Value + blockedTotal.Value)
+                : [];
+        });
         var items = new List<MarketRunItem>();
         foreach (var key in keys)
         {
@@ -198,7 +209,11 @@ public static class MarketRunPlanner
             var unknownReason = uncertainStock.GetValueOrDefault(key) ?? unobserved;
             var reserve = reserves.GetValueOrDefault(key);
             var reserveUnits = reserve?.ReserveUnits ?? 0;
-            var reserveAfterRun = known ? Evidence.Known(spare.Value - refillUnits) : Evidence.Unknown<int>(unknownReason);
+            var pulledQuality = key.Quality == ItemQualityPolicy.HqOnly ? FfxivItemQuality.HQ : FfxivItemQuality.NQ;
+            var pulledUnits = pullsByRetainer.Values.SelectMany(pulls => pulls)
+                .Where(pull => pull.Listing.ItemId == key.ItemId && pull.Listing.Quality == pulledQuality)
+                .Sum(pull => pull.Listing.Quantity);
+            var reserveAfterRun = known ? Evidence.Known(spare.Value - refillUnits + pulledUnits) : Evidence.Unknown<int>(unknownReason);
             var listingItem = listingEvaluation.Find(key.ItemId, key.Quality);
             items.Add(new(
                 key.ItemId,
@@ -213,7 +228,7 @@ public static class MarketRunPlanner
                 reserveUnits,
                 reserveAfterRun,
                 known
-                    ? Evidence.Known(unfilledUnits + Math.Max(0, reserveUnits - reserveAfterRun.Value))
+                    ? Evidence.Known(Math.Max(0, unfilledUnits + Math.Max(0, reserveUnits - (spare.Value - refillUnits)) - pulledUnits))
                     : Evidence.Unknown<int>(unknownReason)));
         }
 
@@ -234,8 +249,7 @@ public static class MarketRunPlanner
                 var observed = projection.Listings.Where(l => l.RetainerId == group.Key).ToArray();
                 var refillTotal = Sum(rows.Select(row => row.RefillListings));
                 var blockedTotal = Sum(rows.Select(row => row.BlockedBySlotsListings));
-                var pulls = complete && refillTotal.IsKnown && blockedTotal.IsKnown
-                    ? SelectListingsToPull(observed, group.ToArray(), refillTotal.Value + blockedTotal.Value) : [];
+                var pulls = pullsByRetainer[group.Key];
                 var unknown = Evidence.Unknown<int>($"Listings for {name} have not been observed.");
                 return new MarketRunRetainer(
                     group.Key,
