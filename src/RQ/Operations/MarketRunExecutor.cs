@@ -229,23 +229,28 @@ public sealed class MarketRunExecutor(
                         // A best-effort final scan is also required for an indeterminate mutation.
                         try
                         {
-                            if (opened && !driverUnsettled && !MarketRunDeadline.HasUnsettled)
+                            if (opened && CanCleanUp(record))
                             {
                                 var final = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
-                                var matches = ListingPlanEvaluator.MatchListings(assignments, Rows(id, retainer.Key.RetainerName, final));
-                                foreach (var a in assignments)
+                                if (CanCleanUp(record))
                                 {
-                                    var present = matches.Count(m => m.AssignmentId == a.Id && m.Kind is ListingMatchKind.Exact or ListingMatchKind.PriceDiffers or ListingMatchKind.UnknownPrice);
-                                    record.StillShort += Math.Max(0, a.ListingCount - present);
+                                    var matches = ListingPlanEvaluator.MatchListings(assignments, Rows(id, retainer.Key.RetainerName, final));
+                                    foreach (var a in assignments)
+                                    {
+                                        var present = matches.Count(m => m.AssignmentId == a.Id && m.Kind is ListingMatchKind.Exact or ListingMatchKind.PriceDiffers or ListingMatchKind.UnknownPrice);
+                                        record.StillShort += Math.Max(0, a.ListingCount - present);
+                                    }
+                                    scannedRetainers.Add(id);
                                 }
-                                scannedRetainers.Add(id);
                             }
                         }
                         catch (Exception e)
                         {
                             Add(record, $"{retainer.Key.RetainerName}: final scan unavailable ({e.Message})");
                         }
-                        if (!driverUnsettled && !MarketRunDeadline.HasUnsettled)
+                        // Recheck after the final scan: unload or character change can
+                        // happen while that read is in flight, too.
+                        if (CanCleanUp(record))
                             await Step(driver.ReturnAsync).ConfigureAwait(false);
                     }
                     Check(record);
@@ -263,8 +268,7 @@ public sealed class MarketRunExecutor(
                 try
                 {
                     // Never overlap an abandoned call, touch a new character, or use an unloaded session.
-                    if (sessionStarted && !disposed && !driverUnsettled && !MarketRunDeadline.HasUnsettled &&
-                        currentPlan()?.Owner.Matches(record.Owner) == true)
+                    if (sessionStarted && CanCleanUp(record))
                     {
                         try { await Step(driver.CloseListAsync).ConfigureAwait(false); }
                         catch (Exception e) { Add(record, $"Could not close retainer list: {e.Message}"); }
@@ -449,6 +453,10 @@ public sealed class MarketRunExecutor(
     }
 
     private Task<bool> Step(Func<CancellationToken, Task> action) => deadline.RunAsync(async t => { await action(t).ConfigureAwait(false); return true; });
+    private bool CanCleanUp(MarketRunRecord record) => !Volatile.Read(ref disposed) &&
+        !driverUnsettled && !MarketRunDeadline.HasUnsettled &&
+        runLease is not null && automation.Owns(runLease) &&
+        currentPlan() is { Owner.HasStableIdentity: true } plan && plan.Owner.Matches(record.Owner);
     private void Check(MarketRunRecord record)
     {
         if (Volatile.Read(ref cancelled) != 0 || Volatile.Read(ref disposed)) throw new OperationCanceledException();

@@ -213,6 +213,41 @@ public sealed class MarketRunExecutorTests
         await executor.RunAsync(plan, Evaluation(plan));
         Assert.Empty(fake.Posts);
         Assert.Equal(0, fake.Closes);
+        Assert.Equal(0, fake.Returns);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task AuthorityLostWhilePostPending_NoNewReadsOrCleanupAfterSettlement(bool unload)
+    {
+        var plan = Plan(); var current = plan; var fake = new Driver();
+        var pending = new TaskCompletionSource<MarketMutationOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        fake.PendingPost = pending.Task;
+        var executor = new MarketRunExecutor(fake, new(), () => current, _ => { });
+        var run = executor.RunAsync(plan, Evaluation(plan));
+        Assert.Single(fake.Posts);
+        var scansAtPost = fake.ListingScans;
+        if (unload) executor.CancelAndWait(TimeSpan.Zero);
+        else current = new ListingPlan { Owner = plan.Owner with { LocalContentId = 999 } };
+        pending.SetResult(MarketMutationOutcome.Committed);
+        await run;
+        Assert.Equal(scansAtPost, fake.ListingScans);
+        Assert.Equal(0, fake.Returns);
+        Assert.Equal(0, fake.Closes);
+        Assert.False(executor.Result!.ListingSummaryComplete);
+    }
+
+    [Fact]
+    public async Task OwnerChangesDuringFinalScan_NoReturnOrVerifiedSummary()
+    {
+        var plan = Plan(); var current = plan; var fake = new Driver();
+        fake.OnPost = () => fake.OnListings = () => current = new ListingPlan { Owner = plan.Owner with { LocalContentId = 999 } };
+        var executor = new MarketRunExecutor(fake, new(), () => current, _ => { });
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Equal(0, fake.Returns);
+        Assert.Equal(0, fake.Closes);
+        Assert.False(executor.Result!.ListingSummaryComplete);
     }
 
     [Fact]
@@ -652,6 +687,8 @@ public sealed class MarketRunExecutorTests
         public List<ulong> Posts = [];
         public List<ulong> Visited = [];
         public int Returns;
+        public int ListingScans;
+        public Action? OnListings;
         public int Closes;
         public Action? OnClose;
         public Task? PendingClose;
@@ -667,9 +704,14 @@ public sealed class MarketRunExecutorTests
         public string ItemName(uint id) => id == 1 ? "Hull" : "Bow";
         public Task RequireRetainerListAsync(CancellationToken t) => Task.CompletedTask;
         public Task OpenAsync(ulong id, string name, CancellationToken t) { active = id; Visited.Add(id); return Task.CompletedTask; }
-        public Task<IReadOnlyList<RetainerMarketListingTarget>> ListingsAsync(CancellationToken t) => Live[active].Any(l => l.UnitPrice is null or 0 or > 999999999)
+        public Task<IReadOnlyList<RetainerMarketListingTarget>> ListingsAsync(CancellationToken t)
+        {
+            ListingScans++;
+            OnListings?.Invoke();
+            return Live[active].Any(l => l.UnitPrice is null or 0 or > 999999999)
             ? Task.FromException<IReadOnlyList<RetainerMarketListingTarget>>(new InvalidOperationException("Invalid market price"))
             : Task.FromResult<IReadOnlyList<RetainerMarketListingTarget>>(Live[active].ToArray());
+        }
         public Task<MarketPlayerInventory> PlayerAsync(CancellationToken t) { OnPlayer?.Invoke(); return Task.FromResult(new MarketPlayerInventory(Stock.ToArray(), FreeSlots)); }
         public Task<MarketMutationOutcome> RepriceAsync(RetainerMarketListingTarget listing, uint price, CancellationToken t)
         { OnReprice?.Invoke(); if (ThrowReprice) throw new RetainerMarketMutationIndeterminateException("Unknown", "After send", null, new OperationCanceledException(), t);
