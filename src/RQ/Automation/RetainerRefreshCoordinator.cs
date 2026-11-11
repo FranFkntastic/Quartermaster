@@ -72,7 +72,8 @@ public sealed class RetainerRefreshCoordinator : IDisposable
     public bool CanStart => !disposed && phase == RetainerRefreshPhase.Idle && !automation.IsHeld;
     public bool CanCancel => phase is RetainerRefreshPhase.Preparing or RetainerRefreshPhase.Refreshing;
     public bool HasRecovery => state.Read(document => document.RetainerRefreshRecovery is not null);
-    public string Status { get; private set; } = "Retainer refresh has not run.";
+    public const string NotRunStatus = "Retainer refresh has not run.";
+    public string Status { get; private set; } = NotRunStatus;
     public IReadOnlyList<RetainerRefreshItemResult> Results { get; private set; } = [];
     public string? LastCompletedRunId { get; private set; }
     public bool? LastRunSucceeded { get; private set; }

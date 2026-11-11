@@ -419,7 +419,7 @@ internal sealed class StockWorkspace
             retainerRefresh.Results.Any(result => result.Outcome == "NotAccessible"))
         {
             ImGui.SameLine();
-            ImGui.TextDisabled(retainerRefresh.HasRecovery && !retainerRefresh.IsRefreshing && retainerRefresh.Results.Count == 0
+            ImGui.TextDisabled(retainerRefresh.HasRecovery && retainerRefresh.Status == RetainerRefreshCoordinator.NotRunStatus
                 ? "Last refresh was interrupted."
                 : retainerRefresh.Status);
             if (ImGui.IsItemHovered() && retainerRefresh.Results.Count != 0)
