@@ -108,14 +108,14 @@ internal sealed class StockWorkspace
             Draw: row => { ImGui.TextUnformatted(string.Join("; ", row.Item.Stacks.GroupBy(s => s.OwnerName).Select(g => $"{g.Key}: {g.Sum(s => s.Quantity):N0}"))); if (ImGui.IsItemHovered()) ImGui.SetTooltip(string.Join("\n", row.Item.Stacks.GroupBy(s => s.OwnerName).Select(g => $"{g.Key}: {g.Sum(s => s.Quantity):N0}"))); }),
         new(
             "Player",
-            52,
+            64,
             row => row.Item.PlayerQuantity.ToString("N0"),
             row => row.Item.PlayerQuantity,
             DrawContextMenu: DrawStockRowContextMenu,
             Id: "player"),
         new(
             "Retainers",
-            60,
+            82,
             row => row.AccessibleRetainerQuantity.ToString("N0"),
             row => row.AccessibleRetainerQuantity,
             DrawContextMenu: DrawStockRowContextMenu,
@@ -419,7 +419,9 @@ internal sealed class StockWorkspace
             retainerRefresh.Results.Any(result => result.Outcome == "NotAccessible"))
         {
             ImGui.SameLine();
-            ImGui.TextDisabled(retainerRefresh.Status);
+            ImGui.TextDisabled(retainerRefresh.HasRecovery && !retainerRefresh.IsRefreshing && retainerRefresh.Results.Count == 0
+                ? "Last refresh was interrupted."
+                : retainerRefresh.Status);
             if (ImGui.IsItemHovered() && retainerRefresh.Results.Count != 0)
             {
                 ImGui.BeginTooltip();
@@ -443,7 +445,6 @@ internal sealed class StockWorkspace
                 .ToArray();
         }
 
-        ImGui.TextUnformatted($"{selected.Length:N0} selected");
         var canPlan = selected.Length > 0 && runtime.Owner.HasStableIdentity;
         if (!canPlan)
             ImGui.BeginDisabled();
@@ -469,7 +470,7 @@ internal sealed class StockWorkspace
             },
             $"{selected.Length:N0} selected");
 
-        ImGui.SameLine();
+        UiLayout.SameLineIfFits("Add to item group");
         if (selected.Length == 0)
             ImGui.BeginDisabled();
         if (ImGui.Button("Add to item group"))
@@ -482,6 +483,7 @@ internal sealed class StockWorkspace
 
         var carried = selected.Where(item => item.PlayerQuantity > 0).ToArray();
         var canStow = carried.Length > 0 && runtime.Owner.HasStableIdentity;
+        UiLayout.SameLineIfFits("Stow carried");
         if (!canStow)
             ImGui.BeginDisabled();
         if (ImGui.Button("Stow carried")) stowRequested = true;
@@ -496,7 +498,7 @@ internal sealed class StockWorkspace
             ImGui.EndPopup();
         }
 
-        ImGui.SameLine();
+        UiLayout.SameLineIfFits("Clear");
         if (selected.Length == 0)
             ImGui.BeginDisabled();
         if (ImGui.Button("Clear"))
@@ -506,6 +508,13 @@ internal sealed class StockWorkspace
         }
         if (selected.Length == 0)
             ImGui.EndDisabled();
+        if (selected.Length > 0)
+        {
+            var count = $"{selected.Length:N0} selected";
+            UiLayout.SameLineIfFits(count);
+            ImGui.AlignTextToFramePadding();
+            ImGui.TextDisabled(count);
+        }
 
         if (selected.Length == 1)
         {
