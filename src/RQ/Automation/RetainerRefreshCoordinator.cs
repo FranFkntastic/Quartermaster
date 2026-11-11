@@ -69,7 +69,7 @@ public sealed class RetainerRefreshCoordinator : IDisposable
     public bool IsRefreshing => phase is RetainerRefreshPhase.Preparing or RetainerRefreshPhase.Refreshing;
     public bool IsQueued => false;
     public bool IsAvailable => !disposed;
-    public bool CanStart => !disposed && phase == RetainerRefreshPhase.Idle && !automation.IsHeld;
+    public bool CanStart => !disposed && phase == RetainerRefreshPhase.Idle && automation.CanAcquire;
     public bool CanCancel => phase is RetainerRefreshPhase.Preparing or RetainerRefreshPhase.Refreshing;
     public bool HasRecovery => state.Read(document => document.RetainerRefreshRecovery is not null);
     public const string NotRunStatus = "Retainer refresh has not run.";
@@ -151,7 +151,7 @@ public sealed class RetainerRefreshCoordinator : IDisposable
         if (!CanStart)
         {
             Status = phase == RetainerRefreshPhase.Idle
-                ? $"Automation is busy with {automation.Holder}."
+                ? automation.AcquisitionBlockReason ?? "Automation is unavailable."
                 : "Retainer refresh is already running.";
             return false;
         }
@@ -163,7 +163,7 @@ public sealed class RetainerRefreshCoordinator : IDisposable
         }
         if (!automation.TryAcquire("retainer refresh", out automationLease))
         {
-            Status = $"Automation is busy with {automation.Holder}.";
+            Status = automation.AcquisitionBlockReason ?? "Automation is unavailable.";
             return false;
         }
 

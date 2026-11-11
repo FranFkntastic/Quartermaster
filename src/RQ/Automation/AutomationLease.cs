@@ -7,6 +7,15 @@ public sealed class AutomationLease(Func<string?>? refusalReason = null)
 
     public string? Holder { get; private set; }
     public string? RefusalReason => refusalReason?.Invoke();
+    public string? AcquisitionBlockReason
+    {
+        get
+        {
+            lock (gate)
+                return Holder is { } holder ? $"Automation is busy with {holder}." : RefusalReason;
+        }
+    }
+    public bool CanAcquire => AcquisitionBlockReason is null;
 
     public bool IsHeld
     {
@@ -22,7 +31,7 @@ public sealed class AutomationLease(Func<string?>? refusalReason = null)
         ArgumentException.ThrowIfNullOrWhiteSpace(holder);
         lock (gate)
         {
-            if (Holder is not null || RefusalReason is not null)
+            if (!CanAcquire)
             {
                 lease = null;
                 return false;

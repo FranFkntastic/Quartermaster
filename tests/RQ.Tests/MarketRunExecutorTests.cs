@@ -386,6 +386,60 @@ public sealed class MarketRunExecutorTests
         accepted!.Dispose();
     }
 
+    [Fact]
+    public async Task UnresolvedReceipt_QueueWaitsWithoutSuppressionAndResumesAfterClear()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var journal = new OperationJournal(repository);
+        var operation = journal.CreateManual(TestData.Owner, [new() { ItemId = 1, ItemName = "Hull", TargetQuantity = 2 }]);
+        repository.Mutate(StateChangeKind.Operations, state =>
+        {
+            state.Operations.Single(o => o.OperationId == operation.OperationId).ExecuteImmediately = true;
+        });
+        MarketRunExecutor? market = null;
+        var automation = new AutomationLease(() => market?.Result?.RequiresAcknowledgement == true ? "Unresolved market run" : null);
+        market = new(new Driver(), automation, () => Plan(), _ => { });
+        market.Restore(new() { State = "Interrupted" });
+        var session = DispatchProxy.Create<IRetainerAutomationSession, SessionProxy>();
+        ((SessionProxy)(object)session).Handler = (_, _) => throw new InvalidOperationException("No game calls expected");
+        using var cache = new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory.Path, "cache.json")));
+        var ipc = new AutoRetainer(); var suppression = new AutoRetainerSuppression(ipc);
+        var transfers = new TransferCoordinator(journal, new RetainerLiveDriver(session), cache, () => TestData.Owner,
+            () => new Dictionary<uint, int> { [1] = 2 }, automation, autoRetainerSuppression: suppression);
+        using var queue = new AutomaticRetrievalQueue(journal, transfers, () => TestData.Owner, suppression);
+        Assert.False(automation.CanAcquire); Assert.False(transfers.CanStart);
+        for (var i = 0; i < 20; i++) queue.Tick();
+        var refused = await transfers.ExecuteRetrievalAsync(operation.OperationId);
+        Assert.False(refused.Started);
+        Assert.Equal("Unresolved market run", refused.Message);
+        Assert.Empty(ipc.SuppressionChanges);
+        Assert.Equal(OperationStatuses.Accepted, journal.Get(operation.OperationId)!.Status);
+        Assert.Null(queue.ActiveOperationId);
+        market.Clear();
+        Assert.True(automation.CanAcquire); Assert.True(transfers.CanStart);
+        queue.Tick(); queue.Tick();
+        Assert.Equal(OperationStatuses.Succeeded, journal.Get(operation.OperationId)!.Status);
+        Assert.Equal([true, false], ipc.SuppressionChanges);
+    }
+
+    [Fact]
+    public async Task RetainerRename_OnePassProtectsAllAssignmentsForStableId()
+    {
+        var plan = Plan();
+        plan.Assignments.Add(new() { ItemId = 2, ItemName = "Bow", RetainerId = 10, RetainerName = "Old name",
+            ListingCount = 19, QuantityPerListing = 1, UnitPrice = 50 });
+        var fake = new Driver();
+        fake.Live[10] = [.. Enumerable.Range(0, 19).Select(i => new RetainerMarketListingTarget(i, 2, 1, false, 50)), new(19, 3, 1, false, 60)];
+        var executor = Create(plan, fake);
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Equal([10ul], fake.Visited);
+        var pull = Assert.Single(executor.Result!.Mutations, m => m.Intent.Kind == "Pull");
+        Assert.Equal(3u, pull.Intent.Listing!.ItemId);
+        Assert.Equal(19, fake.Live[10].Count(l => l.ItemId == 2));
+        Assert.Equal(0, executor.Result.StillShort);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -743,7 +797,8 @@ public sealed class MarketRunExecutorTests
         public bool IsAvailable => true;
         public bool IsBusy { get; set; }
         public bool IsSuppressed { get; private set; }
-        public void SetSuppressed(bool value) => IsSuppressed = value;
+        public List<bool> SuppressionChanges { get; } = [];
+        public void SetSuppressed(bool value) { IsSuppressed = value; SuppressionChanges.Add(value); }
         public void Register(AutoRetainerIpcCallbacks callbacks) { }
         public void QueueRetainerListTask(string consumer) { }
         public void RequestPostprocess(string consumer) { }

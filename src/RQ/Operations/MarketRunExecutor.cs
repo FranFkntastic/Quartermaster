@@ -129,7 +129,7 @@ public sealed class MarketRunExecutor(
     public bool IsRunning => Volatile.Read(ref running) != 0;
     private bool disposed;
     public Task? ActiveTask { get; private set; }
-    public bool CanStart => !disposed && !IsRunning && !automation.IsHeld && Result?.RequiresAcknowledgement != true;
+    public bool CanStart => !disposed && !IsRunning && automation.CanAcquire && Result?.RequiresAcknowledgement != true;
     public void Clear()
     {
         lock (persistenceGate)
@@ -205,25 +205,26 @@ public sealed class MarketRunExecutor(
                 record.GatherBlockedUnits += driver.GatherInventoryBlockedUnits;
                 Check(record);
                 await routeDeadline.RunAsync(async t => { await driver.RequireRetainerListAsync(t).ConfigureAwait(false); return true; }).ConfigureAwait(false);
-                foreach (var retainer in record.Assignments.GroupBy(a => (a.RetainerId, a.RetainerName))
-                    .OrderBy(g => g.Key.RetainerName, StringComparer.OrdinalIgnoreCase).ThenBy(g => g.Key.RetainerId))
+                foreach (var retainer in record.Assignments.GroupBy(a => a.RetainerId)
+                    .Select(g => new { Id = g.Key, Name = g.Select(a => a.RetainerName).FirstOrDefault(n => !string.IsNullOrWhiteSpace(n)) ?? $"Retainer {g.Key}", Assignments = g.ToArray() })
+                    .OrderBy(g => g.Name, StringComparer.OrdinalIgnoreCase).ThenBy(g => g.Id))
                 {
                     Check(record);
-                    Status = retainer.Key.RetainerName;
-                    var id = retainer.Key.RetainerId;
-                    var assignments = retainer.ToArray();
+                    Status = retainer.Name;
+                    var id = retainer.Id;
+                    var assignments = retainer.Assignments;
                     var opened = false;
                     try
                     {
-                        await Step(t => driver.OpenAsync(id, retainer.Key.RetainerName, t)).ConfigureAwait(false);
+                        await Step(t => driver.OpenAsync(id, retainer.Name, t)).ConfigureAwait(false);
                         opened = true;
-                        await ListRetainer(record, id, retainer.Key.RetainerName, assignments).ConfigureAwait(false);
+                        await ListRetainer(record, id, retainer.Name, assignments).ConfigureAwait(false);
                     }
                     catch (RetainerStoppedException) { }
                     catch (OperationCanceledException) { throw; }
                     catch (RunStoppedException) { throw; }
                     catch (Exception e) when (!persistenceFailed && !driverUnsettled && !MarketRunDeadline.HasUnsettled)
-                    { Add(record, $"{retainer.Key.RetainerName}: {e.Message}"); }
+                    { Add(record, $"{retainer.Name}: {e.Message}"); }
                     finally
                     {
                         // A best-effort final scan is also required for an indeterminate mutation.
@@ -234,7 +235,7 @@ public sealed class MarketRunExecutor(
                                 var final = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
                                 if (CanCleanUp(record))
                                 {
-                                    var matches = ListingPlanEvaluator.MatchListings(assignments, Rows(id, retainer.Key.RetainerName, final));
+                                    var matches = ListingPlanEvaluator.MatchListings(assignments, Rows(id, retainer.Name, final));
                                     foreach (var a in assignments)
                                     {
                                         var present = matches.Count(m => m.AssignmentId == a.Id && m.Kind is ListingMatchKind.Exact or ListingMatchKind.PriceDiffers or ListingMatchKind.UnknownPrice);
@@ -246,7 +247,7 @@ public sealed class MarketRunExecutor(
                         }
                         catch (Exception e)
                         {
-                            Add(record, $"{retainer.Key.RetainerName}: final scan unavailable ({e.Message})");
+                            Add(record, $"{retainer.Name}: final scan unavailable ({e.Message})");
                         }
                         // Recheck after the final scan: unload or character change can
                         // happen while that read is in flight, too.

@@ -246,7 +246,7 @@ public sealed class VendorAutomationOwnership
         }
         if (!automation.TryAcquire("vendor procurement", out var lease))
         {
-            error = $"Quartermaster automation is busy with {automation.Holder ?? "another operation"}.";
+            error = automation.AcquisitionBlockReason ?? "Quartermaster automation is unavailable.";
             return false;
         }
         try
