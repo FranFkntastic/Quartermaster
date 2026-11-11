@@ -99,7 +99,7 @@ internal sealed class TransferPlanWorkspace
             Id: "item"),
         new(
             "On player",
-            55,
+            82,
             row => row.PlayerQuantity.ToString("N0"),
             row => row.PlayerQuantity,
             Id: "player"),
@@ -343,7 +343,7 @@ internal sealed class TransferPlanWorkspace
             ImGui.EndDisabled();
 
         ImGui.SameLine();
-        if (ImGui.SmallButton("…##RQTransferPlanMenu"))
+        if (ImGui.Button("…##RQTransferPlanMenu"))
             ImGui.OpenPopup("RQTransferPlanMenu");
         if (ImGui.BeginPopup("RQTransferPlanMenu"))
         {
@@ -382,6 +382,7 @@ internal sealed class TransferPlanWorkspace
             retainerRefresh.IsRefreshing || retainerRefresh.IsQueued);
         var canExecute = availability.CanExecute;
 
+        UiLayout.SameLineIfFits("Execute plan");
         if (!canExecute)
             ImGui.BeginDisabled();
         if (ImGui.Button("Execute plan"))
@@ -412,8 +413,8 @@ internal sealed class TransferPlanWorkspace
 
         DrawScratchActions(runtime, selected);
         ImGui.Separator();
-        ImGui.TextWrapped($"{ownerRules.Count:N0} items · {movements:N0} movements");
-        ImGui.TextWrapped(projection.HasUnknownListingDemand ? "Verifying listing demand..." : $"Retrieve {retrieval.NeededQuantity:N0} · Stow {surplusBatch.RequestedQuantity:N0}");
+        ImGui.TextWrapped($"{ownerRules.Count:N0} items · {movements:N0} movements · " +
+            (projection.HasUnknownListingDemand ? "Verifying listing demand..." : $"Retrieve {retrieval.NeededQuantity:N0} · Stow {surplusBatch.RequestedQuantity:N0}"));
         var remainingShort = Math.Max(0, retrieval.MissingQuantity - vendor.ApprovedQuantity);
         if (!projection.HasUnknownListingDemand && (remainingShort > 0 || surplusBatch.RemainingQuantity > 0))
             ImGui.TextWrapped($"{remainingShort:N0} short · No room for {surplusBatch.RemainingQuantity:N0}");
@@ -499,10 +500,11 @@ internal sealed class TransferPlanWorkspace
     private void DrawScratchActions(QuartermasterRuntimeSnapshot runtime, StowagePlan plan)
     {
         if (!plan.IsEphemeral) return;
+        UiLayout.SameLineIfFits("Save as plan...");
         void RequestSave() { scratchName = string.Empty; saveScratchRequested = true; }
         if (ImGui.Button("Save as plan...")) RequestSave();
         reviewRegistry.RegisterLastButton("quartermaster.transfer.scratch.save-as", "Name the unsaved plan", true, RequestSave, "Available");
-        ImGui.SameLine();
+        UiLayout.SameLineIfFits("Clear plan");
         void Clear() => state.Mutate(s => { var d = StowagePlanCatalog.Draft(s, runtime.Owner, plan.Id); d.Rules.Clear(); StowagePlanCatalog.Apply(s, runtime.Owner, d); });
         if (ImGui.Button("Clear plan")) Clear();
         reviewRegistry.RegisterLastButton("quartermaster.transfer.scratch.clear", "Clear the unsaved plan", true, Clear, "Available");
