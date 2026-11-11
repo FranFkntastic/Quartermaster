@@ -39,6 +39,10 @@ internal sealed class ListingWorkspace
     private (string Query, ulong Retainer, long Revision) choicesKey = ("\0", 0, -1);
     private IReadOnlyList<DalamudSuggestion<ListingAddChoice>> choices = [];
     private int lastFrame = -2;
+    // Several retainers can be expanded at once; bridge controls and the navigation status
+    // belong to the first expanded one and may be registered only once per frame.
+    private int openControlFrame = -1;
+    private int navigationStatusFrame = -1;
     private ListingPlanDraft? previousDraft;
     private bool refreshStartedHere;
     private float? runPaneWidth;
@@ -216,8 +220,12 @@ internal sealed class ListingWorkspace
             ImGui.BeginDisabled(navigation.IsRunning);
             if (ImGui.SmallButton(label)) _ = navigation.OpenRetainerListingsAsync(new(retainer.RetainerId, retainer.RetainerName));
             ImGui.EndDisabled();
-            registry.RegisterLastButton("quartermaster.listings.open-first", label, !navigation.IsRunning,
-                () => _ = navigation.OpenRetainerListingsAsync(new(retainer.RetainerId, retainer.RetainerName)), navigation.IsRunning ? navigation.Status : "Ready");
+            if (openControlFrame != ImGui.GetFrameCount())
+            {
+                openControlFrame = ImGui.GetFrameCount();
+                registry.RegisterLastButton("quartermaster.listings.open-first", label, !navigation.IsRunning,
+                    () => _ = navigation.OpenRetainerListingsAsync(new(retainer.RetainerId, retainer.RetainerName)), navigation.IsRunning ? navigation.Status : "Ready");
+            }
         }
         DrawNavigationStatus();
         var runRetainer = runPane.Retainer(runtime, session, retainer.RetainerId);
@@ -367,7 +375,8 @@ internal sealed class ListingWorkspace
     }
     private void DrawNavigationStatus()
     {
-        if (string.IsNullOrWhiteSpace(navigation.Status)) return;
+        if (string.IsNullOrWhiteSpace(navigation.Status) || navigationStatusFrame == ImGui.GetFrameCount()) return;
+        navigationStatusFrame = ImGui.GetFrameCount();
         ImGui.TextDisabled(navigation.Status);
         if (!navigation.Status.StartsWith("Opened ", StringComparison.Ordinal)) return;
         ImGui.SameLine(); ImGui.BeginDisabled(navigation.IsRunning);
