@@ -178,6 +178,39 @@ internal sealed class ListingPlanDraftSession(
         FocusListingsAssignmentId = a.Id;
         Changed();
     }
+    public bool CanReplan(ulong retainerId, BrowserProjection browser, IReadOnlySet<ulong> currentRetainerIds) =>
+        Draft is not null && currentRetainerIds.Contains(retainerId) &&
+        browser.RetainerListingsCompleteByScope.GetValueOrDefault(BrowserScope.RetainerKey(retainerId));
+
+    public bool CanReplanAll(BrowserProjection browser, IReadOnlySet<ulong> currentRetainerIds) =>
+        currentRetainerIds.Any(id => CanReplan(id, browser, currentRetainerIds));
+
+    public void Replan(ulong retainerId, BrowserProjection browser, IReadOnlySet<ulong> currentRetainerIds)
+    {
+        if (!CanReplan(retainerId, browser, currentRetainerIds)) return;
+        var assignments = AssignmentsFromListings(retainerId, browser);
+        Draft!.Assignments.RemoveAll(a => a.RetainerId == retainerId);
+        Draft.Assignments.AddRange(assignments);
+        Changed();
+    }
+
+    public void ReplanAll(BrowserProjection browser, IReadOnlySet<ulong> currentRetainerIds)
+    {
+        var ids = currentRetainerIds.Where(id => CanReplan(id, browser, currentRetainerIds)).Order().ToArray();
+        if (ids.Length == 0) return;
+        var assignments = ids.SelectMany(id => AssignmentsFromListings(id, browser)).ToArray();
+        Draft!.Assignments.RemoveAll(a => ids.Contains(a.RetainerId));
+        Draft.Assignments.AddRange(assignments);
+        Changed();
+    }
+
+    private static ListingPlanAssignment[] AssignmentsFromListings(ulong retainerId, BrowserProjection browser) =>
+        browser.Listings.Where(l => l.RetainerId == retainerId)
+            .OrderBy(l => l.SlotIndex ?? int.MaxValue)
+            .GroupBy(l => new { l.ItemId, l.Quality, l.Quantity, Known = l.UnitPrice.IsKnown,
+                Price = l.UnitPrice.IsKnown ? l.UnitPrice.Value : 0 })
+            .Select(g => ListingPlanCatalog.AssignmentFromListings(g.ToArray())).ToArray();
+
     public IReadOnlyList<ListingPlanAssignment> PriceSiblings(Guid id, IReadOnlySet<ulong> currentRetainerIds) =>
         Find(id) is not { UnitPrice: > 0 } a ? [] : Draft!.Assignments.Where(b => b.Enabled &&
             b.RetainerId != a.RetainerId && currentRetainerIds.Contains(b.RetainerId) && b.ItemId == a.ItemId &&

@@ -108,10 +108,18 @@ internal sealed class ListingWorkspace
         lastFrame = ImGui.GetFrameCount();
         // Name-only search applies equally to drafts and observed items.
         var search = workbench.ListingFilterState.Expression;
-        ImGui.SetNextItemWidth(-1);
+        const string replanAllLabel = "Replan all as listed";
+        var replanWidth = ImGui.CalcTextSize(replanAllLabel).X + ImGui.GetStyle().FramePadding.X * 2;
+        var searchWidth = ImGui.GetContentRegionAvail().X - replanWidth - ImGui.GetStyle().ItemSpacing.X;
+        ImGui.SetNextItemWidth(searchWidth >= 160 ? searchWidth : -1);
         if (ImGui.InputTextWithHint("##ListingNameSearch", "Search listed or planned items", ref search, 160))
             workbench.ListingFilterState.SetExpression(search);
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Search item names in both planned and observed listings.");
+        UiLayout.SameLineIfFits(replanAllLabel);
+        var currentRetainerIds = session.CurrentRetainerIds(runtime);
+        ImGui.BeginDisabled(!session.CanReplanAll(runtime.Browser, currentRetainerIds));
+        if (ImGui.SmallButton(replanAllLabel)) session.ReplanAll(runtime.Browser, currentRetainerIds);
+        ImGui.EndDisabled();
         var all = Resolve(runtime);
         DrawRefresh(all.Count == 0);
         var visible = all.Where(r => string.IsNullOrWhiteSpace(search) ||
@@ -226,6 +234,15 @@ internal sealed class ListingWorkspace
                 registry.RegisterLastButton("quartermaster.listings.open-first", label, !navigation.IsRunning,
                     () => _ = navigation.OpenRetainerListingsAsync(new(retainer.RetainerId, retainer.RetainerName)), navigation.IsRunning ? navigation.Status : "Ready");
             }
+        }
+        if (retainer.ListingsObserved)
+        {
+            const string label = "Replan as listed";
+            if (retainer.Available) UiLayout.SameLineIfFits(label);
+            var currentRetainerIds = session.CurrentRetainerIds(runtime);
+            ImGui.BeginDisabled(!session.CanReplan(retainer.RetainerId, runtime.Browser, currentRetainerIds));
+            if (ImGui.SmallButton(label)) session.Replan(retainer.RetainerId, runtime.Browser, currentRetainerIds);
+            ImGui.EndDisabled();
         }
         DrawNavigationStatus();
         var runRetainer = runPane.Retainer(runtime, session, retainer.RetainerId);
