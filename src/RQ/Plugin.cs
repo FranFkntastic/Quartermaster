@@ -48,6 +48,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly OperationJournal journal;
     private readonly TransferCoordinator transfers;
     private readonly ListingNavigationCoordinator listingNavigation;
+    private readonly MarketRunExecutor marketRuns;
     private readonly TransferVendorProcurementService vendorProcurement;
     private readonly VendorCatalogLocationObserver vendorCatalogObserver;
     private readonly DalamudExternalUiAutomationSuppression externalUiSuppression;
@@ -205,6 +206,11 @@ public sealed class Plugin : IDalamudPlugin
             CountCachedPlayerItems,
             automation,
             autoRetainerSuppression: autoRetainerSuppression);
+        var marketRunStore = new MarketRunStore(Path.Combine(configDirectory, "market-run.json"));
+        marketRuns = new(new MarketRunLiveDriver(retainerSession, driver, journal, cache, playerInventory,
+                automation, CurrentOwner, id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.Name.ToString() ?? $"Item {id}"),
+            automation, () => state.Read(s => ListingPlanCatalog.OwnerPlan(s, CurrentOwner())), marketRunStore.Save, autoRetainerSuppression);
+        marketRuns.Restore(marketRunStore.Load());
         automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerSuppression);
         runtimeSnapshots = new(scanner, playerInventory, cache, state, CurrentOwner);
         var vendorAccess = new DalamudGilVendorAccessReader(
@@ -293,6 +299,7 @@ public sealed class Plugin : IDalamudPlugin
             new ItemMetadataCatalog(dataManager, log).ResolveWorkshopProject,
             configDirectory,
             new MarketMafiosoSavedJobClient(pluginInterface));
+        window.SetMarketRunExecutor(marketRuns);
         agentBridgeViewportCapture = new(
             configDirectory,
             configuration.PluginInstanceId,
@@ -839,6 +846,7 @@ public sealed class Plugin : IDalamudPlugin
         playerInventory.Flush();
         automaticRetrievals.Dispose();
         listingNavigation.Dispose();
+        marketRuns.Cancel();
         window.CancelAndWaitForActiveTransfer(TimeSpan.FromSeconds(2));
         retainerBellRoute.Dispose();
         vendorProcurement.Dispose();

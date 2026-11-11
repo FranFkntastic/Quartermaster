@@ -45,9 +45,18 @@ public sealed class AutomationLease
         }
     }
 
+    internal bool Owns(IDisposable lease)
+    {
+        lock (gate)
+            return lease is Releaser releaser && releaser.IsActive(this, activeToken) && Holder is not null;
+    }
+
     private sealed class Releaser(AutomationLease owner, Guid token) : IDisposable
     {
         private int disposed;
+
+        public bool IsActive(AutomationLease candidate, Guid candidateToken) =>
+            ReferenceEquals(owner, candidate) && token == candidateToken && Volatile.Read(ref disposed) == 0;
 
         public void Dispose()
         {

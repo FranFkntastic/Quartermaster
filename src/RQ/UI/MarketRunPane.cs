@@ -4,6 +4,7 @@ using RQ.Domain;
 using RQ.Interop;
 using RQ.Planning;
 using RQ.Runtime;
+using RQ.Operations;
 
 namespace RQ.UI;
 
@@ -19,6 +20,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
     private MarketRunCraftExportResult export = new(null, [], []);
     private string? status;
     private IReadOnlyList<MarketRunItem> items = [];
+    internal MarketRunExecutor? Executor { get; set; }
     internal MarketRunRetainer? Retainer(QuartermasterRuntimeSnapshot runtime, ListingPlanDraftSession session, ulong id)
     {
         Update(runtime, session);
@@ -50,6 +52,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         Update(runtime, session);
         ImGui.TextUnformatted(MarketRunPresentation.Header(run));
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(MarketRunPresentation.Header(run));
+        DrawExecution(runtime, session);
         ImGui.Separator(); ImGui.TextUnformatted("Reserves");
         var width = ImGui.GetContentRegionAvail().X;
         var paneClipMin = ImGui.GetWindowDrawList().GetClipRectMin();
@@ -150,6 +153,35 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         if (ImGui.SmallButton("Send to MarketMafioso")) status = importer.Send(export.Json!).Message;
         ImGui.EndDisabled();
         if (!string.IsNullOrEmpty(status)) ImGui.TextWrapped(status);
+    }
+
+    private void DrawExecution(QuartermasterRuntimeSnapshot runtime, ListingPlanDraftSession session)
+    {
+        if (Executor is not { } executor) return;
+        if (executor.IsRunning)
+        {
+            ImGui.TextWrapped(executor.Status);
+            UiLayout.SameLineIfFits("Cancel");
+            if (ImGui.Button("Cancel")) executor.Cancel();
+            return;
+        }
+        var hasWork = run.Retainers.Any(r => r.Assignments.Any(a => a.ShortListings is { IsKnown: true, Value: > 0 } || a.RepriceListings is { IsKnown: true, Value: > 0 }));
+        var reason = session.IsDirty ? "Save plan changes first." : !run.IsComplete ? "Observations incomplete." :
+            !hasWork ? "Nothing to do." : !executor.CanStart ? "Automation busy." : null;
+        ImGui.BeginDisabled(reason is not null);
+        if (ImGui.Button("Start run") && ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner) is { } plan)
+            _ = executor.RunAsync(plan, run, session.IsDirty);
+        ImGui.EndDisabled();
+        if (reason is not null && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) ImGui.SetTooltip(reason);
+        if (executor.Result is not { } result || !result.Owner.Matches(runtime.Owner)) return;
+        ImGui.TextWrapped(result.State + (result.Reason.Length == 0 ? string.Empty : $": {result.Reason}"));
+        foreach (var kind in new[] { "Post", "Reprice", "Pull" })
+            ImGui.TextUnformatted($"{(kind == "Post" ? "Listed" : kind == "Pull" ? "Pulled" : "Repriced")}: {result.Mutations.Count(m => m.Intent.Kind == kind && m.Outcome == MarketMutationOutcome.Committed)}");
+        foreach (var id in result.NeedsCheck.Distinct())
+            ImGui.TextWrapped($"Needs check: {result.Assignments.FirstOrDefault(a => a.RetainerId == id)?.RetainerName ?? id.ToString()}");
+        foreach (var mutation in result.Mutations.Where(m => m.Outcome is null))
+            ImGui.TextWrapped($"{mutation.Intent.Kind} {mutation.Intent.ItemName}: outcome unknown");
+        foreach (var message in result.Results) ImGui.TextWrapped(message);
     }
 
     private void Save()
