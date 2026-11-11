@@ -29,6 +29,7 @@ public sealed class ItemMetadataCatalog
     private readonly IDataManager dataManager;
     private readonly IPluginLog log;
     private readonly Dictionary<uint, ItemMetadata> cache = [];
+    private Dictionary<uint, uint>? workshopProjects;
 
     public ItemMetadataCatalog(IDataManager dataManager, IPluginLog log)
     {
@@ -74,6 +75,34 @@ public sealed class ItemMetadataCatalog
                 log.Verbose(exception, $"Unable to resolve metadata for item {itemId}.");
                 return cache[itemId] = Unknown(itemId);
             }
+        }
+    }
+
+    /// <summary>
+    /// The workshop project (CompanyCraftSequence row) whose result is this item, or null when
+    /// no project crafts it. MarketMafioso saved jobs identify projects by that row id.
+    /// </summary>
+    public uint? ResolveWorkshopProject(uint itemId)
+    {
+        lock (cache)
+        {
+            if (workshopProjects is null)
+            {
+                try
+                {
+                    workshopProjects = dataManager.GetExcelSheet<CompanyCraftSequence>()
+                        .Where(sequence => sequence.RowId > 0 && sequence.ResultItem.RowId > 0 &&
+                                           sequence.CompanyCraftPart.Any(part => part.RowId != 0))
+                        .GroupBy(sequence => sequence.ResultItem.RowId)
+                        .ToDictionary(group => group.Key, group => group.Min(sequence => sequence.RowId));
+                }
+                catch (Exception exception)
+                {
+                    log.Warning(exception, "Unable to load workshop projects.");
+                    workshopProjects = [];
+                }
+            }
+            return workshopProjects.TryGetValue(itemId, out var projectId) ? projectId : null;
         }
     }
 

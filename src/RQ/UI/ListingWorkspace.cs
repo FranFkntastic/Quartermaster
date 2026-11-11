@@ -20,17 +20,14 @@ internal sealed class ListingWorkspace
     private readonly AgentBridgeUiReviewRegistry registry;
     private readonly ListingPlanDraftSession session;
     private readonly Func<string, int, IReadOnlyList<ItemChoice>> searchItems;
+    private const float RunPaneMinWidth = 240;
+    private const float RetainerListMinWidth = 540;
+    private const float SplitterWidth = 6;
+    private const float SlotsColumnWidth = 140;
+    private const float StateColumnWidth = 110;
     private readonly Func<uint, bool?> listability;
-    private readonly Action<QuartermasterRuntimeSnapshot, ListingPlanItemEvaluation, Guid?> prepare;
-    private readonly Func<string> planName;
-    private readonly Func<Guid?> planId;
-    private Guid? pendingPlanId;
-    private ListingItemKey? preparation;
-    private bool preparationPending;
-    private string? preparationError;
     private readonly RetainerRefreshCoordinator refresh;
-    private readonly TableSelectionModel<ulong> selection = new();
-    private readonly DalamudTableProjection<ListingRetainerRow> table;
+    private readonly MarketRunPane runPane;
     private readonly DalamudSuggestionInputState addInput = new();
     private readonly Dictionary<(Guid, string), string> buffers = [];
     private readonly Dictionary<Guid, int> priceAtActivation = [];
@@ -44,19 +41,15 @@ internal sealed class ListingWorkspace
     private int lastFrame = -2;
     private ListingPlanDraft? previousDraft;
     private bool refreshStartedHere;
+    private float? runPaneWidth;
 
     public ListingWorkspace(WorkbenchState workbench, ListingNavigationCoordinator navigation,
         AgentBridgeUiReviewRegistry registry, ListingPlanDraftSession session,
         Func<string, int, IReadOnlyList<ItemChoice>> searchItems, Func<uint, bool?> listability,
-        Action<QuartermasterRuntimeSnapshot, ListingPlanItemEvaluation, Guid?> prepare, Func<string> planName, Func<Guid?> planId, RetainerRefreshCoordinator refresh)
+        RetainerRefreshCoordinator refresh, MarketRunPane runPane)
     {
         this.workbench = workbench; this.navigation = navigation; this.registry = registry; this.session = session;
-        this.searchItems = searchItems; this.listability = listability; this.prepare = prepare; this.planName = planName; this.planId = planId; this.refresh = refresh;
-        table = new([
-            new("Retainer", 1, r => r.RetainerName + (dirtyRetainers.Contains(r.RetainerId) ? " *" : ""), Flags: ImGuiTableColumnFlags.WidthStretch),
-            new("Slots", 132, _ => "", Draw: DrawSlots),
-            new("State", 110, r => r.State.Text, TextColor: r => Color(r.State.Tone)),
-        ], DalamudTableSelection<ListingRetainerRow>.Single(selection, r => r.RetainerId));
+        this.searchItems = searchItems; this.listability = listability; this.refresh = refresh; this.runPane = runPane;
     }
 
     internal static Vector4 Color(ListingStateTone tone) => tone switch
@@ -96,22 +89,15 @@ internal sealed class ListingWorkspace
     private void Select(ulong? id)
     {
         workbench.SelectedListingRetainerId = id;
-        preparation = null;
-        preparationPending = false;
-        preparationError = null;
         workbench.HighlightedListingItem = null;
         session.PriceEchoAssignmentId = null;
         buffers.Clear(); priceAtActivation.Clear();
         addInput.Text = string.Empty; addInput.Active = false;
-        selection.Clear();
-        if (id.HasValue) selection.SetSelected(id.Value, true);
     }
 
     public void Draw(QuartermasterRuntimeSnapshot runtime)
     {
         if (!runtime.Owner.HasStableIdentity || session.Draft is null) return;
-        if (previousDraft is not null && !previousDraft.Owner.Matches(session.Draft.Owner))
-        { preparation = null; preparationPending = false; preparationError = null; }
         if (lastFrame != ImGui.GetFrameCount() - 1 || !ReferenceEquals(previousDraft, session.Draft))
         { buffers.Clear(); priceAtActivation.Clear(); addInput.Active = false; }
         previousDraft = session.Draft;
@@ -124,44 +110,68 @@ internal sealed class ListingWorkspace
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Search item names in both planned and observed listings.");
         var all = Resolve(runtime);
         DrawRefresh(all.Count == 0);
-        if (all.Count == 0) { ImGui.TextDisabled("No retainers observed yet."); DrawNavigationStatus(); return; }
         var visible = all.Where(r => string.IsNullOrWhiteSpace(search) ||
             r.PlanRows.Any(a => a.Assignment.ItemName.Contains(search, StringComparison.OrdinalIgnoreCase)) ||
             runtime.Browser.GetListings(BrowserScope.RetainerKey(r.RetainerId)).Any(l => l.ItemName.Contains(search, StringComparison.OrdinalIgnoreCase))).ToArray();
-        if (!visible.Any(r => r.RetainerId == workbench.SelectedListingRetainerId)) Select(visible.FirstOrDefault()?.RetainerId);
-        if (visible.Length == 0) { ImGui.TextDisabled($"No retainers match \"{search}\"."); return; }
-        if (ImGui.GetContentRegionAvail().X < 900)
+        // A filtered-out expanded retainer hands expansion to the first match; a collapsed list stays collapsed.
+        if (workbench.SelectedListingRetainerId is not null && !visible.Any(r => r.RetainerId == workbench.SelectedListingRetainerId))
+            Select(visible.FirstOrDefault()?.RetainerId);
+
+        var avail = ImGui.GetContentRegionAvail();
+        var height = Math.Max(1, avail.Y);
+        var maxRunWidth = Math.Max(RunPaneMinWidth, avail.X - RetainerListMinWidth - SplitterWidth);
+        var runWidth = Math.Clamp(runPaneWidth ?? avail.X * .38f, RunPaneMinWidth, maxRunWidth);
+        var listWidth = Math.Max(1, avail.X - runWidth - SplitterWidth);
+
+        if (ImGui.BeginChild("RQMarketRetainers", new Vector2(listWidth, height), false))
         {
-            var selectedRetainer = visible.First(r => r.RetainerId == workbench.SelectedListingRetainerId);
-            ImGui.SetNextItemWidth(-1);
-            if (ImGui.BeginCombo("##RQRetainer", selectedRetainer.RetainerName))
-            {
-                foreach (var row in visible)
-                    if (ImGui.Selectable($"{row.RetainerName} · {row.PlannedSlots} planned", row.RetainerId == selectedRetainer.RetainerId)) Select(row.RetainerId);
-                ImGui.EndCombo();
-            }
-            DrawDetail(runtime, visible.First(r => r.RetainerId == workbench.SelectedListingRetainerId));
-            return;
+            if (all.Count == 0) { ImGui.TextDisabled("No retainers observed yet."); DrawNavigationStatus(); }
+            else if (visible.Length == 0) ImGui.TextDisabled($"No retainers match \"{search}\".");
+            foreach (var row in visible) DrawRetainer(runtime, row);
         }
-        if (!ImGui.BeginTable("RQRetainerListingLayout", 2, ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.BordersInnerV)) return;
-        ImGui.TableSetupColumn("Retainers", ImGuiTableColumnFlags.WidthFixed, 350);
-        ImGui.TableSetupColumn("Assignments", ImGuiTableColumnFlags.WidthStretch);
-        ImGui.TableNextRow(); ImGui.TableNextColumn();
-        if (table.Begin("RQRetainerListingsV2", new DalamudTableLayout(new(0, ImGui.GetContentRegionAvail().Y),
-            ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingFixedFit, FreezeRows: 1)))
+        ImGui.EndChild();
+
+        ImGui.SameLine(0, 0);
+        ImGui.InvisibleButton("##RQMarketSplitter", new Vector2(SplitterWidth, height));
+        if (ImGui.IsItemHovered() || ImGui.IsItemActive()) ImGui.SetMouseCursor(ImGuiMouseCursor.ResizeEw);
+        if (ImGui.IsItemActive()) runPaneWidth = Math.Clamp(runWidth - ImGui.GetIO().MouseDelta.X, RunPaneMinWidth, maxRunWidth);
+        var splitterMin = ImGui.GetItemRectMin();
+        var splitterMax = ImGui.GetItemRectMax();
+        var splitterX = (splitterMin.X + splitterMax.X) / 2;
+        ImGui.GetWindowDrawList().AddLine(new Vector2(splitterX, splitterMin.Y), new Vector2(splitterX, splitterMax.Y),
+            ImGui.GetColorU32(ImGuiCol.Separator), 1);
+
+        ImGui.SameLine(0, 0);
+        if (ImGui.BeginChild("RQMarketRun", new Vector2(runWidth, height), false))
+            runPane.Draw(runtime, session, all, workbench.SelectedListingRetainerId);
+        ImGui.EndChild();
+    }
+
+    private void DrawRetainer(QuartermasterRuntimeSnapshot runtime, ListingRetainerRow row)
+    {
+        ImGui.PushID($"retainer:{row.RetainerId}");
+        var lineX = ImGui.GetCursorPosX();
+        var width = ImGui.GetContentRegionAvail().X;
+        var wasOpen = row.RetainerId == workbench.SelectedListingRetainerId;
+        ImGui.SetNextItemOpen(wasOpen, ImGuiCond.Always);
+        var open = ImGui.TreeNodeEx($"{row.RetainerName}{(dirtyRetainers.Contains(row.RetainerId) ? " *" : string.Empty)}###header",
+            ImGuiTreeNodeFlags.SpanAvailWidth | ImGuiTreeNodeFlags.AllowItemOverlap | ImGuiTreeNodeFlags.NoTreePushOnOpen);
+        if (wasOpen && workbench.ScrollToListingRetainer)
+        { ImGui.SetScrollHereY(.1f); workbench.ScrollToListingRetainer = false; }
+        var stateX = lineX + Math.Max(0, width - StateColumnWidth);
+        ImGui.SameLine(Math.Max(lineX, stateX - SlotsColumnWidth));
+        DrawSlots(row);
+        ImGui.SameLine(stateX);
+        ImGui.TextColored(Color(row.State.Tone), row.State.Text);
+        if (open != wasOpen) Select(open ? row.RetainerId : null);
+        if (workbench.SelectedListingRetainerId == row.RetainerId)
         {
-            for (var n = 0; n < visible.Length; n++)
-            {
-                var row = visible[n];
-                if (table.DrawSaneRow(visible, n, $"retainer:{row.RetainerId}")) Select(row.RetainerId);
-                if (row.RetainerId == workbench.SelectedListingRetainerId && workbench.ScrollToListingRetainer)
-                { ImGui.SetScrollHereY(); workbench.ScrollToListingRetainer = false; }
-            }
-            table.End();
+            ImGui.Indent();
+            DrawDetail(runtime, row);
+            ImGui.Unindent();
+            ImGui.Spacing();
         }
-        ImGui.TableNextColumn();
-        if (visible.FirstOrDefault(r => r.RetainerId == workbench.SelectedListingRetainerId) is { } selected) DrawDetail(runtime, selected);
-        ImGui.EndTable();
+        ImGui.PopID();
     }
 
     private void DrawRefresh(bool empty)
@@ -200,11 +210,9 @@ internal sealed class ListingWorkspace
 
     private void DrawDetail(QuartermasterRuntimeSnapshot runtime, ListingRetainerRow retainer)
     {
-        ImGui.TextUnformatted(retainer.RetainerName);
         if (retainer.Available)
         {
             var label = "Open in game";
-            ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - ImGui.CalcTextSize(label).X - ImGui.GetStyle().FramePadding.X * 2));
             ImGui.BeginDisabled(navigation.IsRunning);
             if (ImGui.SmallButton(label)) _ = navigation.OpenRetainerListingsAsync(new(retainer.RetainerId, retainer.RetainerName));
             ImGui.EndDisabled();
@@ -212,7 +220,6 @@ internal sealed class ListingWorkspace
                 () => _ = navigation.OpenRetainerListingsAsync(new(retainer.RetainerId, retainer.RetainerName)), navigation.IsRunning ? navigation.Status : "Ready");
         }
         DrawNavigationStatus();
-        if (!ImGui.BeginChild("ListingDetail", Vector2.Zero, false)) { ImGui.EndChild(); return; }
         var detailLeft = ImGui.GetCursorScreenPos().X;
         var detailRight = detailLeft + ImGui.GetContentRegionAvail().X;
         if (ImGui.BeginTable("RQInlineListingAssignments", 6, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.SizingStretchProp))
@@ -235,7 +242,7 @@ internal sealed class ListingWorkspace
                 if (ImGui.Checkbox("##enabled", ref enabled)) session.SetEnabled(a.Id, enabled, runtime.Browser);
                 ImGui.EndDisabled();
                 ImGui.TableNextColumn(); ItemLabel(a.ItemName, a.Quality);
-                DrawState(runtime, new(a.ItemId, a.Quality), row.State);
+                DrawState(row.State);
                 foreach (var exception in retainer.ObservedGroups.Where(g => g.AssignmentId == a.Id))
                 {
                     ImGui.TextColored(Color(exception.State.Tone), exception.State.Text);
@@ -282,7 +289,6 @@ internal sealed class ListingWorkspace
             }
             ImGui.EndTable();
         }
-        DrawPreparation(runtime);
         if (retainer.Available && session.Free(retainer.RetainerId) > 0 && retainer.PlanRows.Count < 20)
         {
             ImGui.Indent(24 + ImGui.GetStyle().CellPadding.X * 2);
@@ -292,7 +298,6 @@ internal sealed class ListingWorkspace
             ImGui.Unindent(24 + ImGui.GetStyle().CellPadding.X * 2);
         }
         workbench.ScrollToListingDetail = null;
-        ImGui.EndChild();
     }
 
     private void BeginItemRow(ListingItemKey key)
@@ -326,45 +331,9 @@ internal sealed class ListingWorkspace
             priceAtActivation.Remove(a.Id);
         }
     }
-    private void DrawState(QuartermasterRuntimeSnapshot runtime, ListingItemKey key, ListingStateView state)
+    private static void DrawState(ListingStateView state)
     {
-        if (state.Rank is >= 1 and <= 4)
-        {
-            if (ImGui.SmallButton(state.Text + " · Prepare")) preparation = key;
-        }
-        else if (state.Rank < 12) ImGui.TextColored(Color(state.Tone), state.Text);
-    }
-    private void DrawPreparation(QuartermasterRuntimeSnapshot runtime)
-    {
-        if (preparation is not { } key || session.Draft is not { } draft) return;
-        var plan = new ListingPlan { Owner = draft.Owner, Assignments = draft.Assignments.Where(a => a.Enabled).ToList() };
-        var demand = ListingPlanEvaluator.Evaluate(plan, runtime.Browser).Find(key.ItemId, key.Quality);
-        if (demand is null) { preparation = null; return; }
-        if (preparationPending && !refresh.IsRefreshing && !refresh.IsQueued)
-        {
-            preparationPending = false;
-            if (demand.MovementNeedUnits.IsKnown) prepare(runtime, demand, pendingPlanId);
-            else preparationError = "Retainer verification did not produce complete listing observations. Retry preparation or cancel.";
-        }
-        ImGui.Separator();
-        ImGui.TextUnformatted($"Prepare {demand.ItemName} · {QualityLabel(key.Quality)}");
-        ImGui.TextDisabled("Across planned retainers · uses current listing draft");
-        if (demand.MovementNeedUnits.IsKnown)
-        {
-            ImGui.TextWrapped($"Player target {demand.MovementNeedUnits.Value:N0} · carried {demand.PlayerUnits:N0}");
-            if (ImGui.Button($"Add target to {planName()}")) prepare(runtime, demand, planId());
-            ImGui.TextWrapped("Adds an independent transfer target. Does not save or post listings.");
-        }
-        else if (preparationPending) ImGui.TextDisabled("Verifying retainer listings...");
-        else if (ImGui.Button("Verify and prepare target"))
-        {
-            preparationError = null;
-            if (refresh.CanStart) { pendingPlanId = planId(); preparationPending = true; refreshStartedHere = true; refresh.Start(); }
-            else preparationError = "Retainer verification cannot start now. Finish the active operation, then retry preparation.";
-        }
-        if (preparationError is not null) ImGui.TextWrapped(preparationError);
-        if (ImGui.SmallButton("Close details")) { preparation = null; preparationPending = false; }
-        ImGui.Separator();
+        if (state.Rank < 12) ImGui.TextColored(Color(state.Tone), state.Text);
     }
     private void DrawNavigationStatus()
     {

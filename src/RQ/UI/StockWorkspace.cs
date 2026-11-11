@@ -446,7 +446,7 @@ internal sealed class StockWorkspace
         var canPlan = selected.Length > 0 && runtime.Owner.HasStableIdentity;
         if (!canPlan)
             ImGui.BeginDisabled();
-        if (ImGui.Button("Add to plan"))
+        if (ImGui.Button($"Add to {transferPlanEditor.Draft?.Name ?? "plan"}"))
         {
             UpsertSelectedStockRules(runtime, selected, stowCarried: false);
             stockSelection.Clear();
@@ -513,7 +513,7 @@ internal sealed class StockWorkspace
                 if (navigationQualities.Length == 0) return;
                 var quality = navigationQualities.Contains(workbench.SelectedStockListingQuality)
                     ? workbench.SelectedStockListingQuality : navigationQualities[0];
-                if (ImGui.SmallButton("Show in Listings")) showInListings(runtime, new(itemId, quality));
+                if (ImGui.SmallButton("Show in Market")) showInListings(runtime, new(itemId, quality));
             }
             var listingPlan = ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner);
             var demand = ListingPlanEvaluator.Evaluate(listingPlan, runtime.Browser).Items
@@ -585,7 +585,7 @@ internal sealed class StockWorkspace
 
         if (!runtime.Owner.HasStableIdentity)
             ImGui.BeginDisabled();
-        if (ImGui.MenuItem("Add to plan"))
+        if (ImGui.MenuItem($"Add to {transferPlanEditor.Draft?.Name ?? "plan"}"))
             UpsertSelectedStockRules(runtime, [item], stowCarried: false);
         if (!runtime.Owner.HasStableIdentity)
             ImGui.EndDisabled();

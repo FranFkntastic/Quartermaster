@@ -39,6 +39,7 @@ public sealed class QuartermasterWindow : Window
     private readonly ListingPlanDraftSession listingSession;
     private readonly Dictionary<uint, bool?> listability = [];
     private readonly ListingWorkspace listingWorkspace;
+    private readonly MarketRunPane marketRunPane;
     private readonly TransferReviewDialog transferReviewDialog;
     private readonly TransferExecutionController transferExecution;
     private readonly VendorProcurementReviewDialog vendorReviewDialog;
@@ -64,13 +65,17 @@ public sealed class QuartermasterWindow : Window
         PluginConfiguration configuration,
         System.Action saveConfiguration,
         AgentBridgeUiReviewRegistry reviewRegistry,
-        Func<GilVendorCatalog>? vendorCatalogSource = null)
+        Func<GilVendorCatalog>? vendorCatalogSource,
+        Func<uint, uint?> resolveWorkshopProject,
+        string configDirectory,
+        RQ.Interop.MarketMafiosoSavedJobClient marketImporter)
         : base(MainWindowName, ImGuiWindowFlags.NoScrollbar)
     {
         this.state = state;
         this.runtimeSnapshots = runtimeSnapshots;
         this.dataManager = dataManager;
         this.reviewRegistry = reviewRegistry;
+        marketRunPane = new(resolveWorkshopProject, configDirectory, marketImporter);
         historyDialog = new(journal);
         RestockPlanEditor? restockEditor = null;
         TransferPlanEditor? transferEditor = null;
@@ -131,10 +136,8 @@ public sealed class QuartermasterWindow : Window
             listingSession,
             SearchListableItems,
             Listability,
-            (runtime, demand, planId) => transferPlanEditor.Prepare(runtime, demand, planId),
-            () => transferPlanEditor.Draft?.Name ?? "Transfer plan",
-            () => transferPlanEditor.Draft?.PlanId,
-            retainerRefresh);
+            retainerRefresh,
+            marketRunPane);
         TransferReviewDialog? transferReview = null;
         VendorProcurementReviewDialog? vendorReview = null;
         transferPlanWorkspace = new(
@@ -406,69 +409,70 @@ public sealed class QuartermasterWindow : Window
         reviewRegistry.RegisterLastButton("quartermaster.history.open", "Open transfer history", true,
             historyDialog.RequestOpen, "Recent Quartermaster operations");
         historyDialog.Draw(runtime.Owner);
-        transferPlanWorkspace.DrawRibbon(runtime);
-        ImGui.Separator();
 
-        var showSave = runtime.Owner.HasStableIdentity && (listingSession.IsDirty || listingSession.ConflictCount > 0 ||
-            listingSession.MergedElsewhere || listingSession.Error is not null);
-        var stripHeight = showSave ? ImGui.GetFrameHeightWithSpacing() + ImGui.GetStyle().ItemSpacing.Y : 0;
-        var flags = ImGuiTableFlags.Resizable | ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.SizingStretchProp;
-        if (ImGui.BeginTable("RQPersistentWorkspace", 2, flags, new Vector2(0, -stripHeight)))
+        if (ImGui.BeginTabBar("RQViews"))
         {
-            ImGui.TableSetupColumn("Stock or Listings", ImGuiTableColumnFlags.WidthStretch, 1.1f);
-            ImGui.TableSetupColumn("Transfer plan", ImGuiTableColumnFlags.WidthStretch, 1f);
-            ImGui.TableNextRow(); ImGui.TableNextColumn();
-            if (ImGui.BeginChild("RQSourcePane", Vector2.Zero, false))
+            var marketOpen = ImGui.BeginTabItem($"Market ({runtime.Browser.Listings.Count:N0})###RQMarketTab",
+                TabFlags(requestedView == WorkbenchView.Listings));
+            RegisterWorkspaceControl("listings", WorkbenchView.Listings);
+            if (marketOpen)
             {
-                if (ImGui.BeginTabBar("RQViews"))
-                {
-                    var stockRequested = requestedView is WorkbenchView.Stock or WorkbenchView.Restock or WorkbenchView.Stowage;
-                    var stockOpen = ImGui.BeginTabItem("Stock", stockRequested ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None);
-                    RegisterWorkspaceControl("stock", WorkbenchView.Stock);
-                    if (stockOpen)
-                    {
-                        workbench.View = WorkbenchView.Stock;
-                        stockWorkspace.Draw(runtime);
-                        ImGui.EndTabItem();
-                    }
-                    var listingsOpen = ImGui.BeginTabItem($"Listings ({runtime.Browser.Listings.Count:N0})",
-                        requestedView == WorkbenchView.Listings ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None);
-                    RegisterWorkspaceControl("listings", WorkbenchView.Listings);
-                    if (listingsOpen)
-                    {
-                        workbench.View = WorkbenchView.Listings;
-                        listingWorkspace.Draw(runtime);
-                        ImGui.EndTabItem();
-                    }
-                    var groupsOpen = ImGui.BeginTabItem("Item groups",
-                        requestedView == WorkbenchView.ItemGroups ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None);
-                    RegisterWorkspaceControl("item-groups", WorkbenchView.ItemGroups);
-                    if (groupsOpen)
-                    {
-                        workbench.View = WorkbenchView.ItemGroups;
-                        itemGroupWorkspace.DrawWorkspace(runtime.State);
-                        ImGui.EndTabItem();
-                    }
-                    ImGui.EndTabBar();
-                    requestedView = null;
-                }
+                workbench.View = WorkbenchView.Listings;
+                DrawMarketTab(runtime);
+                ImGui.EndTabItem();
             }
-            ImGui.EndChild();
-            ImGui.TableNextColumn();
-            if (ImGui.BeginChild("RQPlanPane", Vector2.Zero, false))
+            var stockOpen = ImGui.BeginTabItem("Stock",
+                TabFlags(requestedView is WorkbenchView.Stock or WorkbenchView.Restock));
+            RegisterWorkspaceControl("stock", WorkbenchView.Stock);
+            if (stockOpen)
             {
+                workbench.View = WorkbenchView.Stock;
+                stockWorkspace.Draw(runtime);
+                ImGui.EndTabItem();
+            }
+            var plansOpen = ImGui.BeginTabItem("Transfer plans",
+                TabFlags(requestedView == WorkbenchView.Stowage));
+            RegisterWorkspaceControl("transfer-plans", WorkbenchView.Stowage);
+            if (plansOpen)
+            {
+                workbench.View = WorkbenchView.Stowage;
                 var started = Stopwatch.GetTimestamp();
+                transferPlanWorkspace.DrawRibbon(runtime);
+                ImGui.Separator();
                 transferPlanWorkspace.Draw(runtime);
                 PlanDrawMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                ImGui.EndTabItem();
             }
-            ImGui.EndChild();
-            ImGui.EndTable();
+            var groupsOpen = ImGui.BeginTabItem("Item groups",
+                TabFlags(requestedView == WorkbenchView.ItemGroups));
+            RegisterWorkspaceControl("item-groups", WorkbenchView.ItemGroups);
+            if (groupsOpen)
+            {
+                workbench.View = WorkbenchView.ItemGroups;
+                itemGroupWorkspace.DrawWorkspace(runtime.State);
+                ImGui.EndTabItem();
+            }
+            ImGui.EndTabBar();
+            requestedView = null;
         }
-        if (showSave) DrawListingSaveStrip(runtime);
         transferPlanEditor.DrawDialogs();
         transferReviewDialog.Draw();
         vendorReviewDialog.Draw();
         confirmationDialog.Draw();
+    }
+
+    private static ImGuiTabItemFlags TabFlags(bool requested) =>
+        requested ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
+
+    private void DrawMarketTab(QuartermasterRuntimeSnapshot runtime)
+    {
+        var showSave = runtime.Owner.HasStableIdentity && (listingSession.IsDirty || listingSession.ConflictCount > 0 ||
+            listingSession.MergedElsewhere || listingSession.Error is not null);
+        var stripHeight = showSave ? ImGui.GetFrameHeightWithSpacing() + ImGui.GetStyle().ItemSpacing.Y : 0;
+        if (ImGui.BeginChild("RQMarketBody", new Vector2(0, -stripHeight), false))
+            listingWorkspace.Draw(runtime);
+        ImGui.EndChild();
+        if (showSave) DrawListingSaveStrip(runtime);
     }
 
     private void RegisterWorkspaceControl(string id, WorkbenchView view) =>

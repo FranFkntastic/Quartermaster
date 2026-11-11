@@ -289,7 +289,10 @@ public sealed class Plugin : IDalamudPlugin
             configuration,
             SaveConfiguration,
             agentReviewRegistry,
-            () => vendorCatalogSource.Current);
+            () => vendorCatalogSource.Current,
+            new ItemMetadataCatalog(dataManager, log).ResolveWorkshopProject,
+            configDirectory,
+            new MarketMafiosoSavedJobClient(pluginInterface));
         agentBridgeViewportCapture = new(
             configDirectory,
             configuration.PluginInstanceId,

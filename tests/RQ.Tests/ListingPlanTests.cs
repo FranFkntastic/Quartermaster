@@ -413,6 +413,135 @@ public sealed class ListingPlanTests
         Assert.Equal(200, baseRule.TargetQuantity);
     }
 
+    [Fact]
+    public void ReserveRules_RoundTripThroughDraftApplyAndJson()
+    {
+        var state = new QuartermasterState();
+        var reserve = Reserve(1, "Ore", 120, preferredRetainerId: 10);
+        var draft = NewDraft(Assignment(1, "Ore", 10, "Botanist", 2, 10, 100));
+        draft.Reserves.Add(reserve);
+
+        ListingPlanCatalog.Apply(state, Owner, draft, _ => 999, new HashSet<ulong> { 10 }, DateTime.UnixEpoch);
+        var json = JsonSerializer.Serialize(state, AtomicDocumentStore<QuartermasterState>.JsonOptions);
+        var loaded = JsonSerializer.Deserialize<QuartermasterState>(json, AtomicDocumentStore<QuartermasterState>.JsonOptions)!;
+        var reopened = ListingPlanCatalog.Draft(loaded, Owner, Projection([]));
+
+        var saved = Assert.Single(loaded.ListingPlans.Single().Reserves);
+        Assert.True(ListingPlanCatalog.ReserveEquals(reserve, saved));
+        Assert.Equal([10UL], saved.Location.PreferredRetainerIds);
+        Assert.True(ListingPlanCatalog.ReserveEquals(reserve, Assert.Single(reopened.Reserves)));
+        Assert.True(ListingPlanCatalog.ReserveEquals(reserve, Assert.Single(reopened.BaselineReserves)));
+        Assert.NotSame(reopened.Reserves[0].Location, reopened.BaselineReserves[0].Location);
+    }
+
+    [Fact]
+    public void ListingPlanWithoutReserves_LoadsWithEmptyReservesAndUnchangedAssignments()
+    {
+        var plan = new ListingPlan { Owner = Owner, Assignments = [Assignment(1, "Ore", 10, "Botanist", 2, 10, 100)] };
+        var json = JsonNode.Parse(JsonSerializer.Serialize(new QuartermasterState { ListingPlans = [plan] },
+            AtomicDocumentStore<QuartermasterState>.JsonOptions))!.AsObject();
+        json["listingPlans"]![0]!.AsObject().Remove("reserves");
+
+        var loaded = JsonSerializer.Deserialize<QuartermasterState>(json, AtomicDocumentStore<QuartermasterState>.JsonOptions)!;
+
+        Assert.Equal("gooseworks-quartermaster-state/v5", loaded.Schema);
+        Assert.Empty(loaded.ListingPlans.Single().Reserves);
+        Assert.Equal(2, loaded.ListingPlans.Single().Assignments.Single().ListingCount);
+    }
+
+    [Fact]
+    public void ReserveValidation_RequiresExactQualityRangeOwnedLocationAndOneEnabledRulePerItem()
+    {
+        var anyQuality = Reserve(1, "Ore", 5);
+        anyQuality.Quality = ItemQualityPolicy.Any;
+        var tooMany = Reserve(2, "Hull", ListingReserveRule.MaxReserveUnits + 1);
+        var foreign = Reserve(3, "Bow", 5, preferredRetainerId: 99);
+        var first = Reserve(4, "Rudder", 5);
+        var second = Reserve(4, "Rudder", 7);
+        var disabledDuplicate = Reserve(4, "Rudder", 9);
+        disabledDuplicate.Enabled = false;
+        var hq = Reserve(4, "Rudder", 3, ItemQualityPolicy.HqOnly);
+
+        var issues = ListingPlanCatalog.ValidateReserves([anyQuality, tooMany, foreign, first, second, disabledDuplicate, hq], new HashSet<ulong> { 10 });
+
+        Assert.Contains(issues, issue => issue.AssignmentId == anyQuality.Id && issue.Field == nameof(ListingReserveRule.Quality));
+        Assert.Contains(issues, issue => issue.AssignmentId == tooMany.Id && issue.Field == nameof(ListingReserveRule.ReserveUnits));
+        Assert.Contains(issues, issue => issue.AssignmentId == foreign.Id && issue.Field == nameof(ListingReserveRule.Location));
+        Assert.Equal([first.Id, second.Id], issues.Where(issue => issue.Field == "ReserveDuplicate").Select(issue => issue.AssignmentId));
+        Assert.DoesNotContain(issues, issue => issue.AssignmentId == disabledDuplicate.Id || issue.AssignmentId == hq.Id);
+        Assert.Empty(ListingPlanCatalog.ValidateReserves([Reserve(1, "Ore", 0)], new HashSet<ulong>()));
+
+        var draft = NewDraft();
+        draft.Reserves.Add(first);
+        draft.Reserves.Add(second);
+        Assert.Throws<ListingPlanValidationException>(() =>
+            ListingPlanCatalog.Apply(new QuartermasterState(), Owner, draft, _ => 999, new HashSet<ulong> { 10 }, DateTime.UnixEpoch));
+    }
+
+    [Fact]
+    public void StaleSave_MergesReserveFieldsAndReportsReserveCollision()
+    {
+        var reserve = Reserve(1, "Ore", 50);
+        var plan = new ListingPlan { Owner = Owner, Reserves = [ListingPlanCatalog.Copy(reserve)] };
+        var state = new QuartermasterState { ListingPlans = [plan] };
+        var draft = ListingPlanCatalog.Draft(state, Owner, Projection([]));
+        draft.Reserves[0].ReserveUnits = 80;
+        draft.Reserves.Add(Reserve(2, "Hull", 4));
+        plan.Reserves[0].Location = new StowageRoutingPolicy { Mode = StowageRoutingMode.HomeFirst, PreferredRetainerIds = [10] };
+        plan.Revision++;
+
+        var saved = ListingPlanCatalog.Apply(state, Owner, draft, _ => 999, new HashSet<ulong> { 10 }, DateTime.UnixEpoch);
+        Assert.Equal(80, saved.Reserves[0].ReserveUnits);
+        Assert.Equal(StowageRoutingMode.HomeFirst, saved.Reserves[0].Location.Mode);
+        Assert.Equal(2, saved.Reserves.Count);
+
+        var collision = ListingPlanCatalog.Draft(state, Owner, Projection([]));
+        collision.Reserves[0].ReserveUnits = 90;
+        collision.Reserves[0].Location = new StowageRoutingPolicy { PreferredRetainerIds = [10] };
+        plan.Reserves[0].ReserveUnits = 70;
+        plan.Reserves[0].Location = new StowageRoutingPolicy { Overflow = StowageOverflowPolicy.HoldOnPlayer };
+        plan.Revision++;
+        var exception = Assert.Throws<ListingPlanConflictException>(() =>
+            ListingPlanCatalog.Apply(state, Owner, collision, _ => 999, new HashSet<ulong> { 10 }, DateTime.UnixEpoch));
+
+        Assert.Contains(exception.Conflicts, issue => issue.Field == nameof(ListingReserveRule.ReserveUnits));
+        Assert.Contains(exception.Conflicts, issue => issue.Field == nameof(ListingReserveRule.Location));
+        Assert.Equal(90, exception.RebasedReserves[0].ReserveUnits);
+        Assert.Equal(70, exception.CanonicalReserves[0].ReserveUnits);
+        Assert.Equal(70, plan.Reserves[0].ReserveUnits);
+    }
+
+    [Fact]
+    public void StaleSave_ReportsReserveDeletedInOneRevisionAndEditedInAnother()
+    {
+        var reserve = Reserve(1, "Ore", 50);
+        var plan = new ListingPlan { Owner = Owner, Reserves = [ListingPlanCatalog.Copy(reserve)] };
+        var state = new QuartermasterState { ListingPlans = [plan] };
+        var draft = ListingPlanCatalog.Draft(state, Owner, Projection([]));
+        draft.Reserves.Clear();
+        plan.Reserves[0].ReserveUnits = 60;
+        plan.Revision++;
+
+        var exception = Assert.Throws<ListingPlanConflictException>(() =>
+            ListingPlanCatalog.Apply(state, Owner, draft, _ => 999, new HashSet<ulong> { 10 }, DateTime.UnixEpoch));
+
+        Assert.Contains(exception.Conflicts, issue => issue.AssignmentId == reserve.Id && issue.Field == "Reserve");
+    }
+
+    private static ListingReserveRule Reserve(
+        uint itemId,
+        string name,
+        int units,
+        ItemQualityPolicy quality = ItemQualityPolicy.NqOnly,
+        ulong? preferredRetainerId = null) => new()
+    {
+        ItemId = itemId,
+        ItemName = name,
+        Quality = quality,
+        ReserveUnits = units,
+        Location = new StowageRoutingPolicy { PreferredRetainerIds = preferredRetainerId is { } id ? [id] : [] },
+    };
+
     private static ListingPlanDraft NewDraft(params ListingPlanAssignment[] assignments) => new()
     {
         PlanId = Guid.NewGuid(),

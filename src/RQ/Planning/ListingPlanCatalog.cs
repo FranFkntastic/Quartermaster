@@ -11,32 +11,43 @@ public sealed class ListingPlanDraft
     public OwnerScope Owner { get; init; } = new();
     public List<ListingPlanAssignment> Assignments { get; set; } = [];
     public List<ListingPlanAssignment> BaselineAssignments { get; set; } = [];
+    public List<ListingReserveRule> Reserves { get; set; } = [];
+    public List<ListingReserveRule> BaselineReserves { get; set; } = [];
     public IReadOnlyList<ulong> IncompleteListingRetainerIds { get; init; } = [];
 }
 
+/// <summary>A validation or merge issue. <paramref name="AssignmentId"/> holds the assignment or reserve rule id.</summary>
 public sealed record ListingPlanValidationIssue(Guid? AssignmentId, string Field, string Message);
 
 public sealed class ListingPlanValidationException(IReadOnlyList<ListingPlanValidationIssue> issues,
     IReadOnlyList<ListingPlanAssignment>? candidate = null,
-    IReadOnlyList<ListingPlanAssignment>? canonicalAssignments = null, long canonicalRevision = 0)
+    IReadOnlyList<ListingPlanAssignment>? canonicalAssignments = null, long canonicalRevision = 0,
+    IReadOnlyList<ListingReserveRule>? candidateReserves = null,
+    IReadOnlyList<ListingReserveRule>? canonicalReserves = null)
     : InvalidOperationException(issues.FirstOrDefault()?.Message ?? "The Listing Plan is invalid.")
 {
     public IReadOnlyList<ListingPlanValidationIssue> Issues { get; } = issues;
     public IReadOnlyList<ListingPlanAssignment>? Candidate { get; } = candidate;
     public IReadOnlyList<ListingPlanAssignment>? CanonicalAssignments { get; } = canonicalAssignments;
     public long CanonicalRevision { get; } = canonicalRevision;
+    public IReadOnlyList<ListingReserveRule>? CandidateReserves { get; } = candidateReserves;
+    public IReadOnlyList<ListingReserveRule>? CanonicalReserves { get; } = canonicalReserves;
 }
 
 public sealed class ListingPlanConflictException(
     IReadOnlyList<ListingPlanValidationIssue> conflicts,
     IReadOnlyList<ListingPlanAssignment> rebasedAssignments,
-    IReadOnlyList<ListingPlanAssignment> canonicalAssignments, long canonicalRevision)
+    IReadOnlyList<ListingPlanAssignment> canonicalAssignments, long canonicalRevision,
+    IReadOnlyList<ListingReserveRule>? rebasedReserves = null,
+    IReadOnlyList<ListingReserveRule>? canonicalReserves = null)
     : InvalidOperationException("The Listing Plan changed while this draft was open. Conflicting fields remain in the draft for review.")
 {
     public IReadOnlyList<ListingPlanValidationIssue> Conflicts { get; } = conflicts;
     public IReadOnlyList<ListingPlanAssignment> RebasedAssignments { get; } = rebasedAssignments;
     public IReadOnlyList<ListingPlanAssignment> CanonicalAssignments { get; } = canonicalAssignments;
     public long CanonicalRevision { get; } = canonicalRevision;
+    public IReadOnlyList<ListingReserveRule> RebasedReserves { get; } = rebasedReserves ?? [];
+    public IReadOnlyList<ListingReserveRule> CanonicalReserves { get; } = canonicalReserves ?? [];
 }
 
 public static class ListingPlanCatalog
@@ -60,6 +71,7 @@ public static class ListingPlanCatalog
         if (existing is not null)
         {
             var assignments = existing.Assignments.Select(Copy).ToList();
+            var reserves = existing.Reserves.Select(Copy).ToList();
             return new ListingPlanDraft
             {
                 PlanId = existing.Id,
@@ -67,6 +79,8 @@ public static class ListingPlanCatalog
                 Owner = owner with { },
                 Assignments = assignments,
                 BaselineAssignments = assignments.Select(Copy).ToList(),
+                Reserves = reserves,
+                BaselineReserves = reserves.Select(Copy).ToList(),
                 IncompleteListingRetainerIds = incomplete,
             };
         }
@@ -95,6 +109,7 @@ public static class ListingPlanCatalog
 
         ListingPlan plan;
         IReadOnlyList<ListingPlanAssignment> candidate;
+        IReadOnlyList<ListingReserveRule> candidateReserves;
         var didMerge = false;
         if (draft.IsNew)
         {
@@ -102,23 +117,39 @@ public static class ListingPlanCatalog
                 throw new InvalidOperationException("This owner already has a Listing Plan.");
             plan = new ListingPlan { Id = draft.PlanId, Owner = owner with { } };
             candidate = draft.Assignments.Select(Copy).ToArray();
+            candidateReserves = draft.Reserves.Select(Copy).ToArray();
         }
         else
         {
             plan = state.ListingPlans.Single(existing => existing.Id == draft.PlanId && existing.Owner.Matches(owner));
             didMerge = plan.Revision != draft.SourceRevision;
-            candidate = plan.Revision == draft.SourceRevision
-                ? draft.Assignments.Select(Copy).ToArray()
-                : MergeAssignments(draft.BaselineAssignments, draft.Assignments, plan.Assignments, plan.Revision);
+            if (didMerge)
+            {
+                var conflicts = new List<ListingPlanValidationIssue>();
+                candidate = MergeAssignments(draft.BaselineAssignments, draft.Assignments, plan.Assignments, conflicts);
+                candidateReserves = MergeReserves(draft.BaselineReserves, draft.Reserves, plan.Reserves, conflicts);
+                if (conflicts.Count != 0)
+                    throw new ListingPlanConflictException(conflicts, candidate.Select(Copy).ToArray(),
+                        plan.Assignments.Select(Copy).ToArray(), plan.Revision,
+                        candidateReserves.Select(Copy).ToArray(), plan.Reserves.Select(Copy).ToArray());
+            }
+            else
+            {
+                candidate = draft.Assignments.Select(Copy).ToArray();
+                candidateReserves = draft.Reserves.Select(Copy).ToArray();
+            }
         }
 
-        var issues = Validate(candidate, resolveMaxStack, ownerRetainerIds);
+        var issues = Validate(candidate, candidateReserves, resolveMaxStack, ownerRetainerIds);
         if (issues.Count != 0)
             throw new ListingPlanValidationException(issues,
                 didMerge ? candidate.Select(Copy).ToArray() : null,
                 didMerge ? plan.Assignments.Select(Copy).ToArray() : null,
-                didMerge ? plan.Revision : 0);
+                didMerge ? plan.Revision : 0,
+                didMerge ? candidateReserves.Select(Copy).ToArray() : null,
+                didMerge ? plan.Reserves.Select(Copy).ToArray() : null);
         plan.Assignments = candidate.Select(Copy).ToList();
+        plan.Reserves = candidateReserves.Select(Copy).ToList();
         plan.UpdatedAtUtc = nowUtc;
         if (draft.IsNew)
             state.ListingPlans.Add(plan);
@@ -162,6 +193,44 @@ public static class ListingPlanCatalog
             var message = $"{retainerName} has {plannedSlots:N0} / 20 planned listing slots.";
             foreach (var assignment in retainer)
                 issues.Add(new(assignment.Id, "RetainerCapacity", message));
+        }
+        return issues;
+    }
+
+    public static IReadOnlyList<ListingPlanValidationIssue> Validate(
+        IReadOnlyList<ListingPlanAssignment> assignments,
+        IReadOnlyList<ListingReserveRule> reserves,
+        Func<uint, int> resolveMaxStack,
+        IReadOnlySet<ulong> ownerRetainerIds) =>
+        Validate(assignments, resolveMaxStack, ownerRetainerIds)
+            .Concat(ValidateReserves(reserves, ownerRetainerIds))
+            .ToArray();
+
+    public static IReadOnlyList<ListingPlanValidationIssue> ValidateReserves(
+        IReadOnlyList<ListingReserveRule> reserves,
+        IReadOnlySet<ulong> ownerRetainerIds)
+    {
+        var issues = new List<ListingPlanValidationIssue>();
+        foreach (var duplicate in reserves.GroupBy(reserve => reserve.Id).Where(group => group.Count() > 1))
+            issues.Add(new(duplicate.Key, "Id", "Reserve rule identities must be unique."));
+        var enabled = reserves.Where(reserve => reserve.Enabled).ToArray();
+        foreach (var reserve in enabled)
+        {
+            if (reserve.ItemId == 0)
+                issues.Add(new(reserve.Id, nameof(reserve.ItemId), "Choose an item."));
+            if (reserve.Quality == ItemQualityPolicy.Any)
+                issues.Add(new(reserve.Id, nameof(reserve.Quality), "Reserve quality must be explicitly NQ or HQ."));
+            if (reserve.ReserveUnits is < 0 or > ListingReserveRule.MaxReserveUnits)
+                issues.Add(new(reserve.Id, nameof(reserve.ReserveUnits), $"Reserve must be between 0 and {ListingReserveRule.MaxReserveUnits:N0} units."));
+            if (reserve.Location is null || reserve.Location.PreferredRetainerIds.Any(id => !ownerRetainerIds.Contains(id)))
+                issues.Add(new(reserve.Id, nameof(reserve.Location), "Reserve location must name retainers owned by this character."));
+        }
+        foreach (var duplicate in enabled.GroupBy(reserve => (reserve.ItemId, reserve.Quality)).Where(group => group.Count() > 1))
+        {
+            var name = duplicate.Select(reserve => reserve.ItemName).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ??
+                       $"Item {duplicate.Key.ItemId}";
+            foreach (var reserve in duplicate)
+                issues.Add(new(reserve.Id, "ReserveDuplicate", $"{name} has more than one enabled reserve rule for this quality."));
         }
         return issues;
     }
@@ -247,20 +316,65 @@ public static class ListingPlanCatalog
         Enabled = source.Enabled,
     };
 
+    public static ListingReserveRule Copy(ListingReserveRule source) => new()
+    {
+        Id = source.Id,
+        ItemId = source.ItemId,
+        ItemName = source.ItemName,
+        Quality = source.Quality,
+        ReserveUnits = source.ReserveUnits,
+        Location = CopyLocation(source.Location),
+        Enabled = source.Enabled,
+    };
+
+    public static StowageRoutingPolicy CopyLocation(StowageRoutingPolicy? source) => new()
+    {
+        Mode = source?.Mode ?? StowageRoutingMode.ConsolidateFirst,
+        Overflow = source?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
+        PreferredRetainerIds = source?.PreferredRetainerIds.ToList() ?? [],
+    };
+
+    public static bool ReserveEquals(ListingReserveRule left, ListingReserveRule right) =>
+        left.Id == right.Id && left.ItemId == right.ItemId && left.ItemName == right.ItemName &&
+        left.Quality == right.Quality && left.ReserveUnits == right.ReserveUnits &&
+        LocationComparer.Instance.Equals(left.Location, right.Location) && left.Enabled == right.Enabled;
+
     private static IReadOnlyList<ListingPlanAssignment> MergeAssignments(
         IReadOnlyList<ListingPlanAssignment> baseline,
         IReadOnlyList<ListingPlanAssignment> draft,
-        IReadOnlyList<ListingPlanAssignment> current, long canonicalRevision)
+        IReadOnlyList<ListingPlanAssignment> current,
+        List<ListingPlanValidationIssue> conflicts) =>
+        MergeById(baseline, draft, current, assignment => assignment.Id, Copy, AssignmentEquals, MergeFields,
+            "Assignment", "assignment", conflicts);
+
+    private static IReadOnlyList<ListingReserveRule> MergeReserves(
+        IReadOnlyList<ListingReserveRule> baseline,
+        IReadOnlyList<ListingReserveRule> draft,
+        IReadOnlyList<ListingReserveRule> current,
+        List<ListingPlanValidationIssue> conflicts) =>
+        MergeById(baseline, draft, current, reserve => reserve.Id, Copy, ReserveEquals, MergeFields,
+            "Reserve", "reserve rule", conflicts);
+
+    private static IReadOnlyList<T> MergeById<T>(
+        IReadOnlyList<T> baseline,
+        IReadOnlyList<T> draft,
+        IReadOnlyList<T> current,
+        Func<T, Guid> identity,
+        Func<T, T> copy,
+        Func<T, T, bool> equals,
+        Func<T, T, T, Guid, List<ListingPlanValidationIssue>, T> mergeFields,
+        string field,
+        string noun,
+        List<ListingPlanValidationIssue> conflicts) where T : class
     {
-        var baselineById = baseline.ToDictionary(assignment => assignment.Id);
-        var draftById = draft.ToDictionary(assignment => assignment.Id);
-        var currentById = current.ToDictionary(assignment => assignment.Id);
-        var order = draft.Select(assignment => assignment.Id)
-            .Concat(current.Select(assignment => assignment.Id))
+        var baselineById = baseline.ToDictionary(identity);
+        var draftById = draft.ToDictionary(identity);
+        var currentById = current.ToDictionary(identity);
+        var order = draft.Select(identity)
+            .Concat(current.Select(identity))
             .Distinct()
             .ToArray();
-        var merged = new List<ListingPlanAssignment>();
-        var conflicts = new List<ListingPlanValidationIssue>();
+        var merged = new List<T>();
         foreach (var id in order)
         {
             baselineById.TryGetValue(id, out var original);
@@ -268,43 +382,67 @@ public static class ListingPlanCatalog
             currentById.TryGetValue(id, out var canonical);
             if (original is null)
             {
-                if (edited is not null && canonical is not null && !AssignmentEquals(edited, canonical))
+                if (edited is not null && canonical is not null && !equals(edited, canonical))
                 {
-                    conflicts.Add(new(id, "Assignment", "This newly added assignment has two different versions."));
-                    merged.Add(Copy(edited));
+                    conflicts.Add(new(id, field, $"This newly added {noun} has two different versions."));
+                    merged.Add(copy(edited));
                 }
                 else if (edited is not null || canonical is not null)
-                    merged.Add(Copy(edited ?? canonical!));
+                    merged.Add(copy(edited ?? canonical!));
                 continue;
             }
             if (edited is null || canonical is null)
             {
                 var survivor = edited ?? canonical;
-                if (survivor is not null && !AssignmentEquals(survivor, original))
+                if (survivor is not null && !equals(survivor, original))
                 {
-                    conflicts.Add(new(id, "Assignment", "This assignment was deleted in one revision and edited in another."));
+                    conflicts.Add(new(id, field, $"This {noun} was deleted in one revision and edited in another."));
                     if (edited is not null)
-                        merged.Add(Copy(edited));
+                        merged.Add(copy(edited));
                 }
                 continue;
             }
 
-            var result = Copy(original);
-            result.ItemId = Merge(original.ItemId, edited.ItemId, canonical.ItemId, id, nameof(result.ItemId), conflicts);
-            result.ItemName = Merge(original.ItemName, edited.ItemName, canonical.ItemName, id, nameof(result.ItemName), conflicts);
-            result.Quality = Merge(original.Quality, edited.Quality, canonical.Quality, id, nameof(result.Quality), conflicts);
-            result.RetainerId = Merge(original.RetainerId, edited.RetainerId, canonical.RetainerId, id, nameof(result.RetainerId), conflicts);
-            result.RetainerName = Merge(original.RetainerName, edited.RetainerName, canonical.RetainerName, id, nameof(result.RetainerName), conflicts);
-            result.ListingCount = Merge(original.ListingCount, edited.ListingCount, canonical.ListingCount, id, nameof(result.ListingCount), conflicts);
-            result.QuantityPerListing = Merge(original.QuantityPerListing, edited.QuantityPerListing, canonical.QuantityPerListing, id, nameof(result.QuantityPerListing), conflicts);
-            result.UnitPrice = Merge(original.UnitPrice, edited.UnitPrice, canonical.UnitPrice, id, nameof(result.UnitPrice), conflicts);
-            result.Enabled = Merge(original.Enabled, edited.Enabled, canonical.Enabled, id, nameof(result.Enabled), conflicts);
-            merged.Add(result);
+            merged.Add(mergeFields(original, edited, canonical, id, conflicts));
         }
-        if (conflicts.Count != 0)
-            throw new ListingPlanConflictException(conflicts, merged.Select(Copy).ToArray(),
-                current.Select(Copy).ToArray(), canonicalRevision);
         return merged;
+    }
+
+    private static ListingReserveRule MergeFields(
+        ListingReserveRule original,
+        ListingReserveRule edited,
+        ListingReserveRule canonical,
+        Guid id,
+        List<ListingPlanValidationIssue> conflicts)
+    {
+        var result = Copy(original);
+        result.ItemId = Merge(original.ItemId, edited.ItemId, canonical.ItemId, id, nameof(result.ItemId), conflicts);
+        result.ItemName = Merge(original.ItemName, edited.ItemName, canonical.ItemName, id, nameof(result.ItemName), conflicts);
+        result.Quality = Merge(original.Quality, edited.Quality, canonical.Quality, id, nameof(result.Quality), conflicts);
+        result.ReserveUnits = Merge(original.ReserveUnits, edited.ReserveUnits, canonical.ReserveUnits, id, nameof(result.ReserveUnits), conflicts);
+        result.Location = CopyLocation(Merge(original.Location, edited.Location, canonical.Location, id, nameof(result.Location), conflicts, LocationComparer.Instance));
+        result.Enabled = Merge(original.Enabled, edited.Enabled, canonical.Enabled, id, nameof(result.Enabled), conflicts);
+        return result;
+    }
+
+    private static ListingPlanAssignment MergeFields(
+        ListingPlanAssignment original,
+        ListingPlanAssignment edited,
+        ListingPlanAssignment canonical,
+        Guid id,
+        List<ListingPlanValidationIssue> conflicts)
+    {
+        var result = Copy(original);
+        result.ItemId = Merge(original.ItemId, edited.ItemId, canonical.ItemId, id, nameof(result.ItemId), conflicts);
+        result.ItemName = Merge(original.ItemName, edited.ItemName, canonical.ItemName, id, nameof(result.ItemName), conflicts);
+        result.Quality = Merge(original.Quality, edited.Quality, canonical.Quality, id, nameof(result.Quality), conflicts);
+        result.RetainerId = Merge(original.RetainerId, edited.RetainerId, canonical.RetainerId, id, nameof(result.RetainerId), conflicts);
+        result.RetainerName = Merge(original.RetainerName, edited.RetainerName, canonical.RetainerName, id, nameof(result.RetainerName), conflicts);
+        result.ListingCount = Merge(original.ListingCount, edited.ListingCount, canonical.ListingCount, id, nameof(result.ListingCount), conflicts);
+        result.QuantityPerListing = Merge(original.QuantityPerListing, edited.QuantityPerListing, canonical.QuantityPerListing, id, nameof(result.QuantityPerListing), conflicts);
+        result.UnitPrice = Merge(original.UnitPrice, edited.UnitPrice, canonical.UnitPrice, id, nameof(result.UnitPrice), conflicts);
+        result.Enabled = Merge(original.Enabled, edited.Enabled, canonical.Enabled, id, nameof(result.Enabled), conflicts);
+        return result;
     }
 
     private static T Merge<T>(
@@ -313,9 +451,10 @@ public static class ListingPlanCatalog
         T current,
         Guid assignmentId,
         string field,
-        ICollection<ListingPlanValidationIssue> conflicts)
+        ICollection<ListingPlanValidationIssue> conflicts,
+        IEqualityComparer<T>? equality = null)
     {
-        var comparer = EqualityComparer<T>.Default;
+        var comparer = equality ?? EqualityComparer<T>.Default;
         if (comparer.Equals(draft, baseline))
             return current;
         if (comparer.Equals(current, baseline) || comparer.Equals(draft, current))
@@ -330,4 +469,16 @@ public static class ListingPlanCatalog
         left.RetainerName == right.RetainerName && left.ListingCount == right.ListingCount &&
         left.QuantityPerListing == right.QuantityPerListing && left.UnitPrice == right.UnitPrice &&
         left.Enabled == right.Enabled;
+
+    private sealed class LocationComparer : IEqualityComparer<StowageRoutingPolicy>
+    {
+        public static readonly LocationComparer Instance = new();
+
+        public bool Equals(StowageRoutingPolicy? left, StowageRoutingPolicy? right) =>
+            ReferenceEquals(left, right) ||
+            (left is not null && right is not null && left.Mode == right.Mode && left.Overflow == right.Overflow &&
+             left.PreferredRetainerIds.SequenceEqual(right.PreferredRetainerIds));
+
+        public int GetHashCode(StowageRoutingPolicy value) => HashCode.Combine(value.Mode, value.Overflow, value.PreferredRetainerIds.Count);
+    }
 }
