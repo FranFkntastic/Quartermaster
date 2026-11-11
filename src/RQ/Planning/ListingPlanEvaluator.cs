@@ -69,6 +69,15 @@ public sealed record TransferPlanListingContribution(
 
 public static class ListingPlanEvaluator
 {
+    public static IReadOnlyList<ListingMatch> MatchListings(
+        IReadOnlyList<ListingPlanAssignment> assignments, IReadOnlyList<ListingRow> listings) =>
+        listings.GroupBy(row => new ListingItemKey(row.ItemId, ListingQuality(row)))
+            .SelectMany(group => MatchAssignments(
+                assignments.Where(a => a.Enabled && a.ItemId == group.Key.ItemId && a.Quality == group.Key.Quality)
+                    .OrderBy(a => a.RetainerId).ThenBy(a => a.Id).ToArray(),
+                group.OrderBy(row => row.RetainerId).ThenBy(row => row.SlotIndex).ToArray()).Matches)
+            .ToArray();
+
     public static ListingPlanEvaluation Evaluate(ListingPlan? plan, BrowserProjection projection, string? scopeKey = null)
     {
         var normalizedScope = string.IsNullOrWhiteSpace(scopeKey) ? BrowserScope.AllKey : scopeKey;

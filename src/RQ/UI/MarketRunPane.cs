@@ -19,6 +19,23 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
     private MarketRunCraftExportResult export = new(null, [], []);
     private string? status;
     private IReadOnlyList<MarketRunItem> items = [];
+    internal MarketRunRetainer? Retainer(QuartermasterRuntimeSnapshot runtime, ListingPlanDraftSession session, ulong id)
+    {
+        Update(runtime, session);
+        return run.Retainers.FirstOrDefault(r => r.RetainerId == id);
+    }
+
+    private void Update(QuartermasterRuntimeSnapshot runtime, ListingPlanDraftSession session)
+    {
+        if (session.Draft is not { } draft) return;
+        var key = (runtime.Revision, session.Version, DateTime.Today);
+        if (cacheKey == key && ReferenceEquals(cachedDraft, draft)) return;
+        cacheKey = key; cachedDraft = draft;
+        run = MarketRunPlanner.Evaluate(MarketRunPresentation.PlanView(draft), runtime.Browser);
+        items = MarketRunPresentation.DisplayItems(run, draft);
+        export = MarketRunCraftExport.Export($"Market run {DateTime.Today:yyyy-MM-dd}", run.CraftQueue,
+            resolveWorkshopProject, DateTime.UtcNow);
+    }
     /// <param name="runtime">Current runtime snapshot.</param>
     /// <param name="session">Shared Listing Plan draft session (its draft is non-null when this is called).</param>
     /// <param name="retainers">Projection of every retainer row, unfiltered by the Market search box.</param>
@@ -30,15 +47,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         ulong? selectedRetainerId)
     {
         if (session.Draft is not { } draft) return;
-        var key = (runtime.Revision, session.Version, DateTime.Today);
-        if (cacheKey != key || !ReferenceEquals(cachedDraft, draft))
-        {
-            cacheKey = key; cachedDraft = draft;
-            run = MarketRunPlanner.Evaluate(MarketRunPresentation.PlanView(draft), runtime.Browser);
-            items = MarketRunPresentation.DisplayItems(run, draft);
-            export = MarketRunCraftExport.Export($"Market run {DateTime.Today:yyyy-MM-dd}", run.CraftQueue,
-                resolveWorkshopProject, DateTime.UtcNow);
-        }
+        Update(runtime, session);
         ImGui.TextUnformatted(MarketRunPresentation.Header(run));
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(MarketRunPresentation.Header(run));
         ImGui.Separator(); ImGui.TextUnformatted("Reserves");

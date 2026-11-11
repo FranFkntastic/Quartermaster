@@ -175,8 +175,8 @@ public static class ListingPlanCatalog
                 issues.Add(new(assignment.Id, nameof(assignment.Quality), "Listing quality must be explicitly NQ or HQ."));
             if (assignment.RetainerId == 0 || !ownerRetainerIds.Contains(assignment.RetainerId))
                 issues.Add(new(assignment.Id, nameof(assignment.RetainerId), "Choose a retainer owned by this character."));
-            if (assignment.ListingCount is < 1 or > 20)
-                issues.Add(new(assignment.Id, nameof(assignment.ListingCount), "Listings must be between 1 and 20."));
+            if (assignment.ListingCount is < 1 or > MarketRunPlanner.ListingCapacity)
+                issues.Add(new(assignment.Id, nameof(assignment.ListingCount), $"Listings must be between 1 and {MarketRunPlanner.ListingCapacity}."));
             var maxStack = assignment.ItemId == 0 ? 1 : Math.Max(1, resolveMaxStack(assignment.ItemId));
             if (assignment.QuantityPerListing < 1 || assignment.QuantityPerListing > maxStack)
                 issues.Add(new(assignment.Id, nameof(assignment.QuantityPerListing), $"Quantity per listing must be between 1 and {maxStack:N0}."));
@@ -186,11 +186,11 @@ public static class ListingPlanCatalog
         foreach (var retainer in assignments.Where(assignment => assignment.Enabled).GroupBy(assignment => assignment.RetainerId))
         {
             var plannedSlots = retainer.Sum(assignment => assignment.ListingCount);
-            if (plannedSlots <= 20)
+            if (plannedSlots <= MarketRunPlanner.ListingCapacity)
                 continue;
             var retainerName = retainer.Select(assignment => assignment.RetainerName)
                 .FirstOrDefault(name => !string.IsNullOrWhiteSpace(name)) ?? $"Retainer {retainer.Key}";
-            var message = $"{retainerName} has {plannedSlots:N0} / 20 planned listing slots.";
+            var message = $"{retainerName} has {plannedSlots:N0} / {MarketRunPlanner.ListingCapacity} planned listing slots.";
             foreach (var assignment in retainer)
                 issues.Add(new(assignment.Id, "RetainerCapacity", message));
         }

@@ -120,8 +120,8 @@ internal sealed class ListingPlanDraftSession(
             if (a.UnitPrice == 0) fields.Add("price");
             result.Add($"{a.RetainerName} · {a.ItemName} ({(fields.Count > 0 ? string.Join(", ", fields) : string.Join(", ", own.Select(i => i.Message)))})");
         }
-        foreach (var group in (Draft?.Assignments ?? []).Where(a => a.Enabled).GroupBy(a => a.RetainerId).Where(g => g.Sum(a => a.ListingCount) > 20))
-            result.Add($"{group.First().RetainerName} ({group.Sum(a => a.ListingCount):N0} / 20 planned listings)");
+        foreach (var group in (Draft?.Assignments ?? []).Where(a => a.Enabled).GroupBy(a => a.RetainerId).Where(g => g.Sum(a => a.ListingCount) > MarketRunPlanner.ListingCapacity))
+            result.Add($"{group.First().RetainerName} ({group.Sum(a => a.ListingCount):N0} / {MarketRunPlanner.ListingCapacity} planned listings)");
         foreach (var r in Draft?.Reserves ?? [])
         {
             var own = validation.Where(i => i.AssignmentId == r.Id).Select(i => i.Message).Distinct().ToArray();
@@ -130,7 +130,7 @@ internal sealed class ListingPlanDraftSession(
         return string.Join("; ", result.Take(6)) + (result.Count > 6 ? $"; +{result.Count - 6} more" : "");
     }
 
-    public int Free(ulong retainerId, Guid? exceptAssignmentId = null) => Math.Max(0, 20 -
+    public int Free(ulong retainerId, Guid? exceptAssignmentId = null) => Math.Max(0, MarketRunPlanner.ListingCapacity -
         (Draft?.Assignments.Where(a => a.Enabled && a.RetainerId == retainerId && a.Id != exceptAssignmentId).Sum(a => a.ListingCount) ?? 0));
     public int MaxStack(BrowserProjection browser, uint itemId) => Math.Max(1, resolveMaxStack(browser, itemId));
     public bool CanBeHq(uint itemId) => canBeHq(itemId);
@@ -138,7 +138,7 @@ internal sealed class ListingPlanDraftSession(
     public ListingPlanAssignment Add(ulong retainerId, string retainerName, uint itemId, string itemName,
         ItemQualityPolicy quality, BrowserProjection browser)
     {
-        if (Draft is null || Free(retainerId) == 0 || Draft.Assignments.Count(a => a.RetainerId == retainerId) >= 20)
+        if (Draft is null || Free(retainerId) == 0 || Draft.Assignments.Count(a => a.RetainerId == retainerId) >= MarketRunPlanner.ListingCapacity)
             throw new InvalidOperationException("No planned capacity remains on this retainer.");
         var assignment = new ListingPlanAssignment { RetainerId = retainerId, RetainerName = retainerName,
             ItemId = itemId, ItemName = itemName, Quality = quality, ListingCount = 0,
@@ -169,7 +169,7 @@ internal sealed class ListingPlanDraftSession(
     public void Remove(Guid id) { if (Draft?.Assignments.RemoveAll(a => a.Id == id) > 0) Changed(); }
     public bool CanAdopt(IReadOnlyList<ListingRow> listings, IReadOnlySet<ulong> currentRetainerIds) =>
         Draft is not null && listings.Count > 0 && currentRetainerIds.Contains(listings[0].RetainerId) &&
-        listings.Count <= Free(listings[0].RetainerId) && Draft.Assignments.Count(a => a.RetainerId == listings[0].RetainerId) < 20;
+        listings.Count <= Free(listings[0].RetainerId) && Draft.Assignments.Count(a => a.RetainerId == listings[0].RetainerId) < MarketRunPlanner.ListingCapacity;
     public void Adopt(IReadOnlyList<ListingRow> listings, IReadOnlySet<ulong> currentRetainerIds)
     {
         if (!CanAdopt(listings, currentRetainerIds)) return;

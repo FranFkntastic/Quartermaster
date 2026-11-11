@@ -41,6 +41,23 @@ internal static class MarketRunPresentation
             var missing = run.Retainers.Count(r => !r.ListingsComplete);
             return missing > 0 ? $"{missing} retainers not yet observed" : "Retainer stock not yet observed";
         }
-        return $"Refill {run.Retainers.Sum(r => (long)r.RefillListings.Value):N0} · Short {run.Retainers.Sum(r => (long)r.UnfilledListings.Value):N0} · Craft {run.Items.Sum(i => (long)i.CraftUnits.Value):N0}";
+        return $"Refill {run.Retainers.Sum(r => (long)r.RefillListings.Value):N0} · Short {run.Retainers.Sum(r => (long)r.UnfilledListings.Value):N0} · Craft {run.Items.Sum(i => (long)i.CraftUnits.Value):N0}" +
+            Capacity(Evidence.Known(run.Retainers.Sum(r => r.PullListings.Value)),
+                Evidence.Known(run.Retainers.Sum(r => r.BlockedBySlotsListings.Value)));
     }
+
+    internal static string Capacity(FieldEvidence<int> pulls, FieldEvidence<int> blocked) =>
+        (!pulls.IsKnown ? " · Pull —" : pulls.Value > 0 ? $" · Pull {pulls.Value:N0}" : string.Empty) +
+        (!blocked.IsKnown ? " · No slot —" : blocked.Value > 0 ? $" · No slot {blocked.Value:N0}" : string.Empty);
+
+    internal static string PullLabel(MarketRunPullListing pull) =>
+        $"Pull · {pull.Listing.ItemName} {(pull.Listing.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ ? "HQ" : "NQ")}";
+
+    /// <summary>The pulls that are members of one observed group, matched by listing identity.</summary>
+    internal static IReadOnlyList<MarketRunPullListing> PullsIn(
+        IReadOnlyList<ListingRow> groupListings, IReadOnlyList<MarketRunPullListing> pulls) =>
+        pulls.Where(pull => groupListings.Any(listing => ReferenceEquals(listing, pull.Listing))).ToArray();
+
+    internal static string PullPrice(MarketRunPullListing pull) =>
+        pull.Listing.UnitPrice.IsKnown ? pull.Listing.UnitPrice.Value.ToString("N0") : "—";
 }

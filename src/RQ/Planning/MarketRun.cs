@@ -16,7 +16,10 @@ public sealed record MarketRunAssignment(
     FieldEvidence<int> RepriceListings,
     FieldEvidence<int> ShortListings,
     FieldEvidence<int> RefillListings,
-    FieldEvidence<int> UnfilledListings);
+    FieldEvidence<int> UnfilledListings,
+    FieldEvidence<int> BlockedBySlotsListings);
+
+public sealed record MarketRunPullListing(ListingRow Listing, int ObservationIndex);
 
 public sealed record MarketRunRetainer(
     ulong RetainerId,
@@ -27,7 +30,12 @@ public sealed record MarketRunRetainer(
     FieldEvidence<int> ExactListings,
     FieldEvidence<int> ShortListings,
     FieldEvidence<int> RefillListings,
-    FieldEvidence<int> UnfilledListings);
+    FieldEvidence<int> UnfilledListings,
+    FieldEvidence<int> ObservedListingCount,
+    FieldEvidence<int> FreeSlots,
+    FieldEvidence<int> PullListings,
+    FieldEvidence<int> BlockedBySlotsListings,
+    IReadOnlyList<MarketRunPullListing> ListingsToPull);
 
 public sealed record MarketRunItem(
     uint ItemId,
@@ -68,6 +76,33 @@ public sealed record MarketRunEvaluation(
 /// </summary>
 public static class MarketRunPlanner
 {
+    public const int ListingCapacity = 20;
+
+    /// <summary>
+    /// Selects pulls from one retainer's complete scan. ObservationIndex is relative to that
+    /// scan; callers must reselect against live observations rather than reuse stale slot identities.
+    /// </summary>
+    public static IReadOnlyList<MarketRunPullListing> SelectListingsToPull(
+        IReadOnlyList<ListingRow> observedListings,
+        IReadOnlyList<ListingPlanAssignment> enabledAssignments,
+        int roomNeeded)
+    {
+        if (roomNeeded <= 0) return [];
+        var matches = ListingPlanEvaluator.MatchListings(enabledAssignments, observedListings);
+        var planned = matches.Where(match => match.Kind is ListingMatchKind.Exact or ListingMatchKind.UnknownPrice or ListingMatchKind.PriceDiffers)
+            .Select(match => match.Listing).ToHashSet(ReferenceEqualityComparer.Instance);
+        var needed = Math.Max(0, roomNeeded - (ListingCapacity - observedListings.Count));
+        // Pull unknown-price listings first, then lowest unit price × quantity; ties use
+        // slot index (missing slots last), then original observation order.
+        return observedListings.Select((listing, index) => new MarketRunPullListing(listing, index))
+            .Where(row => !planned.Contains(row.Listing))
+            .OrderBy(row => row.Listing.UnitPrice.IsKnown ? 1 : 0)
+            .ThenBy(row => row.Listing.UnitPrice.IsKnown ? row.Listing.UnitPrice.Value * row.Listing.Quantity : 0)
+            .ThenBy(row => row.Listing.SlotIndex ?? int.MaxValue)
+            .ThenBy(row => row.ObservationIndex)
+            .Take(needed).ToArray();
+    }
+
     public static MarketRunEvaluation Evaluate(ListingPlan? plan, BrowserProjection projection)
     {
         if (plan is null)
@@ -102,41 +137,83 @@ public static class MarketRunPlanner
             .Distinct()
             .ToArray();
 
-        var refills = new Dictionary<Guid, (FieldEvidence<int> Refill, FieldEvidence<int> Unfilled)>();
+        var refills = new Dictionary<Guid, (FieldEvidence<int> Refill, FieldEvidence<int> Unfilled, FieldEvidence<int> Blocked)>();
+        var availableSlots = assignments.GroupBy(a => a.RetainerId).ToDictionary(g => g.Key, g =>
+        {
+            var observed = projection.Listings.Where(l => l.RetainerId == g.Key).ToArray();
+            return Math.Max(0, ListingCapacity - observed.Length +
+                SelectListingsToPull(observed, g.ToArray(), observed.Length + ListingCapacity).Count);
+        });
+        var spares = keys.ToDictionary(key => key, key => SpareUnits(projection, key));
+        var remainingStock = keys.ToDictionary(key => key, key => spares[key].IsKnown ? spares[key].Value : 0);
+        // Allocation is sequential, so one unknown assignment leaves two things unknown for every
+        // later assignment: how much of that item's stock is left, and how much slot room its
+        // retainer has left. Later assignments that depend on either are unknown too.
+        const string unobserved = "Listings have not been observed for every planned retainer.";
+        var uncertainStock = keys.Where(key => !spares[key].IsKnown)
+            .ToDictionary(key => key, key => spares[key].UnknownReason ?? unobserved);
+        var uncertainSlots = new Dictionary<ulong, string>();
+        foreach (var assignment in assignments)
+        {
+            var key = new ListingItemKey(assignment.ItemId, assignment.Quality);
+            var shortCount = counted[assignment.Id].Short;
+            var reason = !shortCount.IsKnown ? shortCount.UnknownReason ?? unobserved
+                : uncertainStock.GetValueOrDefault(key) ?? uncertainSlots.GetValueOrDefault(assignment.RetainerId);
+            if (reason is not null)
+            {
+                uncertainStock.TryAdd(key, reason);
+                uncertainSlots.TryAdd(assignment.RetainerId, reason);
+                var unknown = Evidence.Unknown<int>(reason);
+                refills[assignment.Id] = (unknown, unknown, unknown);
+                continue;
+            }
+            var shortListings = counted[assignment.Id].Short.Value;
+            var quantity = Math.Max(0, assignment.QuantityPerListing);
+            var stockBacked = quantity == 0 ? 0 : Math.Min(shortListings, remainingStock[key] / quantity);
+            var refill = Math.Min(stockBacked, availableSlots[assignment.RetainerId]);
+            availableSlots[assignment.RetainerId] -= refill;
+            remainingStock[key] -= refill * quantity;
+            refills[assignment.Id] = (Evidence.Known(refill), Evidence.Known(shortListings - stockBacked),
+                Evidence.Known(stockBacked - refill));
+        }
+        // Pulls are settled before item totals: a pulled listing lands in the player's inventory,
+        // so its units count toward that item's stock after the run.
+        var pullsByRetainer = assignments.GroupBy(assignment => assignment.RetainerId).ToDictionary(group => group.Key, group =>
+        {
+            var refillTotal = Sum(group.Select(assignment => refills[assignment.Id].Refill));
+            var blockedTotal = Sum(group.Select(assignment => refills[assignment.Id].Blocked));
+            return ListingsComplete(projection, group.Key) && refillTotal.IsKnown && blockedTotal.IsKnown
+                ? SelectListingsToPull(projection.Listings.Where(l => l.RetainerId == group.Key).ToArray(), group.ToArray(),
+                    refillTotal.Value + blockedTotal.Value)
+                : [];
+        });
         var items = new List<MarketRunItem>();
         foreach (var key in keys)
         {
             var itemAssignments = assignments.Where(assignment => assignment.ItemId == key.ItemId && assignment.Quality == key.Quality).ToArray();
-            var spare = SpareUnits(projection, key);
-            var shortsKnown = itemAssignments.All(assignment => counted[assignment.Id].Short.IsKnown);
+            var spare = spares[key];
             var refillUnits = 0;
             var unfilledUnits = 0;
-            if (spare.IsKnown && shortsKnown)
+            var known = !uncertainStock.ContainsKey(key);
+            if (known)
             {
-                var remaining = spare.Value;
                 foreach (var assignment in itemAssignments)
                 {
-                    var shortListings = counted[assignment.Id].Short.Value;
                     var perListing = assignment.QuantityPerListing;
-                    var refill = perListing <= 0 ? 0 : Math.Min(shortListings, remaining / perListing);
-                    remaining -= refill * perListing;
+                    var refill = refills[assignment.Id].Refill.Value;
                     refillUnits += refill * Math.Max(0, perListing);
-                    unfilledUnits += (shortListings - refill) * Math.Max(0, perListing);
-                    refills[assignment.Id] = (Evidence.Known(refill), Evidence.Known(shortListings - refill));
+                    unfilledUnits += refills[assignment.Id].Unfilled.Value * Math.Max(0, perListing);
                 }
             }
-            else
-            {
-                var reason = spare.UnknownReason ?? "Listings have not been observed for every planned retainer.";
-                foreach (var assignment in itemAssignments)
-                    refills[assignment.Id] = (Evidence.Unknown<int>(reason), Evidence.Unknown<int>(reason));
-            }
 
-            var known = spare.IsKnown && shortsKnown;
-            var unknownReason = spare.UnknownReason ?? "Listings have not been observed for every planned retainer.";
+            var unknownReason = uncertainStock.GetValueOrDefault(key) ?? unobserved;
             var reserve = reserves.GetValueOrDefault(key);
             var reserveUnits = reserve?.ReserveUnits ?? 0;
-            var reserveAfterRun = known ? Evidence.Known(spare.Value - refillUnits) : Evidence.Unknown<int>(unknownReason);
+            var pulledQuality = key.Quality == ItemQualityPolicy.HqOnly ? FfxivItemQuality.HQ : FfxivItemQuality.NQ;
+            var pulledUnits = pullsByRetainer.Values.SelectMany(pulls => pulls)
+                .Where(pull => pull.Listing.ItemId == key.ItemId && pull.Listing.Quality == pulledQuality)
+                .Sum(pull => pull.Listing.Quantity);
+            var reserveAfterRun = known ? Evidence.Known(spare.Value - refillUnits + pulledUnits) : Evidence.Unknown<int>(unknownReason);
             var listingItem = listingEvaluation.Find(key.ItemId, key.Quality);
             items.Add(new(
                 key.ItemId,
@@ -151,7 +228,7 @@ public static class MarketRunPlanner
                 reserveUnits,
                 reserveAfterRun,
                 known
-                    ? Evidence.Known(unfilledUnits + Math.Max(0, reserveUnits - reserveAfterRun.Value))
+                    ? Evidence.Known(Math.Max(0, unfilledUnits + Math.Max(0, reserveUnits - (spare.Value - refillUnits)) - pulledUnits))
                     : Evidence.Unknown<int>(unknownReason)));
         }
 
@@ -164,10 +241,16 @@ public static class MarketRunPlanner
                     var count = counted[assignment.Id];
                     var refill = refills[assignment.Id];
                     return new MarketRunAssignment(assignment, assignment.ListingCount, count.Exact, count.Reprice,
-                        count.Short, refill.Refill, refill.Unfilled);
+                        count.Short, refill.Refill, refill.Unfilled, refill.Blocked);
                 }).ToArray();
                 var name = group.Select(assignment => assignment.RetainerName).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ??
                            $"Retainer {group.Key}";
+                var complete = ListingsComplete(projection, group.Key);
+                var observed = projection.Listings.Where(l => l.RetainerId == group.Key).ToArray();
+                var refillTotal = Sum(rows.Select(row => row.RefillListings));
+                var blockedTotal = Sum(rows.Select(row => row.BlockedBySlotsListings));
+                var pulls = pullsByRetainer[group.Key];
+                var unknown = Evidence.Unknown<int>($"Listings for {name} have not been observed.");
                 return new MarketRunRetainer(
                     group.Key,
                     name,
@@ -177,7 +260,12 @@ public static class MarketRunPlanner
                     Sum(rows.Select(row => row.ExactListings)),
                     Sum(rows.Select(row => row.ShortListings)),
                     Sum(rows.Select(row => row.RefillListings)),
-                    Sum(rows.Select(row => row.UnfilledListings)));
+                    Sum(rows.Select(row => row.UnfilledListings)),
+                    complete ? Evidence.Known(observed.Length) : unknown,
+                    complete ? Evidence.Known(ListingCapacity - observed.Length) : unknown,
+                    !complete ? unknown : refillTotal.IsKnown && blockedTotal.IsKnown ? Evidence.Known(pulls.Count) : refillTotal,
+                    !complete ? unknown : blockedTotal,
+                    pulls);
             })
             .ToArray();
 
