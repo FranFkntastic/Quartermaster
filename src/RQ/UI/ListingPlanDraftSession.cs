@@ -43,8 +43,10 @@ internal sealed class ListingPlanDraftSession(
         }
         if (!Draft.IsNew || plan is null) return;
         var local = Draft.Assignments.Select(ListingPlanCatalog.Copy).ToArray();
+        var localReserves = Draft.Reserves.Select(ListingPlanCatalog.Copy).ToArray();
         Draft = ListingPlanCatalog.Draft(document, owner, browser);
         Draft.Assignments.AddRange(local);
+        Draft.Reserves.AddRange(localReserves);
         MergedElsewhere = true;
         Changed();
     }
@@ -64,9 +66,15 @@ internal sealed class ListingPlanDraftSession(
         if (Draft is null) return [];
         var baseline = Draft.BaselineAssignments.ToDictionary(a => a.Id);
         var current = Draft.Assignments.ToDictionary(a => a.Id);
+        var baselineReserves = Draft.BaselineReserves.ToDictionary(r => r.Id);
+        var currentReserves = Draft.Reserves.ToDictionary(r => r.Id);
         return baseline.Keys.Union(current.Keys).Where(id =>
             !baseline.TryGetValue(id, out var before) || !current.TryGetValue(id, out var after) ||
-            !ListingPlanCatalog.AssignmentEquals(before, after)).ToHashSet();
+            !ListingPlanCatalog.AssignmentEquals(before, after))
+            .Concat(baselineReserves.Keys.Union(currentReserves.Keys).Where(id =>
+                !baselineReserves.TryGetValue(id, out var before) || !currentReserves.TryGetValue(id, out var after) ||
+                !ListingPlanCatalog.ReserveEquals(before, after)))
+            .ToHashSet();
     }
 
     private void Changed()
@@ -91,7 +99,7 @@ internal sealed class ListingPlanDraftSession(
     {
         if (issueKey == (Version, runtime.Revision)) return issues;
         issueKey = (Version, runtime.Revision);
-        return issues = Draft is null ? [] : ListingPlanCatalog.Validate(Draft.Assignments,
+        return issues = Draft is null ? [] : ListingPlanCatalog.Validate(Draft.Assignments, Draft.Reserves,
             id => MaxStack(runtime.Browser, id), CurrentRetainerIds(runtime));
     }
 
@@ -114,6 +122,11 @@ internal sealed class ListingPlanDraftSession(
         }
         foreach (var group in (Draft?.Assignments ?? []).Where(a => a.Enabled).GroupBy(a => a.RetainerId).Where(g => g.Sum(a => a.ListingCount) > 20))
             result.Add($"{group.First().RetainerName} ({group.Sum(a => a.ListingCount):N0} / 20 planned listings)");
+        foreach (var r in Draft?.Reserves ?? [])
+        {
+            var own = validation.Where(i => i.AssignmentId == r.Id).Select(i => i.Message).Distinct().ToArray();
+            if (own.Length > 0) result.Add($"{r.ItemName} reserve ({string.Join(", ", own)})");
+        }
         return string.Join("; ", result.Take(6)) + (result.Count > 6 ? $"; +{result.Count - 6} more" : "");
     }
 
@@ -175,6 +188,34 @@ internal sealed class ListingPlanDraftSession(
         foreach (var sibling in PriceSiblings(id, currentRetainerIds)) sibling.UnitPrice = a.UnitPrice;
         Changed();
     }
+    public ListingReserveRule AddReserve(uint itemId, string itemName, ItemQualityPolicy quality)
+    {
+        if (Draft is null)
+            throw new InvalidOperationException("No Listing Plan draft is open.");
+        var reserve = new ListingReserveRule { ItemId = itemId, ItemName = itemName, Quality = quality };
+        Draft.Reserves.Add(reserve);
+        Changed();
+        return reserve;
+    }
+
+    private ListingReserveRule? FindReserve(Guid id) => Draft?.Reserves.FirstOrDefault(r => r.Id == id);
+    public void SetReserveUnits(Guid id, string text) { if (FindReserve(id) is { } r) { r.ReserveUnits = ReserveInput(text); Changed(); } }
+    public void SetReserveLocation(Guid id, StowageRoutingPolicy location) { if (FindReserve(id) is { } r) { r.Location = ListingPlanCatalog.CopyLocation(location); Changed(); } }
+    public void SetReserveEnabled(Guid id, bool enabled) { if (FindReserve(id) is { } r) { r.Enabled = enabled; Changed(); } }
+    public void RemoveReserve(Guid id) { if (Draft?.Reserves.RemoveAll(r => r.Id == id) > 0) Changed(); }
+
+    // Zero is a meaningful reserve (keep nothing spare), unlike listing counts.
+    private static int ReserveInput(string text)
+    {
+        long value = 0;
+        foreach (var c in text)
+        {
+            if (c is < '0' or > '9') continue;
+            value = Math.Min(ListingReserveRule.MaxReserveUnits, value * 10 + c - '0');
+        }
+        return (int)value;
+    }
+
     public void Discard(QuartermasterRuntimeSnapshot runtime)
     {
         if (runtime.Owner.HasStableIdentity) Reset(state.Snapshot(), runtime.Owner, runtime.Browser);
@@ -195,12 +236,12 @@ internal sealed class ListingPlanDraftSession(
         }
         catch (ListingPlanConflictException ex)
         {
-            Rebase(ex.RebasedAssignments, ex.CanonicalAssignments, ex.CanonicalRevision);
+            Rebase(ex.RebasedAssignments, ex.CanonicalAssignments, ex.RebasedReserves, ex.CanonicalReserves, ex.CanonicalRevision);
             ConflictCount = ex.Conflicts.Count;
         }
         catch (ListingPlanValidationException ex) when (ex.Candidate is not null && ex.CanonicalAssignments is not null)
         {
-            Rebase(ex.Candidate, ex.CanonicalAssignments, ex.CanonicalRevision);
+            Rebase(ex.Candidate, ex.CanonicalAssignments, ex.CandidateReserves ?? [], ex.CanonicalReserves ?? [], ex.CanonicalRevision);
             MergedElsewhere = true;
         }
         catch (InvalidOperationException ex)
@@ -216,7 +257,8 @@ internal sealed class ListingPlanDraftSession(
         }
     }
 
-    private void Rebase(IReadOnlyList<ListingPlanAssignment> assignments, IReadOnlyList<ListingPlanAssignment> baseline, long revision)
+    private void Rebase(IReadOnlyList<ListingPlanAssignment> assignments, IReadOnlyList<ListingPlanAssignment> baseline,
+        IReadOnlyList<ListingReserveRule> reserves, IReadOnlyList<ListingReserveRule> baselineReserves, long revision)
     {
         Draft = new ListingPlanDraft
         {
@@ -224,6 +266,8 @@ internal sealed class ListingPlanDraftSession(
             IncompleteListingRetainerIds = Draft.IncompleteListingRetainerIds,
             Assignments = assignments.Select(ListingPlanCatalog.Copy).ToList(),
             BaselineAssignments = baseline.Select(ListingPlanCatalog.Copy).ToList(),
+            Reserves = reserves.Select(ListingPlanCatalog.Copy).ToList(),
+            BaselineReserves = baselineReserves.Select(ListingPlanCatalog.Copy).ToList(),
             SourceRevision = revision,
         };
         Changed();

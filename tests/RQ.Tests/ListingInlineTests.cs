@@ -244,6 +244,61 @@ public sealed class ListingInlineTests
     }
 
     [Fact]
+    public void SessionReserveEditsTrackDirtySaveReloadAndDiscard()
+    {
+        using var f = new Fixture();
+        f.Session.Ensure(f.Runtime());
+        var r = f.Session.AddReserve(1, "Item 1", ItemQualityPolicy.NqOnly);
+        Assert.True(f.Session.IsDirty); Assert.Equal(1, f.Session.ChangeCount);
+        Assert.Empty(f.Session.DirtyRetainerIds());
+        f.Session.SetReserveUnits(r.Id, "1,250");
+        f.Session.SetReserveLocation(r.Id, new StowageRoutingPolicy { Mode = StowageRoutingMode.HomeFirst, PreferredRetainerIds = [11] });
+        Assert.Equal(1, f.Session.ChangeCount);
+        f.Session.Save(f.Runtime());
+        Assert.Null(f.Session.Error); Assert.False(f.Session.IsDirty);
+        var reloaded = new StateRepository(new QuartermasterStateStore(f.PathToState)).Snapshot().ListingPlans.Single().Reserves.Single();
+        Assert.Equal(1_250, reloaded.ReserveUnits); Assert.Equal([11UL], reloaded.Location.PreferredRetainerIds);
+
+        f.Session.SetReserveUnits(r.Id, "0");
+        Assert.True(f.Session.IsDirty); Assert.Equal(0, f.Session.Draft!.Reserves.Single().ReserveUnits);
+        f.Session.SetReserveUnits(r.Id, "1250");
+        Assert.False(f.Session.IsDirty);
+        f.Session.SetReserveEnabled(r.Id, false); f.Session.Discard(f.Runtime());
+        Assert.True(f.Session.Draft!.Reserves.Single().Enabled);
+        f.Session.RemoveReserve(r.Id); f.Session.Save(f.Runtime());
+        Assert.Empty(f.Repository.Snapshot().ListingPlans.Single().Reserves);
+    }
+
+    [Fact]
+    public void SessionReserveIssuesBlockSaveAndNameTheReserve()
+    {
+        using var f = new Fixture();
+        f.Session.Ensure(f.Runtime());
+        f.Session.AddReserve(1, "Item 1", ItemQualityPolicy.NqOnly);
+        f.Session.AddReserve(1, "Item 1", ItemQualityPolicy.NqOnly);
+        Assert.Contains(f.Session.Issues(f.Runtime()), i => i.Field == "ReserveDuplicate");
+        Assert.Contains("Item 1 reserve", f.Session.SaveBlockedTooltip(f.Runtime()));
+        f.Session.Save(f.Runtime());
+        Assert.NotNull(f.Session.Error); Assert.Empty(f.Repository.Snapshot().ListingPlans);
+    }
+
+    [Fact]
+    public void SessionReserveConflictRebasesReserves()
+    {
+        using var f = new Fixture(); f.Session.Ensure(f.Runtime());
+        var r = f.Session.AddReserve(1, "Item 1", ItemQualityPolicy.NqOnly);
+        f.Session.SetReserveUnits(r.Id, "10"); f.Session.Save(f.Runtime());
+        f.Session.SetReserveUnits(r.Id, "20");
+        f.Repository.Mutate(s => { s.ListingPlans[0].Reserves[0].ReserveUnits = 30; s.ListingPlans[0].Revision++; });
+        f.Session.Save(f.Runtime());
+        Assert.Equal(1, f.Session.ConflictCount);
+        Assert.Equal(20, f.Session.Draft!.Reserves.Single().ReserveUnits);
+        Assert.Equal(30, f.Session.Draft.BaselineReserves.Single().ReserveUnits);
+        f.Session.Save(f.Runtime());
+        Assert.Equal(20, f.Repository.Snapshot().ListingPlans[0].Reserves.Single().ReserveUnits);
+    }
+
+    [Fact]
     public void NewPlanRaceMergesIntentWithoutPersistingUntilNextSave()
     {
         using var f = new Fixture(); var a = f.Add();
