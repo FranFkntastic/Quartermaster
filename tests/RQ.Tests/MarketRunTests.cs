@@ -9,6 +9,16 @@ namespace RQ.Tests;
 public sealed class MarketRunTests
 {
     [Fact]
+    public void UnknownPriceIsNeitherShortNorActionableRepricingWork()
+    {
+        var plan = Plan([Assignment(1, "Hull", 10, "Alpha", 1, 2, 100)]);
+        var listing = Listing(1, "Hull", 10, "Alpha", 2, 100) with { UnitPrice = Evidence.Unknown<decimal>("Unknown") };
+        var run = MarketRunPlanner.Evaluate(plan, Projection([listing], []));
+        var assignment = Assert.Single(Assert.Single(run.Retainers).Assignments);
+        Assert.Equal(0, assignment.RepriceListings.Value);
+        Assert.Equal(0, assignment.ShortListings.Value);
+    }
+    [Fact]
     public void Capacity_FreeSlotsSuffice_NoPull()
     {
         var run = MarketRunPlanner.Evaluate(Plan([Assignment(1, "Hull", 10, "Alpha", 2, 1, 100)]),

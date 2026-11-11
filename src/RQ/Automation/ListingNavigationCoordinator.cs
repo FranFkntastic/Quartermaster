@@ -85,7 +85,7 @@ public sealed class ListingNavigationCoordinator : IDisposable
             request.ItemId == 0 || request.Quantity <= 0)
             return Complete(false, false, "This listing does not have a stable physical identity.");
         if (!automation.TryAcquire("listing navigation", out var lease))
-            return Complete(false, false, $"Automation is busy with {automation.Holder}.");
+            return Complete(false, false, automation.AcquisitionBlockReason ?? "Automation is unavailable.");
 
         using (lease)
         {
@@ -175,7 +175,7 @@ public sealed class ListingNavigationCoordinator : IDisposable
         if (request.RetainerId == 0 || string.IsNullOrWhiteSpace(request.RetainerName))
             return Complete(false, false, "This retainer does not have a stable identity.");
         if (!automation.TryAcquire("listing navigation", out var lease))
-            return Complete(false, false, $"Automation is busy with {automation.Holder}.");
+            return Complete(false, false, automation.AcquisitionBlockReason ?? "Automation is unavailable.");
 
         using (lease)
         {
@@ -255,7 +255,7 @@ public sealed class ListingNavigationCoordinator : IDisposable
     {
         ObjectDisposedException.ThrowIf(disposed, this);
         if (!automation.TryAcquire("listing navigation", out var lease))
-            return Complete(false, false, $"Automation is busy with {automation.Holder}.");
+            return Complete(false, false, automation.AcquisitionBlockReason ?? "Automation is unavailable.");
 
         using (lease)
         {

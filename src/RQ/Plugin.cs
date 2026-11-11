@@ -48,6 +48,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly OperationJournal journal;
     private readonly TransferCoordinator transfers;
     private readonly ListingNavigationCoordinator listingNavigation;
+    private readonly MarketRunExecutor marketRuns;
     private readonly TransferVendorProcurementService vendorProcurement;
     private readonly VendorCatalogLocationObserver vendorCatalogObserver;
     private readonly DalamudExternalUiAutomationSuppression externalUiSuppression;
@@ -171,7 +172,9 @@ public sealed class Plugin : IDalamudPlugin
         });
         StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
         TransferPlanMigration.EnsureOwnerPlans(state, CurrentOwner());
-        var automation = new AutomationLease();
+        MarketRunExecutor? activeMarketRuns = null;
+        var automation = new AutomationLease(() => activeMarketRuns?.Result?.RequiresAcknowledgement == true
+            ? "Unresolved market run; review its result in Market before clearing it." : null);
         // Keep retrieval verification bound to the exact inventory changes emitted
         // while its native command is in flight; this survives retainer slot compaction.
         var retainerSession = new DalamudRetainerAutomationSession(
@@ -205,6 +208,12 @@ public sealed class Plugin : IDalamudPlugin
             CountCachedPlayerItems,
             automation,
             autoRetainerSuppression: autoRetainerSuppression);
+        var marketRunStore = new MarketRunStore(Path.Combine(configDirectory, "market-run.json"));
+        marketRuns = new(new MarketRunLiveDriver(retainerSession, driver, journal, cache, playerInventory,
+                automation, CurrentOwner, id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.Name.ToString() ?? $"Item {id}"),
+            automation, () => state.Read(s => ListingPlanCatalog.OwnerPlan(s, CurrentOwner())), marketRunStore.Save, autoRetainerSuppression, clear: marketRunStore.Clear);
+        marketRuns.Restore(marketRunStore.Load());
+        activeMarketRuns = marketRuns;
         automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerSuppression);
         runtimeSnapshots = new(scanner, playerInventory, cache, state, CurrentOwner);
         var vendorAccess = new DalamudGilVendorAccessReader(
@@ -293,6 +302,7 @@ public sealed class Plugin : IDalamudPlugin
             new ItemMetadataCatalog(dataManager, log).ResolveWorkshopProject,
             configDirectory,
             new MarketMafiosoSavedJobClient(pluginInterface));
+        window.SetMarketRunExecutor(marketRuns);
         agentBridgeViewportCapture = new(
             configDirectory,
             configuration.PluginInstanceId,
@@ -839,6 +849,7 @@ public sealed class Plugin : IDalamudPlugin
         playerInventory.Flush();
         automaticRetrievals.Dispose();
         listingNavigation.Dispose();
+        marketRuns.CancelAndWait(TimeSpan.FromSeconds(2));
         window.CancelAndWaitForActiveTransfer(TimeSpan.FromSeconds(2));
         retainerBellRoute.Dispose();
         vendorProcurement.Dispose();

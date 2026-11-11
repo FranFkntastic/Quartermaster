@@ -91,7 +91,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
     }
 
     public bool IsRunning => Volatile.Read(ref running) != 0;
-    public bool CanStart => !automation.IsHeld && !IsRunning;
+    public bool CanStart => automation.CanAcquire && !IsRunning;
 
     public Task<TransferExecutionResult> ExecutePlanAsync(
         string? retrievalOperationId,
@@ -142,10 +142,19 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             () => ExecuteRetrievalCoreAsync(operationId, cancellationToken),
             cancellationToken);
 
-    private async Task<TransferExecutionResult> ExecuteRetrievalCoreAsync(string operationId, CancellationToken cancellationToken)
+    internal Task<TransferExecutionResult> ExecuteRetrievalUnderLeaseAsync(
+        string operationId, IDisposable lease, CancellationToken cancellationToken)
     {
-        if (!automation.TryAcquire("retainer transfer", out var lease))
-            return new(false, $"Automation is busy with {automation.Holder}.");
+        if (!automation.Owns(lease))
+            throw new InvalidOperationException("The caller does not own the automation lease.");
+        return ExecuteRetrievalCoreAsync(operationId, cancellationToken, lease);
+    }
+
+    private async Task<TransferExecutionResult> ExecuteRetrievalCoreAsync(string operationId, CancellationToken cancellationToken, IDisposable? borrowedLease = null)
+    {
+        IDisposable? lease = null;
+        if (borrowedLease is null && !automation.TryAcquire("retainer transfer", out lease))
+            return new(false, automation.AcquisitionBlockReason ?? "Automation is unavailable.");
         using (lease)
         {
         if (Interlocked.CompareExchange(ref running, 1, 0) != 0)
@@ -264,6 +273,9 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         stockMutations,
                         async mutationToken =>
                         {
+                            if (borrowedLease is not null && !automation.Owns(borrowedLease))
+                                return VerifiedMutationAttempt<RetrievalResult, RetainerVariantObservation>.Unchanged(
+                                    new(false, 0, "LeaseLost", "The caller no longer owns the automation lease."));
                             movementAttempted = true;
                             var result = await driver.RetrieveAsync(
                                 stack,
@@ -292,6 +304,16 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                                         attempt.Evidence != VerifiedMutationEvidence.Unchanged;
                     if (!result.Success)
                     {
+                        if (borrowedLease is not null && !result.MovementMayHaveOccurred)
+                        {
+                            movementAttempted = false;
+                            if (result.Code == "GatherCancelled") throw new OperationCanceledException();
+                            if (result.Code is "InventoryFull" or "SourceSlotChanged")
+                            {
+                                journal.RecordWarning(operationId, result.Code, result.Message);
+                                continue;
+                            }
+                        }
                         throw new InvalidOperationException(result.Message);
                     }
                     remaining[key] -= result.Transferred;
@@ -305,6 +327,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         result.Transferred,
                         result.Code,
                         result.Message);
+                    if (borrowedLease is not null) movementAttempted = false;
                 }
                 await driver.CloseRetainerAsync(token).ConfigureAwait(false);
                 retainerOpen = false;
@@ -336,17 +359,19 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         catch (OperationCanceledException)
         {
             Exception? releaseFailure = null;
-            if (retainerOpen)
+            if (retainerOpen && !MarketRunDeadline.HasUnsettled)
             {
                 try { await driver.CloseRetainerAsync(CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure = closeException; }
             }
-            if (retainerSessionOpen)
+            if (retainerSessionOpen && !MarketRunDeadline.HasUnsettled)
             {
                 try { await driver.CloseRetainerListAsync(CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure ??= closeException; }
             }
-            MarkCancelled(operationId);
+            if (borrowedLease is not null && !movementAttempted && journal.Get(operationId)?.Status == OperationStatuses.Running)
+                journal.Transition(operationId, OperationStatuses.Cancelled, "CancelledBeforeMovement", "Gather cancelled with no unresolved movement.");
+            else MarkCancelled(operationId);
             return new(
                 true,
                 releaseFailure is null
@@ -356,12 +381,12 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         catch (Exception exception)
         {
             Exception? releaseFailure = null;
-            if (retainerOpen)
+            if (retainerOpen && !MarketRunDeadline.HasUnsettled)
             {
                 try { await driver.CloseRetainerAsync(CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure = closeException; }
             }
-            if (retainerSessionOpen)
+            if (retainerSessionOpen && !MarketRunDeadline.HasUnsettled)
             {
                 try { await driver.CloseRetainerListAsync(CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure ??= closeException; }
@@ -396,7 +421,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
     private async Task<TransferExecutionResult> ExecuteDepositCoreAsync(string operationId, CancellationToken cancellationToken)
     {
         if (!automation.TryAcquire("retainer transfer", out var lease))
-            return new(false, $"Automation is busy with {automation.Holder}.");
+            return new(false, automation.AcquisitionBlockReason ?? "Automation is unavailable.");
         using (lease)
         {
         if (Interlocked.CompareExchange(ref running, 1, 0) != 0)
@@ -800,6 +825,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         Func<Task<TransferExecutionResult>> body,
         CancellationToken cancellationToken)
     {
+        if (automation.RefusalReason is { } refusal) return new(false, refusal);
         var suppression = autoRetainerSuppression;
         if (suppression is null || !suppression.IsAvailable || coordinationAmbient.Value)
             return await body().ConfigureAwait(false);

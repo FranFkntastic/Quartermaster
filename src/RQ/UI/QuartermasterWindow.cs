@@ -53,6 +53,8 @@ public sealed class QuartermasterWindow : Window
     private TransferReviewDialogState? capturePreviousTransferReviewState;
     private VendorProcurementReviewDialogState? capturePreviousVendorReviewState;
 
+    internal void SetMarketRunExecutor(MarketRunExecutor executor) => marketRunPane.Executor = executor;
+
     public QuartermasterWindow(
         StateRepository state,
         QuartermasterRuntimeSnapshotSource runtimeSnapshots,

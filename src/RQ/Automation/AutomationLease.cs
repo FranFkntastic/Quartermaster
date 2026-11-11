@@ -1,11 +1,21 @@
 namespace RQ.Automation;
 
-public sealed class AutomationLease
+public sealed class AutomationLease(Func<string?>? refusalReason = null)
 {
     private readonly object gate = new();
     private Guid activeToken;
 
     public string? Holder { get; private set; }
+    public string? RefusalReason => refusalReason?.Invoke();
+    public string? AcquisitionBlockReason
+    {
+        get
+        {
+            lock (gate)
+                return Holder is { } holder ? $"Automation is busy with {holder}." : RefusalReason;
+        }
+    }
+    public bool CanAcquire => AcquisitionBlockReason is null;
 
     public bool IsHeld
     {
@@ -21,7 +31,7 @@ public sealed class AutomationLease
         ArgumentException.ThrowIfNullOrWhiteSpace(holder);
         lock (gate)
         {
-            if (Holder is not null)
+            if (!CanAcquire)
             {
                 lease = null;
                 return false;
@@ -45,9 +55,18 @@ public sealed class AutomationLease
         }
     }
 
+    internal bool Owns(IDisposable lease)
+    {
+        lock (gate)
+            return lease is Releaser releaser && releaser.IsActive(this, activeToken) && Holder is not null;
+    }
+
     private sealed class Releaser(AutomationLease owner, Guid token) : IDisposable
     {
         private int disposed;
+
+        public bool IsActive(AutomationLease candidate, Guid candidateToken) =>
+            ReferenceEquals(owner, candidate) && token == candidateToken && Volatile.Read(ref disposed) == 0;
 
         public void Dispose()
         {
