@@ -49,6 +49,7 @@ internal sealed class StockWorkspace
     private int visibleStockCount;
     private int renderedStockRowCount;
     private double stockDrawMilliseconds;
+    private bool stowRequested;
 
     public StockWorkspace(
         StateRepository state,
@@ -95,18 +96,26 @@ internal sealed class StockWorkspace
             row => row.Item.ItemName,
             row => row.Item.ItemName,
             ImGuiTableColumnFlags.WidthStretch | ImGuiTableColumnFlags.DefaultSort | ImGuiTableColumnFlags.NoHide,
+            Draw: row => { ImGui.TextUnformatted(row.Item.ItemName); if (ImGui.IsItemHovered()) ImGui.SetTooltip(string.Join("\n", row.Item.Stacks.GroupBy(s => s.OwnerName).Select(g => $"{g.Key}: {g.Sum(s => s.Quantity):N0}"))); },
             DrawContextMenu: DrawStockRowContextMenu,
             Id: "item"),
         new(
+            "Locations",
+            1.5f,
+            row => string.Join("; ", row.Item.Stacks.GroupBy(s => s.OwnerName).Select(g => $"{g.Key}: {g.Sum(s => s.Quantity):N0}")),
+            Flags: ImGuiTableColumnFlags.WidthStretch | ImGuiTableColumnFlags.DefaultHide,
+            Id: "locations",
+            Draw: row => { ImGui.TextUnformatted(string.Join("; ", row.Item.Stacks.GroupBy(s => s.OwnerName).Select(g => $"{g.Key}: {g.Sum(s => s.Quantity):N0}"))); if (ImGui.IsItemHovered()) ImGui.SetTooltip(string.Join("\n", row.Item.Stacks.GroupBy(s => s.OwnerName).Select(g => $"{g.Key}: {g.Sum(s => s.Quantity):N0}"))); }),
+        new(
             "Player",
-            80,
+            52,
             row => row.Item.PlayerQuantity.ToString("N0"),
             row => row.Item.PlayerQuantity,
             DrawContextMenu: DrawStockRowContextMenu,
             Id: "player"),
         new(
             "Retainers",
-            84,
+            60,
             row => row.AccessibleRetainerQuantity.ToString("N0"),
             row => row.AccessibleRetainerQuantity,
             DrawContextMenu: DrawStockRowContextMenu,
@@ -136,13 +145,13 @@ internal sealed class StockWorkspace
             1f,
             StockPlanState,
             row => StockPlanState(row),
-            ImGuiTableColumnFlags.WidthStretch,
+            ImGuiTableColumnFlags.WidthStretch | ImGuiTableColumnFlags.DefaultHide,
             TextColor: row => row.Rule is null
                 ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
                 : TransferPresentation.ActionColor(row.Line?.Action),
             DrawContextMenu: DrawStockRowContextMenu,
             Id: "plan-state"),
-    ]);
+    ], DalamudTableSelection<StockWorkbenchRow>.Multi(stockSelection, row => row.Item.ItemId));
 
 
     public void Draw(QuartermasterRuntimeSnapshot runtime)
@@ -205,12 +214,7 @@ internal sealed class StockWorkspace
                 rows,
                 (row, rowIndex) =>
                 {
-                    stockTable.DrawSelectableRow(
-                        row,
-                        stockSelection,
-                        rowKeys,
-                        rowIndex,
-                        $"##stock-row:{row.Item.ItemId}");
+                    stockTable.DrawSaneRow(rows, rowIndex, $"##stock-row:{row.Item.ItemId}");
                     var stockSelected = stockSelection.IsSelected(row.Item.ItemId);
                     reviewRegistry.RegisterLastButton(
                         $"quartermaster.stock.select.{row.Item.ItemId}",
@@ -282,8 +286,7 @@ internal sealed class StockWorkspace
             .ToDictionary(group => group.Key, group => group.First());
         var evaluated = selectedPlan is null || transferPlanEditor.HasChanges
             ? new Dictionary<Guid, StowageEvaluationLine>()
-            : runtime.Stowage
-                .FirstOrDefault(plan => plan.PlanId == selectedPlan.Id)?
+            : StowageEvaluator.BuildPlan(runtime.State, runtime.Browser, runtime.Owner, selectedPlan.Id)?
                 .Lines.ToDictionary(line => line.RuleId) ?? [];
         var listingEvaluation = ListingPlanEvaluator.Evaluate(
             ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner),
@@ -310,14 +313,14 @@ internal sealed class StockWorkspace
     private void DrawStockToolbar(BrowserProjection projection, IReadOnlyList<StockGroup> sourceItems)
     {
         var context = BrowserQueryController.CreateItemContext(sourceItems, projection.Owner);
-        var trailingWidth = 180f;
+        var trailingWidth = 190f;
         var filterBeforeDraw = workbench.ItemFilterState.Expression;
         DalamudFilterAutocompleteRenderer.Draw(
             "RQStockWorkbench",
             "Search accessible stock by item name",
             context,
             workbench.ItemFilterState,
-            Math.Max(220, ImGui.GetContentRegionAvail().X - trailingWidth));
+            Math.Max(100, ImGui.GetContentRegionAvail().X - trailingWidth));
         if (!string.Equals(filterBeforeDraw, workbench.ItemFilterState.Expression, StringComparison.Ordinal))
             workbench.FocusedStockItemId = null;
         reviewRegistry.RegisterLastAction(
@@ -383,7 +386,6 @@ internal sealed class StockWorkspace
             ImGui.EndPopup();
         }
 
-        ImGui.SameLine();
         if (!retainerRefresh.CanStart)
             ImGui.BeginDisabled();
         if (ImGui.SmallButton("Refresh retainers"))
@@ -442,11 +444,10 @@ internal sealed class StockWorkspace
         }
 
         ImGui.TextUnformatted($"{selected.Length:N0} selected");
-        ImGui.SameLine();
         var canPlan = selected.Length > 0 && runtime.Owner.HasStableIdentity;
         if (!canPlan)
             ImGui.BeginDisabled();
-        if (ImGui.Button($"Add to {transferPlanEditor.Draft?.Name ?? "plan"}"))
+        if (ImGui.Button("Add to plan"))
         {
             UpsertSelectedStockRules(runtime, selected, stowCarried: false);
             stockSelection.Clear();
@@ -479,22 +480,26 @@ internal sealed class StockWorkspace
         if (selected.Length == 0)
             ImGui.EndDisabled();
 
-        ImGui.SameLine();
         var carried = selected.Where(item => item.PlayerQuantity > 0).ToArray();
-        if (carried.Length == 0)
+        var canStow = carried.Length > 0 && runtime.Owner.HasStableIdentity;
+        if (!canStow)
             ImGui.BeginDisabled();
-        if (ImGui.Button("Stow carried"))
-        {
-            UpsertSelectedStockRules(runtime, carried, stowCarried: true);
-            stockSelection.Clear();
-        }
-        if (carried.Length == 0)
+        if (ImGui.Button("Stow carried")) stowRequested = true;
+        if (!canStow)
             ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton("quartermaster.stock.stow", "Choose a stow destination", canStow,
+            () => stowRequested = true, "Selected carried stock");
+        if (stowRequested) { ImGui.OpenPopup("RQStockStow"); stowRequested = false; }
+        if (ImGui.BeginPopup("RQStockStow"))
+        {
+            DrawStowDestinations(runtime, carried);
+            ImGui.EndPopup();
+        }
 
         ImGui.SameLine();
         if (selected.Length == 0)
             ImGui.BeginDisabled();
-        if (ImGui.SmallButton("Clear"))
+        if (ImGui.Button("Clear"))
         {
             stockSelection.Clear();
             workbench.FocusedStockItemId = null;
@@ -544,7 +549,7 @@ internal sealed class StockWorkspace
                     link.ItemId == selectedDemand.ItemId && link.Quality == selectedDemand.Quality);
                 if (linked)
                     ImGui.TextDisabled($"Linked to {transferPlan!.Name}");
-                else
+                else if (transferPlan?.IsEphemeral is not true)
                 {
                     var destination = transferPlanEditor.Draft?.Name ?? "Transfer plan";
                     if (ImGui.SmallButton($"Prepare target in {destination}"))
@@ -565,8 +570,7 @@ internal sealed class StockWorkspace
         string id,
         string context)
     {
-        ImGui.TextDisabled(context);
-        ImGui.SameLine();
+
         var buttonWidth = ImGui.CalcTextSize("Columns").X + (ImGui.GetStyle().FramePadding.X * 2f);
         ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - buttonWidth));
         table.DrawColumnMenuButton(id);
@@ -585,7 +589,7 @@ internal sealed class StockWorkspace
 
         if (!runtime.Owner.HasStableIdentity)
             ImGui.BeginDisabled();
-        if (ImGui.MenuItem($"Add to {transferPlanEditor.Draft?.Name ?? "plan"}"))
+        if (ImGui.MenuItem("Add to plan"))
             UpsertSelectedStockRules(runtime, [item], stowCarried: false);
         if (!runtime.Owner.HasStableIdentity)
             ImGui.EndDisabled();
@@ -595,8 +599,11 @@ internal sealed class StockWorkspace
 
         if (item.PlayerQuantity == 0 || !runtime.Owner.HasStableIdentity)
             ImGui.BeginDisabled();
-        if (ImGui.MenuItem("Stow carried"))
-            UpsertSelectedStockRules(runtime, [item], stowCarried: true);
+        if (ImGui.BeginMenu("Stow carried"))
+        {
+            DrawStowDestinations(runtime, [item]);
+            ImGui.EndMenu();
+        }
         if (item.PlayerQuantity == 0 || !runtime.Owner.HasStableIdentity)
             ImGui.EndDisabled();
     }
@@ -612,6 +619,19 @@ internal sealed class StockWorkspace
         itemGroupWorkspace.AddStockItems(runtime.State, items);
     }
 
+    private void DrawStowDestinations(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items)
+    {
+        void Add(ulong? id) { try { transferPlanEditor.AddStock(runtime, items, true, id); stockSelection.Clear(); } catch (Exception exception) { transferExecution.ReportInlineError(exception.Message); } }
+        if (ImGui.MenuItem("Any retainer")) Add(null);
+        reviewRegistry.RegisterLastButton("quartermaster.stock.stow.any", "Stow in any retainer", items.Count > 0, () => Add(null), "Available");
+        foreach (var retainer in runtime.Retainers.Values.Where(r => r.Owner.Matches(runtime.Owner) && r.IsCurrentlyAssigned is not false && r.IsUiAccessible is not false).OrderBy(r => r.RetainerName))
+        {
+            if (ImGui.MenuItem(retainer.RetainerName)) Add(retainer.RetainerId);
+            reviewRegistry.RegisterLastButton($"quartermaster.stock.stow.{retainer.RetainerId}", $"Stow in {retainer.RetainerName}", items.Count > 0,
+                () => Add(retainer.RetainerId), "Available");
+        }
+    }
+
     private void UpsertSelectedStockRules(
         QuartermasterRuntimeSnapshot runtime,
         IReadOnlyList<StockGroup> items,
@@ -619,7 +639,8 @@ internal sealed class StockWorkspace
     {
         if (!runtime.Owner.HasStableIdentity || items.Count == 0)
             return;
-        transferPlanEditor.AddStock(runtime, items, stowCarried);
+        try { transferPlanEditor.AddStock(runtime, items, stowCarried); transferExecution.ClearInlineError(); }
+        catch (Exception exception) { transferExecution.ReportInlineError(exception.Message); }
     }
 
     private static string StockPlanState(StockWorkbenchRow row) =>

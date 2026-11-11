@@ -51,7 +51,7 @@ public static class StowagePlanMigration
         {
             if (!NeedsMigration(state, owner))
                 return;
-            var plan = state.StowagePlans.FirstOrDefault(candidate => candidate.Owner.Matches(owner));
+            var plan = state.StowagePlans.FirstOrDefault(candidate => !candidate.IsEphemeral && candidate.Owner.Matches(owner));
             if (plan is null)
             {
                 plan = new StowagePlan
@@ -90,14 +90,14 @@ public static class StowagePlanMigration
 
     public static bool NeedsMigration(QuartermasterState state, OwnerScope owner) =>
         owner.HasStableIdentity &&
-        (state.StowagePlans.All(plan => !plan.Owner.Matches(owner)) ||
+        (state.StowagePlans.All(plan => plan.IsEphemeral || !plan.Owner.Matches(owner)) ||
          state.PlanItems.Any(rule => rule.StowagePlanId == Guid.Empty) ||
          state.StowageMigrations.All(record =>
              record.MigrationId != MigrationId || !record.Owner.Matches(owner)));
 
     public static StowagePlan? OwnerPlan(QuartermasterState state, OwnerScope owner) =>
         state.StowagePlans
-            .Where(plan => plan.Owner.Matches(owner))
+            .Where(plan => !plan.IsEphemeral && plan.Owner.Matches(owner))
             .OrderBy(plan => plan.Priority)
             .ThenBy(plan => plan.Name, StringComparer.OrdinalIgnoreCase)
             .ThenBy(plan => plan.Id)
@@ -109,7 +109,7 @@ public static class StowagePlanMigration
         bool enabledPlansOnly = true)
     {
         var planIds = state.StowagePlans
-            .Where(plan => plan.Owner.Matches(owner) && (!enabledPlansOnly || plan.Enabled))
+            .Where(plan => !plan.IsEphemeral && plan.Owner.Matches(owner) && (!enabledPlansOnly || plan.Enabled))
             .Select(plan => plan.Id)
             .ToHashSet();
         return state.PlanItems.Where(rule => planIds.Contains(rule.StowagePlanId)).ToArray();
@@ -137,7 +137,7 @@ public static class TransferPlanMigration
                 .ThenBy(plan => plan.Id)
                 .ToArray();
             var emptyPlaceholder = state.StowagePlans.FirstOrDefault(plan =>
-                plan.Owner.Matches(owner) &&
+                !plan.IsEphemeral && plan.Owner.Matches(owner) &&
                 plan.Enabled &&
                 state.PlanItems.All(rule => rule.StowagePlanId != plan.Id));
             if (sources.Any(source => source.Enabled) && emptyPlaceholder is not null)
@@ -213,7 +213,7 @@ public static class StowageEvaluator
     {
         var groups = stock.Items.ToDictionary(group => group.ItemId);
         return state.StowagePlans
-            .Where(plan => plan.Enabled && plan.Owner.Matches(owner))
+            .Where(plan => !plan.IsEphemeral && plan.Enabled && plan.Owner.Matches(owner))
             .OrderBy(plan => plan.Priority)
             .ThenBy(plan => plan.Name, StringComparer.OrdinalIgnoreCase)
             .ThenBy(plan => plan.Id)

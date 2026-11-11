@@ -245,7 +245,7 @@ public static class ListingPlanCatalog
     {
         if (quality == ItemQualityPolicy.Any)
             throw new InvalidOperationException("Listing demand links require exact NQ or HQ quality.");
-        _ = state.StowagePlans.Single(plan => plan.Id == stowagePlanId && plan.Owner.Matches(owner));
+        _ = state.StowagePlans.Single(plan => !plan.IsEphemeral && plan.Id == stowagePlanId && plan.Owner.Matches(owner));
         var listingPlan = state.ListingPlans.Single(plan => plan.Id == listingPlanId && plan.Owner.Matches(owner));
         if (!listingPlan.Assignments.Any(assignment => assignment.Enabled && assignment.ItemId == itemId && assignment.Quality == quality))
             throw new InvalidOperationException("The Listing Plan has no enabled assignment for this item and quality.");
@@ -276,7 +276,7 @@ public static class ListingPlanCatalog
         uint itemId,
         ItemQualityPolicy quality)
     {
-        _ = state.StowagePlans.Single(plan => plan.Id == stowagePlanId && plan.Owner.Matches(owner));
+        _ = state.StowagePlans.Single(plan => !plan.IsEphemeral && plan.Id == stowagePlanId && plan.Owner.Matches(owner));
         _ = state.ListingPlans.Single(plan => plan.Id == listingPlanId && plan.Owner.Matches(owner));
         return state.TransferPlanListingLinks.RemoveAll(link =>
             link.StowagePlanId == stowagePlanId && link.ListingPlanId == listingPlanId &&

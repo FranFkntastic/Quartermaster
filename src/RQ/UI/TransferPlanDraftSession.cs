@@ -39,14 +39,16 @@ internal sealed class TransferPlanDraftSession(StateRepository repository)
         {
             drafts.Clear(); Draft = null; Error = null; owner = currentOwner with { };
         }
+        if (!repository.Read(s => s.StowagePlans.Any(p => p.IsEphemeral && p.Owner.Matches(currentOwner))))
+            repository.Mutate(s => StowagePlanCatalog.EnsureScratch(s, currentOwner));
         var state = repository.Snapshot();
         if (selected is { } id && drafts.TryGetValue(id, out var cached)) Draft = cached.Draft;
-        else if (selected is { } planId && StowagePlanCatalog.OwnerPlans(state, currentOwner).Any(p => p.Id == planId))
+        else if (selected is { } planId && state.StowagePlans.Any(p => p.Id == planId && p.Owner.Matches(currentOwner)))
             Adopt(StowagePlanCatalog.Draft(state, currentOwner, planId));
-        else if (Draft is null)
+        else
         {
-            var first = StowagePlanCatalog.OwnerPlans(state, currentOwner).FirstOrDefault();
-            Adopt(first is null ? StowagePlanCatalog.NewDraft(state, currentOwner) : StowagePlanCatalog.Draft(state, currentOwner, first.Id));
+            var first = state.StowagePlans.Single(p => p.IsEphemeral && p.Owner.Matches(currentOwner));
+            Adopt(StowagePlanCatalog.Draft(state, currentOwner, first.Id));
         }
         Reconcile(state);
     }

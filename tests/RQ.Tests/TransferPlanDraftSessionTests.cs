@@ -30,7 +30,11 @@ public sealed class TransferPlanDraftSessionTests
         {
             Session.Add(1, "Silver Ingot", ItemQualityPolicy.Any, 30);
             Assert.True(Session.Save(Owner), Session.Error);
-            return Session.Draft!.PlanId;
+            var id = Session.Draft!.PlanId;
+            Repository.Mutate(s => StowagePlanCatalog.PromoteScratch(s, Owner, id, "Saved fixture"));
+            Session.Forget(id);
+            Session.Ensure(Owner, id);
+            return id;
         }
         public void External(Action<StowagePlanDraft> edit)
         {
@@ -40,11 +44,11 @@ public sealed class TransferPlanDraftSessionTests
     }
 
     [Fact]
-    public void EmptyOwnerGetsUnsavedDraftWithoutWritingAPlan()
+    public void EmptyOwnerGetsPersistedScratchWithoutUnsavedEdits()
     {
         using var f = new Fixture();
         Assert.NotNull(f.Session.Draft); Assert.False(f.Session.HasChanges);
-        Assert.Empty(f.Repository.Snapshot().StowagePlans);
+        Assert.True(Assert.Single(f.Repository.Snapshot().StowagePlans).IsEphemeral);
     }
 
     [Fact]
