@@ -53,6 +53,11 @@ internal static class MarketRunPresentation
     internal static string PullLabel(MarketRunPullListing pull) =>
         $"Pull · {pull.Listing.ItemName} {(pull.Listing.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ ? "HQ" : "NQ")}";
 
+    /// <summary>The pulls that are members of one observed group, matched by listing identity.</summary>
+    internal static IReadOnlyList<MarketRunPullListing> PullsIn(
+        IReadOnlyList<ListingRow> groupListings, IReadOnlyList<MarketRunPullListing> pulls) =>
+        pulls.Where(pull => groupListings.Any(listing => ReferenceEquals(listing, pull.Listing))).ToArray();
+
     internal static string PullPrice(MarketRunPullListing pull) =>
         pull.Listing.UnitPrice.IsKnown ? pull.Listing.UnitPrice.Value.ToString("N0") : "—";
 }

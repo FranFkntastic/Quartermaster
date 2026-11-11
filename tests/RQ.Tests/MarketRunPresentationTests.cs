@@ -31,6 +31,18 @@ public sealed class MarketRunPresentationTests
     }
 
     [Fact]
+    public void PullsInMatchesByListingIdentityNotByValue()
+    {
+        var listing = new ListingRow("retainer:10", 10, "Alpha", null, 1, "Hull", 2,
+            Franthropy.FFXIV.Filtering.FfxivItemQuality.NQ, Evidence.Unknown<decimal>("Not observed"),
+            Evidence.Known(100m), Evidence.Known(200m), DateTime.UnixEpoch);
+        var twin = listing with { };
+        var pulls = new MarketRunPullListing[] { new(twin, 1) };
+        Assert.Same(twin, Assert.Single(MarketRunPresentation.PullsIn([listing, twin], pulls)).Listing);
+        Assert.Empty(MarketRunPresentation.PullsIn([listing], pulls));
+    }
+
+    [Fact]
     public void PlanViewUsesCurrentDraftAndDoesNotAliasMutableRows()
     {
         var draft = new ListingPlanDraft { PlanId = Guid.NewGuid(), SourceRevision = 8,

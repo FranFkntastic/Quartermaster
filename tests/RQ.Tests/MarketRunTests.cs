@@ -83,6 +83,99 @@ public sealed class MarketRunTests
     }
 
     [Fact]
+    public void Capacity_ExactlyEnoughFreeSlots_RefillsWithoutPulling()
+    {
+        var observed = Enumerable.Range(0, 17).Select(i => Listing(1, "Hull", 10, "Alpha", 1, 100))
+            .Append(Listing(3, "Prow", 10, "Alpha", 1, 1)).ToArray();
+        var plan = Plan([Assignment(1, "Hull", 10, "Alpha", 17, 1, 100), Assignment(2, "Bow", 10, "Alpha", 2, 1, 100)]);
+        var retainer = Assert.Single(MarketRunPlanner.Evaluate(plan, Projection(observed, [Player(2, "Bow", 2)])).Retainers);
+        Assert.Equal(2, retainer.FreeSlots.Value);
+        Assert.Equal(2, retainer.RefillListings.Value);
+        Assert.Equal(0, retainer.PullListings.Value);
+        Assert.Equal(0, retainer.BlockedBySlotsListings.Value);
+        Assert.Empty(retainer.ListingsToPull);
+    }
+
+    [Fact]
+    public void Capacity_FullRetainer_PullsOneUnplannedForOneRefill()
+    {
+        var unplanned = Listing(3, "Prow", 10, "Alpha", 1, 1);
+        var observed = Enumerable.Range(0, 19).Select(i => Listing(1, "Hull", 10, "Alpha", 1, 100)).Append(unplanned).ToArray();
+        var plan = Plan([Assignment(1, "Hull", 10, "Alpha", 19, 1, 100), Assignment(2, "Bow", 10, "Alpha", 1, 1, 100)]);
+        var retainer = Assert.Single(MarketRunPlanner.Evaluate(plan, Projection(observed, [Player(2, "Bow", 1)])).Retainers);
+        Assert.Equal(0, retainer.FreeSlots.Value);
+        Assert.Equal(1, retainer.RefillListings.Value);
+        Assert.Equal(0, retainer.BlockedBySlotsListings.Value);
+        Assert.Same(unplanned, Assert.Single(retainer.ListingsToPull).Listing);
+    }
+
+    [Fact]
+    public void Capacity_FullOfPlannedListings_BlocksTheRefillAndPullsNothing()
+    {
+        var observed = Enumerable.Range(0, 20).Select(i => Listing(1, "Hull", 10, "Alpha", 1, 100)).ToArray();
+        var plan = Plan([Assignment(1, "Hull", 10, "Alpha", 20, 1, 100), Assignment(2, "Bow", 10, "Alpha", 1, 1, 100)]);
+        var run = MarketRunPlanner.Evaluate(plan, Projection(observed, [Player(2, "Bow", 1)]));
+        var retainer = Assert.Single(run.Retainers);
+        Assert.Equal(0, retainer.RefillListings.Value);
+        Assert.Equal(1, retainer.BlockedBySlotsListings.Value);
+        Assert.Empty(retainer.ListingsToPull);
+        Assert.Empty(run.CraftQueue);
+    }
+
+    [Fact]
+    public void Capacity_UnknownEarlierAssignment_LeavesLaterOnesOnThatRetainerUnknown()
+    {
+        // Alpha is unobserved, so how much Prow stock reaches Beta is unknown. Beta has one slot
+        // left; the Prow listing ahead of Bow in plan order may or may not take it.
+        var plan = Plan([
+            Assignment(3, "Prow", 10, "Alpha", 1, 1, 50),
+            Assignment(1, "Hull", 11, "Beta", 19, 1, 100),
+            Assignment(3, "Prow", 11, "Beta", 1, 1, 50),
+            Assignment(2, "Bow", 11, "Beta", 1, 1, 100)]);
+        var run = MarketRunPlanner.Evaluate(plan, Projection(
+            Enumerable.Range(0, 19).Select(i => Listing(1, "Hull", 11, "Beta", 1, 100)).ToArray(),
+            [Player(3, "Prow", 1)], retainerIds: [10, 11],
+            listingComplete: new Dictionary<string, bool>
+            {
+                [BrowserScope.AllKey] = false,
+                [BrowserScope.RetainerKey(10)] = false,
+                [BrowserScope.RetainerKey(11)] = true,
+            }));
+        var beta = run.Retainers.Single(retainer => retainer.RetainerId == 11);
+        Assert.Equal(0, beta.Assignments[0].RefillListings.Value);
+        Assert.False(beta.Assignments[1].RefillListings.IsKnown);
+        Assert.False(beta.Assignments[2].RefillListings.IsKnown);
+        Assert.False(beta.Assignments[2].BlockedBySlotsListings.IsKnown);
+        Assert.False(beta.PullListings.IsKnown);
+        Assert.True(run.Find(1, ItemQualityPolicy.NqOnly)!.CraftUnits.IsKnown);
+        Assert.False(run.Find(2, ItemQualityPolicy.NqOnly)!.CraftUnits.IsKnown);
+        Assert.False(run.Find(3, ItemQualityPolicy.NqOnly)!.CraftUnits.IsKnown);
+        Assert.Empty(run.CraftQueue);
+        Assert.False(run.IsComplete);
+    }
+
+    [Fact]
+    public void Capacity_ObservedRetainerAheadOfAnUnobservedOne_KeepsItsOwnNumbers()
+    {
+        var plan = Plan([
+            Assignment(3, "Prow", 10, "Alpha", 1, 1, 50),
+            Assignment(2, "Bow", 10, "Alpha", 1, 1, 100),
+            Assignment(3, "Prow", 11, "Beta", 1, 1, 50)]);
+        var run = MarketRunPlanner.Evaluate(plan, Projection([], [Player(3, "Prow", 1)], retainerIds: [10, 11],
+            listingComplete: new Dictionary<string, bool>
+            {
+                [BrowserScope.AllKey] = false,
+                [BrowserScope.RetainerKey(10)] = true,
+                [BrowserScope.RetainerKey(11)] = false,
+            }));
+        var alpha = run.Retainers.Single(retainer => retainer.RetainerId == 10);
+        Assert.Equal([1, 0], alpha.Assignments.Select(a => a.RefillListings.Value));
+        Assert.Equal(1, alpha.Assignments[1].UnfilledListings.Value);
+        Assert.False(run.Find(3, ItemQualityPolicy.NqOnly)!.CraftUnits.IsKnown);
+        Assert.Equal([(uint)2], run.CraftQueue.Select(line => line.ItemId));
+    }
+
+    [Fact]
     public void Capacity_PullOrder_UnknownThenTotalValueThenSlotThenObservation()
     {
         var rows = Enumerable.Range(0, 20).Select(i => Listing((uint)(i + 1), "Item", 10, "Alpha", 1, 1000)).ToArray();

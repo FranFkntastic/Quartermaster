@@ -145,15 +145,25 @@ public static class MarketRunPlanner
                 SelectListingsToPull(observed, g.ToArray(), observed.Length + ListingCapacity).Count);
         });
         var spares = keys.ToDictionary(key => key, key => SpareUnits(projection, key));
-        var knownItems = keys.ToDictionary(key => key, key => spares[key].IsKnown &&
-            assignments.Where(a => a.ItemId == key.ItemId && a.Quality == key.Quality).All(a => counted[a.Id].Short.IsKnown));
         var remainingStock = keys.ToDictionary(key => key, key => spares[key].IsKnown ? spares[key].Value : 0);
+        // Allocation is sequential, so one unknown assignment leaves two things unknown for every
+        // later assignment: how much of that item's stock is left, and how much slot room its
+        // retainer has left. Later assignments that depend on either are unknown too.
+        const string unobserved = "Listings have not been observed for every planned retainer.";
+        var uncertainStock = keys.Where(key => !spares[key].IsKnown)
+            .ToDictionary(key => key, key => spares[key].UnknownReason ?? unobserved);
+        var uncertainSlots = new Dictionary<ulong, string>();
         foreach (var assignment in assignments)
         {
             var key = new ListingItemKey(assignment.ItemId, assignment.Quality);
-            if (!knownItems[key])
+            var shortCount = counted[assignment.Id].Short;
+            var reason = !shortCount.IsKnown ? shortCount.UnknownReason ?? unobserved
+                : uncertainStock.GetValueOrDefault(key) ?? uncertainSlots.GetValueOrDefault(assignment.RetainerId);
+            if (reason is not null)
             {
-                var unknown = Evidence.Unknown<int>(spares[key].UnknownReason ?? "Listings have not been observed for every planned retainer.");
+                uncertainStock.TryAdd(key, reason);
+                uncertainSlots.TryAdd(assignment.RetainerId, reason);
+                var unknown = Evidence.Unknown<int>(reason);
                 refills[assignment.Id] = (unknown, unknown, unknown);
                 continue;
             }
@@ -173,7 +183,8 @@ public static class MarketRunPlanner
             var spare = spares[key];
             var refillUnits = 0;
             var unfilledUnits = 0;
-            if (knownItems[key])
+            var known = !uncertainStock.ContainsKey(key);
+            if (known)
             {
                 foreach (var assignment in itemAssignments)
                 {
@@ -184,8 +195,7 @@ public static class MarketRunPlanner
                 }
             }
 
-            var known = knownItems[key];
-            var unknownReason = spare.UnknownReason ?? "Listings have not been observed for every planned retainer.";
+            var unknownReason = uncertainStock.GetValueOrDefault(key) ?? unobserved;
             var reserve = reserves.GetValueOrDefault(key);
             var reserveUnits = reserve?.ReserveUnits ?? 0;
             var reserveAfterRun = known ? Evidence.Known(spare.Value - refillUnits) : Evidence.Unknown<int>(unknownReason);

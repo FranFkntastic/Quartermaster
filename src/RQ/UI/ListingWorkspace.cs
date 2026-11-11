@@ -280,30 +280,43 @@ internal sealed class ListingWorkspace
                 ImGui.PopID();
             }
             var groupIndex = 0;
-            foreach (var pull in runRetainer?.ListingsToPull ?? [])
+            // A listing the run will pull is shown once: as the pulled part of its unplanned
+            // group when it has one, otherwise as a row of its own.
+            var pulls = runRetainer?.ListingsToPull ?? [];
+            var grouped = new HashSet<ListingRow>(ReferenceEqualityComparer.Instance);
+            void PullRow(MarketRunPullListing pull, int count)
             {
                 BeginItemRow(new(pull.Listing.ItemId, pull.Listing.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ
                     ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly));
                 ImGui.TableNextColumn(); ImGui.TableNextColumn();
                 ImGui.TextDisabled(MarketRunPresentation.PullLabel(pull));
-                ImGui.TableNextColumn(); ImGui.TableNextColumn();
-                ImGui.TextDisabled(pull.Listing.Quantity.ToString("N0"));
+                ImGui.TableNextColumn(); ImGui.TextDisabled(count.ToString("N0"));
+                ImGui.TableNextColumn(); ImGui.TextDisabled(pull.Listing.Quantity.ToString("N0"));
                 ImGui.TableNextColumn(); ImGui.TextDisabled(MarketRunPresentation.PullPrice(pull));
                 ImGui.TableNextColumn();
             }
             foreach (var g in retainer.ObservedGroups.Where(g => g.Kind == ListingMatchKind.Unplanned))
             {
                 ImGui.PushID($"observed:{groupIndex++}");
-                BeginItemRow(new(g.ItemId, g.Quality));
-                ImGui.TableNextColumn(); ImGui.TableNextColumn(); ItemLabel(g.ItemName, g.Quality);
-                ImGui.TableNextColumn(); ImGui.TextDisabled(g.Listings.Count.ToString("N0"));
-                ImGui.TableNextColumn(); ImGui.TextDisabled(g.Quantity.ToString("N0"));
-                ImGui.TableNextColumn(); ImGui.TextDisabled(g.UnitPrice.IsKnown ? g.UnitPrice.Value.ToString("N0") : "—");
-                ImGui.TableNextColumn();
-                if (g.Kind == ListingMatchKind.Unplanned && session.CanAdopt(g.Listings, session.CurrentRetainerIds(runtime)))
+                var groupPulls = MarketRunPresentation.PullsIn(g.Listings, pulls);
+                foreach (var pull in groupPulls) grouped.Add(pull.Listing);
+                if (groupPulls.Count > 0) PullRow(groupPulls[0], groupPulls.Count);
+                var kept = g.Listings.Count - groupPulls.Count;
+                if (kept > 0)
+                {
+                    BeginItemRow(new(g.ItemId, g.Quality));
+                    ImGui.TableNextColumn(); ImGui.TableNextColumn(); ItemLabel(g.ItemName, g.Quality);
+                    ImGui.TableNextColumn(); ImGui.TextDisabled(kept.ToString("N0"));
+                    ImGui.TableNextColumn(); ImGui.TextDisabled(g.Quantity.ToString("N0"));
+                    ImGui.TableNextColumn(); ImGui.TextDisabled(g.UnitPrice.IsKnown ? g.UnitPrice.Value.ToString("N0") : "—");
+                    ImGui.TableNextColumn();
+                }
+                if (session.CanAdopt(g.Listings, session.CurrentRetainerIds(runtime)))
                 { ImGui.TableNextRow(); ImGui.TableSetColumnIndex(1); if (ImGui.SmallButton("Plan as listed")) session.Adopt(g.Listings, session.CurrentRetainerIds(runtime)); }
                 ImGui.PopID();
             }
+            foreach (var pull in pulls.Where(pull => !grouped.Contains(pull.Listing)))
+                PullRow(pull, 1);
             ImGui.EndTable();
         }
         if (retainer.Available && session.Free(retainer.RetainerId) > 0 && retainer.PlanRows.Count < 20)
