@@ -174,17 +174,23 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
             _ = executor.RunAsync(plan, run, session.IsDirty);
         ImGui.EndDisabled();
         if (reason is not null && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) ImGui.SetTooltip(reason);
-        if (executor.Result is not { } result || !result.Owner.Matches(runtime.Owner)) return;
+        if (executor.Result is not { } result) return;
+        if (!result.Owner.Matches(runtime.Owner)) ImGui.TextWrapped(ResultOwnerLabel(result.Owner));
         ImGui.TextWrapped(result.State + (result.Reason.Length == 0 ? string.Empty : $": {result.Reason}"));
         UiLayout.SameLineIfFits("Clear");
         if (ImGui.SmallButton("Clear")) executor.Clear();
         int Count(string kind) => result.Mutations.Count(m => m.Intent.Kind == kind && m.Outcome == MarketMutationOutcome.Committed);
-        ImGui.TextWrapped($"Listed {Count("Post")} / Repriced {Count("Reprice")} / Pulled {Count("Pull")} / Still short {result.StillShort} / No slot {result.NoSlot} / No inventory space {result.NoInventorySpace} / Split across stacks {result.SplitStacks}");
+        ImGui.TextWrapped($"Listed {Count("Post")} / Repriced {Count("Reprice")} / Pulled {Count("Pull")} / Still short {(result.ListingSummaryComplete ? result.StillShort.ToString() : "Unknown")} / No slot {result.NoSlot} / Inventory-blocked listings {result.NoInventorySpace} / Gather-blocked units {result.GatherBlockedUnits} / Split across stacks {result.SplitStacks}");
+        foreach (var message in result.Results) ImGui.TextWrapped(message);
         foreach (var group in result.Mutations.Where(m => m.Intent.Kind == "Pull" && m.Outcome == MarketMutationOutcome.Committed).GroupBy(m => m.Intent.ItemName))
             ImGui.TextWrapped($"{group.Key} × {group.Sum(m => m.Intent.Quantity)} (player inventory)");
         foreach (var id in result.NeedsCheck.Distinct())
             ImGui.TextWrapped($"Needs check: {result.NeedsCheckNames.GetValueOrDefault(id) ?? result.Assignments.FirstOrDefault(a => a.RetainerId == id)?.RetainerName ?? id.ToString()}");
     }
+
+    internal static string ResultOwnerLabel(OwnerScope owner) => string.IsNullOrWhiteSpace(owner.CharacterName)
+        ? "Previous character's market run"
+        : $"Market run: {owner.CharacterName} @ {owner.HomeWorldName}";
 
     private void Save()
     {

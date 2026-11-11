@@ -15,6 +15,7 @@ internal sealed class MarketRunLiveDriver(
 {
     private static readonly InventoryType[] Bags = [InventoryType.Inventory1, InventoryType.Inventory2, InventoryType.Inventory3, InventoryType.Inventory4];
     private readonly MarketRunDeadline deadline = new(TimeSpan.FromSeconds(15));
+    private readonly MarketRunDeadline routeDeadline = new(MarketRunDeadline.RetainerListTimeout);
     private ulong retainerId;
     private string retainerName = string.Empty;
     private OwnerScope owner = new();
@@ -70,6 +71,7 @@ internal sealed class MarketRunLiveDriver(
     public async Task<MarketMutationOutcome> PostAsync(DalamudInventoryStack source, int quantity, uint price, CancellationToken token) =>
         (MarketMutationOutcome)(int)(await session.PostMarketListingAsync(source, quantity, price, token).ConfigureAwait(false)).Outcome;
     public async Task ReturnAsync(CancellationToken token) => Require(await session.ReturnToRetainerListAsync(token).ConfigureAwait(false));
+    public async Task CloseListAsync(CancellationToken token) => Require(await session.CloseRetainerListAsync(token).ConfigureAwait(false));
 
     public async Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, CancellationToken token)
     {
@@ -86,7 +88,7 @@ internal sealed class MarketRunLiveDriver(
             var player = await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
             var held = player.Stacks.Where(s => s.ItemId == target.ItemId && s.IsHighQuality == (target.Quality == ItemQualityPolicy.HqOnly)).Sum(s => s.Quantity);
             if (held >= target.Units) continue;
-            var guarded = new GatherDriver(transferDriver, this, check, target, deadline);
+            var guarded = new GatherDriver(transferDriver, this, check, target, deadline, routeDeadline);
             var operation = journal.CreateManual(owner, [new TargetPlanItem { ItemId = target.ItemId, ItemName = target.ItemName,
                 Quality = target.Quality, TargetQuantity = target.Units }]);
             var coordinator = new TransferCoordinator(journal, guarded, cache, currentOwner,
@@ -117,7 +119,7 @@ internal sealed class MarketRunLiveDriver(
             DateTime.UtcNow, stacks.Where(s => s.ItemId == target.ItemId && s.IsHighQuality == (target.Quality == ItemQualityPolicy.HqOnly)).ToArray()));
 
     private sealed class GatherDriver(RetainerLiveDriver inner, MarketRunLiveDriver market, Action check,
-        MarketGatherTarget target, IMarketRunDeadline deadline) : IRetainerTransferDriver
+        MarketGatherTarget target, IMarketRunDeadline deadline, IMarketRunDeadline routeDeadline) : IRetainerTransferDriver
     {
         public bool BlockedByInventory { get; private set; }
         public int InventoryBlockedUnits { get; private set; }
@@ -126,7 +128,11 @@ internal sealed class MarketRunLiveDriver(
         public ulong CurrentRetainer => currentRetainer;
         public string CurrentRetainerName { get; private set; } = string.Empty;
         private Task<bool> Step(Func<CancellationToken, Task> action) => deadline.RunAsync(async t => { await action(t).ConfigureAwait(false); return true; });
-        public Task RequireRetainerListAsync(CancellationToken token) { check(); return Step(inner.RequireRetainerListAsync); }
+        public Task RequireRetainerListAsync(CancellationToken token)
+        {
+            check();
+            return routeDeadline.RunAsync(async t => { await inner.RequireRetainerListAsync(t).ConfigureAwait(false); return true; });
+        }
         public async Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken token)
         {
             check();

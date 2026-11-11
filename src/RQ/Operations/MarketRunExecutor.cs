@@ -34,6 +34,7 @@ public interface IMarketRunDriver
     Task<MarketMutationOutcome> PullAsync(RetainerMarketListingTarget listing, CancellationToken token);
     Task<MarketMutationOutcome> PostAsync(DalamudInventoryStack source, int quantity, uint price, CancellationToken token);
     Task ReturnAsync(CancellationToken token);
+    Task CloseListAsync(CancellationToken token);
     Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, CancellationToken token);
 }
 
@@ -44,6 +45,8 @@ public interface IMarketRunDeadline
 
 public sealed class MarketRunDeadline(TimeSpan timeout) : IMarketRunDeadline
 {
+    // Bell routing has its own two-minute budget; leave room for opening the list.
+    public static readonly TimeSpan RetainerListTimeout = TimeSpan.FromSeconds(150);
     internal static readonly AsyncLocal<ConcurrentBag<Task>?> Calls = new();
     internal static bool HasUnsettled => Calls.Value?.Any(t => !t.IsCompleted) == true;
     public async Task<T> RunAsync<T>(Func<CancellationToken, Task<T>> action)
@@ -71,8 +74,10 @@ public sealed class MarketRunRecord
     public List<ulong> NeedsCheck { get; set; } = [];
     public Dictionary<ulong, string> NeedsCheckNames { get; set; } = [];
     public int StillShort { get; set; }
+    public bool ListingSummaryComplete { get; set; }
     public int NoSlot { get; set; }
     public int NoInventorySpace { get; set; }
+    public int GatherBlockedUnits { get; set; }
     public int SplitStacks { get; set; }
     public bool RequiresAcknowledgement => State == "Interrupted" || NeedsCheck.Count > 0 ||
         Mutations.Any(m => m.Outcome is null or MarketMutationOutcome.Indeterminate);
@@ -111,9 +116,10 @@ public sealed class MarketRunStore(string path)
 public sealed class MarketRunExecutor(
     IMarketRunDriver driver, AutomationLease automation, Func<ListingPlan?> currentPlan,
     Action<MarketRunRecord> persist, AutoRetainerSuppression? suppression = null,
-    IMarketRunDeadline? deadlines = null, Action? clear = null)
+    IMarketRunDeadline? deadlines = null, Action? clear = null, IMarketRunDeadline? routeDeadlines = null)
 {
     private readonly IMarketRunDeadline deadline = deadlines ?? new MarketRunDeadline(TimeSpan.FromSeconds(15));
+    private readonly IMarketRunDeadline routeDeadline = routeDeadlines ?? new MarketRunDeadline(MarketRunDeadline.RetainerListTimeout);
     private int running;
     private int cancelled;
     private bool driverUnsettled;
@@ -135,8 +141,11 @@ public sealed class MarketRunExecutor(
     }
     public void CancelAndWait(TimeSpan timeout)
     {
-        lock (persistenceGate) disposed = true;
-        Cancel();
+        lock (persistenceGate)
+        {
+            Cancel();
+            disposed = true;
+        }
         try { ActiveTask?.Wait(timeout); } catch (AggregateException) { }
     }
     public string Status { get; private set; } = string.Empty;
@@ -169,6 +178,8 @@ public sealed class MarketRunExecutor(
             var record = new MarketRunRecord { PlanId = plan.Id, PlanRevision = plan.Revision, Owner = plan.Owner with { },
                 Assignments = plan.Assignments.Where(a => a.Enabled).Select(ListingPlanCatalog.Copy).ToList() };
             AutoRetainerSuppression.Scope? scope = null;
+            var sessionStarted = false;
+            var scannedRetainers = new HashSet<ulong>();
             try
             {
                 Persist(record);
@@ -186,13 +197,14 @@ public sealed class MarketRunExecutor(
                     if (suppression.IsAvailable) scope = suppression.Acquire();
                 }
                 Status = "Gathering stock";
+                sessionStarted = true;
                 var targets = evaluation.Items.Where(i => i.RefillUnits.Value > 0)
                     .Select(i => new MarketGatherTarget(i.ItemId, i.ItemName, i.Quality, i.RefillUnits.Value)).ToArray();
                 // Gather owns per-call deadlines, not a single deadline for a multi-retainer route.
                 record.Results.AddRange(await driver.GatherAsync(targets, lease!, () => Check(record), CancellationToken.None).ConfigureAwait(false));
-                record.NoInventorySpace += driver.GatherInventoryBlockedUnits;
+                record.GatherBlockedUnits += driver.GatherInventoryBlockedUnits;
                 Check(record);
-                await Step(driver.RequireRetainerListAsync).ConfigureAwait(false);
+                await routeDeadline.RunAsync(async t => { await driver.RequireRetainerListAsync(t).ConfigureAwait(false); return true; }).ConfigureAwait(false);
                 foreach (var retainer in record.Assignments.GroupBy(a => (a.RetainerId, a.RetainerName))
                     .OrderBy(g => g.Key.RetainerName, StringComparer.OrdinalIgnoreCase).ThenBy(g => g.Key.RetainerId))
                 {
@@ -226,6 +238,7 @@ public sealed class MarketRunExecutor(
                                     var present = matches.Count(m => m.AssignmentId == a.Id && m.Kind is ListingMatchKind.Exact or ListingMatchKind.PriceDiffers or ListingMatchKind.UnknownPrice);
                                     record.StillShort += Math.Max(0, a.ListingCount - present);
                                 }
+                                scannedRetainers.Add(id);
                             }
                         }
                         catch (Exception e)
@@ -249,6 +262,14 @@ public sealed class MarketRunExecutor(
             {
                 try
                 {
+                    // Never overlap an abandoned call, touch a new character, or use an unloaded session.
+                    if (sessionStarted && !disposed && !driverUnsettled && !MarketRunDeadline.HasUnsettled &&
+                        currentPlan()?.Owner.Matches(record.Owner) == true)
+                    {
+                        try { await Step(driver.CloseListAsync).ConfigureAwait(false); }
+                        catch (Exception e) { Add(record, $"Could not close retainer list: {e.Message}"); }
+                    }
+                    record.ListingSummaryComplete = record.Assignments.Select(a => a.RetainerId).Distinct().All(scannedRetainers.Contains);
                     Status = record.State + (record.Reason.Length == 0 ? string.Empty : $": {record.Reason}");
                     Result = record;
                     Persist(record);
@@ -430,7 +451,7 @@ public sealed class MarketRunExecutor(
     private Task<bool> Step(Func<CancellationToken, Task> action) => deadline.RunAsync(async t => { await action(t).ConfigureAwait(false); return true; });
     private void Check(MarketRunRecord record)
     {
-        if (Volatile.Read(ref cancelled) != 0) throw new OperationCanceledException();
+        if (Volatile.Read(ref cancelled) != 0 || Volatile.Read(ref disposed)) throw new OperationCanceledException();
         if (runLease is null || !automation.Owns(runLease)) throw new RunStoppedException("Automation lease lost.");
         var plan = currentPlan();
         if (plan is null) throw new RunStoppedException("No Listing Plan or character still loading.");

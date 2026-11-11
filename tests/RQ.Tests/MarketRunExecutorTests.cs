@@ -190,6 +190,110 @@ public sealed class MarketRunExecutorTests
 
     private static MarketRunExecutor Create(ListingPlan plan, Driver fake) => new(fake, new(), () => plan, _ => { });
 
+    [Fact]
+    public async Task PreviousOwnerResult_RemainsBlockedUntilVisibleAcknowledgement()
+    {
+        var plan = Plan(); var fake = new Driver(); var executor = Create(plan, fake);
+        var previous = plan.Owner with { LocalContentId = 77, CharacterName = "Other Character", HomeWorldName = "World" };
+        var record = new MarketRunRecord { Owner = previous, State = "Interrupted" };
+        executor.Restore(record);
+        Assert.False(previous.Matches(plan.Owner));
+        Assert.Equal("Market run: Other Character @ World", RQ.UI.MarketRunPane.ResultOwnerLabel(previous));
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Same(record, executor.Result);
+        executor.Clear();
+        Assert.True(executor.CanStart);
+    }
+
+    [Fact]
+    public async Task UnloadBeforeMutation_NoDispatchAndNoCleanupOnDisposedDriver()
+    {
+        var plan = Plan(); var fake = new Driver(); var executor = Create(plan, fake);
+        fake.OnPlayer = () => executor.CancelAndWait(TimeSpan.Zero);
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Empty(fake.Posts);
+        Assert.Equal(0, fake.Closes);
+    }
+
+    [Fact]
+    public async Task UnloadAtIntentPersistence_StopsBeforeSend()
+    {
+        var plan = Plan(); var fake = new Driver();
+        MarketRunExecutor? executor = null;
+        executor = new(fake, new(), () => plan, r =>
+        {
+            if (r.Mutations.Count > 0) executor!.CancelAndWait(TimeSpan.Zero);
+        });
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Empty(fake.Posts);
+        Assert.Equal(MarketMutationOutcome.FailedBeforeSend, Assert.Single(executor.Result!.Mutations).Outcome);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CloseRunsUnderLeaseAndSuppression_WithoutChangingOutcome(bool fails)
+    {
+        var plan = Plan(); var fake = new Driver { FailClose = fails }; var lease = new AutomationLease(); var ipc = new AutoRetainer();
+        fake.OnClose = () => { Assert.True(lease.IsHeld); Assert.True(ipc.IsSuppressed); };
+        var executor = new MarketRunExecutor(fake, lease, () => plan, _ => { }, new(ipc));
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Equal(1, fake.Closes);
+        Assert.Equal("Completed", executor.Result!.State);
+        Assert.Equal(string.Empty, executor.Result.Reason);
+        Assert.Equal(fails, executor.Result.Results.Any(s => s.Contains("Could not close retainer list")));
+        Assert.False(lease.IsHeld); Assert.False(ipc.IsSuppressed);
+    }
+
+    [Fact]
+    public async Task UnsettledClose_KeepsLeaseUntilCompletion()
+    {
+        var plan = Plan(); var pending = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new Driver { PendingClose = pending.Task }; var lease = new AutomationLease();
+        var executor = new MarketRunExecutor(fake, lease, () => plan, _ => { }, deadlines: new MarketRunDeadline(TimeSpan.FromMilliseconds(5)));
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.True(lease.IsHeld);
+        Assert.Equal("Completed", executor.Result!.State);
+        pending.SetResult();
+        for (var n = 0; n < 100 && lease.IsHeld; n++) await Task.Delay(5);
+        Assert.False(lease.IsHeld);
+    }
+
+    [Fact]
+    public async Task CancelDuringGather_LeavesShortageUnknownAndClosesList()
+    {
+        var plan = Plan(); var fake = new Driver(); var executor = Create(plan, fake);
+        fake.OnGather = executor.Cancel;
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.False(executor.Result!.ListingSummaryComplete);
+        Assert.Equal(1, fake.Closes);
+    }
+
+    [Fact]
+    public async Task FinalScanAcrossAllRetainers_MakesShortageKnown()
+    {
+        var plan = Plan(); var fake = new Driver(); var executor = Create(plan, fake);
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.True(executor.Result!.ListingSummaryComplete);
+        Assert.Equal(0, executor.Result.StillShort);
+    }
+
+    [Fact]
+    public async Task RetainerListUsesRouteDeadline_NotMutationDeadline()
+    {
+        var plan = Plan(); var fake = new Driver(); var routeDeadline = new CountingDeadline();
+        var executor = new MarketRunExecutor(fake, new(), () => plan, _ => { }, routeDeadlines: routeDeadline);
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Equal(1, routeDeadline.Calls);
+        Assert.True(MarketRunDeadline.RetainerListTimeout > TimeSpan.FromMinutes(2));
+    }
+
+    private sealed class CountingDeadline : IMarketRunDeadline
+    {
+        public int Calls;
+        public Task<T> RunAsync<T>(Func<CancellationToken, Task<T>> action) { Calls++; return action(CancellationToken.None); }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -463,7 +567,8 @@ public sealed class MarketRunExecutorTests
                 await executor.RunAsync(plan, Evaluation(plan));
                 Assert.Equal("Completed", executor.Result!.State);
                 Assert.Single(fake.Posts); Assert.Equal(4, transferred);
-                Assert.Equal(3, executor.Result.NoInventorySpace);
+                Assert.Equal(3, executor.Result.GatherBlockedUnits);
+                Assert.Equal(0, executor.Result.NoInventorySpace);
                 Assert.Equal(OperationStatuses.PartiallySucceeded, Assert.Single(journal.History(plan.Owner, 10)).Status);
                 Assert.False(automation.IsHeld);
                 return;
@@ -525,6 +630,10 @@ public sealed class MarketRunExecutorTests
         public List<ulong> Posts = [];
         public List<ulong> Visited = [];
         public int Returns;
+        public int Closes;
+        public Action? OnClose;
+        public Task? PendingClose;
+        public bool FailClose;
         public bool Compact, ThrowPull, ThrowReprice;
         public Task<MarketMutationOutcome>? PendingPost;
         public int FreeSlots = 100;
@@ -568,6 +677,11 @@ public sealed class MarketRunExecutorTests
             return Task.FromResult(Outcome);
         }
         public Task ReturnAsync(CancellationToken t) { Returns++; return FailReturn ? Task.FromException(new InvalidOperationException("List unreachable")) : Task.CompletedTask; }
+        public Task CloseListAsync(CancellationToken t)
+        {
+            Closes++; OnClose?.Invoke();
+            return FailClose ? Task.FromException(new InvalidOperationException("Close failed")) : PendingClose ?? Task.CompletedTask;
+        }
         public Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, CancellationToken t)
         { OnGather?.Invoke(); check(); return GatherOverride?.Invoke(targets, lease, check, t) ?? Task.FromResult<IReadOnlyList<string>>([]); }
     }
