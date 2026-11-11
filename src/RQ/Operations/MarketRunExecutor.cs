@@ -303,18 +303,23 @@ public sealed class MarketRunExecutor(
     private async Task ListRetainer(MarketRunRecord record, ulong id, string name, ListingPlanAssignment[] assignments)
     {
         var listings = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
-        var repriced = new HashSet<int>();
+        int? previousPriceDifferences = null;
         while (true)
         {
             Check(record);
             listings = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
-            var match = ListingPlanEvaluator.MatchListings(assignments, Rows(id, name, listings))
-                .FirstOrDefault(m => m.Kind == ListingMatchKind.PriceDiffers && m.Listing.SlotIndex is { } slot && !repriced.Contains(slot));
-            if (match is null) break;
+            var priceDifferences = ListingPlanEvaluator.MatchListings(assignments, Rows(id, name, listings))
+                .Where(m => m.Kind == ListingMatchKind.PriceDiffers).ToArray();
+            if (priceDifferences.Length == 0) break;
+            // Slot numbers are locations, not listing identities. Fresh work must
+            // converge instead of skipping a different listing that reused a slot.
+            if (previousPriceDifferences is { } previous && priceDifferences.Length >= previous)
+                throw new RunStoppedException("Repricing did not converge on the planned prices; run stopped.");
+            previousPriceDifferences = priceDifferences.Length;
+            var match = priceDifferences[0];
             var assignment = assignments.Single(a => a.Id == match.AssignmentId);
             var listing = listings.FirstOrDefault(l => l.SlotIndex == match.Listing.SlotIndex);
             if (listing is null) { Add(record, $"{assignment.ItemName}: no longer present"); break; }
-            repriced.Add(listing.SlotIndex);
             await Mutate(record, new("Reprice", id, assignment.ItemName, listing, null, listing.Quantity, (uint)assignment.UnitPrice),
                 t => driver.RepriceAsync(listing, (uint)assignment.UnitPrice, t)).ConfigureAwait(false);
         }

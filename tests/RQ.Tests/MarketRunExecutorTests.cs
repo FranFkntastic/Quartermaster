@@ -51,6 +51,44 @@ public sealed class MarketRunExecutorTests
     }
 
     [Fact]
+    public async Task RepriceReselectsListingThatMovesIntoPreviouslyUsedSlot()
+    {
+        var plan = Plan(2); var fake = new Driver();
+        fake.Live[10] = [new(0, 1, 2, false, 10), new(1, 1, 2, false, 20)];
+        var reprices = 0;
+        fake.OnReprice = () =>
+        {
+            if (++reprices != 1) return;
+            fake.OnListings = () =>
+            {
+                fake.OnListings = null;
+                fake.Live[10].RemoveAt(0); // The first repriced listing sells.
+                fake.Live[10] = fake.Live[10].Select((l, i) => l with { SlotIndex = i }).ToList();
+            };
+        };
+        var executor = Create(plan, fake);
+        await executor.RunAsync(plan, Evaluation(plan));
+        var receipts = executor.Result!.Mutations.Where(m => m.Intent.Kind == "Reprice").ToArray();
+        Assert.Equal(2, receipts.Length);
+        Assert.All(receipts, r => Assert.Equal(0, r.Intent.Listing!.SlotIndex));
+        Assert.All(fake.Live[10], l => Assert.Equal(50u, l.UnitPrice));
+        Assert.Equal("Completed", executor.Result.State);
+    }
+
+    [Fact]
+    public async Task RepriceWithoutObservedProgress_StopsInsteadOfLoopingOrReportingCompletion()
+    {
+        var plan = Plan(); var fake = new Driver { ApplyReprice = false };
+        fake.Live[10] = [new(0, 1, 2, false, 10)];
+        var executor = Create(plan, fake);
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Single(executor.Result!.Mutations);
+        Assert.Equal("Stopped", executor.Result.State);
+        Assert.Contains("did not converge", executor.Result.Reason);
+        Assert.Empty(fake.Posts);
+    }
+
+    [Fact]
     public async Task PullThenPost_OnlyNeededNumber_LiveDisagreesWithEvaluation()
     {
         var plan = Plan(); var fake = new Driver();
