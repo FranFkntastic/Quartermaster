@@ -141,7 +141,7 @@ public static class ListingPlanEvaluator
         OwnerScope owner)
     {
         var enabledPlanIds = state.StowagePlans
-            .Where(plan => plan.Enabled && plan.Owner.Matches(owner))
+            .Where(plan => !plan.IsEphemeral && plan.Enabled && plan.Owner.Matches(owner))
             .Select(plan => plan.Id)
             .ToHashSet();
         return enabledPlanIds.SelectMany(planId => ComposeRules(state, projection, owner, planId)).ToArray();

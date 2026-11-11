@@ -421,41 +421,45 @@ public sealed class QuartermasterWindow : Window
                 DrawMarketTab(runtime);
                 ImGui.EndTabItem();
             }
-            var stockOpen = ImGui.BeginTabItem("Stock",
-                TabFlags(requestedView is WorkbenchView.Stock or WorkbenchView.Restock));
+            var stockOpen = ImGui.BeginTabItem("Stock & plans",
+                TabFlags(requestedView is WorkbenchView.Stock or WorkbenchView.Restock or WorkbenchView.Stowage or WorkbenchView.ItemGroups));
             RegisterWorkspaceControl("stock", WorkbenchView.Stock);
+            RegisterWorkspaceControl("transfer-plans", WorkbenchView.Stowage);
             if (stockOpen)
             {
-                workbench.View = WorkbenchView.Stock;
-                stockWorkspace.Draw(runtime);
-                ImGui.EndTabItem();
-            }
-            var plansOpen = ImGui.BeginTabItem("Transfer plans",
-                TabFlags(requestedView == WorkbenchView.Stowage));
-            RegisterWorkspaceControl("transfer-plans", WorkbenchView.Stowage);
-            if (plansOpen)
-            {
-                workbench.View = WorkbenchView.Stowage;
-                var started = Stopwatch.GetTimestamp();
-                transferPlanWorkspace.DrawRibbon(runtime);
-                ImGui.Separator();
-                transferPlanWorkspace.Draw(runtime);
-                PlanDrawMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-                ImGui.EndTabItem();
-            }
-            var groupsOpen = ImGui.BeginTabItem("Item groups",
-                TabFlags(requestedView == WorkbenchView.ItemGroups));
-            RegisterWorkspaceControl("item-groups", WorkbenchView.ItemGroups);
-            if (groupsOpen)
-            {
-                workbench.View = WorkbenchView.ItemGroups;
-                itemGroupWorkspace.DrawWorkspace(runtime.State);
+                if (requestedView == WorkbenchView.ItemGroups) workbench.View = WorkbenchView.ItemGroups;
+                else if (requestedView.HasValue || workbench.View != WorkbenchView.ItemGroups) workbench.View = WorkbenchView.Stowage;
+                if (ImGui.BeginTable("RQStockTransferWorkbench", 2, ImGuiTableFlags.Resizable | ImGuiTableFlags.BordersInnerV))
+                {
+                    ImGui.TableSetupColumn("Stock", ImGuiTableColumnFlags.WidthStretch, 1);
+                    ImGui.TableSetupColumn("Transfer plan", ImGuiTableColumnFlags.WidthStretch, 1.2f);
+                    ImGui.TableNextRow(); ImGui.TableNextColumn();
+                    if (ImGui.BeginChild("RQSourcePane", Vector2.Zero, false)) stockWorkspace.Draw(runtime);
+                    ImGui.EndChild();
+                    ImGui.TableNextColumn();
+                    if (ImGui.BeginChild("RQPlanPane", Vector2.Zero, false))
+                    {
+                        var started = Stopwatch.GetTimestamp();
+                        var transferSelected = workbench.View != WorkbenchView.ItemGroups;
+                        if (ImGui.Selectable("Transfer plan##RQPlannerMode", transferSelected, ImGuiSelectableFlags.None, new Vector2(112, 0))) workbench.View = WorkbenchView.Stowage;
+                        reviewRegistry.RegisterLastButton("quartermaster.workspace.transfer", "Show Transfer Plan workspace", true, () => workbench.View = WorkbenchView.Stowage, "Available");
+                        ImGui.SameLine();
+                        if (ImGui.Selectable("Item groups##RQPlannerMode", !transferSelected, ImGuiSelectableFlags.None, new Vector2(104, 0))) workbench.View = WorkbenchView.ItemGroups;
+                        reviewRegistry.RegisterLastButton("quartermaster.workspace.item-groups", "Show Item Groups workspace", true, () => workbench.View = WorkbenchView.ItemGroups, "Available");
+                        ImGui.Separator();
+                        if (workbench.View == WorkbenchView.ItemGroups) itemGroupWorkspace.DrawWorkspace(runtime.State);
+                        else transferPlanWorkspace.Draw(runtime);
+                        PlanDrawMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                    }
+                    ImGui.EndChild();
+                    ImGui.EndTable();
+                }
                 ImGui.EndTabItem();
             }
             ImGui.EndTabBar();
             requestedView = null;
         }
-        transferPlanEditor.DrawDialogs();
+        transferPlanEditor.Draw(runtime);
         transferReviewDialog.Draw();
         vendorReviewDialog.Draw();
         confirmationDialog.Draw();
@@ -539,6 +543,7 @@ public sealed class QuartermasterWindow : Window
 
     private void RequestDeleteStowagePlan(StowagePlan plan, OwnerScope owner)
     {
+        if (plan.IsEphemeral) return;
         var planId = plan.Id;
         confirmationDialog.Request(
             $"transfer-plan:{planId}",
@@ -553,7 +558,7 @@ public sealed class QuartermasterWindow : Window
                     document.TransferPlanListingLinks.RemoveAll(link => link.StowagePlanId == planId);
                     document.StowagePlans.RemoveAll(candidate => candidate.Id == planId && candidate.Owner.Matches(owner));
                     StowagePlanCatalog.ClearStaleRecovery(document);
-                    return StowagePlanCatalog.OwnerPlans(document, owner).FirstOrDefault()?.Id;
+                    return (Guid?)StowagePlanCatalog.EnsureScratch(document, owner).Id;
                 });
                 transferPlanEditor.Forget(planId);
             });

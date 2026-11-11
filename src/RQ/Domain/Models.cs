@@ -167,6 +167,7 @@ public sealed class StowageRoutingPolicy
 
 public sealed class StowagePlan
 {
+    public bool IsEphemeral { get; set; }
     public Guid Id { get; set; } = Guid.NewGuid();
     public long Revision { get; set; } = 1;
     public OwnerScope Owner { get; set; } = new();

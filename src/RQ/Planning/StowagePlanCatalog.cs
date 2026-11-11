@@ -14,9 +14,55 @@ public sealed class StowagePlanDraft
 
 public static class StowagePlanCatalog
 {
+    // Additive v5 migration: absent IsEphemeral fields deserialize as false. Create
+    // lazily under the repository mutation lock, after the legacy plan migrations.
+    public static StowagePlan EnsureScratch(QuartermasterState state, OwnerScope owner)
+    {
+        if (!owner.HasStableIdentity)
+            throw new InvalidOperationException("Transfer plans require stable owner identity.");
+        var existing = state.StowagePlans.SingleOrDefault(p => p.IsEphemeral && p.Owner.Matches(owner));
+        if (existing is not null) return existing;
+        var plan = new StowagePlan { Owner = owner with { }, Name = "Unsaved plan", IsEphemeral = true, Enabled = false };
+        state.StowagePlans.Add(plan);
+        return plan;
+    }
+
+    public static StowagePlan PromoteScratch(QuartermasterState state, OwnerScope owner, Guid id, string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) throw new InvalidOperationException("A Transfer Plan needs a name.");
+        var plan = state.StowagePlans.Single(p => p.Id == id && p.Owner.Matches(owner) && p.IsEphemeral);
+        plan.Name = UniqueName(state, owner, name, id);
+        plan.IsEphemeral = false;
+        plan.Revision = checked(plan.Revision + 1);
+        EnsureScratch(state, owner);
+        ClearStaleRecovery(state);
+        return plan;
+    }
+
+    public static void SetStockRule(StowagePlanDraft draft, uint itemId, string name, int retrieveTarget, bool stow, ulong? retainerId = null)
+    {
+        var rule = draft.Rules.FirstOrDefault(r => r.ItemId == itemId && r.Quality == ItemQualityPolicy.Any);
+        if (rule is null)
+        {
+            rule = new TargetPlanItem { StowagePlanId = draft.PlanId, ItemId = itemId, ItemName = name, TargetQuantity = Math.Max(0, retrieveTarget) };
+            draft.Rules.Add(rule);
+        }
+        rule.Enabled = true;
+        if (stow)
+        {
+            rule.TargetQuantity = 0;
+            rule.Routing = new StowageRoutingPolicy
+            {
+                Mode = retainerId.HasValue ? StowageRoutingMode.HomeFirst : StowageRoutingMode.ConsolidateFirst,
+                PreferredRetainerIds = retainerId.HasValue ? [retainerId.Value] : [],
+                Overflow = retainerId.HasValue ? StowageOverflowPolicy.HoldOnPlayer : StowageOverflowPolicy.AnyOwnerRetainer,
+            };
+        }
+    }
+
     public static IReadOnlyList<StowagePlan> OwnerPlans(QuartermasterState state, OwnerScope owner) =>
         state.StowagePlans
-            .Where(plan => plan.Owner.Matches(owner))
+            .Where(plan => !plan.IsEphemeral && plan.Owner.Matches(owner))
             .OrderByDescending(plan => plan.Enabled)
             .ThenBy(plan => plan.Priority)
             .ThenBy(plan => plan.Name, StringComparer.OrdinalIgnoreCase)
@@ -30,7 +76,7 @@ public static class StowagePlanCatalog
     {
         if (!owner.HasStableIdentity)
             throw new InvalidOperationException("Transfer plans require stable owner identity.");
-        var hasEnabledPlan = state.StowagePlans.Any(plan => plan.Owner.Matches(owner) && plan.Enabled);
+        var hasEnabledPlan = OwnerPlans(state, owner).Any(plan => plan.Enabled);
         var plan = new StowagePlan
         {
             Owner = owner with { },
@@ -89,7 +135,7 @@ public static class StowagePlanCatalog
             PlanId = Guid.NewGuid(),
             IsNew = true,
             Name = UniqueName(state, owner, requestedName),
-            Enabled = !state.StowagePlans.Any(plan => plan.Owner.Matches(owner) && plan.Enabled),
+            Enabled = !OwnerPlans(state, owner).Any(plan => plan.Enabled),
         };
     }
 
@@ -179,12 +225,12 @@ public static class StowagePlanCatalog
             plan.Revision = checked(plan.Revision + 1);
         }
 
-        plan.Name = UniqueName(state, owner, draft.Name, plan.Id);
-        plan.Enabled = draft.Enabled;
+        plan.Name = plan.IsEphemeral ? "Unsaved plan" : UniqueName(state, owner, draft.Name, plan.Id);
+        plan.Enabled = !plan.IsEphemeral && draft.Enabled;
         if (plan.Enabled)
         {
             foreach (var other in state.StowagePlans.Where(candidate =>
-                         candidate.Id != plan.Id && candidate.Owner.Matches(owner) && candidate.Enabled))
+                         !candidate.IsEphemeral && candidate.Id != plan.Id && candidate.Owner.Matches(owner) && candidate.Enabled))
             {
                 other.Enabled = false;
                 other.Revision = checked(other.Revision + 1);
@@ -223,7 +269,7 @@ public static class StowagePlanCatalog
     {
         var basis = string.IsNullOrWhiteSpace(requestedName) ? "Transfer plan" : requestedName.Trim();
         var used = state.StowagePlans
-            .Where(plan => plan.Owner.Matches(owner) && plan.Id != excludingPlanId)
+            .Where(plan => !plan.IsEphemeral && plan.Owner.Matches(owner) && plan.Id != excludingPlanId)
             .Select(plan => plan.Name)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         if (!used.Contains(basis))

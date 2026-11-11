@@ -298,7 +298,7 @@ public sealed class SnapshotPublisher
         {
             schema,
             plans = state.StowagePlans
-                .Where(plan => plan.Owner.Matches(owner))
+                .Where(plan => !plan.IsEphemeral && plan.Owner.Matches(owner))
                 .OrderBy(plan => plan.Priority)
                 .ThenBy(plan => plan.Name, StringComparer.OrdinalIgnoreCase)
                 .Select(plan => new
