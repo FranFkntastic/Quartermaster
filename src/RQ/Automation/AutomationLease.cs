@@ -1,11 +1,12 @@
 namespace RQ.Automation;
 
-public sealed class AutomationLease
+public sealed class AutomationLease(Func<string?>? refusalReason = null)
 {
     private readonly object gate = new();
     private Guid activeToken;
 
     public string? Holder { get; private set; }
+    public string? RefusalReason => refusalReason?.Invoke();
 
     public bool IsHeld
     {
@@ -21,7 +22,7 @@ public sealed class AutomationLease
         ArgumentException.ThrowIfNullOrWhiteSpace(holder);
         lock (gate)
         {
-            if (Holder is not null)
+            if (Holder is not null || RefusalReason is not null)
             {
                 lease = null;
                 return false;

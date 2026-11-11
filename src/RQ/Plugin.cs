@@ -172,7 +172,9 @@ public sealed class Plugin : IDalamudPlugin
         });
         StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
         TransferPlanMigration.EnsureOwnerPlans(state, CurrentOwner());
-        var automation = new AutomationLease();
+        MarketRunExecutor? activeMarketRuns = null;
+        var automation = new AutomationLease(() => activeMarketRuns?.Result?.RequiresAcknowledgement == true
+            ? "Unresolved market run; review its result in Market before clearing it." : null);
         // Keep retrieval verification bound to the exact inventory changes emitted
         // while its native command is in flight; this survives retainer slot compaction.
         var retainerSession = new DalamudRetainerAutomationSession(
@@ -211,6 +213,7 @@ public sealed class Plugin : IDalamudPlugin
                 automation, CurrentOwner, id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.Name.ToString() ?? $"Item {id}"),
             automation, () => state.Read(s => ListingPlanCatalog.OwnerPlan(s, CurrentOwner())), marketRunStore.Save, autoRetainerSuppression, clear: marketRunStore.Clear);
         marketRuns.Restore(marketRunStore.Load());
+        activeMarketRuns = marketRuns;
         automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerSuppression);
         runtimeSnapshots = new(scanner, playerInventory, cache, state, CurrentOwner);
         var vendorAccess = new DalamudGilVendorAccessReader(

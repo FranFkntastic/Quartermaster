@@ -294,6 +294,28 @@ public sealed class MarketRunExecutorTests
         public Task<T> RunAsync<T>(Func<CancellationToken, Task<T>> action) { Calls++; return action(CancellationToken.None); }
     }
 
+    [Fact]
+    public void RestoredUnresolvedReceipt_BlocksAllSharedAutomationUntilAcknowledged()
+    {
+        var record = new MarketRunRecord { State = "Interrupted" };
+        MarketRunExecutor? executor = null;
+        var automation = new AutomationLease(() => executor?.Result?.RequiresAcknowledgement == true ? "Unresolved market run" : null);
+        executor = new(new Driver(), automation, () => Plan(), _ => { });
+        executor.Restore(record);
+        foreach (var holder in new[] { "transfer", "automatic retrieval", "refresh", "listing navigation" })
+        {
+            Assert.False(automation.TryAcquire(holder, out var lease));
+            Assert.Null(lease);
+        }
+        Assert.NotNull(automation.RefusalReason);
+        // A durable receipt is an interlock, not an active lease: Clear must stay reachable.
+        Assert.False(automation.IsHeld);
+        executor.Clear();
+        Assert.Null(automation.RefusalReason);
+        Assert.True(automation.TryAcquire("transfer", out var accepted));
+        accepted!.Dispose();
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
