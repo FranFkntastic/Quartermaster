@@ -68,7 +68,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
                 var label = Label(item.ItemName, item.Quality);
                 var open = ImGui.TreeNodeEx(label + "###item", ImGuiTreeNodeFlags.NoTreePushOnOpen | ImGuiTreeNodeFlags.SpanAvailWidth);
                 if (ImGui.IsItemHovered()) ImGui.SetTooltip(label);
-                if (listed) { ImGui.TableNextColumn(); ImGui.TextUnformatted($"{MarketRunPresentation.InPlace(item)} / {item.PlannedUnits:N0}"); }
+                if (listed) { ImGui.TableNextColumn(); ImGui.TextUnformatted($"{MarketRunPresentation.InPlace(run, item)} / {item.PlannedUnits:N0}"); }
                 if (full) { ImGui.TableNextColumn(); ImGui.TextUnformatted(MarketRunPresentation.Number(item.SpareUnits)); }
                 ImGui.TableNextColumn();
                 var reserve = draft.Reserves.FirstOrDefault(r => r.ItemId == item.ItemId && r.Quality == item.Quality);
@@ -88,7 +88,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
                     ImGui.PushClipRect(paneClipMin, paneClipMax, false);
                     if (ImGui.BeginChild("detail", new Vector2(width - 8, ImGui.GetFrameHeightWithSpacing() * (reserve is null ? 2 : 4) + (listed ? 0 : ImGui.GetTextLineHeightWithSpacing()) + (full ? 0 : ImGui.GetTextLineHeightWithSpacing())), false))
                     {
-                        if (!listed) ImGui.TextUnformatted($"Listed {MarketRunPresentation.InPlace(item)} / {item.PlannedUnits:N0}");
+                        if (!listed) ImGui.TextUnformatted($"Listed {MarketRunPresentation.InPlace(run, item)} / {item.PlannedUnits:N0}");
                         if (!full) ImGui.TextUnformatted($"Spare {MarketRunPresentation.Number(item.SpareUnits)} · After run {MarketRunPresentation.Number(item.ReserveAfterRun)}");
                         // The location is editable before a level is typed; changing it creates the rule.
                         var current = reserve?.Location ?? new StowageRoutingPolicy();
