@@ -110,7 +110,6 @@ internal sealed class ListingWorkspace
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Search item names in both planned and observed listings.");
         var all = Resolve(runtime);
         DrawRefresh(all.Count == 0);
-        if (all.Count == 0) { ImGui.TextDisabled("No retainers observed yet."); DrawNavigationStatus(); return; }
         var visible = all.Where(r => string.IsNullOrWhiteSpace(search) ||
             r.PlanRows.Any(a => a.Assignment.ItemName.Contains(search, StringComparison.OrdinalIgnoreCase)) ||
             runtime.Browser.GetListings(BrowserScope.RetainerKey(r.RetainerId)).Any(l => l.ItemName.Contains(search, StringComparison.OrdinalIgnoreCase))).ToArray();
@@ -126,7 +125,8 @@ internal sealed class ListingWorkspace
 
         if (ImGui.BeginChild("RQMarketRetainers", new Vector2(listWidth, height), false))
         {
-            if (visible.Length == 0) ImGui.TextDisabled($"No retainers match \"{search}\".");
+            if (all.Count == 0) { ImGui.TextDisabled("No retainers observed yet."); DrawNavigationStatus(); }
+            else if (visible.Length == 0) ImGui.TextDisabled($"No retainers match \"{search}\".");
             foreach (var row in visible) DrawRetainer(runtime, row);
         }
         ImGui.EndChild();

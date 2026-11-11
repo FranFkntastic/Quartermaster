@@ -444,78 +444,16 @@ internal sealed class TransferPlanEditor
 
     private void DrawStowageRouteCombo(TargetPlanItem rule, QuartermasterRuntimeSnapshot runtime)
     {
-        ImGui.SetNextItemWidth(-1);
-        if (!ImGui.BeginCombo(
-                $"##draftdestination{rule.Id}",
-                TransferPresentation.RouteSummary(rule.Routing, runtime.Retainers, runtime.Owner)))
-            return;
-
-        ImGui.TextDisabled("Placement");
-        foreach (var mode in Enum.GetValues<StowageRoutingMode>())
-            if (ImGui.Selectable(TransferPresentation.RoutingModeLabel(mode), rule.Routing.Mode == mode))
-                rule.Routing.Mode = mode;
-
-        ImGui.Separator();
-        ImGui.TextDisabled("Preferred retainers - in order");
-        var ownerRetainers = runtime.Retainers.Values
-            .Where(retainer => retainer.Owner.Matches(runtime.Owner))
-            .OrderBy(retainer => retainer.RetainerName, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(retainer => retainer.RetainerId)
-            .ToArray();
-        for (var index = 0; index < rule.Routing.PreferredRetainerIds.Count; index++)
+        RoutingPolicyEditor.DrawDestination(rule.Routing, runtime, () =>
         {
-            var retainerId = rule.Routing.PreferredRetainerIds[index];
-            var retainer = ownerRetainers.FirstOrDefault(candidate => candidate.RetainerId == retainerId);
-            ImGui.PushID($"inline-route{rule.Id}:{retainerId}:{index}");
-            ImGui.TextUnformatted(retainer?.RetainerName ?? $"Retainer {retainerId}");
-            ImGui.SameLine();
-            if (index > 0 && ImGui.SmallButton("Up"))
-                (rule.Routing.PreferredRetainerIds[index - 1], rule.Routing.PreferredRetainerIds[index]) =
-                    (rule.Routing.PreferredRetainerIds[index], rule.Routing.PreferredRetainerIds[index - 1]);
-            ImGui.SameLine();
-            if (index + 1 < rule.Routing.PreferredRetainerIds.Count && ImGui.SmallButton("Down"))
-                (rule.Routing.PreferredRetainerIds[index], rule.Routing.PreferredRetainerIds[index + 1]) =
-                    (rule.Routing.PreferredRetainerIds[index + 1], rule.Routing.PreferredRetainerIds[index]);
-            ImGui.SameLine();
-            if (ImGui.SmallButton("Remove"))
-            {
-                rule.Routing.PreferredRetainerIds.RemoveAt(index);
-                ImGui.PopID();
-                break;
-            }
-            ImGui.PopID();
-        }
-        var available = ownerRetainers
-            .Where(retainer => !rule.Routing.PreferredRetainerIds.Contains(retainer.RetainerId))
-            .ToArray();
-        ImGui.SetNextItemWidth(240);
-        if (ImGui.BeginCombo($"##addinlinepreferred{rule.Id}", "Add preferred retainer"))
-        {
-            foreach (var retainer in available)
-                if (ImGui.Selectable($"{retainer.RetainerName}##addinline{retainer.RetainerId}"))
-                    rule.Routing.PreferredRetainerIds.Add(retainer.RetainerId);
-            ImGui.EndCombo();
-        }
-
-        ImGui.Separator();
-        ImGui.TextDisabled("Note");
-        var notes = rule.Notes;
-        ImGui.SetNextItemWidth(300);
-        if (ImGui.InputText($"##draftstowagenote{rule.Id}", ref notes, 160))
-            rule.Notes = notes;
-        ImGui.EndCombo();
+            ImGui.Separator(); ImGui.TextDisabled("Note");
+            var notes = rule.Notes;
+            ImGui.SetNextItemWidth(300);
+            if (ImGui.InputText("##routeNote", ref notes, 160)) rule.Notes = notes;
+        });
     }
 
-    private static void DrawStowageOverflowCombo(TargetPlanItem rule)
-    {
-        ImGui.SetNextItemWidth(-1);
-        if (!ImGui.BeginCombo($"##draftoverflow{rule.Id}", TransferPresentation.OverflowLabel(rule.Routing.Overflow)))
-            return;
-        foreach (var overflow in Enum.GetValues<StowageOverflowPolicy>())
-            if (ImGui.Selectable(TransferPresentation.OverflowLabel(overflow), rule.Routing.Overflow == overflow))
-                rule.Routing.Overflow = overflow;
-        ImGui.EndCombo();
-    }
+    private static void DrawStowageOverflowCombo(TargetPlanItem rule) => RoutingPolicyEditor.DrawOverflow(rule.Routing);
 
     private IReadOnlyList<TargetPlanItem> FilteredDraftRules(StowagePlanDraft draft)
     {

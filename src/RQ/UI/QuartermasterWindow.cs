@@ -39,7 +39,7 @@ public sealed class QuartermasterWindow : Window
     private readonly ListingPlanDraftSession listingSession;
     private readonly Dictionary<uint, bool?> listability = [];
     private readonly ListingWorkspace listingWorkspace;
-    private readonly MarketRunPane marketRunPane = new();
+    private readonly MarketRunPane marketRunPane;
     private readonly TransferReviewDialog transferReviewDialog;
     private readonly TransferExecutionController transferExecution;
     private readonly VendorProcurementReviewDialog vendorReviewDialog;
@@ -65,13 +65,17 @@ public sealed class QuartermasterWindow : Window
         PluginConfiguration configuration,
         System.Action saveConfiguration,
         AgentBridgeUiReviewRegistry reviewRegistry,
-        Func<GilVendorCatalog>? vendorCatalogSource = null)
+        Func<GilVendorCatalog>? vendorCatalogSource,
+        Func<uint, uint?> resolveWorkshopProject,
+        string configDirectory,
+        RQ.Interop.MarketMafiosoSavedJobClient marketImporter)
         : base(MainWindowName, ImGuiWindowFlags.NoScrollbar)
     {
         this.state = state;
         this.runtimeSnapshots = runtimeSnapshots;
         this.dataManager = dataManager;
         this.reviewRegistry = reviewRegistry;
+        marketRunPane = new(resolveWorkshopProject, configDirectory, marketImporter);
         historyDialog = new(journal);
         RestockPlanEditor? restockEditor = null;
         TransferPlanEditor? transferEditor = null;
