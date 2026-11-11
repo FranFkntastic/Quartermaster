@@ -330,6 +330,43 @@ public sealed class MarketRunExecutorTests
     }
 
     [Fact]
+    public async Task UnsettledFinalScan_StopsBeforeNextRetainerAndHoldsOwnershipUntilSettlement()
+    {
+        var plan = Plan();
+        plan.Assignments.Add(new() { ItemId = 1, ItemName = "Hull", RetainerId = 11, RetainerName = "Beta", QuantityPerListing = 2, UnitPrice = 50 });
+        var pending = new TaskCompletionSource<IReadOnlyList<RetainerMarketListingTarget>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new Driver();
+        fake.OnPost = () => fake.PendingListings = pending.Task;
+        var lease = new AutomationLease(); var ipc = new AutoRetainer();
+        var executor = new MarketRunExecutor(fake, lease, () => plan, _ => { }, new(ipc), deadlines: new MarketRunDeadline(TimeSpan.FromMilliseconds(5)));
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Equal([10ul], fake.Visited);
+        Assert.Equal("Stopped", executor.Result!.State);
+        Assert.False(executor.Result.ListingSummaryComplete);
+        Assert.Equal(0, fake.Returns); Assert.Equal(0, fake.Closes);
+        Assert.True(lease.IsHeld); Assert.True(ipc.IsSuppressed);
+        pending.SetResult(fake.Live[10].ToArray());
+        for (var n = 0; n < 100 && lease.IsHeld; n++) await Task.Delay(5);
+        Assert.False(lease.IsHeld); Assert.False(ipc.IsSuppressed);
+        Assert.Equal([10ul], fake.Visited);
+    }
+
+    [Fact]
+    public async Task SettledFinalScanFailure_CanReturnAndContinueWithUnknownSummary()
+    {
+        var plan = Plan();
+        plan.Assignments.Add(new() { ItemId = 1, ItemName = "Hull", RetainerId = 11, RetainerName = "Beta", QuantityPerListing = 2, UnitPrice = 50 });
+        var fake = new Driver();
+        fake.OnPost = () => fake.PendingListings = Task.FromException<IReadOnlyList<RetainerMarketListingTarget>>(new InvalidOperationException("Read failed"));
+        var executor = Create(plan, fake);
+        await executor.RunAsync(plan, Evaluation(plan));
+        Assert.Equal([10ul, 11ul], fake.Visited);
+        Assert.Equal("Completed", executor.Result!.State);
+        Assert.False(executor.Result.ListingSummaryComplete);
+        Assert.Equal(2, fake.Returns); Assert.Equal(1, fake.Closes);
+    }
+
+    [Fact]
     public async Task CancelDuringGather_LeavesShortageUnknownAndClosesList()
     {
         var plan = Plan(); var fake = new Driver(); var executor = Create(plan, fake);
@@ -823,6 +860,7 @@ public sealed class MarketRunExecutorTests
         public bool Compact, ThrowPull, ThrowReprice;
         public Task<MarketMutationOutcome>? PendingPost;
         public Task<MarketMutationOutcome>? PendingReprice;
+        public Task<IReadOnlyList<RetainerMarketListingTarget>>? PendingListings;
         public int FreeSlots = 100;
         public bool ThrowBeforeSend, ThrowAfterSend;
         public bool ApplyReprice = true, FailReturn;
@@ -836,6 +874,7 @@ public sealed class MarketRunExecutorTests
         {
             ListingScans++;
             OnListings?.Invoke();
+            if (PendingListings is not null) return PendingListings;
             return Live[active].Any(l => l.UnitPrice is null or 0 or > 999999999)
             ? Task.FromException<IReadOnlyList<RetainerMarketListingTarget>>(new InvalidOperationException("Invalid market price"))
             : Task.FromResult<IReadOnlyList<RetainerMarketListingTarget>>(Live[active].ToArray());

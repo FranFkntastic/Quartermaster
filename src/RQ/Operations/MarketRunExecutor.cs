@@ -248,6 +248,11 @@ public sealed class MarketRunExecutor(
                         catch (Exception e)
                         {
                             Add(record, $"{retainer.Name}: final scan unavailable ({e.Message})");
+                            if (MarketRunDeadline.HasUnsettled)
+                            {
+                                driverUnsettled = true;
+                                throw new RunStoppedException("Final listing scan has not settled; run stopped to prevent overlapping session calls.");
+                            }
                         }
                         // Recheck after the final scan: unload or character change can
                         // happen while that read is in flight, too.
@@ -464,6 +469,8 @@ public sealed class MarketRunExecutor(
     private void Check(MarketRunRecord record)
     {
         if (Volatile.Read(ref cancelled) != 0 || Volatile.Read(ref disposed)) throw new OperationCanceledException();
+        if (driverUnsettled || MarketRunDeadline.HasUnsettled)
+            throw new RunStoppedException("A session call has not settled; run stopped to prevent overlapping requests.");
         if (runLease is null || !automation.Owns(runLease)) throw new RunStoppedException("Automation lease lost.");
         var plan = currentPlan();
         if (plan is null) throw new RunStoppedException("No Listing Plan or character still loading.");
