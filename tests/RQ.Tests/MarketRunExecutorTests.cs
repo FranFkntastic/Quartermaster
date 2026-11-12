@@ -312,6 +312,144 @@ public sealed class MarketRunExecutorTests
         Assert.Equal(atDispose, writes); Assert.False(executor.CanStart);
     }
 
+    [Theory]
+    [InlineData("lost")]
+    [InlineData("unload")]
+    [InlineData("owner")]
+    [InlineData("scanowner")]
+    [InlineData("scanunload")]
+    public async Task Gather_UsesJournalAndBorrowedLease_RetrievesOnlyShortfall(string mode)
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "rq-market-gather-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var plan = Plan();
+            var state = new StateRepository(new QuartermasterStateStore(Path.Combine(directory, "state.json")));
+            var journal = new OperationJournal(state);
+            using var cache = new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory, "retainers.json")));
+            cache.Upsert(new CachedRetainer { RetainerId = 10, RetainerName = "Alpha", Owner = plan.Owner,
+                Bags = [new() { BagName = "RetainerPage1", ObservedAtUtc = DateTime.UtcNow,
+                    Items = [new() { ItemId = 1, ItemName = "Hull", Quantity = 20 }] }] });
+            var playerCache = new PlayerInventoryCacheRepository(new PlayerInventoryCacheStore(Path.Combine(directory, "player.json")));
+            var player = new List<DalamudInventoryStack> { new(InventoryType.Inventory1, 0, 1, 3) };
+            if (mode == "full") player.AddRange(Enumerable.Range(1, 139).Select(i => new DalamudInventoryStack((InventoryType)(i / 35), i % 35, 2, 1)));
+            var source = new DalamudInventoryStack(InventoryType.RetainerPage1, 0, 1, 20);
+            var split = mode is "partial" or "cancel" or "lost";
+            var sources = split ? new List<DalamudInventoryStack> { source with { Quantity = 4 }, source with { SlotIndex = 1, Quantity = 16 } } : [source];
+            var transferred = 0;
+            var cancel = false;
+            var authority = true;
+            var currentOwner = plan.Owner;
+            var callsAfterAuthorityLoss = 0;
+            var closes = 0;
+            var sourceReads = 0;
+            IDisposable? lease = null;
+            var automation = new AutomationLease();
+            var session = DispatchProxy.Create<IRetainerAutomationSession, SessionProxy>();
+            ((SessionProxy)(object)session).Handler = (method, args) =>
+            {
+                if (!authority || !currentOwner.Matches(plan.Owner) || !automation.IsHeld) callsAfterAuthorityLoss++;
+                if (method.Name == nameof(IRetainerAutomationSession.CloseRetainerAsync)) closes++;
+                if (mode != "lost" || transferred == 0) Assert.True(automation.IsHeld);
+                switch (method.Name)
+                {
+                    case nameof(IRetainerAutomationSession.ScanPlayerInventoryAsync):
+                        return Task.FromResult<IReadOnlyList<DalamudInventoryStack>>(player.ToArray());
+                    case nameof(IRetainerAutomationSession.ScanRetainerAsync):
+                        if (mode is "scanowner" or "scanunload")
+                        {
+                            if (mode == "scanowner") currentOwner = plan.Owner with { LocalContentId = 999 };
+                            else authority = false;
+                            return Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([source with { Quantity = 19 }]);
+                        }
+                        if (mode == "changed" && ++sourceReads == 2) sources[0] = sources[0] with { Quantity = 19 };
+                        return Task.FromResult<IReadOnlyList<DalamudInventoryStack>>(sources.Where(s => s.Quantity > 0).ToArray());
+                    case nameof(IRetainerAutomationSession.RetrieveAsync):
+                        var quantity = (int)args![1]!;
+                        transferred += quantity;
+                        source = source with { Quantity = source.Quantity - quantity };
+                        var selected = (DalamudInventoryStack)args[0]!;
+                        var index = sources.FindIndex(s => s.SlotIndex == selected.SlotIndex);
+                        sources[index] = sources[index] with { Quantity = sources[index].Quantity - quantity };
+                        player[0] = player[0] with { Quantity = player[0].Quantity + quantity };
+                        if (mode == "partial") player.AddRange(Enumerable.Range(1, 139).Select(i => new DalamudInventoryStack((InventoryType)(i / 35), i % 35, 2, 1)));
+                        if (mode == "cancel") cancel = true;
+                        if (mode == "lost") lease!.Dispose();
+                        if (mode == "unload") authority = false;
+                        if (mode == "owner") currentOwner = plan.Owner with { LocalContentId = 999 };
+                        return Task.FromResult(new RetainerRetrievalResult(true, quantity, "Retrieved", "Verified"));
+                    default:
+                        if (mode == "deadline") return Task.FromCanceled<RetainerAutomationResult>(new CancellationToken(true));
+                        return Task.FromResult(RetainerAutomationResult.Succeeded("Ready", "Ready"));
+                }
+            };
+            var adapter = new MarketRunLiveDriver(session, new RetainerLiveDriver(session), journal, cache, playerCache, automation,
+                () => currentOwner, _ => "Hull");
+            if (mode == "partial")
+            {
+                var fake = new Driver { Stock = player };
+                fake.GatherOverride = async (_, borrowed, check, hasAuthority, token) =>
+                {
+                    var reports = await adapter.GatherAsync([new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], borrowed, check, hasAuthority, token);
+                    fake.GatherInventoryBlockedUnits = adapter.GatherInventoryBlockedUnits;
+                    return reports;
+                };
+                var executor = new MarketRunExecutor(fake, automation, () => plan, _ => { });
+                await executor.RunAsync(plan, Evaluation(plan));
+                Assert.Equal("Completed", executor.Result!.State);
+                Assert.Single(fake.Posts); Assert.Equal(4, transferred);
+                Assert.Equal(3, executor.Result.GatherBlockedUnits);
+                Assert.Equal(0, executor.Result.NoInventorySpace);
+                Assert.Equal(OperationStatuses.PartiallySucceeded, Assert.Single(journal.History(plan.Owner, 10)).Status);
+                Assert.False(automation.IsHeld);
+                return;
+            }
+            Assert.True(automation.TryAcquire("market test", out lease));
+            using (lease)
+            {
+                IReadOnlyList<string> reports = [];
+                if (mode is "scanowner" or "scanunload")
+                {
+                    await Assert.ThrowsAsync<InvalidOperationException>(() => adapter.GatherAsync(
+                        [new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], lease!, () => { }, () => authority, CancellationToken.None));
+                    Assert.Equal(0, callsAfterAuthorityLoss);
+                    Assert.Equal(0, closes);
+                    Assert.Equal(20u, cache.Snapshot()[10].Bags.SelectMany(b => b.Items).Single(i => i.ItemId == 1).Quantity);
+                    return;
+                }
+                if (mode is "unload" or "owner" or "lost")
+                {
+                    await Assert.ThrowsAsync<MarketGatherIndeterminateException>(() => adapter.GatherAsync(
+                        [new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], lease!, () => { }, () => authority, CancellationToken.None));
+                    Assert.Equal(0, callsAfterAuthorityLoss);
+                    Assert.Equal(0, closes);
+                    Assert.Equal(OperationStatuses.Indeterminate, Assert.Single(journal.History(plan.Owner, 10)).Status);
+                    return;
+                }
+                Task Gather() => adapter.GatherAsync([new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], lease!, () => { if (cancel) throw new OperationCanceledException(); }, () => true, CancellationToken.None);
+                if (mode == "cancel") await Assert.ThrowsAnyAsync<OperationCanceledException>(Gather);
+                else reports = await adapter.GatherAsync([new(1, "Hull", ItemQualityPolicy.NqOnly, 10)], lease!, () => { }, () => true, CancellationToken.None);
+                Assert.Equal(mode != "lost", automation.IsHeld);
+                Assert.Equal(mode is "full" or "changed" or "deadline" ? 0 : split ? 4 : 7, transferred);
+                var operation = Assert.Single(journal.History(plan.Owner, 10));
+                Assert.Equal(mode is "cancel" or "deadline" ? OperationStatuses.Cancelled : mode is "full" or "lost" or "changed" ? OperationStatuses.Failed : mode == "partial" ? OperationStatuses.PartiallySucceeded : OperationStatuses.Succeeded, operation.Status);
+                Assert.Equal(transferred, Assert.Single(operation.Lines).TransferredQuantity);
+                if (mode is "full" or "partial") Assert.Contains(reports, r => r.Contains("inventory space"));
+                if (mode == "normal") Assert.Equal(13u, cache.Snapshot()[10].Bags.SelectMany(b => b.Items).Single(i => i.ItemId == 1).Quantity);
+                if (mode == "cancel") Assert.True(closes > 0);
+            }
+            Assert.False(automation.IsHeld);
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    public class SessionProxy : DispatchProxy
+    {
+        public Func<MethodInfo, object?[]?, object?> Handler { get; set; } = null!;
+        protected override object? Invoke(MethodInfo? targetMethod, object?[]? args) => Handler(targetMethod!, args);
+    }
+
     private sealed class AutoRetainer : IAutoRetainerIpc
     {
         public bool IsAvailable => true;

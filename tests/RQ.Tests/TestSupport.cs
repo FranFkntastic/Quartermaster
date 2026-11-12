@@ -1,8 +1,5 @@
-using System.Text.Json;
 using RQ.Domain;
-using RQ.Interop;
 using RQ.Inventory;
-using RQ.Operations;
 using RQ.Persistence;
 
 namespace RQ.Tests;
@@ -48,36 +45,4 @@ internal static class TestData
 
     public static StateRepository Repository(string directory) => new(new QuartermasterStateStore(System.IO.Path.Combine(directory, "state.json")));
 
-    public static ShortageRequest Request(string requestId = "request-1", string operationId = "operation-1", OwnerScope? owner = null) => new()
-    {
-        Schema = ShortageSubmissionService.RequestSchema,
-        ProviderInstanceId = "provider-1",
-        RequestId = requestId,
-        OperationId = operationId,
-        SubmittedAtUtc = new DateTimeOffset(2026, 7, 21, 12, 0, 0, TimeSpan.Zero),
-        Owner = new RequestOwner
-        {
-            LocalContentId = (owner ?? Owner).LocalContentId ?? 0,
-            HomeWorldId = (owner ?? Owner).HomeWorldId ?? 0,
-            CharacterName = (owner ?? Owner).CharacterName,
-        },
-        Items =
-        [
-            new ShortageRequestItem { ItemId = 100, ItemName = "Darksteel Ore", TargetQuantity = 50, ShortageQuantity = 30 },
-        ],
-    };
-
-    public static string Json(object value) => JsonSerializer.Serialize(value, new JsonSerializerOptions(JsonSerializerDefaults.Web));
-}
-
-internal sealed class TestWorkQueue : IFrameworkWorkQueue
-{
-    private readonly Queue<Action> actions = new();
-    public void Enqueue(Action action) => actions.Enqueue(action);
-    public int Count => actions.Count;
-    public void Drain()
-    {
-        while (actions.TryDequeue(out var action))
-            action();
-    }
 }

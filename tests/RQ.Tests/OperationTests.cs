@@ -127,19 +127,4 @@ public sealed class OperationTests
         public void CancelActive() { }
     }
 
-    private sealed class PartialDriver : IRetainerTransferDriver
-    {
-        public Task RequireRetainerListAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task OpenInventoryAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task<IReadOnlyList<DalamudInventoryStack>> ScanRetainerAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken) =>
-            Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([new(InventoryType.RetainerPage1, 0, 200, 2)]);
-        public Task<RetrievalResult> RetrieveAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken) =>
-            Task.FromResult(new RetrievalResult(true, quantity, "TransferVerified", "Verified."));
-        public Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerCrystalsAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken) => Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([]);
-        public Task<RetainerCrystalTransferResult> DepositCrystalAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task CloseRetainerAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-        public void CancelActive() { }
-    }
-
 }
