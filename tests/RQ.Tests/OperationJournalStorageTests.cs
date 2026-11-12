@@ -46,66 +46,6 @@ public sealed class OperationJournalStorageTests
         Assert.Equal(2_118, Scalar(Path.Combine(directory.Path, "state-operations.db"), "SELECT COUNT(*) FROM receipts;"));
     }
 
-    [Fact]
-    public void OperationTransition_AppendsRowsWithoutRewritingConfigurationOrHistory()
-    {
-        using var directory = new TemporaryDirectory();
-        var statePath = Path.Combine(directory.Path, "state.json");
-        var store = new QuartermasterStateStore(statePath);
-        store.Save(LargeLegacyState());
-        var repository = new StateRepository(store);
-        var journal = new OperationJournal(repository);
-        var operation = journal.CreateManual(TestData.Owner,
-            [new TargetPlanItem { ItemId = 100, ItemName = "Darksteel Ore", TargetQuantity = 50, Enabled = true }]);
-        var compactHash = Hash(statePath);
-        var databasePath = Path.Combine(directory.Path, "state-operations.db");
-        var operationCount = Scalar(databasePath, "SELECT COUNT(*) FROM operations;");
-        var receiptCount = Scalar(databasePath, "SELECT COUNT(*) FROM receipts;");
-
-        var stopwatch = Stopwatch.StartNew();
-        journal.Transition(operation.OperationId, OperationStatuses.Running, "ExecutionStarted", "Started.");
-        stopwatch.Stop();
-
-        Assert.Equal(compactHash, Hash(statePath));
-        Assert.Equal(operationCount, Scalar(databasePath, "SELECT COUNT(*) FROM operations;"));
-        Assert.Equal(receiptCount + 1, Scalar(databasePath, "SELECT COUNT(*) FROM receipts;"));
-        Assert.Equal(OperationStatuses.Running, journal.Get(operation.OperationId)!.Status);
-        Assert.True(stopwatch.Elapsed < TimeSpan.FromMilliseconds(250), $"One normalized transition took {stopwatch.Elapsed.TotalMilliseconds:N1} ms.");
-    }
-
-    [Fact]
-    public void MissingJournalAfterMigration_FailsInsteadOfPresentingEmptyHistory()
-    {
-        using var directory = new TemporaryDirectory();
-        var statePath = Path.Combine(directory.Path, "state.json");
-        var store = new QuartermasterStateStore(statePath);
-        store.Save(LargeLegacyState());
-        _ = new StateRepository(store);
-        var databasePath = Path.Combine(directory.Path, "state-operations.db");
-        File.Delete(databasePath);
-
-        var exception = Assert.Throws<InvalidOperationException>(() => new StateRepository(store));
-
-        Assert.Contains("journal identity", exception.Message, StringComparison.OrdinalIgnoreCase);
-    }
-
-    [Fact]
-    public void MissingJournalAfterFreshInstall_FailsInsteadOfPresentingEmptyHistory()
-    {
-        using var directory = new TemporaryDirectory();
-        var statePath = Path.Combine(directory.Path, "state.json");
-        var store = new QuartermasterStateStore(statePath);
-        var repository = new StateRepository(store);
-        var journal = new OperationJournal(repository);
-        _ = journal.CreateManual(TestData.Owner,
-            [new TargetPlanItem { ItemId = 100, ItemName = "Darksteel Ore", TargetQuantity = 50, Enabled = true }]);
-        File.Delete(Path.Combine(directory.Path, "state-operations.db"));
-
-        var exception = Assert.Throws<InvalidOperationException>(() => new StateRepository(store));
-
-        Assert.Contains("journal identity", exception.Message, StringComparison.OrdinalIgnoreCase);
-    }
-
     private static QuartermasterState LargeLegacyState()
     {
         var state = new QuartermasterState

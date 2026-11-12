@@ -48,24 +48,6 @@ internal static class TestData
 
     public static StateRepository Repository(string directory) => new(new QuartermasterStateStore(System.IO.Path.Combine(directory, "state.json")));
 
-    public static ItemMetadata Metadata(uint itemId, string? name = null) => new(
-        itemId,
-        name ?? $"Item {itemId}",
-        null,
-        false,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        999);
-
     public static ShortageRequest Request(string requestId = "request-1", string operationId = "operation-1", OwnerScope? owner = null) => new()
     {
         Schema = ShortageSubmissionService.RequestSchema,
@@ -98,16 +80,4 @@ internal sealed class TestWorkQueue : IFrameworkWorkQueue
         while (actions.TryDequeue(out var action))
             action();
     }
-}
-
-internal sealed class RecordingIpcRegistrar : IIpcRegistrar
-{
-    public Dictionary<string, Delegate?> Registrations { get; } = new();
-    public List<string> Unregistered { get; } = [];
-    public List<(string Channel, string Json)> Notifications { get; } = [];
-    public void Register(string channel, Func<string> callback) => Registrations[channel] = callback;
-    public void Register(string channel, Func<string, string> callback) => Registrations[channel] = callback;
-    public void RegisterNotification(string channel) => Registrations[channel] = null;
-    public void SendNotification(string channel, string json) => Notifications.Add((channel, json));
-    public void Unregister(string channel) => Unregistered.Add(channel);
 }
