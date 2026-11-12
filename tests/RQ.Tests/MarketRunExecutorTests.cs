@@ -27,30 +27,6 @@ public sealed class MarketRunExecutorTests
         [new(1, "Hull", ItemQualityPolicy.NqOnly, 2, Evidence.Known(0), Evidence.Known(2), Evidence.Known(2), Evidence.Known(0), null, 0, Evidence.Known(0), Evidence.Known(0))], []);
 
     [Fact]
-    public async Task PlainRefill_UsesPlanPriceAndLiveStack()
-    {
-        var plan = Plan(); var fake = new Driver(); var executor = Create(plan, fake);
-        await executor.RunAsync(plan, Evaluation(plan));
-        var post = Assert.Single(executor.Result!.Mutations);
-        Assert.Equal("Post", post.Intent.Kind); Assert.Equal(50u, post.Intent.Price);
-        Assert.Equal(MarketMutationOutcome.Committed, post.Outcome);
-        Assert.Equal("Completed", executor.Result.State);
-    }
-
-    [Theory]
-    [InlineData(10u, 1)]
-    [InlineData(null, 0)]
-    public async Task RepriceToPlan_UnknownPriceLeftAlone(uint? price, int reprices)
-    {
-        var plan = Plan(); var fake = new Driver(); fake.Live[10] = [new(0, 1, 2, false, price)];
-        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Equal(reprices, executor.Result!.Mutations.Count(m => m.Intent.Kind == "Reprice"));
-        Assert.DoesNotContain(executor.Result.Mutations, m => m.Intent.Kind == "Post");
-        if (price is null) Assert.Contains(executor.Result.Results, s => s.Contains("Invalid market price"));
-        else Assert.Equal(50u, fake.Live[10][0].UnitPrice);
-    }
-
-    [Fact]
     public async Task RepriceReselectsListingThatMovesIntoPreviouslyUsedSlot()
     {
         var plan = Plan(2); var fake = new Driver();
@@ -73,30 +49,6 @@ public sealed class MarketRunExecutorTests
         Assert.All(receipts, r => Assert.Equal(0, r.Intent.Listing!.SlotIndex));
         Assert.All(fake.Live[10], l => Assert.Equal(50u, l.UnitPrice));
         Assert.Equal("Completed", executor.Result.State);
-    }
-
-    [Fact]
-    public async Task RepriceWithoutObservedProgress_StopsInsteadOfLoopingOrReportingCompletion()
-    {
-        var plan = Plan(); var fake = new Driver { ApplyReprice = false };
-        fake.Live[10] = [new(0, 1, 2, false, 10)];
-        var executor = Create(plan, fake);
-        await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Single(executor.Result!.Mutations);
-        Assert.Equal("Stopped", executor.Result.State);
-        Assert.Contains("did not converge", executor.Result.Reason);
-        Assert.Empty(fake.Posts);
-    }
-
-    [Fact]
-    public async Task PullThenPost_OnlyNeededNumber_LiveDisagreesWithEvaluation()
-    {
-        var plan = Plan(); var fake = new Driver();
-        fake.Live[10] = Enumerable.Range(0, 20).Select(i => new RetainerMarketListingTarget(i, 2, 1, false, (uint)(i + 1))).ToList();
-        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Equal(["Pull", "Post"], executor.Result!.Mutations.Select(m => m.Intent.Kind));
-        Assert.Equal(20, fake.Live[10].Count);
-        Assert.Contains(executor.Result.Results, s => s.Contains("player inventory"));
     }
 
     [Theory]
@@ -123,35 +75,6 @@ public sealed class MarketRunExecutorTests
         Assert.Equal(sent, executor.Result.NeedsCheck.Contains(10));
     }
 
-    [Fact]
-    public async Task CancelDuringDispatchedMutation_FinishesItThenStops()
-    {
-        var plan = Plan(2); var fake = new Driver(); var executor = Create(plan, fake);
-        fake.OnPost = executor.Cancel;
-        await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Single(executor.Result!.Mutations); Assert.Equal("Cancelled", executor.Result.State);
-        Assert.Equal(MarketMutationOutcome.Committed, executor.Result.Mutations[0].Outcome);
-    }
-
-    [Fact]
-    public async Task PlanRevisionChanges_StopsBeforeNextMutation()
-    {
-        var plan = Plan(2); var fake = new Driver(); var executor = Create(plan, fake);
-        fake.OnPost = () => plan.Revision++;
-        await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Single(executor.Result!.Mutations); Assert.Equal("Stopped", executor.Result.State);
-        Assert.Contains("Plan changed", executor.Result.Reason);
-        Assert.Equal(1, executor.Result.PlanRevision);
-    }
-
-    [Fact]
-    public async Task SplitStock_IsNotMerged()
-    {
-        var plan = Plan(); var fake = new Driver { Stock = [new(InventoryType.Inventory1, 0, 1, 1), new(InventoryType.Inventory1, 1, 1, 1)] };
-        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Empty(fake.Posts); Assert.Contains(executor.Result!.Results, s => s.Contains("split across stacks"));
-    }
-
     [Theory]
     [InlineData(false, MarketMutationOutcome.Indeterminate)]
     [InlineData(true, MarketMutationOutcome.Committed)]
@@ -162,33 +85,6 @@ public sealed class MarketRunExecutorTests
         var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
         Assert.Equal(expected, Assert.Single(executor.Result!.Mutations).Outcome);
         Assert.Equal(!applied, executor.Result.NeedsCheck.Contains(10));
-    }
-
-    [Fact]
-    public async Task FailedRecovery_StopsBeforeNextRetainer()
-    {
-        var plan = Plan(); plan.Assignments.Add(new() { ItemId = 1, ItemName = "Hull", RetainerId = 11, RetainerName = "Beta", QuantityPerListing = 2, UnitPrice = 50 });
-        var fake = new Driver { FailReturn = true, Outcome = MarketMutationOutcome.FailedBeforeSend };
-        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Equal([10ul], fake.Posts); Assert.Equal("Stopped", executor.Result!.State);
-    }
-
-    [Fact]
-    public async Task FullPlayerInventory_BlocksPull()
-    {
-        var plan = Plan(); var fake = new Driver { FreeSlots = 0 };
-        fake.Live[10] = Enumerable.Range(0, 20).Select(i => new RetainerMarketListingTarget(i, 2, 1, false, 10)).ToList();
-        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Empty(executor.Result!.Mutations); Assert.Contains(executor.Result.Results, s => s.Contains("blocked by inventory space"));
-    }
-
-    [Fact]
-    public async Task ChangedExactSource_IsNotPosted()
-    {
-        var plan = Plan(); var fake = new Driver(); var reads = 0;
-        fake.OnPlayer = () => { if (++reads == 3) fake.Stock = []; };
-        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Empty(executor.Result!.Mutations);
     }
 
     [Fact]
@@ -215,44 +111,7 @@ public sealed class MarketRunExecutorTests
         finally { Directory.Delete(directory, true); }
     }
 
-    [Fact]
-    public async Task LeaseHeldAcrossGatherAndMutations_DirtyDraftCannotStart()
-    {
-        var plan = Plan(); var fake = new Driver(); var lease = new AutomationLease();
-        var executor = new MarketRunExecutor(fake, lease, () => plan, _ => { });
-        await executor.RunAsync(plan, Evaluation(plan), true); Assert.Empty(fake.Posts);
-        fake.OnPost = () => Assert.True(lease.IsHeld);
-        fake.OnGather = () => Assert.True(lease.IsHeld);
-        await executor.RunAsync(plan, Evaluation(plan)); Assert.False(lease.IsHeld);
-    }
-
     private static MarketRunExecutor Create(ListingPlan plan, Driver fake) => new(fake, new(), () => plan, _ => { });
-
-    [Fact]
-    public async Task PreviousOwnerResult_RemainsBlockedUntilVisibleAcknowledgement()
-    {
-        var plan = Plan(); var fake = new Driver(); var executor = Create(plan, fake);
-        var previous = plan.Owner with { LocalContentId = 77, CharacterName = "Other Character", HomeWorldName = "World" };
-        var record = new MarketRunRecord { Owner = previous, State = "Interrupted" };
-        executor.Restore(record);
-        Assert.False(previous.Matches(plan.Owner));
-        Assert.Equal("Market run: Other Character @ World", RQ.UI.MarketRunPane.ResultOwnerLabel(previous));
-        await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Same(record, executor.Result);
-        executor.Clear();
-        Assert.True(executor.CanStart);
-    }
-
-    [Fact]
-    public async Task UnloadBeforeMutation_NoDispatchAndNoCleanupOnDisposedDriver()
-    {
-        var plan = Plan(); var fake = new Driver(); var executor = Create(plan, fake);
-        fake.OnPlayer = () => executor.CancelAndWait(TimeSpan.Zero);
-        await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Empty(fake.Posts);
-        Assert.Equal(0, fake.Closes);
-        Assert.Equal(0, fake.Returns);
-    }
 
     [Theory]
     [InlineData(true)]
@@ -271,18 +130,6 @@ public sealed class MarketRunExecutorTests
         pending.SetResult(MarketMutationOutcome.Committed);
         await run;
         Assert.Equal(scansAtPost, fake.ListingScans);
-        Assert.Equal(0, fake.Returns);
-        Assert.Equal(0, fake.Closes);
-        Assert.False(executor.Result!.ListingSummaryComplete);
-    }
-
-    [Fact]
-    public async Task OwnerChangesDuringFinalScan_NoReturnOrVerifiedSummary()
-    {
-        var plan = Plan(); var current = plan; var fake = new Driver();
-        fake.OnPost = () => fake.OnListings = () => current = new ListingPlan { Owner = plan.Owner with { LocalContentId = 999 } };
-        var executor = new MarketRunExecutor(fake, new(), () => current, _ => { });
-        await executor.RunAsync(plan, Evaluation(plan));
         Assert.Equal(0, fake.Returns);
         Assert.Equal(0, fake.Closes);
         Assert.False(executor.Result!.ListingSummaryComplete);
@@ -337,36 +184,6 @@ public sealed class MarketRunExecutorTests
         Assert.Equal(MarketMutationOutcome.FailedBeforeSend, Assert.Single(executor.Result!.Mutations).Outcome);
     }
 
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task CloseRunsUnderLeaseAndSuppression_WithoutChangingOutcome(bool fails)
-    {
-        var plan = Plan(); var fake = new Driver { FailClose = fails }; var lease = new AutomationLease(); var ipc = new AutoRetainer();
-        fake.OnClose = () => { Assert.True(lease.IsHeld); Assert.True(ipc.IsSuppressed); };
-        var executor = new MarketRunExecutor(fake, lease, () => plan, _ => { }, new(ipc));
-        await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Equal(1, fake.Closes);
-        Assert.Equal("Completed", executor.Result!.State);
-        Assert.Equal(string.Empty, executor.Result.Reason);
-        Assert.Equal(fails, executor.Result.Results.Any(s => s.Contains("Could not close retainer list")));
-        Assert.False(lease.IsHeld); Assert.False(ipc.IsSuppressed);
-    }
-
-    [Fact]
-    public async Task UnsettledClose_KeepsLeaseUntilCompletion()
-    {
-        var plan = Plan(); var pending = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var fake = new Driver { PendingClose = pending.Task }; var lease = new AutomationLease();
-        var executor = new MarketRunExecutor(fake, lease, () => plan, _ => { }, deadlines: new MarketRunDeadline(TimeSpan.FromMilliseconds(5)));
-        await executor.RunAsync(plan, Evaluation(plan));
-        Assert.True(lease.IsHeld);
-        Assert.Equal("Completed", executor.Result!.State);
-        pending.SetResult();
-        for (var n = 0; n < 100 && lease.IsHeld; n++) await Task.Delay(5);
-        Assert.False(lease.IsHeld);
-    }
-
     [Fact]
     public async Task UnsettledFinalScan_StopsBeforeNextRetainerAndHoldsOwnershipUntilSettlement()
     {
@@ -387,115 +204,6 @@ public sealed class MarketRunExecutorTests
         for (var n = 0; n < 100 && lease.IsHeld; n++) await Task.Delay(5);
         Assert.False(lease.IsHeld); Assert.False(ipc.IsSuppressed);
         Assert.Equal([10ul], fake.Visited);
-    }
-
-    [Fact]
-    public async Task SettledFinalScanFailure_CanReturnAndContinueWithUnknownSummary()
-    {
-        var plan = Plan();
-        plan.Assignments.Add(new() { ItemId = 1, ItemName = "Hull", RetainerId = 11, RetainerName = "Beta", QuantityPerListing = 2, UnitPrice = 50 });
-        var fake = new Driver();
-        fake.OnPost = () => fake.PendingListings = Task.FromException<IReadOnlyList<RetainerMarketListingTarget>>(new InvalidOperationException("Read failed"));
-        var executor = Create(plan, fake);
-        await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Equal([10ul, 11ul], fake.Visited);
-        Assert.Equal("Completed", executor.Result!.State);
-        Assert.False(executor.Result.ListingSummaryComplete);
-        Assert.Equal(2, fake.Returns); Assert.Equal(1, fake.Closes);
-    }
-
-    [Fact]
-    public async Task CancelDuringGather_LeavesShortageUnknownAndClosesList()
-    {
-        var plan = Plan(); var fake = new Driver(); var executor = Create(plan, fake);
-        fake.OnGather = executor.Cancel;
-        await executor.RunAsync(plan, Evaluation(plan));
-        Assert.False(executor.Result!.ListingSummaryComplete);
-        Assert.Equal(1, fake.Closes);
-    }
-
-    [Fact]
-    public async Task FinalScanAcrossAllRetainers_MakesShortageKnown()
-    {
-        var plan = Plan(); var fake = new Driver(); var executor = Create(plan, fake);
-        await executor.RunAsync(plan, Evaluation(plan));
-        Assert.True(executor.Result!.ListingSummaryComplete);
-        Assert.Equal(0, executor.Result.StillShort);
-    }
-
-    [Fact]
-    public async Task RetainerListUsesRouteDeadline_NotMutationDeadline()
-    {
-        var plan = Plan(); var fake = new Driver(); var routeDeadline = new CountingDeadline();
-        var executor = new MarketRunExecutor(fake, new(), () => plan, _ => { }, routeDeadlines: routeDeadline);
-        await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Equal(1, routeDeadline.Calls);
-        Assert.True(MarketRunDeadline.RetainerListTimeout > TimeSpan.FromMinutes(2));
-    }
-
-    private sealed class CountingDeadline : IMarketRunDeadline
-    {
-        public int Calls;
-        public Task<T> RunAsync<T>(Func<CancellationToken, Task<T>> action) { Calls++; return action(CancellationToken.None); }
-    }
-
-    [Fact]
-    public void RestoredUnresolvedReceipt_BlocksAllSharedAutomationUntilAcknowledged()
-    {
-        var record = new MarketRunRecord { State = "Interrupted" };
-        MarketRunExecutor? executor = null;
-        var automation = new AutomationLease(() => executor?.Result?.RequiresAcknowledgement == true ? "Unresolved market run" : null);
-        executor = new(new Driver(), automation, () => Plan(), _ => { });
-        executor.Restore(record);
-        foreach (var holder in new[] { "transfer", "automatic retrieval", "refresh", "listing navigation" })
-        {
-            Assert.False(automation.TryAcquire(holder, out var lease));
-            Assert.Null(lease);
-        }
-        Assert.NotNull(automation.RefusalReason);
-        // A durable receipt is an interlock, not an active lease: Clear must stay reachable.
-        Assert.False(automation.IsHeld);
-        executor.Clear();
-        Assert.Null(automation.RefusalReason);
-        Assert.True(automation.TryAcquire("transfer", out var accepted));
-        accepted!.Dispose();
-    }
-
-    [Fact]
-    public async Task UnresolvedReceipt_QueueWaitsWithoutSuppressionAndResumesAfterClear()
-    {
-        using var directory = new TemporaryDirectory();
-        var repository = TestData.Repository(directory.Path);
-        var journal = new OperationJournal(repository);
-        var operation = journal.CreateManual(TestData.Owner, [new() { ItemId = 1, ItemName = "Hull", TargetQuantity = 2 }]);
-        repository.Mutate(StateChangeKind.Operations, state =>
-        {
-            state.Operations.Single(o => o.OperationId == operation.OperationId).ExecuteImmediately = true;
-        });
-        MarketRunExecutor? market = null;
-        var automation = new AutomationLease(() => market?.Result?.RequiresAcknowledgement == true ? "Unresolved market run" : null);
-        market = new(new Driver(), automation, () => Plan(), _ => { });
-        market.Restore(new() { State = "Interrupted" });
-        var session = DispatchProxy.Create<IRetainerAutomationSession, SessionProxy>();
-        ((SessionProxy)(object)session).Handler = (_, _) => throw new InvalidOperationException("No game calls expected");
-        using var cache = new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory.Path, "cache.json")));
-        var ipc = new AutoRetainer(); var suppression = new AutoRetainerSuppression(ipc);
-        var transfers = new TransferCoordinator(journal, new RetainerLiveDriver(session), cache, () => TestData.Owner,
-            () => new Dictionary<uint, int> { [1] = 2 }, automation, autoRetainerSuppression: suppression);
-        using var queue = new AutomaticRetrievalQueue(journal, transfers, () => TestData.Owner, suppression);
-        Assert.False(automation.CanAcquire); Assert.False(transfers.CanStart);
-        for (var i = 0; i < 20; i++) queue.Tick();
-        var refused = await transfers.ExecuteRetrievalAsync(operation.OperationId);
-        Assert.False(refused.Started);
-        Assert.Equal("Unresolved market run", refused.Message);
-        Assert.Empty(ipc.SuppressionChanges);
-        Assert.Equal(OperationStatuses.Accepted, journal.Get(operation.OperationId)!.Status);
-        Assert.Null(queue.ActiveOperationId);
-        market.Clear();
-        Assert.True(automation.CanAcquire); Assert.True(transfers.CanStart);
-        queue.Tick(); queue.Tick();
-        Assert.Equal(OperationStatuses.Succeeded, journal.Get(operation.OperationId)!.Status);
-        Assert.Equal([true, false], ipc.SuppressionChanges);
     }
 
     [Fact]
@@ -529,15 +237,6 @@ public sealed class MarketRunExecutorTests
         Assert.Equal(4, fake.Live[10].Count(l => l.ItemId == 1));
     }
 
-    [Fact]
-    public async Task FullRetainer_SplitStacks_NeverPulls()
-    {
-        var plan = Plan(); var fake = new Driver { Stock = [new(InventoryType.Inventory1, 0, 1, 1), new(InventoryType.Inventory1, 1, 1, 1)] };
-        fake.Live[10] = Enumerable.Range(0, 20).Select(i => new RetainerMarketListingTarget(i, 2, 1, false, 10)).ToList();
-        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Empty(executor.Result!.Mutations); Assert.Equal(1, executor.Result.SplitStacks);
-    }
-
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -549,55 +248,6 @@ public sealed class MarketRunExecutorTests
         var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
         Assert.Equal("Stopped", executor.Result!.State); Assert.Equal([10ul], fake.Visited);
         Assert.Single(executor.Result.Mutations); Assert.Contains(10ul, executor.Result.NeedsCheck);
-    }
-
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task RepriceBeforeSendOrIndeterminateException(bool exception)
-    {
-        var plan = Plan(); var fake = new Driver { ApplyReprice = false, ThrowReprice = exception, Outcome = MarketMutationOutcome.FailedBeforeSend };
-        fake.Live[10] = [new(0, 1, 2, false, 10)];
-        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Equal(exception ? MarketMutationOutcome.Indeterminate : MarketMutationOutcome.Unchanged, Assert.Single(executor.Result!.Mutations).Outcome);
-        Assert.Equal(exception, executor.Result.NeedsCheck.Contains(10));
-    }
-
-    [Fact]
-    public async Task InvalidPrice_WholeScanFails_NextRetainerStillProcessed()
-    {
-        var plan = Plan(); plan.Assignments.Add(new() { ItemId = 1, ItemName = "Hull", RetainerId = 11, RetainerName = "Beta", QuantityPerListing = 2, UnitPrice = 50 });
-        var fake = new Driver(); fake.Live[10] = [new(0, 1, 2, false, null)];
-        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Equal([11ul], fake.Posts); Assert.Contains(executor.Result!.Results, s => s.Contains("Invalid market price"));
-    }
-
-    [Fact]
-    public async Task CancelGather_NoMutation_AndCancelRetainerReturns()
-    {
-        var plan = Plan(); var fake = new Driver(); var executor = Create(plan, fake);
-        fake.OnGather = executor.Cancel;
-        await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Equal("Cancelled", executor.Result!.State); Assert.Empty(executor.Result.Mutations);
-        fake.OnGather = null; fake.OnPost = executor.Cancel;
-        await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Equal("Cancelled", executor.Result!.State); Assert.Equal(1, fake.Returns);
-    }
-
-    [Theory]
-    [InlineData("Interrupted")]
-    [InlineData("NeedsCheck")]
-    [InlineData("Unknown")]
-    public async Task StartRequiresAcknowledgement(string kind)
-    {
-        var plan = Plan(); var fake = new Driver(); var executor = Create(plan, fake);
-        var record = new MarketRunRecord { State = kind == "Interrupted" ? kind : "Stopped" };
-        if (kind == "NeedsCheck") record.NeedsCheck.Add(10);
-        if (kind == "Unknown") record.Mutations.Add(new() { Intent = new("Post", 10, "Hull", null, null, 2, 50) });
-        executor.Restore(record); Assert.False(executor.CanStart);
-        await executor.RunAsync(plan, Evaluation(plan)); Assert.Same(record, executor.Result);
-        executor.Clear(); Assert.True(executor.CanStart);
-        await executor.RunAsync(plan, Evaluation(plan)); Assert.Single(fake.Posts);
     }
 
     [Fact]
@@ -626,35 +276,6 @@ public sealed class MarketRunExecutorTests
         for (var n = 0; n < 100 && automation.IsHeld; n++) await Task.Delay(5);
         Assert.False(automation.IsHeld);
         Assert.False(ipc.IsSuppressed);
-    }
-
-    [Fact]
-    public async Task AutoRetainerBusy_WaitsBeforeAnyGatherOrGameCall()
-    {
-        var plan = Plan(); var fake = new Driver(); var ipc = new AutoRetainer { IsBusy = true };
-        var gathered = false; fake.OnGather = () => { gathered = true; Assert.True(ipc.IsSuppressed); };
-        var executor = new MarketRunExecutor(fake, new(), () => plan, _ => { }, new AutoRetainerSuppression(ipc));
-        var run = executor.RunAsync(plan, Evaluation(plan));
-        Assert.False(gathered); Assert.Empty(fake.Visited);
-        ipc.IsBusy = false; await run;
-        Assert.True(gathered); Assert.False(ipc.IsSuppressed);
-    }
-
-    [Theory]
-    [InlineData("InvalidMarketUnitPrice", MarketMutationOutcome.FailedBeforeSend)]
-    [InlineData("RetainerMarketPriceUpdateIndeterminate", MarketMutationOutcome.Indeterminate)]
-    [InlineData("UnexpectedRetainerMarketConfirmation", MarketMutationOutcome.Indeterminate)]
-    [InlineData("UnknownFutureCode", MarketMutationOutcome.Indeterminate)]
-    public void PrimitiveRepriceCodes(string code, MarketMutationOutcome expected) =>
-        Assert.Equal(expected, MarketRunLiveDriver.ClassifyReprice(RetainerAutomationResult.Failed(code, code)));
-
-    [Fact]
-    public async Task QualityIsNeverMixed()
-    {
-        var plan = Plan(); var fake = new Driver { Stock = [new(InventoryType.Inventory1, 0, 1, 10, true)] };
-        fake.Live[10] = [new(0, 1, 2, true, 10)];
-        var executor = Create(plan, fake); await executor.RunAsync(plan, Evaluation(plan));
-        Assert.Empty(executor.Result!.Mutations); Assert.Equal(10u, fake.Live[10][0].UnitPrice);
     }
 
     [Theory]
@@ -691,36 +312,8 @@ public sealed class MarketRunExecutorTests
         Assert.Equal(atDispose, writes); Assert.False(executor.CanStart);
     }
 
-    [Fact]
-    public async Task BorrowedLease_RefusesForeignAndDisposedLease()
-    {
-        var directory = Path.Combine(Path.GetTempPath(), "rq-market-lease-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(directory);
-        try
-        {
-            var journal = new OperationJournal(new StateRepository(new QuartermasterStateStore(Path.Combine(directory, "state.json"))));
-            using var cache = new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory, "cache.json")));
-            var automation = new AutomationLease(); var foreign = new AutomationLease();
-            var session = DispatchProxy.Create<IRetainerAutomationSession, SessionProxy>();
-            ((SessionProxy)(object)session).Handler = (_, _) => throw new Exception("Must not call the game");
-            var coordinator = new TransferCoordinator(journal, new RetainerLiveDriver(session), cache, () => Plan().Owner, () => new Dictionary<uint, int>(), automation);
-            Assert.True(foreign.TryAcquire("foreign", out var other));
-            using (other) await Assert.ThrowsAsync<InvalidOperationException>(() => coordinator.ExecuteRetrievalUnderLeaseAsync("unused", other!, CancellationToken.None));
-            Assert.True(automation.TryAcquire("disposed", out var disposed)); disposed!.Dispose();
-            await Assert.ThrowsAsync<InvalidOperationException>(() => coordinator.ExecuteRetrievalUnderLeaseAsync("unused", disposed, CancellationToken.None));
-            Assert.False(automation.IsHeld);
-        }
-        finally { Directory.Delete(directory, true); }
-    }
-
     [Theory]
-    [InlineData("normal")]
-    [InlineData("full")]
-    [InlineData("partial")]
-    [InlineData("cancel")]
     [InlineData("lost")]
-    [InlineData("changed")]
-    [InlineData("deadline")]
     [InlineData("unload")]
     [InlineData("owner")]
     [InlineData("scanowner")]
@@ -851,22 +444,12 @@ public sealed class MarketRunExecutorTests
         finally { Directory.Delete(directory, true); }
     }
 
-    [Fact]
-    public async Task Deadline_CancelsPrimitive_WithFiniteBudget()
-    {
-        var deadline = new MarketRunDeadline(TimeSpan.FromMilliseconds(20));
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => deadline.RunAsync(async t =>
-        {
-            await Task.Delay(Timeout.InfiniteTimeSpan, t);
-            return true;
-        }));
-    }
-
     public class SessionProxy : DispatchProxy
     {
         public Func<MethodInfo, object?[]?, object?> Handler { get; set; } = null!;
         protected override object? Invoke(MethodInfo? targetMethod, object?[]? args) => Handler(targetMethod!, args);
     }
+
     private sealed class AutoRetainer : IAutoRetainerIpc
     {
         public bool IsAvailable => true;

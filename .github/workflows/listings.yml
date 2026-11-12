@@ -39,11 +39,11 @@ jobs:
         run: |
           Invoke-WebRequest https://goatcorp.github.io/dalamud-distrib/latest.zip -OutFile "$env:RUNNER_TEMP/dalamud.zip"
           Expand-Archive "$env:RUNNER_TEMP/dalamud.zip" "$env:APPDATA/XIVLauncher/addon/Hooks/dev"
-      - name: Build and test listing journeys
+      - name: Build and test retained consequential regressions
         working-directory: quartermaster
         shell: pwsh
         run: |
           # CI pairs exact source because commit packages live in a private local feed.
           # Deployment separately verifies the immutable package-mode build.
-          dotnet test tests/RQ.Tests -c Release -p:FranthropySource=Local "-p:FranthropyRoot=$env:GITHUB_WORKSPACE/franthropy" --filter "FullyQualifiedName~ListingPlanTests|FullyQualifiedName~ListingInlineTests|FullyQualifiedName~ListingNavigationTests|FullyQualifiedName~TransferPlanDraftSessionTests|FullyQualifiedName~MarketRunTests|FullyQualifiedName~MarketRunExecutorTests"
+          dotnet test tests/RQ.Tests -c Release -p:FranthropySource=Local "-p:FranthropyRoot=$env:GITHUB_WORKSPACE/franthropy"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
