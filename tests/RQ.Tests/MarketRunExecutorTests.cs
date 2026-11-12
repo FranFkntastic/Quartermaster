@@ -329,6 +329,8 @@ public sealed class MarketRunExecutorTests
             var journal = new OperationJournal(state);
             using var cache = new RetainerCacheRepository(new RetainerCacheStore(Path.Combine(directory, "retainers.json")));
             cache.Upsert(new CachedRetainer { RetainerId = 10, RetainerName = "Alpha", Owner = plan.Owner,
+                RequestedSources = DalamudRetainerInventory.OrdinaryItemContainers.Select(type => type.ToString()).ToList(),
+                ObservedSources = DalamudRetainerInventory.OrdinaryItemContainers.Select(type => type.ToString()).ToList(),
                 Bags = [new() { BagName = "RetainerPage1", ObservedAtUtc = DateTime.UtcNow,
                     Items = [new() { ItemId = 1, ItemName = "Hull", Quantity = 20 }] }] });
             var playerCache = new PlayerInventoryCacheRepository(new PlayerInventoryCacheStore(Path.Combine(directory, "player.json")));

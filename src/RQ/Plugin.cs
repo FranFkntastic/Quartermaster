@@ -302,7 +302,13 @@ public sealed class Plugin : IDalamudPlugin
             new ItemMetadataCatalog(dataManager, log).ResolveWorkshopProject,
             configDirectory,
             new MarketMafiosoSavedJobClient(pluginInterface));
-        window.SetMarketRunExecutor(marketRuns);
+        var marketHistory = new MarketRunHistoryWindow(marketRunStore.History, CurrentOwner)
+        {
+            Size = new System.Numerics.Vector2(780, 650),
+            SizeCondition = Dalamud.Bindings.ImGui.ImGuiCond.FirstUseEver,
+        };
+        windows.AddWindow(marketHistory);
+        window.SetMarketRunExecutor(marketRuns, marketHistory, new ComplicatedMarketBoardItemClient(pluginInterface));
         agentBridgeViewportCapture = new(
             configDirectory,
             configuration.PluginInstanceId,

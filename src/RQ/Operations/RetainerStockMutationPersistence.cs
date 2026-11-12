@@ -7,11 +7,15 @@ namespace RQ.Operations;
 internal sealed record RetainerStockMutationIntent(
     string OperationId,
     ulong RetainerId,
-    OwnerScope Owner);
+    OwnerScope Owner,
+    uint ItemId,
+    string ItemName,
+    bool IsHighQuality);
 
 internal sealed class RetainerStockMutationPersistence(
     OperationJournal journal,
-    RetainerCacheRepository cache)
+    RetainerCacheRepository cache,
+    Func<RetainerStockMutationIntent, Task<RetainerVariantObservation>>? recoverObservation = null)
     : IVerifiedMutationPersistence<RetainerStockMutationIntent, RetainerVariantObservation>
 {
     public ValueTask ArmAsync(RetainerStockMutationIntent intent)
@@ -28,12 +32,27 @@ internal sealed class RetainerStockMutationPersistence(
         return ValueTask.CompletedTask;
     }
 
-    public ValueTask InvalidateAsync(RetainerStockMutationIntent intent)
+    public async ValueTask InvalidateAsync(RetainerStockMutationIntent intent)
     {
-        var invalidation = cache.Invalidate(intent.RetainerId);
+        // Withdraw authority before publishing any recovery observation.
+        var invalidation = cache.InvalidateStock(intent.RetainerId);
         if (!invalidation.Persisted)
             throw new IOException($"Retainer {intent.RetainerId} cache invalidation did not persist: {invalidation.Error}");
-        return ValueTask.CompletedTask;
+        if (recoverObservation is not null)
+        {
+            try
+            {
+                // Repair observations only, never replay or acknowledge the movement.
+                var observed = await recoverObservation(intent).ConfigureAwait(false);
+                // A reread is an observation, not proof that a late move cannot arrive.
+                // Coverage stays invalid even when this observation succeeds.
+                cache.ReplaceObservedVariant(observed);
+            }
+            catch (Exception exception)
+            {
+                journal.RecordWarning(intent.OperationId, "StockObservationRecoveryFailed", exception.Message);
+            }
+        }
     }
 
     public ValueTask ResolveAsync(RetainerStockMutationIntent intent)
@@ -47,7 +66,7 @@ internal sealed class RetainerStockMutationPersistence(
         var recovered = 0;
         foreach (var pending in journal.PendingCacheInvalidations())
         {
-            var result = cache.Invalidate(pending.RetainerId);
+            var result = cache.InvalidateStock(pending.RetainerId);
             if (!result.Persisted)
                 continue;
             journal.ResolveCacheInvalidation(pending.OperationId, pending.RetainerId);

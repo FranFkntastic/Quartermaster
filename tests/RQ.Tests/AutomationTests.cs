@@ -33,7 +33,10 @@ public sealed class AutomationTests
             persisted.Revision++;
         });
         var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
-        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = TestData.Retainer(10, "Eris", (100, "Ore", 10)) });
+        var observed = TestData.Retainer(10, "Eris", (100, "Ore", 10));
+        observed.RequestedSources = DalamudRetainerInventory.OrdinaryItemContainers.Select(type => type.ToString()).ToList();
+        observed.ObservedSources = [.. observed.RequestedSources];
+        store.Save(new Dictionary<ulong, CachedRetainer> { [10] = observed });
         var driver = new IndefiniteDriver();
         var ipc = new FakeAutoRetainerIpc();
         var suppression = new AutoRetainerSuppression(ipc);

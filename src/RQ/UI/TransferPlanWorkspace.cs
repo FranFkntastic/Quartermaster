@@ -415,9 +415,11 @@ internal sealed class TransferPlanWorkspace
         ImGui.Separator();
         ImGui.TextWrapped($"{ownerRules.Count:N0} items · {movements:N0} movements · " +
             (projection.HasUnknownListingDemand ? "Verifying listing demand..." : $"Retrieve {retrieval.NeededQuantity:N0} · Stow {surplusBatch.RequestedQuantity:N0}"));
-        var remainingShort = Math.Max(0, retrieval.MissingQuantity - vendor.ApprovedQuantity);
-        if (!projection.HasUnknownListingDemand && (remainingShort > 0 || surplusBatch.RemainingQuantity > 0))
-            ImGui.TextWrapped($"{remainingShort:N0} short · No room for {surplusBatch.RemainingQuantity:N0}");
+        var stockUnverified = retrieval.Lines.Any(line => line.Status == PlanLineStatus.StockUnverified);
+        var remainingShort = Math.Max(0, retrieval.Lines.Where(line => line.Status != PlanLineStatus.StockUnverified)
+            .Sum(line => line.MissingQuantity) - vendor.ApprovedQuantity);
+        if (!projection.HasUnknownListingDemand && (remainingShort > 0 || stockUnverified || surplusBatch.RemainingQuantity > 0))
+            ImGui.TextWrapped($"{remainingShort:N0} known short{(stockUnverified ? " · Retainer stock unverified" : string.Empty)} · No room for {surplusBatch.RemainingQuantity:N0}");
         var canReviewVendor = vendor.CanStart &&
                               !projection.HasUnknownListingDemand &&
                               !vendorProcurement.HasActiveRun &&

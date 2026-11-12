@@ -87,7 +87,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         this.autoRetainerSuppression = autoRetainerSuppression;
         this.autoRetainerWait = autoRetainerWait ?? TimeSpan.FromSeconds(30);
         this.autoRetainerPoll = autoRetainerPoll ?? TimeSpan.FromMilliseconds(250);
-        stockMutations = new(journal, cache);
+        stockMutations = new(journal, cache, RecoverStockObservationAsync);
     }
 
     public bool IsRunning => Volatile.Read(ref running) != 0;
@@ -269,7 +269,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     var variantKey = OperationJournal.VariantKey(stack.ItemId, stack.IsHighQuality);
                     var previousMovementAttempted = movementAttempted;
                     var attempt = await VerifiedMutationTransaction.ExecuteAsync(
-                        new RetainerStockMutationIntent(operationId, candidate.Route.RetainerId, operation.Owner),
+                        new RetainerStockMutationIntent(operationId, candidate.Route.RetainerId, operation.Owner, stack.ItemId, itemName, stack.IsHighQuality),
                         stockMutations,
                         async mutationToken =>
                         {
@@ -529,7 +529,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         var itemName = operationLine.ItemName;
                         var previousMovementAttempted = movementAttempted;
                         var attempt = await VerifiedMutationTransaction.ExecuteAsync(
-                            new RetainerStockMutationIntent(operationId, candidate.RetainerId, operation.Owner),
+                            new RetainerStockMutationIntent(operationId, candidate.RetainerId, operation.Owner, stack.ItemId, itemName, stack.IsHighQuality),
                             stockMutations,
                             async mutationToken =>
                             {
@@ -916,6 +916,22 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             .Where(stack => OperationJournal.VariantKey(stack.ItemId, stack.IsHighQuality) == variantKey)
             .Sum(stack => stack.Quantity);
         return current == expected;
+    }
+
+    private async Task<RetainerVariantObservation> RecoverStockObservationAsync(RetainerStockMutationIntent intent)
+    {
+        void RequireAuthority()
+        {
+            if (MarketRunDeadline.HasUnsettled || intent.ItemId == 0 || !intent.Owner.HasStableIdentity ||
+                !intent.Owner.Matches(currentOwner()) ||
+                !cache.Snapshot().TryGetValue(intent.RetainerId, out var retained) || !intent.Owner.Matches(retained.Owner))
+                throw new InvalidOperationException("Stock observation recovery has no settled owner-bound session.");
+        }
+        RequireAuthority();
+        var observation = await ObserveVariantAsync(intent.RetainerId, intent.ItemId, intent.ItemName,
+            intent.IsHighQuality, CancellationToken.None).ConfigureAwait(false);
+        RequireAuthority();
+        return observation;
     }
 
     private async Task<RetainerVariantObservation> ObserveVariantAsync(

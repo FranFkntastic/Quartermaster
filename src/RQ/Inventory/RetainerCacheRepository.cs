@@ -1,6 +1,7 @@
 using RQ.Domain;
 using RQ.Persistence;
 using Franthropy.Dalamud.Automation.Inventory;
+using Franthropy.Dalamud.Automation.Retainers;
 
 namespace RQ.Inventory;
 
@@ -456,6 +457,32 @@ public sealed class RetainerCacheRepository : IDisposable
             new(listing.Quantity, listing.IsHq, listing.UnitPrice);
     }
 
+    public CacheInvalidationResult InvalidateStock(ulong retainerId)
+    {
+        Exception? persistenceError = null;
+        var changed = false;
+        lock (gate)
+        {
+            var candidate = new Dictionary<ulong, CachedRetainer>(cache);
+            if (candidate.TryGetValue(retainerId, out var current))
+            {
+                var updated = Copy(current);
+                // Preserve the last observation and unrelated listings/roster/gil.
+                // Lost coverage prevents using this stock as authoritative capacity.
+                updated.ObservedSources.RemoveAll(source =>
+                    DalamudRetainerInventory.ItemContainers.Any(type => type.ToString() == source));
+                candidate[retainerId] = updated;
+                cache = candidate;
+                Revision++;
+                changed = true;
+            }
+            try { store.SaveAfterInvalidation(candidate); }
+            catch (Exception exception) { persistenceError = exception; }
+        }
+        if (changed) Changed?.Invoke(RetainerCacheChangeKind.Stock);
+        return new(false, persistenceError is null, persistenceError?.Message);
+    }
+
     public CacheInvalidationResult Invalidate(ulong retainerId)
     {
         Exception? persistenceError = null;
@@ -494,8 +521,7 @@ public sealed class RetainerCacheRepository : IDisposable
             ObservedAtUtc = observedAtUtc,
         };
         retainer.Bags.Add(bag);
-        if (!retainer.ObservedSources.Contains(container, StringComparer.Ordinal))
-            retainer.ObservedSources.Add(container);
+        // A single variant cannot establish coverage for a whole container.
         return bag;
     }
 

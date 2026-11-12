@@ -62,6 +62,9 @@ public sealed class MarketRunDeadline(TimeSpan timeout) : IMarketRunDeadline
 
 public sealed class MarketRunRecord
 {
+    // Null means the legacy receipt did not record this time, not the import time.
+    public DateTime? StartedAtUtc { get; set; }
+    public DateTime? FinishedAtUtc { get; set; }
     public Guid Id { get; set; } = Guid.NewGuid();
     public Guid PlanId { get; set; }
     public long PlanRevision { get; set; }
@@ -94,6 +97,7 @@ public sealed class MarketMutationReceipt
 public sealed class MarketRunStore(string path)
 {
     private readonly AtomicDocumentStore<MarketRunRecord> store = new(path);
+    public MarketRunHistoryStore History { get; } = new(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path))!, "market-run-history"));
     public MarketRunRecord? Load()
     {
         if (!store.Exists) return null;
@@ -106,10 +110,18 @@ public sealed class MarketRunStore(string path)
                 if (!record.NeedsCheck.Contains(mutation.Intent.RetainerId)) record.NeedsCheck.Add(mutation.Intent.RetainerId);
             store.Save(record);
         }
+        History.Save(record);
         return record;
     }
-    public void Save(MarketRunRecord record) => store.Save(record);
-    public void Clear() { if (File.Exists(path)) File.Delete(path); }
+    public void Save(MarketRunRecord record) { store.Save(record); History.Save(record); }
+    public void Clear()
+    {
+        if (!store.Exists) return;
+        // History is advisory. An explicit acknowledgement must not depend on its I/O.
+        try { History.Save(store.Load()); }
+        catch (Exception exception) { History.ReportWarning($"Could not archive the acknowledged receipt: {exception.Message}"); }
+        File.Delete(path);
+    }
 }
 
 /// <summary>Owns one immutable plan snapshot and one lease across gather and listing passes.</summary>
@@ -129,14 +141,18 @@ public sealed class MarketRunExecutor(
     public bool IsRunning => Volatile.Read(ref running) != 0;
     private bool disposed;
     public Task? ActiveTask { get; private set; }
-    public bool CanStart => !disposed && !IsRunning && automation.CanAcquire && Result?.RequiresAcknowledgement != true;
+    public string? PersistenceError { get; private set; }
+    public bool CanStart => !disposed && !IsRunning && automation.CanAcquire && Result?.RequiresAcknowledgement != true && PersistenceError is null;
     public void Clear()
     {
         lock (persistenceGate)
         {
             if (disposed || IsRunning || automation.IsHeld) return;
-            try { clear?.Invoke(); Result = null; }
-            catch (Exception e) { if (Result is { } result) result.Reason = $"Could not clear result: {e.Message}"; }
+            try
+            {
+                clear?.Invoke(); Result = null; PersistenceError = null;
+            }
+            catch (Exception e) { PersistenceError = $"Could not clear result: {e.Message}"; }
         }
     }
     public void CancelAndWait(TimeSpan timeout)
@@ -175,7 +191,7 @@ public sealed class MarketRunExecutor(
             runLease = lease;
             driverUnsettled = false;
             persistenceFailed = false;
-            var record = new MarketRunRecord { PlanId = plan.Id, PlanRevision = plan.Revision, Owner = plan.Owner with { },
+            var record = new MarketRunRecord { StartedAtUtc = DateTime.UtcNow, PlanId = plan.Id, PlanRevision = plan.Revision, Owner = plan.Owner with { },
                 Assignments = plan.Assignments.Where(a => a.Enabled).Select(ListingPlanCatalog.Copy).ToList() };
             AutoRetainerSuppression.Scope? scope = null;
             var sessionStarted = false;
@@ -280,6 +296,7 @@ public sealed class MarketRunExecutor(
                         catch (Exception e) { Add(record, $"Could not close retainer list: {e.Message}"); }
                     }
                     record.ListingSummaryComplete = record.Assignments.Select(a => a.RetainerId).Distinct().All(scannedRetainers.Contains);
+                    record.FinishedAtUtc = DateTime.UtcNow;
                     Status = record.State + (record.Reason.Length == 0 ? string.Empty : $": {record.Reason}");
                     Result = record;
                     Persist(record);
@@ -489,7 +506,7 @@ public sealed class MarketRunExecutor(
         {
             if (disposed) return;
             try { persist(record); }
-            catch { persistenceFailed = true; throw; }
+            catch (Exception e) { persistenceFailed = true; PersistenceError = $"Market run persistence failed: {e.Message}"; throw; }
         }
     }
     private static void Add(MarketRunRecord record, string message) => record.Results.Add(message);

@@ -57,7 +57,8 @@ internal sealed class MarketRunLiveDriver(
         }).ToArray()));
         return scan.Listings;
     }
-    public async Task<MarketPlayerInventory> PlayerAsync(CancellationToken token)
+    public Task<MarketPlayerInventory> PlayerAsync(CancellationToken token) => ReadPlayerAsync(token, true);
+    private async Task<MarketPlayerInventory> ReadPlayerAsync(CancellationToken token, bool complete)
     {
         RequireSessionAuthority();
         var stacks = await session.ScanPlayerInventoryAsync(null, token).ConfigureAwait(false);
@@ -68,7 +69,7 @@ internal sealed class MarketRunLiveDriver(
             BagName = b.ToString(), Items = stacks.Where(s => s.Container == b).Select(s => new InventoryItem
             { ItemId = s.ItemId, ItemName = itemName(s.ItemId), Quantity = (uint)s.Quantity, IsHq = s.IsHighQuality,
                 ContainerKey = b.ToString(), SlotIndex = s.SlotIndex }).ToList(),
-        }).ToArray(), names, names), DateTime.UtcNow);
+        }).ToArray(), names, names), DateTime.UtcNow, coverageUncertain: !complete);
         return new(stacks, Math.Max(0, 140 - stacks.Select(s => (s.Container, s.SlotIndex)).Distinct().Count()));
     }
     public async Task<MarketMutationOutcome> RepriceAsync(RetainerMarketListingTarget listing, uint price, CancellationToken token)
@@ -78,7 +79,7 @@ internal sealed class MarketRunLiveDriver(
     }
     internal static MarketMutationOutcome ClassifyReprice(RetainerAutomationResult result) => result.Success
         ? MarketMutationOutcome.Committed : result.Code is "InvalidObservedMarketUnitPrice" or "InvalidMarketUnitPrice" or
-            "MarketUnitPriceUnchanged" or "InvalidMarketListing" or "RetainerSellingListingTimeout" or
+            "MarketUnitPriceUnchanged" or "InvalidMarketListing" or "RetainerSellingListingTimeout" or "RetainerSellingListingSelectionFailed" or
             "RetainerSellingListTimeout" or "RetainerIdentityMismatch" or "RetainerMarketUnavailable" or "RetainerMarketListingChanged"
             ? MarketMutationOutcome.FailedBeforeSend : MarketMutationOutcome.Indeterminate;
     public async Task<MarketMutationOutcome> PullAsync(RetainerMarketListingTarget listing, CancellationToken token)
@@ -121,7 +122,16 @@ internal sealed class MarketRunLiveDriver(
             await coordinator.ExecuteRetrievalUnderLeaseAsync(operation.OperationId, lease, token).ConfigureAwait(false);
             var outcome = journal.Get(operation.OperationId);
             if (outcome?.Status == OperationStatuses.Indeterminate)
+            {
+                // Refresh the player projection, not the ambiguous movement receipt.
+                // A failed read must not hide the original needs-check or trigger a resend.
+                if (!MarketRunDeadline.HasUnsettled && HasSessionAuthority())
+                {
+                    try { await deadline.RunAsync(t => ReadPlayerAsync(t, false)).ConfigureAwait(false); }
+                    catch (Exception exception) { journal.RecordWarning(operation.OperationId, "GatherPlayerObservationRecoveryFailed", exception.Message); }
+                }
                 throw new MarketGatherIndeterminateException(guarded.CurrentRetainer, guarded.CurrentRetainerName, $"Gather needs a check: {target.ItemName}. {outcome.Message}");
+            }
             if (MarketRunDeadline.HasUnsettled) throw new TimeoutException("Gather driver has not settled.");
             check();
             if (guarded.BlockedByInventory)

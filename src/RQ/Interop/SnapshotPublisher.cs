@@ -377,6 +377,7 @@ public sealed class SnapshotPublisher
         retainer.ListingsObservedAtUtc,
         retainer.RequestedSources,
         retainer.ObservedSources,
+        stockCoverage = new { ordinary = StockCoverage.Ordinary(retainer), crystals = StockCoverage.Crystals(retainer) },
         retainer.Bags,
         listings = retainer.Listings.Select(listing => new
         {

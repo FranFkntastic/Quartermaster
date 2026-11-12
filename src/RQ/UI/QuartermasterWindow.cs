@@ -53,7 +53,13 @@ public sealed class QuartermasterWindow : Window
     private TransferReviewDialogState? capturePreviousTransferReviewState;
     private VendorProcurementReviewDialogState? capturePreviousVendorReviewState;
 
-    internal void SetMarketRunExecutor(MarketRunExecutor executor) => marketRunPane.Executor = executor;
+    internal void SetMarketRunExecutor(MarketRunExecutor executor, MarketRunHistoryWindow history,
+        RQ.Interop.ComplicatedMarketBoardItemClient itemClient)
+    {
+        marketRunPane.Executor = executor;
+        marketRunPane.History = history;
+        listingWorkspace.ItemClient = itemClient;
+    }
 
     public QuartermasterWindow(
         StateRepository state,
@@ -400,6 +406,7 @@ public sealed class QuartermasterWindow : Window
         deferredView = null;
         var runtime = runtimeSnapshots.Current;
         workbench.EnsureScope(runtime.Browser);
+        workbench.EnsureListingOwner(runtime.Owner);
         listingSession.Ensure(runtime);
         transferPlanEditor.Ensure(runtime);
         if (requestedView == WorkbenchView.Activity)
@@ -411,6 +418,8 @@ public sealed class QuartermasterWindow : Window
         reviewRegistry.RegisterLastButton("quartermaster.history.open", "Open transfer history", true,
             historyDialog.RequestOpen, "Recent Quartermaster operations");
         historyDialog.Draw(runtime.Owner);
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Market run history")) marketRunPane.History?.Open();
 
         if (ImGui.BeginTabBar("RQViews"))
         {
