@@ -234,7 +234,7 @@ public sealed class QuartermasterRuntimeSnapshotSource
         return new(
             bags.Values.OrderBy(bag => bag.BagName, StringComparer.Ordinal).ToArray(),
             current.RequestedSources,
-            current.ObservedSources.Union(change.Slots.Select(slot => slot.ContainerKey), StringComparer.Ordinal).ToArray());
+            current.ObservedSources);
     }
 
     private static RQ.Domain.InventoryItem Copy(RQ.Domain.InventoryItem source) => new()

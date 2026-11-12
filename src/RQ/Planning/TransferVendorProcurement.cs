@@ -12,6 +12,7 @@ public enum TransferVendorProcurementState
     ExactQualityUnsupported,
     OfferNotCataloged,
     VendorUnavailable,
+    StockUnverified,
 }
 
 public sealed record TransferVendorCandidate(
@@ -183,6 +184,10 @@ public sealed class TransferVendorProcurementPlanner
 
     private TransferVendorProcurementLine BuildLine(TargetPlanItem rule, PlanLine retrieval)
     {
+        if (retrieval.Status == PlanLineStatus.StockUnverified)
+            return new(rule.Id, rule.ItemId, rule.ItemName, rule.Quality, retrieval.TargetQuantity, 0,
+                TransferVendorProcurementState.StockUnverified,
+                "Retainer stock is unverified; a safe vendor purchase quantity cannot be established.", [], null);
         if (rule.Quality != ItemQualityPolicy.Any)
         {
             return new(

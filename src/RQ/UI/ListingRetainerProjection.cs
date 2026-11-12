@@ -194,7 +194,7 @@ internal static class ListingRetainerProjection
             var held = browser.Items.FirstOrDefault(i => i.ItemId == a.ItemId)?.Stacks
                 .Where(s => s.RetainerId == a.RetainerId && s.Quality == quality).Sum(s => s.Quantity) ?? 0;
             if (item.Coverage == ListingCoverageState.ReadyOnAssignedRetainer)
-                return held >= slotUnits ? new($"List {remaining:N0}", ListingStateTone.Amber, 5, Amount: remaining) : new("Shape differs", ListingStateTone.Info, 7);
+                return held >= slotUnits ? new(AmountText(5, remaining), ListingStateTone.Amber, 5, Amount: remaining) : new("Shape differs", ListingStateTone.Info, 7);
             if (item.Coverage == ListingCoverageState.Satisfied) return new("Shape differs", ListingStateTone.Info, 7);
             return new($"{remaining:N0} unlisted", ListingStateTone.Dim, 11);
         }
@@ -213,8 +213,26 @@ internal static class ListingRetainerProjection
 
     private static string AmountText(int rank, int amount) => rank switch
     {
-        1 => $"Missing {amount:N0}", 2 => $"Retrieve {amount:N0}", 3 => $"Move {amount:N0} from player",
-        4 => $"Need {amount:N0} · source?", _ => $"List {amount:N0}",
+        1 => $"Short {amount:N0} units", 2 => $"From retainers: {amount:N0}", 3 => $"On player: {amount:N0}",
+        4 => "Stock unverified", _ => $"{amount:N0} ready to list",
+    };
+
+    internal static string Tooltip(ListingStateView state) => state.Rank switch
+    {
+        0 => "This planned retainer is not in the currently assigned owner roster. Its saved intent is preserved.",
+        1 => "Units still missing after the planner accounts for observed listings and known stock. Shared item/quality coverage is counted once across the draft, not once per retainer.",
+        2 => $"{state.Amount:N0} item units retrievable from observed retainer stock. This is aggregate item/quality coverage, not a count at this destination or a live retrieval guarantee.",
+        3 => $"{state.Amount:N0} item units in observed player inventory for movement. This is aggregate item/quality coverage, not stock on this retainer.",
+        4 => $"{state.Amount:N0} required item units come from planned listing demand; source coverage is not fully observed. Unknown stock is not zero.",
+        5 => "Number of missing listing slots backed by observed stock on the assigned retainer. Quantity per listing is measured in item units.",
+        6 => "Observed unit price differs from the saved or draft plan price. This compares against your plan, not competitors; no undercut assessment.",
+        7 => "Observed listing quantity does not match the planned stack shape; aggregate units alone do not prove a matching listing.",
+        8 => "The observation did not establish the unit price. No price is inferred.",
+        9 => "No complete listing observation for this retainer. Planned cells remain visible but do not prove occupancy.",
+        10 => "The draft still needs a positive listing count, units per listing, and unit price before execution.",
+        11 => "Unlisted counts are planned listing slots not matched by observations. Unplanned listings are observed listings outside the plan; neither is a count of inventory units.",
+        12 => "Observed listings match planned item, quality, units per listing and unit price. Observations are not a fresh live market scan.",
+        _ => "Excluded or non-sellable draft rows do not add listing demand.",
     };
 
     private static ListingStateView Summary(IEnumerable<ListingStateView> entries)
@@ -224,7 +242,11 @@ internal static class ListingRetainerProjection
         var rank = ranked.Min(s => s.Rank);
         var same = ranked.Where(s => s.Rank == rank).ToArray();
         var state = same[0] with { Action = ListingStateAction.None };
-        if (rank is >= 1 and <= 5) return state with { Text = AmountText(rank, same.Sum(s => s.Amount)) };
+        if (rank is >= 1 and <= 5)
+        {
+            var amount = same.Sum(s => s.Amount);
+            return state with { Text = AmountText(rank, amount), Amount = amount };
+        }
         if (rank == 10 && same.Select(s => s.Text).Distinct().Count() > 1) return state with { Text = "Incomplete" };
         return rank == 11 ? state with { Text = "Unplanned" } : state;
     }

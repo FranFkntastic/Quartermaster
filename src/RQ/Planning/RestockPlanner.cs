@@ -8,6 +8,7 @@ public enum PlanLineStatus
     Ready,
     Partial,
     NoCachedStock,
+    StockUnverified,
 }
 
 public sealed record RetainerCandidate(
@@ -81,6 +82,7 @@ public static class RestockPlanner
                 .Where(retainer => retainer.Owner.Matches(owner))
                 .Where(retainer => retainer.IsCurrentlyAssigned is not false)
                 .Where(retainer => retainer.IsUiAccessible is not false)
+                .Where(retainer => StockCoverage.CoversItem(retainer, row.ItemId))
                 .Select(retainer =>
                 {
                     var evidence = retainer.Bags
@@ -106,7 +108,12 @@ public static class RestockPlanner
                 .ToArray();
         var cached = candidates.Sum(candidate => candidate.CachedQuantity);
         var missing = Math.Max(0, needed - cached);
-        var status = needed == 0
+        var unverified = cache.Values.Any(retainer => retainer.Owner.Matches(owner) &&
+            retainer.IsCurrentlyAssigned is not false && retainer.IsUiAccessible is not false &&
+            !StockCoverage.CoversItem(retainer, row.ItemId));
+        var status = needed > cached && unverified
+            ? PlanLineStatus.StockUnverified
+            : needed == 0
             ? PlanLineStatus.Satisfied
             : cached == 0
                 ? PlanLineStatus.NoCachedStock

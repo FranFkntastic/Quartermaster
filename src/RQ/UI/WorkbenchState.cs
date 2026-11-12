@@ -16,6 +16,26 @@ public sealed class WorkbenchState
     public DalamudFilterAutocompleteState ItemFilterState { get; } = new();
     public DalamudFilterAutocompleteState ListingFilterState { get; } = new();
     public ulong? SelectedListingRetainerId { get; set; }
+    private OwnerScope? listingOwner;
+    private readonly HashSet<ulong> expandedListingRetainers = [];
+    public bool IsListingExpanded(ulong id) => expandedListingRetainers.Contains(id);
+    public void ExpandListing(ulong id) => expandedListingRetainers.Add(id);
+    public void ToggleListing(ulong id)
+    {
+        if (!expandedListingRetainers.Add(id)) expandedListingRetainers.Remove(id);
+        SelectedListingRetainerId = id;
+    }
+    public void EnsureListingOwner(OwnerScope owner)
+    {
+        if (listingOwner == owner) return;
+        listingOwner = owner;
+        expandedListingRetainers.Clear();
+        SelectedListingRetainerId = null;
+        HighlightedListingItem = null;
+        ScrollToListingRetainer = false;
+        ScrollToListingDetail = null;
+        ListingFilterState.SetExpression(string.Empty);
+    }
     public ListingItemKey? HighlightedListingItem { get; set; }
     public bool ScrollToListingRetainer { get; set; }
     public ListingItemKey? ScrollToListingDetail { get; set; }

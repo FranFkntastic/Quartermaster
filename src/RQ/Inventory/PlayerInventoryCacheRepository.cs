@@ -62,7 +62,7 @@ public sealed class PlayerInventoryCacheRepository
         }
     }
 
-    public bool Observe(OwnerScope owner, PlayerStorageCapture observation, DateTime observedAtUtc)
+    public bool Observe(OwnerScope owner, PlayerStorageCapture observation, DateTime observedAtUtc, bool coverageUncertain = false)
     {
         if (!owner.HasStableIdentity)
             return false;
@@ -97,7 +97,7 @@ public sealed class PlayerInventoryCacheRepository
             current.Owner = owner with { };
             current.UpdatedAtUtc = observedAtUtc;
             current.RequestedSources = observation.RequestedSources.Distinct(StringComparer.Ordinal).ToList();
-            current.ObservedSources = observation.ObservedSources.Distinct(StringComparer.Ordinal).ToList();
+            current.ObservedSources = coverageUncertain ? [] : observation.ObservedSources.Distinct(StringComparer.Ordinal).ToList();
             current.Bags = bags.Values.OrderBy(bag => bag.BagName, StringComparer.Ordinal).ToList();
 
             changed = previous is null || !Equivalent(previous, current);
@@ -235,8 +235,8 @@ public sealed class PlayerInventoryCacheRepository
             {
                 current.Bags.RemoveAll(candidate => candidate.BagName == containerKey);
                 current.Bags.Add(bag);
-                if (!current.ObservedSources.Contains(containerKey, StringComparer.Ordinal))
-                    current.ObservedSources.Add(containerKey);
+                // Deltas maintain existing coverage; only a full observation can
+                // establish it after an ambiguous movement or missing baseline.
             }
             current.Bags = current.Bags.OrderBy(bag => bag.BagName, StringComparer.Ordinal).ToList();
             current.ObservedSources = current.ObservedSources.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList();

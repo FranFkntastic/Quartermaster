@@ -15,6 +15,8 @@ internal static class RetainerRetrievalResultPolicy
         "SourceSlotChanged",
         "RetainerAgentUnavailable",
         "CommandUnavailable",
+        "QuantityPopupAlreadyOpen",
+        "InvalidRetainerBaseline",
         "RetainerIdentityMismatch",
     };
 

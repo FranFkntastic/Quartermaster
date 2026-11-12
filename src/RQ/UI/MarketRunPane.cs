@@ -21,6 +21,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
     private string? status;
     private IReadOnlyList<MarketRunItem> items = [];
     internal MarketRunExecutor? Executor { get; set; }
+    internal MarketRunHistoryWindow? History { get; set; }
     internal MarketRunRetainer? Retainer(QuartermasterRuntimeSnapshot runtime, ListingPlanDraftSession session, ulong id)
     {
         Update(runtime, session);
@@ -51,7 +52,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         if (session.Draft is not { } draft) return;
         Update(runtime, session);
         ImGui.TextUnformatted(MarketRunPresentation.Header(run));
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(MarketRunPresentation.Header(run));
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Refill, short, pull and no-slot counts are listing slots; craft is item units. These are projections from the current draft and observations, not completed actions. Reserve table quantities are item units across the evaluated scope, not counts at the selected reserve destination.");
         DrawExecution(runtime, session);
         ImGui.Separator(); ImGui.TextUnformatted("Reserves");
         var width = ImGui.GetContentRegionAvail().X;
@@ -167,25 +168,41 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         }
         var hasWork = run.Retainers.Any(r => r.Assignments.Any(a => a.ShortListings is { IsKnown: true, Value: > 0 } || a.RepriceListings is { IsKnown: true, Value: > 0 }));
         var reason = session.IsDirty ? "Save plan changes first." : !run.IsComplete ? "Observations incomplete." :
-            executor.Result?.RequiresAcknowledgement == true ? "Clear the unresolved result first." :
+            executor.PersistenceError is not null ? executor.PersistenceError :
+            executor.Result?.RequiresAcknowledgement == true ? "Review the unresolved receipt before explicitly acknowledging it." :
             !hasWork ? "Nothing to do." : !executor.CanStart ? "Automation busy." : null;
         ImGui.BeginDisabled(reason is not null);
         if (ImGui.Button("Start run") && ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner) is { } plan)
             _ = executor.RunAsync(plan, run, session.IsDirty);
         ImGui.EndDisabled();
         if (reason is not null && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) ImGui.SetTooltip(reason);
+        if (executor.PersistenceError is not null) ImGui.TextWrapped(executor.PersistenceError);
+        if (ImGui.SmallButton("Run summaries")) History?.Open();
+        if (History?.Warning is { } historyWarning) ImGui.TextWrapped(historyWarning);
+        var latest = History?.Latest(runtime.Owner);
+        if (latest is not null)
+        {
+            ImGui.TextWrapped($"Latest run: {latest.State} · {MarketRunHistoryWindow.Time(latest.StartedAtUtc)}");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(latest.Reason + "\n" + MarketRunHistoryWindow.Summary(latest));
+        }
         if (executor.Result is not { } result) return;
-        if (!result.Owner.Matches(runtime.Owner)) ImGui.TextWrapped(ResultOwnerLabel(result.Owner));
-        ImGui.TextWrapped(result.State + (result.Reason.Length == 0 ? string.Empty : $": {result.Reason}"));
-        UiLayout.SameLineIfFits("Clear");
-        if (ImGui.SmallButton("Clear")) executor.Clear();
-        int Count(string kind) => result.Mutations.Count(m => m.Intent.Kind == kind && m.Outcome == MarketMutationOutcome.Committed);
-        ImGui.TextWrapped($"Listed {Count("Post")} / Repriced {Count("Reprice")} / Pulled {Count("Pull")} / Still short {(result.ListingSummaryComplete ? result.StillShort.ToString() : "Unknown")} / No slot {result.NoSlot} / Inventory-blocked listings {result.NoInventorySpace} / Gather-blocked units {result.GatherBlockedUnits} / Split across stacks {result.SplitStacks}");
-        foreach (var message in result.Results) ImGui.TextWrapped(message);
-        foreach (var group in result.Mutations.Where(m => m.Intent.Kind == "Pull" && m.Outcome == MarketMutationOutcome.Committed).GroupBy(m => m.Intent.ItemName))
-            ImGui.TextWrapped($"{group.Key} × {group.Sum(m => m.Intent.Quantity)} (player inventory)");
-        foreach (var id in result.NeedsCheck.Distinct())
-            ImGui.TextWrapped($"Needs check: {result.NeedsCheckNames.GetValueOrDefault(id) ?? result.Assignments.FirstOrDefault(a => a.RetainerId == id)?.RetainerName ?? id.ToString()}");
+        if (!result.Owner.Matches(runtime.Owner)) { ImGui.TextWrapped(ResultOwnerLabel(result.Owner) + " requires review on that character."); return; }
+        ImGui.TextWrapped($"Recovery receipt: {result.State}{(result.RequiresAcknowledgement ? " · Needs check" : string.Empty)}");
+        if (result.Reason.Length > 0 && ImGui.IsItemHovered()) ImGui.SetTooltip(result.Reason);
+        ImGui.BeginDisabled(executor.IsRunning);
+        if (ImGui.SmallButton(result.RequiresAcknowledgement ? "Review acknowledgement..." : "Clear latest status"))
+        {
+            if (result.RequiresAcknowledgement) ImGui.OpenPopup("Acknowledge market receipt");
+            else executor.Clear();
+        }
+        ImGui.EndDisabled();
+        if (ImGui.BeginPopup("Acknowledge market receipt"))
+        {
+            ImGui.TextWrapped("Confirm you have checked the uncertain outcome in game. This removes the recovery gate, never retries a mutation, and keeps the summary in history.");
+            if (ImGui.Button("I checked; acknowledge")) { executor.Clear(); ImGui.CloseCurrentPopup(); }
+            ImGui.SameLine(); if (ImGui.Button("Keep unresolved")) ImGui.CloseCurrentPopup();
+            ImGui.EndPopup();
+        }
     }
 
     internal static string ResultOwnerLabel(OwnerScope owner) => string.IsNullOrWhiteSpace(owner.CharacterName)

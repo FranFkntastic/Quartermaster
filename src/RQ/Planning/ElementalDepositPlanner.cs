@@ -27,7 +27,8 @@ public static class ElementalDepositPlanner
         var scoped = cache.Values.Where(retainer => retainer.Owner.Matches(owner)).ToArray();
         var candidates = scoped.Select(retainer =>
             {
-                var crystals = retainer.Bags.FirstOrDefault(bag => bag.BagName == "RetainerCrystals");
+                var crystals = StockCoverage.Crystals(retainer)
+                    ? retainer.Bags.FirstOrDefault(bag => bag.BagName == "RetainerCrystals") : null;
                 var capacities = carried.Keys.ToDictionary(
                     itemId => itemId,
                     itemId => crystals is null
@@ -54,6 +55,6 @@ public static class ElementalDepositPlanner
             var planned = Math.Min(entry.Value, capacity);
             return new ElementalDepositLine(entry.Key, resolveName(entry.Key) ?? $"Item {entry.Key}", entry.Value, capacity, planned, entry.Value - planned);
         }).ToArray();
-        return new(nowUtc, lines, candidates, scoped.Count(retainer => retainer.Bags.All(bag => bag.BagName != "RetainerCrystals")));
+        return new(nowUtc, lines, candidates, scoped.Count(retainer => !StockCoverage.Crystals(retainer) || retainer.Bags.All(bag => bag.BagName != "RetainerCrystals")));
     }
 }
