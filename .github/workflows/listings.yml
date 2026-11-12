@@ -45,5 +45,5 @@ jobs:
         run: |
           # CI pairs exact source because commit packages live in a private local feed.
           # Deployment separately verifies the immutable package-mode build.
-          dotnet test tests/RQ.Tests -c Release -p:FranthropySource=Local "-p:FranthropyRoot=$env:GITHUB_WORKSPACE/franthropy" --filter "FullyQualifiedName~ListingPlanTests|FullyQualifiedName~ListingInlineTests|FullyQualifiedName~TransferPlanDraftSessionTests|FullyQualifiedName~MarketRunTests|FullyQualifiedName~MarketRunExecutorTests"
+          dotnet test tests/RQ.Tests -c Release -p:FranthropySource=Local "-p:FranthropyRoot=$env:GITHUB_WORKSPACE/franthropy" --filter "FullyQualifiedName~ListingPlanTests|FullyQualifiedName~ListingInlineTests|FullyQualifiedName~ListingNavigationTests|FullyQualifiedName~TransferPlanDraftSessionTests|FullyQualifiedName~MarketRunTests|FullyQualifiedName~MarketRunExecutorTests"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
