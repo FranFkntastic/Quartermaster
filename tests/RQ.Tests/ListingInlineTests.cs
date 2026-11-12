@@ -43,6 +43,19 @@ public sealed class ListingInlineTests
     }
 
     [Fact]
+    public void RetainerTableSortingPreservesIdentityAndFilteringPreservesEstablishedExpansionPolicy()
+    {
+        var draft = Draft(A(retainer: 10), A(retainer: 11));
+        var rows = ListingRetainerProjection.Build(draft, Browser(), new HashSet<ulong> { 10, 11 }, _ => 999, _ => true);
+        Assert.Equal(10UL, ListingWorkspace.ResolveVisibleSelection(10, rows.Reverse().ToArray()));
+        Assert.Equal(11UL, ListingWorkspace.ResolveVisibleSelection(10, rows.Where(r => r.RetainerId == 11).ToArray()));
+        Assert.Null(ListingWorkspace.ResolveVisibleSelection(null, rows));
+        Assert.Null(ListingWorkspace.ResolveVisibleSelection(10, []));
+        Assert.Equal(2, draft.Assignments.Count);
+        Assert.All(draft.Assignments, a => Assert.Equal(100, a.UnitPrice));
+    }
+
+    [Fact]
     public void PriceDifferenceOccupiesPlannedSlotOnlyOnce()
     {
         var row = View(Draft(A(2)), Browser([L(price: 101)], [S(1)]));
