@@ -65,12 +65,23 @@ internal sealed class SaddlebagRetrievalStep(
         InventoryMoveOutcome.Indeterminate,
     };
 
-    public sealed record LegResult(IReadOnlyDictionary<uint, int> BagIncrease, int VerifiedRetrieved, bool Dispatched);
+    /// <param name="Credit">
+    /// Observed bag increase per plan line (item + quality policy), measured only over the
+    /// variants that line may draw, from fresh complete reads around that line's moves.
+    /// </param>
+    /// <param name="Unreconciled">
+    /// Set when a move may have happened but the bags could not be reread completely. The
+    /// caller must stop the operation instead of planning retainers from the pre-leg count.
+    /// </param>
+    public sealed record LegResult(
+        IReadOnlyDictionary<(uint ItemId, ItemQualityPolicy Quality), int> Credit,
+        int VerifiedRetrieved,
+        bool Dispatched,
+        string? Unreconciled = null);
 
     /// <summary>
     /// Retrieves saddlebag stock for every plan line still short. Returns the observed
-    /// per-item increase in the player bags (from fresh complete reads around each line)
-    /// and the quantity proven by retrieval receipts.
+    /// per-line bag increase and the quantity proven by retrieval receipts.
     /// </summary>
     public async Task<LegResult> ExecuteAsync(
         string operationId,
@@ -78,12 +89,12 @@ internal sealed class SaddlebagRetrievalStep(
         Func<bool> stillAuthorized,
         CancellationToken token)
     {
-        var increase = new Dictionary<uint, int>();
+        var credit = new Dictionary<(uint ItemId, ItemQualityPolicy Quality), int>();
         var verified = 0;
         var dispatched = false;
         var shortLines = plan.Lines.Where(line => line.NeededQuantity > 0).ToArray();
         if (shortLines.Length == 0)
-            return new(increase, 0, false);
+            return new(credit, 0, false);
 
         var read = await driver.ReadAsync(token).ConfigureAwait(false);
         if (!read.BagsComplete || !read.SaddlebagLoaded)
@@ -96,13 +107,14 @@ internal sealed class SaddlebagRetrievalStep(
                     Math.Min(line.NeededQuantity, cached[line.ItemId]),
                     $"Cached saddlebag stock {cached[line.ItemId]:N0} was not retrieved; retainers cover the full shortfall {line.NeededQuantity:N0}. {read.Message}");
             }
-            return new(increase, 0, false);
+            return new(credit, 0, false);
         }
 
         foreach (var line in shortLines)
         {
             token.ThrowIfCancellationRequested();
-            var need = Math.Max(0, line.NeededQuantity - increase.GetValueOrDefault(line.ItemId));
+            var key = (line.ItemId, line.Quality);
+            var need = Math.Max(0, line.NeededQuantity - credit.GetValueOrDefault(key));
             if (need == 0)
                 continue;
             var before = read;
@@ -111,11 +123,13 @@ internal sealed class SaddlebagRetrievalStep(
                 continue;
 
             var stop = false;
+            var mayHaveMoved = false;
             foreach (var (stack, quantity) in sources)
             {
                 dispatched = true;
                 var result = await RetrieveOneAsync(operationId, line, stack, quantity, stillAuthorized, token).ConfigureAwait(false);
                 verified += result.Retrieved;
+                mayHaveMoved |= result.MayHaveMoved;
                 if (result.Stop is not null)
                 {
                     stop = result.Stop == StopScope.Leg;
@@ -125,28 +139,36 @@ internal sealed class SaddlebagRetrievalStep(
 
             // Re-plan only from a fresh complete read, whatever the receipts say.
             read = await driver.ReadAsync(token).ConfigureAwait(false);
-            if (read.BagsComplete && before.BagsComplete)
+            if (!read.BagsComplete)
             {
-                var gained = CountItem(read.Bags, line.ItemId) - CountItem(before.Bags, line.ItemId);
-                if (gained > 0)
-                    increase[line.ItemId] = increase.GetValueOrDefault(line.ItemId) + gained;
+                if (!mayHaveMoved)
+                    break; // Nothing could have moved for this line; earlier lines are already reconciled.
+                // A move may have landed, but its effect is unknown: planning retainers from the
+                // pre-leg count could exceed the target. Stop the operation; never resend.
+                var message =
+                    $"SaddlebagReconciliationIncomplete: item={line.ItemName} ({line.ItemId} {line.Quality}) shortfall={line.NeededQuantity:N0} " +
+                    $"receiptsVerified={verified:N0}; the bags could not be reread completely after a saddlebag move, so retainer retrieval is not planned. {read.Message}";
+                warning?.Invoke(message);
+                journal.RecordWarning(operationId, "SaddlebagReconciliationIncomplete", message);
+                return new(credit, verified, true, message);
             }
-            else
-            {
-                warning?.Invoke(
-                    $"SaddlebagRetrievalUnobserved: {line.ItemName} ({line.ItemId}) bags could not be reread after the saddlebag leg; retainers will plan against the pre-leg count. {read.Message}");
-                journal.RecordWarning(operationId, "SaddlebagRetrievalUnobserved", read.Message);
-                break;
-            }
+            var gained = CountVariant(read.Bags, line.ItemId, line.Quality) - CountVariant(before.Bags, line.ItemId, line.Quality);
+            if (gained > 0)
+                credit[key] = credit.GetValueOrDefault(key) + Math.Min(gained, need);
             if (stop || !read.SaddlebagLoaded)
                 break;
         }
-        return new(increase, verified, dispatched);
+        return new(credit, verified, dispatched);
     }
 
     private enum StopScope { Line, Leg }
 
-    private readonly record struct OneResult(int Retrieved, StopScope? Stop);
+    private readonly record struct OneResult(int Retrieved, StopScope? Stop, bool MayHaveMoved = true);
+
+    // Outcomes after which items may have left the source slot.
+    private static bool MayHaveMoved(InventoryMoveOutcome outcome) =>
+        outcome is InventoryMoveOutcome.Retrieved or InventoryMoveOutcome.Staged or
+            InventoryMoveOutcome.Indeterminate or InventoryMoveOutcome.OutsideMutation;
 
     private async Task<OneResult> RetrieveOneAsync(
         string operationId,
@@ -160,7 +182,7 @@ internal sealed class SaddlebagRetrievalStep(
         if (first.Outcome == InventoryMoveOutcome.Retrieved)
             return new(Complete(operationId, line, stack, quantity, first), null);
         if (first.Outcome != InventoryMoveOutcome.Staged)
-            return new(0, Fail(operationId, line, stack, quantity, first, staged: false));
+            return new(0, Fail(operationId, line, stack, quantity, first, staged: false), MayHaveMoved(first.Outcome));
 
         information?.Invoke(Describe("SaddlebagRetrievalStaged", first.Code, line, stack, quantity,
             $"split to {Slot(first.StagedPiece)}; retrieving that piece once."));
@@ -251,8 +273,8 @@ internal sealed class SaddlebagRetrievalStep(
         return selected;
     }
 
-    private static int CountItem(IReadOnlyList<DalamudInventoryStack> stacks, uint itemId) =>
-        stacks.Where(stack => stack.ItemId == itemId).Sum(stack => stack.Quantity);
+    private static int CountVariant(IReadOnlyList<DalamudInventoryStack> stacks, uint itemId, ItemQualityPolicy quality) =>
+        stacks.Where(stack => stack.ItemId == itemId && QualityMatches(quality, stack.IsHighQuality)).Sum(stack => stack.Quantity);
 
     private static bool QualityMatches(ItemQualityPolicy policy, bool isHighQuality) => policy switch
     {

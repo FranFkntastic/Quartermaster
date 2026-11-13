@@ -218,19 +218,21 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     token).ConfigureAwait(false);
                 movementAttempted = leg.Dispatched;
                 transferred = leg.VerifiedRetrieved;
-                if (leg.BagIncrease.Count > 0)
+                if (leg.Unreconciled is { } unreconciled)
                 {
-                    // Re-plan from the fresh bag reads, never from receipts alone.
-                    var observed = baselineInventory.ToDictionary(entry => entry.Key, entry => entry.Value);
-                    foreach (var (itemId, gained) in leg.BagIncrease)
-                        observed[itemId] = observed.GetValueOrDefault(itemId) + gained;
-                    plan = RestockPlanner.Build(rows, observed, cache.Snapshot(), owner, utcNow());
-                    remaining = plan.Lines
-                        .GroupBy(line => RetrievalKey(line.ItemId, line.Quality))
-                        .ToDictionary(group => group.Key, group => group.Sum(line => line.NeededQuantity));
+                    journal.Transition(operationId, OperationStatuses.Indeterminate, "SaddlebagReconciliationIncomplete", unreconciled);
+                    return new(true, "Saddlebag retrieval could not be reconciled; retainer retrieval was not started.");
+                }
+                // Re-plan per line (item + quality) from the fresh bag reads, never from receipts alone.
+                foreach (var ((itemId, quality), gained) in leg.Credit)
+                {
+                    var key = RetrievalKey(itemId, quality);
+                    if (remaining.ContainsKey(key))
+                        remaining[key] = Math.Max(0, remaining[key] - gained);
                 }
             }
-            if (plan.NeededQuantity == 0 && transferred > 0)
+            var remainingNeed = remaining.Values.Sum();
+            if (remainingNeed == 0 && transferred > 0)
             {
                 journal.Transition(
                     operationId,
@@ -239,7 +241,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     $"Retrieved {transferred:N0} units from the saddlebag and satisfied every target.");
                 return new(true, "Retrieval completed from the saddlebag.");
             }
-            if (plan.NeededQuantity == 0)
+            if (remainingNeed == 0)
             {
                 journal.Transition(
                     operationId,
@@ -250,7 +252,9 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         : "Reviewed execution confirmed player inventory already satisfies every target.");
                 return new(true, "Player inventory already satisfies every target.");
             }
-            var candidates = plan.Lines.SelectMany(line => line.Candidates.Select(candidate => (line.ItemId, line.Quality, Candidate: candidate)))
+            var candidates = plan.Lines
+                .Where(line => remaining.GetValueOrDefault(RetrievalKey(line.ItemId, line.Quality)) > 0)
+                .SelectMany(line => line.Candidates.Select(candidate => (line.ItemId, line.Quality, Candidate: candidate)))
                 .GroupBy(entry => entry.Candidate.RetainerId)
                 .Select(group => new
                 {
@@ -269,7 +273,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         operationId,
                         OperationStatuses.PartiallySucceeded,
                         "RetrievalPartial",
-                        $"Retrieved {transferred:N0} units from the saddlebag; {plan.NeededQuantity:N0} units remain and no owner-scoped cached retainer candidates cover them.");
+                        $"Retrieved {transferred:N0} units from the saddlebag; {remainingNeed:N0} units remain and no owner-scoped cached retainer candidates cover them.");
                     return new(true, "Retrieval completed with missing units.");
                 }
                 journal.Transition(operationId, OperationStatuses.Failed, "NoCachedCandidates", "No owner-scoped cached retainer candidates cover this operation.");
