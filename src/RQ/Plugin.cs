@@ -207,11 +207,11 @@ public sealed class Plugin : IDalamudPlugin
             CurrentOwner,
             CountCachedPlayerItems,
             automation,
-            autoRetainerSuppression: autoRetainerSuppression);
+            autoRetainerSuppression: autoRetainerSuppression, warning: message => log.Warning(message));
         var marketRunStore = new MarketRunStore(Path.Combine(configDirectory, "market-run.json"));
         marketRuns = new(new MarketRunLiveDriver(retainerSession, driver, journal, cache, playerInventory,
-                automation, CurrentOwner, id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.Name.ToString() ?? $"Item {id}"),
-            automation, () => state.Read(s => ListingPlanCatalog.OwnerPlan(s, CurrentOwner())), marketRunStore.Save, autoRetainerSuppression, clear: marketRunStore.Clear);
+                automation, CurrentOwner, id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.Name.ToString() ?? $"Item {id}", message => log.Warning(message)),
+            automation, () => state.Read(s => ListingPlanCatalog.OwnerPlan(s, CurrentOwner())), marketRunStore.Save, autoRetainerSuppression, clear: marketRunStore.Clear, warning: message => log.Warning(message));
         marketRuns.Restore(marketRunStore.Load());
         activeMarketRuns = marketRuns;
         automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerSuppression);

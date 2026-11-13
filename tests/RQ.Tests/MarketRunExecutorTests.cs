@@ -503,11 +503,11 @@ public sealed class MarketRunExecutorTests
             : Task.FromResult<IReadOnlyList<RetainerMarketListingTarget>>(Live[active].ToArray());
         }
         public Task<MarketPlayerInventory> PlayerAsync(CancellationToken t) { OnPlayer?.Invoke(); return Task.FromResult(new MarketPlayerInventory(Stock.ToArray(), FreeSlots)); }
-        public Task<MarketMutationOutcome> RepriceAsync(RetainerMarketListingTarget listing, uint price, CancellationToken t)
-        { OnReprice?.Invoke(); if (PendingReprice is not null) return PendingReprice;
+        public async Task<MarketMutationResult> RepriceAsync(RetainerMarketListingTarget listing, uint price, CancellationToken t)
+        { OnReprice?.Invoke(); if (PendingReprice is not null) return new(await PendingReprice);
             if (ThrowReprice) throw new RetainerMarketMutationIndeterminateException("Unknown", "After send", null, new OperationCanceledException(), t);
-            if (ApplyReprice) Live[active][Live[active].IndexOf(listing)] = listing with { UnitPrice = price }; return Task.FromResult(Outcome); }
-        public Task<MarketMutationOutcome> PullAsync(RetainerMarketListingTarget listing, CancellationToken t)
+            if (ApplyReprice) Live[active][Live[active].IndexOf(listing)] = listing with { UnitPrice = price }; return new(Outcome); }
+        public Task<MarketMutationResult> PullAsync(RetainerMarketListingTarget listing, CancellationToken t)
         {
             OnPull?.Invoke();
             if (ThrowPull) throw new RetainerMarketMutationIndeterminateException("Unknown", "After send", null, new OperationCanceledException(), t);
@@ -516,12 +516,12 @@ public sealed class MarketRunExecutorTests
                 Live[active].Remove(listing);
                 if (Compact) Live[active] = Live[active].Select((l, i) => l with { SlotIndex = i }).ToList();
             }
-            return Task.FromResult(Outcome);
+            return Task.FromResult(new MarketMutationResult(Outcome));
         }
-        public Task<MarketMutationOutcome> PostAsync(DalamudInventoryStack source, int quantity, uint price, CancellationToken t)
+        public async Task<MarketMutationResult> PostAsync(DalamudInventoryStack source, int quantity, uint price, CancellationToken t)
         {
             Posts.Add(active); OnPost?.Invoke();
-            if (PendingPost is not null) return PendingPost;
+            if (PendingPost is not null) return new(await PendingPost);
             if (ThrowBeforeSend) throw new OperationCanceledException();
             if (ThrowAfterSend) throw new RetainerMarketMutationIndeterminateException("Deadline", "After send", null, new OperationCanceledException(), t);
             if (Outcome == MarketMutationOutcome.Committed)
@@ -529,7 +529,7 @@ public sealed class MarketRunExecutorTests
                 Stock[Stock.IndexOf(source)] = source with { Quantity = source.Quantity - quantity };
                 Live[active].Add(new(Enumerable.Range(0, 20).First(i => Live[active].All(l => l.SlotIndex != i)), source.ItemId, quantity, source.IsHighQuality, price));
             }
-            return Task.FromResult(Outcome);
+            return new(Outcome);
         }
         public Task ReturnAsync(CancellationToken t) { Returns++; return FailReturn ? Task.FromException(new InvalidOperationException("List unreachable")) : Task.CompletedTask; }
         public Task CloseListAsync(CancellationToken t)
@@ -537,7 +537,7 @@ public sealed class MarketRunExecutorTests
             Closes++; OnClose?.Invoke();
             return FailClose ? Task.FromException(new InvalidOperationException("Close failed")) : PendingClose ?? Task.CompletedTask;
         }
-        public Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken t)
+        public Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken t, Action<MarketMutationReceipt>? receiptChanged = null)
         { OnGather?.Invoke(); check(); return GatherOverride?.Invoke(targets, lease, check, hasAuthority, t) ?? Task.FromResult<IReadOnlyList<string>>([]); }
     }
 }

@@ -11,8 +11,10 @@ namespace RQ.Automation;
 internal sealed class MarketRunLiveDriver(
     IRetainerAutomationSession session, RetainerLiveDriver transferDriver,
     OperationJournal journal, RetainerCacheRepository cache, PlayerInventoryCacheRepository playerCache,
-    AutomationLease automation, Func<OwnerScope> currentOwner, Func<uint, string> itemName) : IMarketRunDriver
+    AutomationLease automation, Func<OwnerScope> currentOwner, Func<uint, string> itemName,
+    Action<string>? warning = null) : IMarketRunDriver
 {
+    private readonly Action<string>? logWarning = warning;
     private static readonly InventoryType[] Bags = [InventoryType.Inventory1, InventoryType.Inventory2, InventoryType.Inventory3, InventoryType.Inventory4];
     private readonly MarketRunDeadline deadline = new(TimeSpan.FromSeconds(15));
     private readonly MarketRunDeadline routeDeadline = new(MarketRunDeadline.RetainerListTimeout);
@@ -72,32 +74,35 @@ internal sealed class MarketRunLiveDriver(
         }).ToArray(), names, names), DateTime.UtcNow, coverageUncertain: !complete);
         return new(stacks, Math.Max(0, 140 - stacks.Select(s => (s.Container, s.SlotIndex)).Distinct().Count()));
     }
-    public async Task<MarketMutationOutcome> RepriceAsync(RetainerMarketListingTarget listing, uint price, CancellationToken token)
+    public async Task<MarketMutationResult> RepriceAsync(RetainerMarketListingTarget listing, uint price, CancellationToken token)
     {
         RequireSessionAuthority();
-        return ClassifyReprice(await session.UpdateSellingListingPriceAsync(listing, price, token).ConfigureAwait(false));
+        var result = await session.UpdateSellingListingPriceAsync(listing, price, token).ConfigureAwait(false);
+        return new(ClassifyReprice(result), result.Code, result.Message);
     }
     internal static MarketMutationOutcome ClassifyReprice(RetainerAutomationResult result) => result.Success
         ? MarketMutationOutcome.Committed : result.Code is "InvalidObservedMarketUnitPrice" or "InvalidMarketUnitPrice" or
             "MarketUnitPriceUnchanged" or "InvalidMarketListing" or "RetainerSellingListingTimeout" or "RetainerSellingListingSelectionFailed" or
             "RetainerSellingListTimeout" or "RetainerIdentityMismatch" or "RetainerMarketUnavailable" or "RetainerMarketListingChanged"
             ? MarketMutationOutcome.FailedBeforeSend : MarketMutationOutcome.Indeterminate;
-    public async Task<MarketMutationOutcome> PullAsync(RetainerMarketListingTarget listing, CancellationToken token)
+    public async Task<MarketMutationResult> PullAsync(RetainerMarketListingTarget listing, CancellationToken token)
     {
         RequireSessionAuthority();
-        return (MarketMutationOutcome)(int)(await session.RemoveMarketListingToPlayerInventoryAsync(listing, token).ConfigureAwait(false)).Outcome;
+        var result = await session.RemoveMarketListingToPlayerInventoryAsync(listing, token).ConfigureAwait(false);
+        return new((MarketMutationOutcome)(int)result.Outcome, result.Code, result.Message);
     }
-    public async Task<MarketMutationOutcome> PostAsync(DalamudInventoryStack source, int quantity, uint price, CancellationToken token)
+    public async Task<MarketMutationResult> PostAsync(DalamudInventoryStack source, int quantity, uint price, CancellationToken token)
     {
         RequireSessionAuthority();
-        return (MarketMutationOutcome)(int)(await session.PostMarketListingAsync(source, quantity, price, token).ConfigureAwait(false)).Outcome;
+        var result = await session.PostMarketListingAsync(source, quantity, price, token).ConfigureAwait(false);
+        return new((MarketMutationOutcome)(int)result.Outcome, result.Code, result.Message);
     }
     public async Task ReturnAsync(CancellationToken token)
     { RequireSessionAuthority(); Require(await session.ReturnToRetainerListAsync(token).ConfigureAwait(false)); }
     public async Task CloseListAsync(CancellationToken token)
     { RequireSessionAuthority(); Require(await session.CloseRetainerListAsync(token).ConfigureAwait(false)); }
 
-    public async Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token)
+    public async Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token, Action<MarketMutationReceipt>? receiptChanged = null)
     {
         var reports = new List<string>();
         gatherLease = lease;
@@ -113,11 +118,11 @@ internal sealed class MarketRunLiveDriver(
             var player = await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
             var held = player.Stacks.Where(s => s.ItemId == target.ItemId && s.IsHighQuality == (target.Quality == ItemQualityPolicy.HqOnly)).Sum(s => s.Quantity);
             if (held >= target.Units) continue;
-            var guarded = new GatherDriver(transferDriver, this, check, target, deadline, routeDeadline);
+            var guarded = new GatherDriver(transferDriver, this, check, target, deadline, routeDeadline, receiptChanged);
             var operation = journal.CreateManual(owner, [new TargetPlanItem { ItemId = target.ItemId, ItemName = target.ItemName,
                 Quality = target.Quality, TargetQuantity = target.Units }]);
             var coordinator = new TransferCoordinator(journal, guarded, cache, currentOwner,
-                () => new Dictionary<uint, int> { [target.ItemId] = held }, automation);
+                () => new Dictionary<uint, int> { [target.ItemId] = held }, automation, warning: logWarning);
             check();
             await coordinator.ExecuteRetrievalUnderLeaseAsync(operation.OperationId, lease, token).ConfigureAwait(false);
             var outcome = journal.Get(operation.OperationId);
@@ -153,7 +158,8 @@ internal sealed class MarketRunLiveDriver(
             DateTime.UtcNow, stacks.Where(s => s.ItemId == target.ItemId && s.IsHighQuality == (target.Quality == ItemQualityPolicy.HqOnly)).ToArray()));
 
     private sealed class GatherDriver(RetainerLiveDriver inner, MarketRunLiveDriver market, Action check,
-        MarketGatherTarget target, IMarketRunDeadline deadline, IMarketRunDeadline routeDeadline) : IRetainerTransferDriver
+        MarketGatherTarget target, IMarketRunDeadline deadline, IMarketRunDeadline routeDeadline,
+        Action<MarketMutationReceipt>? receiptChanged) : IRetainerTransferDriver
     {
         public bool BlockedByInventory { get; private set; }
         public int InventoryBlockedUnits { get; private set; }
@@ -212,8 +218,30 @@ internal sealed class MarketRunLiveDriver(
                 if (!live.Contains(stack)) { SourceChanged = true; return new(false, 0, "SourceSlotChanged", "Gather source changed."); }
                 check();
                 if (!market.OwnsGatherLease()) return new(false, 0, "LeaseLost", "Gather lease lost.");
+                var receipt = new MarketMutationReceipt
+                { Intent = new("Retrieval", currentRetainer, target.ItemName, null, stack, quantity, 0), RetainerName = CurrentRetainerName };
+                receiptChanged?.Invoke(receipt); // Durable intent before dispatch, just like listing mutations.
                 dispatched = true;
-                return await deadline.RunAsync(t => inner.RetrieveAsync(stack, quantity, before, t)).ConfigureAwait(false);
+                try
+                {
+                    var result = await deadline.RunAsync(t => inner.RetrieveAsync(stack, quantity, before, t)).ConfigureAwait(false);
+                    receipt.Outcome = result.Success && result.Transferred > 0 ? MarketMutationOutcome.Committed :
+                        result.MovementMayHaveOccurred ? MarketMutationOutcome.Indeterminate : MarketMutationOutcome.FailedBeforeSend;
+                    receipt.Code = result.Code; receipt.Message = result.Message;
+                    return result;
+                }
+                catch (Exception e)
+                {
+                    receipt.Outcome = MarketMutationOutcome.Indeterminate;
+                    receipt.Code = "RetrievalFaulted"; receipt.Message = e.Message;
+                    throw;
+                }
+                finally
+                {
+                    if (receipt.Outcome != MarketMutationOutcome.Committed)
+                        market.logWarning?.Invoke($"Retrieval {target.ItemName} at {CurrentRetainerName}: {receipt.Code}: {receipt.Message}");
+                    receiptChanged?.Invoke(receipt);
+                }
             }
             catch (OperationCanceledException) when (!dispatched)
             { return new(false, 0, "GatherCancelled", "Gather cancelled before dispatch."); }
