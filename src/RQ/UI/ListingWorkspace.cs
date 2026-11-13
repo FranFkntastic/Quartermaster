@@ -28,6 +28,10 @@ internal sealed class ListingWorkspace
     private readonly Func<uint, bool?> listability;
     private readonly RetainerRefreshCoordinator refresh;
     private readonly MarketRunPane runPane;
+    private readonly Dalamud.Plugin.Services.IPluginLog log;
+    private bool openFirstRegistered;
+    private bool repeatDetailWarned;
+    private string? duplicateRowsWarned;
     private readonly DalamudTableProjection<ListingRetainerRow> retainerTable;
     private readonly Dictionary<ulong, DalamudSuggestionInputState> addInputs = [];
     internal RQ.Interop.ComplicatedMarketBoardItemClient? ItemClient { get; set; }
@@ -50,8 +54,9 @@ internal sealed class ListingWorkspace
     public ListingWorkspace(WorkbenchState workbench, ListingNavigationCoordinator navigation,
         AgentBridgeUiReviewRegistry registry, ListingPlanDraftSession session,
         Func<string, int, IReadOnlyList<ItemChoice>> searchItems, Func<uint, bool?> listability,
-        RetainerRefreshCoordinator refresh, MarketRunPane runPane)
+        RetainerRefreshCoordinator refresh, MarketRunPane runPane, Dalamud.Plugin.Services.IPluginLog log)
     {
+        this.log = log;
         this.workbench = workbench; this.navigation = navigation; this.registry = registry; this.session = session;
         this.searchItems = searchItems; this.listability = listability; this.refresh = refresh; this.runPane = runPane;
         retainerTable = new(
@@ -155,7 +160,8 @@ internal sealed class ListingWorkspace
             {
                 try
                 {
-                    var ordered = retainerTable.Apply(visible, ImGui.TableGetSortSpecs());
+                    var ordered = DistinctRetainers(retainerTable.Apply(visible, ImGui.TableGetSortSpecs()));
+                    openFirstRegistered = false;
                     for (var index = 0; index < ordered.Count; index++)
                     {
                         var row = ordered[index];
@@ -221,6 +227,29 @@ internal sealed class ListingWorkspace
         if (ImGui.IsItemHovered()) ImGui.SetTooltip($"{row.PlannedSlots} planned · {row.UnplannedSlots} listed off-plan");
     }
 
+    // A retainer listed twice would draw two detail panels and register the same review
+    // control twice in one frame. Keep the first row and say which retainer repeated.
+    private IReadOnlyList<ListingRetainerRow> DistinctRetainers(IReadOnlyList<ListingRetainerRow> rows)
+    {
+        var seen = new HashSet<ulong>();
+        List<ListingRetainerRow>? distinct = null;
+        List<string>? repeated = null;
+        for (var i = 0; i < rows.Count; i++)
+        {
+            if (seen.Add(rows[i].RetainerId)) { distinct?.Add(rows[i]); continue; }
+            distinct ??= rows.Take(i).ToList();
+            (repeated ??= []).Add($"{rows[i].RetainerName} ({rows[i].RetainerId})");
+        }
+        if (repeated is null) { duplicateRowsWarned = null; return rows; }
+        var summary = string.Join(", ", repeated);
+        if (duplicateRowsWarned != summary)
+        {
+            duplicateRowsWarned = summary;
+            log.Warning("ListingRetainerRowsDuplicated retainers=[{Retainers}] rows={Rows} distinct={Distinct}; duplicates hidden", summary, rows.Count, distinct!.Count);
+        }
+        return distinct!;
+    }
+
     private void DrawDetail(QuartermasterRuntimeSnapshot runtime, ListingRetainerRow retainer)
     {
         drawingRetainerId = retainer.RetainerId;
@@ -230,9 +259,17 @@ internal sealed class ListingWorkspace
             ImGui.BeginDisabled(navigation.IsRunning);
             if (ImGui.SmallButton(label)) _ = navigation.OpenRetainerListingsAsync(new(retainer.RetainerId, retainer.RetainerName));
             ImGui.EndDisabled();
-            if (retainer.RetainerId == workbench.SelectedListingRetainerId)
+            if (retainer.RetainerId == workbench.SelectedListingRetainerId && openFirstRegistered && !repeatDetailWarned)
+            {
+                repeatDetailWarned = true;
+                log.Warning("ListingDetailDrawnTwice retainer={Retainer} ({RetainerId}); second open-first registration skipped", retainer.RetainerName, retainer.RetainerId);
+            }
+            if (retainer.RetainerId == workbench.SelectedListingRetainerId && !openFirstRegistered)
+            {
+                openFirstRegistered = true;
                 registry.RegisterLastButton("quartermaster.listings.open-first", label, !navigation.IsRunning,
                     () => _ = navigation.OpenRetainerListingsAsync(new(retainer.RetainerId, retainer.RetainerName)), navigation.IsRunning ? navigation.Status : "Ready");
+            }
         }
         if (retainer.ListingsObserved)
         {

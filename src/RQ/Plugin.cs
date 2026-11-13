@@ -301,7 +301,8 @@ public sealed class Plugin : IDalamudPlugin
             () => vendorCatalogSource.Current,
             new ItemMetadataCatalog(dataManager, log).ResolveWorkshopProject,
             configDirectory,
-            new MarketMafiosoSavedJobClient(pluginInterface));
+            new MarketMafiosoSavedJobClient(pluginInterface),
+            log);
         var marketHistory = new MarketRunHistoryWindow(marketRunStore.History, CurrentOwner)
         {
             Size = new System.Numerics.Vector2(780, 650),
