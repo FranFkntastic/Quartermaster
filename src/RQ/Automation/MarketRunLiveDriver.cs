@@ -77,14 +77,36 @@ internal sealed class MarketRunLiveDriver(
     }
     public async Task<MarketMutationResult> RepriceAsync(RetainerMarketListingTarget listing, uint price, CancellationToken token)
     {
-        RequireSessionAuthority();
-        var result = await session.UpdateSellingListingPriceAsync(listing, price, token).ConfigureAwait(false);
+        RetainerAutomationResult result;
+        try
+        {
+            RequireSessionAuthority();
+            result = await session.UpdateSellingListingPriceAsync(listing, price, token).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is not RetainerMarketMutationIndeterminateException and not OperationCanceledException)
+        {
+            // Franthropy catches every exception once the price request may have been sent and
+            // returns RetainerMarketPriceUpdateIndeterminate, so an exception escaping it was raised
+            // before dispatch. Cancellation keeps its own classification in the executor.
+            return new(MarketMutationOutcome.FailedBeforeSend, "RepriceFaultedBeforeSend", e.Message);
+        }
         return new(ClassifyReprice(result), result.Code, result.Message);
     }
+
+    /// <summary>
+    /// The price change is dispatched only by the editor's confirm click. Every code below is
+    /// returned before that click (policy checks, list/menu/selection, editor entry) and is
+    /// FailedBeforeSend. RetainerSellingListingSelectionIndeterminate is uncertain UI state from
+    /// opening the editor, never a sent price. Fail closed: post-send codes
+    /// (RetainerMarketPriceUpdateIndeterminate), UnexpectedRetainerMarketConfirmation (used both
+    /// before and after the click) and any unknown code stay Indeterminate.
+    /// </summary>
     internal static MarketMutationOutcome ClassifyReprice(RetainerAutomationResult result) => result.Success
         ? MarketMutationOutcome.Committed : result.Code is "InvalidObservedMarketUnitPrice" or "InvalidMarketUnitPrice" or
             "MarketUnitPriceUnchanged" or "InvalidMarketListing" or "RetainerSellingListingTimeout" or "RetainerSellingListingSelectionFailed" or
-            "RetainerSellingListTimeout" or "RetainerIdentityMismatch" or "RetainerMarketUnavailable" or "RetainerMarketListingChanged"
+            "RetainerSellingListingSelectionIndeterminate" or "RetainerSellingListTimeout" or "RetainerIdentityMismatch" or
+            "RetainerMarketUnavailable" or "RetainerMarketListingChanged" or "RetainerMenuUnavailable" or "RetainerCommandUnavailable" or
+            "NativeCapabilityUnavailable"
             ? MarketMutationOutcome.FailedBeforeSend : MarketMutationOutcome.Indeterminate;
     public async Task<MarketMutationResult> PullAsync(RetainerMarketListingTarget listing, CancellationToken token)
     {

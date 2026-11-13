@@ -533,6 +533,7 @@ public sealed class MarketRunExecutor(
         // Listings whose reprice was proven not to have been sent this visit. They stay at
         // their old price; the rest of the visit (other reprices, posts) still runs.
         var leftUnchanged = new List<RetainerMarketListingTarget>();
+        int? unsentBudget = null;
         while (reprice)
         {
             Check(record);
@@ -541,6 +542,9 @@ public sealed class MarketRunExecutor(
                 .Where(m => m.Kind == ListingMatchKind.PriceDiffers &&
                     !leftUnchanged.Contains(listings.FirstOrDefault(l => l.SlotIndex == m.Listing.SlotIndex)!)).ToArray();
             if (priceDifferences.Length == 0) break;
+            // Unsent reprices are bounded by the visit's first count of price differences, so a
+            // listing that keeps shifting slots cannot loop the visit.
+            unsentBudget ??= priceDifferences.Length;
             // Slot numbers are locations, not listing identities. Fresh work must
             // converge instead of skipping a different listing that reused a slot.
             if (previousPriceDifferences is { } previous && priceDifferences.Length >= previous)
@@ -554,11 +558,17 @@ public sealed class MarketRunExecutor(
                 t => driver.RepriceAsync(listing, (uint)assignment.UnitPrice, t)).ConfigureAwait(false);
             if (outcome == MarketMutationOutcome.Unchanged)
             {
-                // Exact original listing re-observed after a pre-send failure: nothing was
-                // dispatched, so the remaining work here is safe. Never resent this visit.
+                // Nothing was dispatched (Mutate logged why), so the remaining work here is
+                // safe. This exact listing is not resent this visit. A sale or slot shift
+                // changes the listing set, so convergence is measured afresh from here.
                 leftUnchanged.Add(listing);
-                warning?.Invoke($"MarketRunRepriceSkipped: {assignment.ItemName} × {listing.Quantity} at {name} left at {listing.UnitPrice?.ToString() ?? "unknown"} gil " +
-                    $"(planned {assignment.UnitPrice}); continuing with the rest of this retainer.");
+                previousPriceDifferences = null;
+                if (leftUnchanged.Count >= unsentBudget)
+                {
+                    warning?.Invoke($"MarketRunRepricePassEnded: {leftUnchanged.Count} reprices at {name} were not sent; " +
+                        "the remaining price differences are left for the next run, continuing with posts.");
+                    break;
+                }
             }
         }
 
@@ -694,20 +704,44 @@ public sealed class MarketRunExecutor(
         Persist(record);
         if (intent.Kind == "Reprice" && receipt.Outcome != MarketMutationOutcome.Committed)
         {
+            // Only a price change that was actually dispatched can be uncertain. A pre-send
+            // failure is Unchanged whatever the listing did since, including selling.
+            var notSent = receipt.Outcome == MarketMutationOutcome.FailedBeforeSend;
+            IReadOnlyList<RetainerMarketListingTarget> live;
             try
             {
-                if (!CanCleanUp(record)) throw new RunStoppedException("Reprice outcome unknown; run authority lost.");
-                var live = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
-                if (!CanCleanUp(record)) throw new RunStoppedException("Reprice outcome unknown; run authority lost.");
-                receipt.Outcome = live.Contains(intent.Listing! with { UnitPrice = intent.Price }) ? MarketMutationOutcome.Committed :
-                    receipt.Outcome == MarketMutationOutcome.FailedBeforeSend && live.Contains(intent.Listing!) ? MarketMutationOutcome.Unchanged : MarketMutationOutcome.Indeterminate;
+                if (!CanCleanUp(record)) throw new RunStoppedException(notSent ? "Run authority lost after an unsent reprice." : "Reprice outcome unknown; run authority lost.");
+                live = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
+                if (!CanCleanUp(record)) throw new RunStoppedException(notSent ? "Run authority lost after an unsent reprice." : "Reprice outcome unknown; run authority lost.");
             }
-            catch
+            catch (Exception e)
             {
+                if (notSent)
+                {
+                    receipt.Outcome = MarketMutationOutcome.Unchanged;
+                    warning?.Invoke($"MarketRunRepriceObservationUnavailable: {intent.ItemName} × {intent.Quantity} slot {intent.Listing!.SlotIndex} at {receipt.RetainerName}: " +
+                        $"reprice failed before send ({receipt.Code}); the re-scan failed ({e.Message}). Nothing was sent, so no check is needed.");
+                    Persist(record);
+                    Add(record, $"{intent.Kind} {intent.ItemName} × {intent.Quantity}: {receipt.Outcome} · {receipt.Code}: {receipt.Message}");
+                    throw;
+                }
                 receipt.Outcome = MarketMutationOutcome.Indeterminate;
                 record.NeedsCheck.Add(intent.RetainerId);
                 Persist(record);
                 throw;
+            }
+            var original = intent.Listing!;
+            if (live.Contains(original with { UnitPrice = intent.Price })) receipt.Outcome = MarketMutationOutcome.Committed;
+            else if (!notSent) receipt.Outcome = MarketMutationOutcome.Indeterminate;
+            else
+            {
+                receipt.Outcome = MarketMutationOutcome.Unchanged;
+                if (live.Contains(original))
+                    warning?.Invoke($"MarketRunRepriceSkipped: {intent.ItemName} × {original.Quantity} slot {original.SlotIndex} at {receipt.RetainerName} left at {original.UnitPrice?.ToString() ?? "unknown"} gil " +
+                        $"(planned {intent.Price}) after {receipt.Code}; not resent this visit, continuing with the rest of this retainer.");
+                else
+                    warning?.Invoke($"MarketRunRepriceListingChanged: {intent.ItemName} × {original.Quantity} at {original.UnitPrice?.ToString() ?? "unknown"} gil slot {original.SlotIndex} at {receipt.RetainerName}: " +
+                        $"{DescribeChange(live, original)}. Reprice failed before send ({receipt.Code}); nothing was sent, continuing with the rest of this retainer.");
             }
         }
         if (receipt.Outcome == MarketMutationOutcome.Indeterminate && !record.NeedsCheck.Contains(intent.RetainerId)) record.NeedsCheck.Add(intent.RetainerId);
@@ -721,6 +755,18 @@ public sealed class MarketRunExecutor(
         return MarketMutationOutcome.Committed;
 
         void Warn() => warning?.Invoke($"{intent.Kind} {intent.ItemName} × {intent.Quantity} at {record.Assignments.FirstOrDefault(a => a.RetainerId == intent.RetainerId)?.RetainerName ?? intent.RetainerId.ToString()}: {receipt.Code}: {receipt.Message}");
+    }
+
+    private string DescribeChange(IReadOnlyList<RetainerMarketListingTarget> live, RetainerMarketListingTarget original)
+    {
+        if (live.FirstOrDefault(l => l != original && l with { SlotIndex = original.SlotIndex } == original) is { } moved)
+            return $"the listing moved to slot {moved.SlotIndex}";
+        var now = live.FirstOrDefault(l => l.SlotIndex == original.SlotIndex);
+        // Gone listings free a slot; this visit's posting pass re-reads the live listings, so
+        // the freed slot and the assignment's new shortfall are counted there and by the top-up.
+        return now is null
+            ? $"the listing is gone (sold or removed) and slot {original.SlotIndex} is now empty; the freed slot counts toward this visit's posts"
+            : $"the listing is gone (sold or removed); slot {original.SlotIndex} now holds {driver.ItemName(now.ItemId)} × {now.Quantity} at {now.UnitPrice?.ToString() ?? "unknown"} gil; the freed slot counts toward this visit's posts";
     }
 
     private Task<bool> Step(Func<CancellationToken, Task> action) => deadline.RunAsync(async t => { await action(t).ConfigureAwait(false); return true; });
