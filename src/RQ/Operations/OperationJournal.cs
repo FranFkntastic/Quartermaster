@@ -481,6 +481,29 @@ public sealed class OperationJournal
         ulong retainerId,
         int quantity,
         string code,
+        string message) =>
+        RecordRetrievalTransferCore(operationId, itemId, isHighQuality, retainerId, quantity, code, message);
+
+    /// <summary>
+    /// Records a verified saddlebag-to-bag retrieval against the same persisted
+    /// retrieval authorization as retainer movement. The receipt has no retainer.
+    /// </summary>
+    public void RecordSaddlebagRetrieval(
+        string operationId,
+        uint itemId,
+        bool isHighQuality,
+        int quantity,
+        string code,
+        string message) =>
+        RecordRetrievalTransferCore(operationId, itemId, isHighQuality, null, quantity, code, message);
+
+    private void RecordRetrievalTransferCore(
+        string operationId,
+        uint itemId,
+        bool isHighQuality,
+        ulong? retainerId,
+        int quantity,
+        string code,
         string message)
     {
         if (quantity <= 0)

@@ -120,6 +120,14 @@ internal sealed class TransferPlanWorkspace
             Id: "accessible-storage",
             HeaderTooltip: "Current matching quantity in accessible retainer storage."),
         new(
+            "Saddlebag",
+            82,
+            row => (row.Line?.SaddlebagQuantity ?? 0).ToString("N0"),
+            row => row.Line?.SaddlebagQuantity ?? 0,
+            Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.DefaultHide,
+            Id: "saddlebag",
+            HeaderTooltip: "Current matching quantity in the saddlebag; retrieved before retainer storage."),
+        new(
             "Outcome",
             100,
             row => TransferOutcome(row).Text,
@@ -242,7 +250,8 @@ internal sealed class TransferPlanWorkspace
             action,
             Math.Abs(row.Difference),
             row.AccessibleStorageQuantity,
-            row.RoutedDepositQuantity);
+            row.RoutedDepositQuantity,
+            row.Line?.SaddlebagQuantity ?? 0);
     }
 
     private static void DrawTransferOutcome(TransferWorkbenchRow row)
@@ -254,6 +263,11 @@ internal sealed class TransferPlanWorkspace
                 ? new Vector4(1f, .7f, .3f, 1f)
                 : TransferPresentation.ActionColor(row.Line?.Action);
         ImGui.TextColored(primaryColor, outcome.Primary);
+        if (!string.IsNullOrWhiteSpace(outcome.Source))
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled($"· {outcome.Source}");
+        }
         if (string.IsNullOrWhiteSpace(outcome.Constraint))
             return;
         ImGui.SameLine();

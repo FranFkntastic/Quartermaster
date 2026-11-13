@@ -25,7 +25,9 @@ internal static class TransferPresentation
             ? "Verify listing demand"
             : row.Line?.Action switch
             {
-                StowageAction.Retrieve => $"Retrieve {row.Line.RetrieveQuantity:N0}",
+                StowageAction.Retrieve => Math.Min(row.Line.RetrieveQuantity, row.Line.SaddlebagQuantity) is > 0 and var fromSaddlebag
+                    ? $"Retrieve {row.Line.RetrieveQuantity:N0} · {fromSaddlebag:N0} saddlebag"
+                    : $"Retrieve {row.Line.RetrieveQuantity:N0}",
                 StowageAction.Deposit => $"Stow {row.Line.DepositQuantity:N0} · {RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner)}",
                 _ => "On target · skip",
             };
