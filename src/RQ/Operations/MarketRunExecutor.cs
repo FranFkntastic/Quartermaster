@@ -49,6 +49,13 @@ public sealed class MarketRunDeadline(TimeSpan timeout) : IMarketRunDeadline
 {
     // Bell routing has its own two-minute budget; leave room for opening the list.
     public static readonly TimeSpan RetainerListTimeout = TimeSpan.FromSeconds(150);
+    // Franthropy's reprice recovers pre-send selection failures for up to 40 attempts, each
+    // bounded in frames (backoff 10, surface release <=360, quiet wait <=360, menu wait <=360,
+    // label settle ~26). With the final release, the post-Adjust-Price editor wait (~360) and
+    // the confirm observation (~360), the worst case is about 45,900 frames: ~12.8 min at
+    // 60 fps, ~25.5 min at 30 fps. Forty minutes stays above that down to about 19 fps, so
+    // this deadline never turns a pre-send recovery into an Indeterminate timeout.
+    public static readonly TimeSpan RepriceTimeout = TimeSpan.FromMinutes(40);
     internal static readonly AsyncLocal<ConcurrentBag<Task>?> Calls = new();
     internal static bool HasUnsettled => Calls.Value?.Any(t => !t.IsCompleted) == true;
     public async Task<T> RunAsync<T>(Func<CancellationToken, Task<T>> action)
@@ -138,9 +145,11 @@ public sealed class MarketRunExecutor(
     IMarketRunDriver driver, AutomationLease automation, Func<ListingPlan?> currentPlan,
     Action<MarketRunRecord> persist, AutoRetainerSuppression? suppression = null,
     IMarketRunDeadline? deadlines = null, Action? clear = null, IMarketRunDeadline? routeDeadlines = null,
-    Action<string>? warning = null, Action<string>? information = null)
+    Action<string>? warning = null, Action<string>? information = null, IMarketRunDeadline? repriceDeadlines = null)
 {
     private readonly IMarketRunDeadline deadline = deadlines ?? new MarketRunDeadline(TimeSpan.FromSeconds(15));
+    // A caller-supplied deadline (tests) also governs reprices unless one is given for them.
+    private readonly IMarketRunDeadline repriceDeadline = repriceDeadlines ?? deadlines ?? new MarketRunDeadline(MarketRunDeadline.RepriceTimeout);
     private readonly IMarketRunDeadline routeDeadline = routeDeadlines ?? new MarketRunDeadline(MarketRunDeadline.RetainerListTimeout);
     private int running;
     private int cancelled;
@@ -690,7 +699,7 @@ public sealed class MarketRunExecutor(
         }
         try
         {
-            var result = await deadline.RunAsync(action).ConfigureAwait(false);
+            var result = await (intent.Kind == "Reprice" ? repriceDeadline : deadline).RunAsync(action).ConfigureAwait(false);
             receipt.Outcome = result.Outcome; receipt.Code = result.Code; receipt.Message = result.Message;
         }
         catch (RetainerMarketMutationIndeterminateException e)

@@ -94,17 +94,18 @@ internal sealed class MarketRunLiveDriver(
     }
 
     /// <summary>
-    /// The price change is dispatched only by the editor's confirm click. Every code below is
-    /// returned before that click (policy checks, list/menu/selection, editor entry) and is
-    /// FailedBeforeSend. RetainerSellingListingSelectionIndeterminate is uncertain UI state from
-    /// opening the editor, never a sent price. Fail closed: post-send codes
-    /// (RetainerMarketPriceUpdateIndeterminate), UnexpectedRetainerMarketConfirmation (used both
-    /// before and after the click) and any unknown code stay Indeterminate.
+    /// FailedBeforeSend codes are returned before the Adjust Price callback fires (policy checks,
+    /// list, row selection, recovery) or, for NativeCapabilityUnavailable, before the editor's
+    /// confirm click. RetainerRepriceRecoveryExhausted means every pre-dispatch selection attempt
+    /// failed. Fail closed: RetainerSellingListingSelectionIndeterminate (after the Adjust Price
+    /// callback), RetainerMarketPriceUpdateIndeterminate (after the confirm click),
+    /// UnexpectedRetainerMarketConfirmation (returned both before and after the click) and any
+    /// unknown code stay Indeterminate.
     /// </summary>
     internal static MarketMutationOutcome ClassifyReprice(RetainerAutomationResult result) => result.Success
         ? MarketMutationOutcome.Committed : result.Code is "InvalidObservedMarketUnitPrice" or "InvalidMarketUnitPrice" or
             "MarketUnitPriceUnchanged" or "InvalidMarketListing" or "RetainerSellingListingTimeout" or "RetainerSellingListingSelectionFailed" or
-            "RetainerSellingListingSelectionIndeterminate" or "RetainerSellingListTimeout" or "RetainerIdentityMismatch" or
+            "RetainerRepriceRecoveryExhausted" or "RetainerSellingListTimeout" or "RetainerIdentityMismatch" or
             "RetainerMarketUnavailable" or "RetainerMarketListingChanged" or "RetainerMenuUnavailable" or "RetainerCommandUnavailable" or
             "NativeCapabilityUnavailable"
             ? MarketMutationOutcome.FailedBeforeSend : MarketMutationOutcome.Indeterminate;
