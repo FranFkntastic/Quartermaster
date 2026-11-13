@@ -4,9 +4,9 @@ using RQ.Planning;
 
 namespace RQ.UI;
 
-internal readonly record struct TransferOutcomePresentation(string Primary, string? Constraint = null)
+internal readonly record struct TransferOutcomePresentation(string Primary, string? Constraint = null, string? Source = null)
 {
-    public string Text => string.IsNullOrWhiteSpace(Constraint) ? Primary : $"{Primary} · {Constraint}";
+    public string Text => string.Join(" · ", new[] { Primary, Source, Constraint }.Where(part => !string.IsNullOrWhiteSpace(part)));
 }
 
 internal static class TransferWorkbenchPresentation
@@ -46,26 +46,28 @@ internal static class TransferWorkbenchPresentation
         StowageAction action,
         int requestedQuantity,
         int accessibleStorageQuantity,
-        int routedDepositQuantity = 0)
+        int routedDepositQuantity = 0,
+        int saddlebagQuantity = 0)
     {
         requestedQuantity = Math.Max(0, requestedQuantity);
         return action switch
         {
-            StowageAction.Retrieve => Retrieval(requestedQuantity, accessibleStorageQuantity),
+            StowageAction.Retrieve => Retrieval(requestedQuantity, accessibleStorageQuantity, saddlebagQuantity),
             StowageAction.Deposit => Deposit(requestedQuantity, routedDepositQuantity),
             _ => new("On target"),
         };
     }
 
-    private static TransferOutcomePresentation Retrieval(int requested, int accessible)
+    private static TransferOutcomePresentation Retrieval(int requested, int accessible, int saddlebag)
     {
-        var retrievable = Math.Min(requested, Math.Max(0, accessible));
+        var fromSaddlebag = Math.Min(requested, Math.Max(0, saddlebag));
+        var retrievable = fromSaddlebag + Math.Min(requested - fromSaddlebag, Math.Max(0, accessible));
         var missing = requested - retrievable;
+        var source = fromSaddlebag > 0 ? $"{fromSaddlebag:N0} saddlebag" : null;
         return missing switch
         {
-            <= 0 => new($"Retrieve {retrievable:N0}"),
-            _ when retrievable == 0 => new("Retrieve 0", $"short {missing:N0}"),
-            _ => new($"Retrieve {retrievable:N0}", $"short {missing:N0}"),
+            <= 0 => new($"Retrieve {retrievable:N0}", Source: source),
+            _ => new($"Retrieve {retrievable:N0}", $"short {missing:N0}", source),
         };
     }
 

@@ -4,6 +4,7 @@ using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.Automation;
+using Franthropy.Dalamud.Automation.Inventory;
 using Franthropy.Dalamud.Automation.Retainers;
 using Franthropy.Dalamud.Automation.Vendors;
 using Franthropy.Dalamud.Automation.Vendors.Coordination;
@@ -47,6 +48,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly RetainerBellRoute retainerBellRoute;
     private readonly OperationJournal journal;
     private readonly TransferCoordinator transfers;
+    private readonly DalamudInventoryMover inventoryMover;
     private readonly ListingNavigationCoordinator listingNavigation;
     private readonly MarketRunExecutor marketRuns;
     private readonly TransferVendorProcurementService vendorProcurement;
@@ -86,7 +88,8 @@ public sealed class Plugin : IDalamudPlugin
         IPluginLog log,
         IObjectTable objects,
         ITargetManager targets,
-        ISigScanner sigScanner)
+        ISigScanner sigScanner,
+        IGameInteropProvider gameInterop)
     {
         this.pluginInterface = pluginInterface;
         this.commands = commands;
@@ -201,6 +204,8 @@ public sealed class Plugin : IDalamudPlugin
             captureSessions,
             CurrentOwner,
             autoRetainerSuppression);
+        // Lazy: constructing the mover installs no hooks and reads no native memory.
+        inventoryMover = new DalamudInventoryMover(sigScanner, gameInterop, dataManager, log);
         transfers = new TransferCoordinator(
             journal,
             driver,
@@ -208,7 +213,11 @@ public sealed class Plugin : IDalamudPlugin
             CurrentOwner,
             CountCachedPlayerItems,
             automation,
-            autoRetainerSuppression: autoRetainerSuppression, warning: message => log.Warning(message));
+            autoRetainerSuppression: autoRetainerSuppression,
+            warning: message => log.Warning(message),
+            saddlebagDriver: new SaddlebagLiveDriver(framework, inventoryMover),
+            cachedSaddlebag: CountCachedSaddlebagItems,
+            information: message => log.Information(message));
         var marketRunStore = new MarketRunStore(Path.Combine(configDirectory, "market-run.json"));
         marketRuns = new(new MarketRunLiveDriver(retainerSession, driver, journal, cache, playerInventory,
                 automation, CurrentOwner, id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.Name.ToString() ?? $"Item {id}", message => log.Warning(message)),
@@ -388,6 +397,13 @@ public sealed class Plugin : IDalamudPlugin
     private IReadOnlyDictionary<uint, int> CountCachedPlayerItems() =>
         playerInventory.Snapshot(CurrentOwner(), scanner.RequestedPlayerStorageSources()).Bags
             .Where(bag => !InventoryScanner.IsSaddlebag(bag.BagName))
+            .SelectMany(bag => bag.Items)
+            .GroupBy(item => item.ItemId)
+            .ToDictionary(group => group.Key, group => group.Sum(item => checked((int)item.Quantity)));
+
+    private IReadOnlyDictionary<uint, int> CountCachedSaddlebagItems() =>
+        playerInventory.Snapshot(CurrentOwner(), scanner.RequestedPlayerStorageSources()).Bags
+            .Where(bag => InventoryScanner.IsSaddlebag(bag.BagName))
             .SelectMany(bag => bag.Items)
             .GroupBy(item => item.ItemId)
             .ToDictionary(group => group.Key, group => group.Sum(item => checked((int)item.Quantity)));
@@ -868,6 +884,7 @@ public sealed class Plugin : IDalamudPlugin
         listingNavigation.Dispose();
         marketRuns.CancelAndWait(TimeSpan.FromSeconds(2));
         window.CancelAndWaitForActiveTransfer(TimeSpan.FromSeconds(2));
+        inventoryMover.Dispose();
         retainerBellRoute.Dispose();
         vendorProcurement.Dispose();
         externalUiSuppression.Dispose();

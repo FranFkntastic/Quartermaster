@@ -57,6 +57,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
     private readonly AutomationLease automation;
     private readonly Func<DateTime> utcNow;
     private readonly RetainerStockMutationPersistence stockMutations;
+    private readonly SaddlebagRetrievalStep? saddlebag;
     private readonly AutoRetainerSuppression? autoRetainerSuppression;
     private readonly TimeSpan autoRetainerWait;
     private readonly TimeSpan autoRetainerPoll;
@@ -77,7 +78,10 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         AutoRetainerSuppression? autoRetainerSuppression = null,
         TimeSpan? autoRetainerWait = null,
         TimeSpan? autoRetainerPoll = null,
-        Action<string>? warning = null)
+        Action<string>? warning = null,
+        ISaddlebagRetrievalDriver? saddlebagDriver = null,
+        Func<IReadOnlyDictionary<uint, int>>? cachedSaddlebag = null,
+        Action<string>? information = null)
     {
         this.journal = journal;
         this.warning = warning;
@@ -91,6 +95,9 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         this.autoRetainerWait = autoRetainerWait ?? TimeSpan.FromSeconds(30);
         this.autoRetainerPoll = autoRetainerPoll ?? TimeSpan.FromMilliseconds(250);
         stockMutations = new(journal, cache, RecoverStockObservationAsync);
+        saddlebag = saddlebagDriver is null
+            ? null
+            : new SaddlebagRetrievalStep(saddlebagDriver, journal, cachedSaddlebag, warning, information);
     }
 
     public bool IsRunning => Volatile.Read(ref running) != 0;
@@ -188,7 +195,8 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                 Quality = line.Quality,
                 Enabled = true,
             }).ToArray();
-            var plan = RestockPlanner.Build(rows, playerInventory(), cache.Snapshot(), owner, utcNow());
+            var baselineInventory = playerInventory();
+            var plan = RestockPlanner.Build(rows, baselineInventory, cache.Snapshot(), owner, utcNow());
             var remaining = plan.Lines
                 .GroupBy(line => RetrievalKey(line.ItemId, line.Quality))
                 .ToDictionary(group => group.Key, group => group.Sum(line => line.NeededQuantity));
@@ -197,7 +205,43 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                 OperationStatuses.Running,
                 "ExecutionStarted",
                 operation.ExecuteImmediately ? "Automatic live retrieval verification started." : "Reviewed live retrieval verification started.");
-            if (plan.NeededQuantity == 0)
+            var transferred = 0;
+            // Saddlebag leg first: the retainers cover only what it leaves short. Gather
+            // runs under a borrowed market lease keep their own retainer-only contract.
+            if (saddlebag is not null && borrowedLease is null && plan.NeededQuantity > 0)
+            {
+                movementAttempted = true;
+                var leg = await saddlebag.ExecuteAsync(
+                    operationId,
+                    plan,
+                    () => !token.IsCancellationRequested && operation.Owner.Matches(currentOwner()),
+                    token).ConfigureAwait(false);
+                movementAttempted = leg.Dispatched;
+                transferred = leg.VerifiedRetrieved;
+                if (leg.Unreconciled is { } unreconciled)
+                {
+                    journal.Transition(operationId, OperationStatuses.Indeterminate, "SaddlebagReconciliationIncomplete", unreconciled);
+                    return new(true, "Saddlebag retrieval could not be reconciled; retainer retrieval was not started.");
+                }
+                // Re-plan per line (item + quality) from the fresh bag reads, never from receipts alone.
+                foreach (var ((itemId, quality), gained) in leg.Credit)
+                {
+                    var key = RetrievalKey(itemId, quality);
+                    if (remaining.ContainsKey(key))
+                        remaining[key] = Math.Max(0, remaining[key] - gained);
+                }
+            }
+            var remainingNeed = remaining.Values.Sum();
+            if (remainingNeed == 0 && transferred > 0)
+            {
+                journal.Transition(
+                    operationId,
+                    OperationStatuses.Succeeded,
+                    "RetrievalComplete",
+                    $"Retrieved {transferred:N0} units from the saddlebag and satisfied every target.");
+                return new(true, "Retrieval completed from the saddlebag.");
+            }
+            if (remainingNeed == 0)
             {
                 journal.Transition(
                     operationId,
@@ -208,7 +252,9 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         : "Reviewed execution confirmed player inventory already satisfies every target.");
                 return new(true, "Player inventory already satisfies every target.");
             }
-            var candidates = plan.Lines.SelectMany(line => line.Candidates.Select(candidate => (line.ItemId, line.Quality, Candidate: candidate)))
+            var candidates = plan.Lines
+                .Where(line => remaining.GetValueOrDefault(RetrievalKey(line.ItemId, line.Quality)) > 0)
+                .SelectMany(line => line.Candidates.Select(candidate => (line.ItemId, line.Quality, Candidate: candidate)))
                 .GroupBy(entry => entry.Candidate.RetainerId)
                 .Select(group => new
                 {
@@ -221,11 +267,19 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                 .ToArray();
             if (candidates.Length == 0)
             {
+                if (transferred > 0)
+                {
+                    journal.Transition(
+                        operationId,
+                        OperationStatuses.PartiallySucceeded,
+                        "RetrievalPartial",
+                        $"Retrieved {transferred:N0} units from the saddlebag; {remainingNeed:N0} units remain and no owner-scoped cached retainer candidates cover them.");
+                    return new(true, "Retrieval completed with missing units.");
+                }
                 journal.Transition(operationId, OperationStatuses.Failed, "NoCachedCandidates", "No owner-scoped cached retainer candidates cover this operation.");
                 return new(true, "No owner-scoped cached retainer candidates cover this operation.");
             }
 
-            var transferred = 0;
             var retainerLegMessage = default(string);
             foreach (var candidate in candidates)
             {

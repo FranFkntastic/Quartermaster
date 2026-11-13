@@ -30,12 +30,16 @@ public sealed record PlanLine(
     IReadOnlyList<RetainerCandidate> Candidates,
     PlanLineStatus Status,
     TimeSpan? OldestEvidenceAge,
-    int SaddlebagQuantity = 0);
+    int SaddlebagQuantity = 0)
+{
+    /// <summary>Units the saddlebag leg retrieves before any retainer is opened.</summary>
+    public int SaddlebagCoverQuantity => Math.Min(NeededQuantity, SaddlebagQuantity);
+}
 
 public sealed record RetrievalPlan(DateTime BuiltAtUtc, IReadOnlyList<PlanLine> Lines)
 {
     public int NeededQuantity => Lines.Sum(line => line.NeededQuantity);
-    public int CoveredQuantity => Lines.Sum(line => Math.Min(line.NeededQuantity, line.CachedRetainerQuantity));
+    public int CoveredQuantity => Lines.Sum(line => Math.Min(line.NeededQuantity, line.SaddlebagCoverQuantity + line.CachedRetainerQuantity));
     public int MissingQuantity => Lines.Sum(line => line.MissingQuantity);
 }
 
@@ -111,15 +115,17 @@ public static class RestockPlanner
                 .ThenBy(candidate => candidate.RetainerName, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
         var cached = candidates.Sum(candidate => candidate.CachedQuantity);
-        var missing = Math.Max(0, needed - cached);
+        // The saddlebag is drawn first; retainers cover only what it leaves short.
+        var retainerNeed = needed - Math.Min(needed, saddlebag);
+        var missing = Math.Max(0, retainerNeed - cached);
         var unverified = cache.Values.Any(retainer => retainer.Owner.Matches(owner) &&
             retainer.IsCurrentlyAssigned is not false && retainer.IsUiAccessible is not false &&
             !StockCoverage.CoversItem(retainer, row.ItemId));
-        var status = needed > cached && unverified
+        var status = retainerNeed > cached && unverified
             ? PlanLineStatus.StockUnverified
             : needed == 0
             ? PlanLineStatus.Satisfied
-            : cached == 0
+            : cached == 0 && retainerNeed == needed
                 ? PlanLineStatus.NoCachedStock
                 : missing > 0 ? PlanLineStatus.Partial : PlanLineStatus.Ready;
         TimeSpan? oldestAge = candidates.Length == 0 ? null : nowUtc - candidates.Min(candidate => candidate.ObservedAtUtc);
