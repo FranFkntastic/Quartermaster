@@ -71,7 +71,7 @@ internal sealed class MarketRunHistoryWindow(MarketRunHistoryStore history, Func
         ImGui.TextDisabled("Needs-check describes this receipt, not the current acknowledgement state.");
         var lines = result.Results.Concat(result.NeedsCheck.Distinct().Select(id =>
                 $"Needs check: {result.NeedsCheckNames.GetValueOrDefault(id) ?? result.Assignments.FirstOrDefault(a => a.RetainerId == id)?.RetainerName ?? id.ToString()}"))
-            .Concat(result.Mutations.Select(m => $"{m.Intent.Kind}: {m.Intent.ItemName} × {m.Intent.Quantity:N0} units · {m.Outcome?.ToString() ?? "Unknown (intent recorded)"}"))
+            .Concat(result.Mutations.Select(m => $"{m.Intent.Kind}: {m.Intent.ItemName} × {m.Intent.Quantity:N0} units ({Retainer(result, m)}) · {m.Outcome?.ToString() ?? "Unknown (intent recorded)"} · {m.Code}: {m.Message}"))
             .ToArray();
         const int outputSize = 50;
         outputPage = Math.Clamp(outputPage, 0, Math.Max(0, (lines.Length - 1) / outputSize));
@@ -88,6 +88,20 @@ internal sealed class MarketRunHistoryWindow(MarketRunHistoryStore history, Func
     }
 
     internal static string Time(DateTime? time) => time is { } value ? $"{value.ToUniversalTime():yyyy-MM-dd HH:mm:ss} UTC" : "Unknown (not recorded)";
+    internal static string Retainer(MarketRunRecord record, MarketMutationReceipt receipt) =>
+        !string.IsNullOrEmpty(receipt.RetainerName) ? receipt.RetainerName :
+        record.NeedsCheckNames.GetValueOrDefault(receipt.Intent.RetainerId) ??
+        record.Assignments.FirstOrDefault(a => a.RetainerId == receipt.Intent.RetainerId)?.RetainerName ?? "Retainer not recorded";
+
+    internal static (string Label, string Detail)[] Unconfirmed(MarketRunRecord record)
+    {
+        var mutations = record.Mutations.Where(m => m.Outcome is null or MarketMutationOutcome.Indeterminate).ToArray();
+        return mutations.Select(m => ($"{m.Intent.Kind.ToLowerInvariant()} ({m.Intent.ItemName}, {Retainer(record, m)})",
+                $"{m.Code}: {m.Message}"))
+            .Concat(record.NeedsCheck.Distinct().Where(id => mutations.All(m => m.Intent.RetainerId != id)).Select(id =>
+                ($"item move ({record.NeedsCheckNames.GetValueOrDefault(id) ?? record.Assignments.FirstOrDefault(a => a.RetainerId == id)?.RetainerName ?? "Retainer not recorded"})", record.Reason)))
+            .DefaultIfEmpty(("item move (details not recorded)", record.Reason)).ToArray();
+    }
     internal static string Summary(MarketRunRecord result)
     {
         int Count(string kind) => result.Mutations.Count(m => m.Intent.Kind == kind && m.Outcome == MarketMutationOutcome.Committed);

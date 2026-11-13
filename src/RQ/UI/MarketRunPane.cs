@@ -169,7 +169,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         var hasWork = run.Retainers.Any(r => r.Assignments.Any(a => a.ShortListings is { IsKnown: true, Value: > 0 } || a.RepriceListings is { IsKnown: true, Value: > 0 }));
         var reason = session.IsDirty ? "Save plan changes first." : !run.IsComplete ? "Observations incomplete." :
             executor.PersistenceError is not null ? executor.PersistenceError :
-            executor.Result?.RequiresAcknowledgement == true ? "Review the unresolved receipt before explicitly acknowledging it." :
+            executor.Result?.RequiresAcknowledgement == true ? "Blocked until you confirm the last run's unconfirmed moves (Review…)" :
             !hasWork ? "Nothing to do." : !executor.CanStart ? "Automation busy." : null;
         ImGui.BeginDisabled(reason is not null);
         if (ImGui.Button("Start run") && ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner) is { } plan)
@@ -187,10 +187,14 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         }
         if (executor.Result is not { } result) return;
         if (!result.Owner.Matches(runtime.Owner)) { ImGui.TextWrapped(ResultOwnerLabel(result.Owner) + " requires review on that character."); return; }
-        ImGui.TextWrapped($"Recovery receipt: {result.State}{(result.RequiresAcknowledgement ? " · Needs check" : string.Empty)}");
-        if (result.Reason.Length > 0 && ImGui.IsItemHovered()) ImGui.SetTooltip(result.Reason);
+        var unconfirmed = MarketRunHistoryWindow.Unconfirmed(result);
+        ImGui.TextWrapped(result.RequiresAcknowledgement
+            ? $"Last run stopped — {unconfirmed.Length} {(unconfirmed.Length == 1 ? unconfirmed[0].Label + " couldn't be confirmed" : "item moves couldn't be confirmed: " + string.Join(", ", unconfirmed.Select(m => m.Label)))}"
+            : $"Last run: {result.State}");
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(result.RequiresAcknowledgement
+            ? string.Join("\n", unconfirmed.Select(m => $"{m.Label}: {m.Detail}")) : result.Reason);
         ImGui.BeginDisabled(executor.IsRunning);
-        if (ImGui.SmallButton(result.RequiresAcknowledgement ? "Review acknowledgement..." : "Clear latest status"))
+        if (ImGui.SmallButton(result.RequiresAcknowledgement ? "Review…" : "Clear latest status"))
         {
             if (result.RequiresAcknowledgement) ImGui.OpenPopup("Acknowledge market receipt");
             else executor.Clear();
@@ -198,9 +202,10 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         ImGui.EndDisabled();
         if (ImGui.BeginPopup("Acknowledge market receipt"))
         {
-            ImGui.TextWrapped("Confirm you have checked the uncertain outcome in game. This removes the recovery gate, never retries a mutation, and keeps the summary in history.");
-            if (ImGui.Button("I checked; acknowledge")) { executor.Clear(); ImGui.CloseCurrentPopup(); }
-            ImGui.SameLine(); if (ImGui.Button("Keep unresolved")) ImGui.CloseCurrentPopup();
+            ImGui.TextWrapped($"Quartermaster couldn't confirm {unconfirmed.Length} item move(s). Check your retainer and inventory in game. New runs stay blocked until you confirm. Nothing will be retried automatically; the summary stays in Market run history.");
+            foreach (var move in unconfirmed) ImGui.TextWrapped($"{move.Label}: {move.Detail}");
+            if (ImGui.Button("Checked, unblock runs")) { executor.Clear(); ImGui.CloseCurrentPopup(); }
+            ImGui.SameLine(); if (ImGui.Button("Not yet")) ImGui.CloseCurrentPopup();
             ImGui.EndPopup();
         }
     }

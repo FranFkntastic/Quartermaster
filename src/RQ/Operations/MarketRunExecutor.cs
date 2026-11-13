@@ -11,6 +11,7 @@ using RQ.Planning;
 namespace RQ.Operations;
 
 public enum MarketMutationOutcome { FailedBeforeSend, Committed, Indeterminate, Unchanged }
+public sealed record MarketMutationResult(MarketMutationOutcome Outcome, string Code = "", string Message = "");
 public sealed record MarketPlayerInventory(IReadOnlyList<DalamudInventoryStack> Stacks, int FreeSlots);
 public sealed record MarketGatherTarget(uint ItemId, string ItemName, ItemQualityPolicy Quality, int Units);
 internal sealed class MarketGatherIndeterminateException(ulong retainerId, string retainerName, string message) : Exception(message)
@@ -30,12 +31,12 @@ public interface IMarketRunDriver
     Task OpenAsync(ulong retainerId, string name, CancellationToken token);
     Task<IReadOnlyList<RetainerMarketListingTarget>> ListingsAsync(CancellationToken token);
     Task<MarketPlayerInventory> PlayerAsync(CancellationToken token);
-    Task<MarketMutationOutcome> RepriceAsync(RetainerMarketListingTarget listing, uint price, CancellationToken token);
-    Task<MarketMutationOutcome> PullAsync(RetainerMarketListingTarget listing, CancellationToken token);
-    Task<MarketMutationOutcome> PostAsync(DalamudInventoryStack source, int quantity, uint price, CancellationToken token);
+    Task<MarketMutationResult> RepriceAsync(RetainerMarketListingTarget listing, uint price, CancellationToken token);
+    Task<MarketMutationResult> PullAsync(RetainerMarketListingTarget listing, CancellationToken token);
+    Task<MarketMutationResult> PostAsync(DalamudInventoryStack source, int quantity, uint price, CancellationToken token);
     Task ReturnAsync(CancellationToken token);
     Task CloseListAsync(CancellationToken token);
-    Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token);
+    Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token, Action<MarketMutationReceipt>? receiptChanged = null);
 }
 
 public interface IMarketRunDeadline
@@ -92,6 +93,9 @@ public sealed class MarketMutationReceipt
     // Null is deliberately persisted before dispatch: after reload it means unknown,
     // not failed, and it never authorizes replay.
     public MarketMutationOutcome? Outcome { get; set; }
+    public string Code { get; set; } = string.Empty;
+    public string Message { get; set; } = string.Empty;
+    public string RetainerName { get; set; } = string.Empty;
 }
 
 public sealed class MarketRunStore(string path)
@@ -128,7 +132,8 @@ public sealed class MarketRunStore(string path)
 public sealed class MarketRunExecutor(
     IMarketRunDriver driver, AutomationLease automation, Func<ListingPlan?> currentPlan,
     Action<MarketRunRecord> persist, AutoRetainerSuppression? suppression = null,
-    IMarketRunDeadline? deadlines = null, Action? clear = null, IMarketRunDeadline? routeDeadlines = null)
+    IMarketRunDeadline? deadlines = null, Action? clear = null, IMarketRunDeadline? routeDeadlines = null,
+    Action<string>? warning = null)
 {
     private readonly IMarketRunDeadline deadline = deadlines ?? new MarketRunDeadline(TimeSpan.FromSeconds(15));
     private readonly IMarketRunDeadline routeDeadline = routeDeadlines ?? new MarketRunDeadline(MarketRunDeadline.RetainerListTimeout);
@@ -217,7 +222,13 @@ public sealed class MarketRunExecutor(
                 var targets = evaluation.Items.Where(i => i.RefillUnits.Value > 0)
                     .Select(i => new MarketGatherTarget(i.ItemId, i.ItemName, i.Quality, i.RefillUnits.Value)).ToArray();
                 // Gather owns per-call deadlines, not a single deadline for a multi-retainer route.
-                record.Results.AddRange(await driver.GatherAsync(targets, lease!, () => Check(record), () => HasSessionAuthority(record), CancellationToken.None).ConfigureAwait(false));
+                record.Results.AddRange(await driver.GatherAsync(targets, lease!, () => Check(record), () => HasSessionAuthority(record), CancellationToken.None, receipt =>
+                {
+                    if (!record.Mutations.Contains(receipt)) record.Mutations.Add(receipt);
+                    if (receipt.Outcome is not null)
+                        Add(record, $"{receipt.Intent.Kind} {receipt.Intent.ItemName} × {receipt.Intent.Quantity}: {receipt.Outcome} · {receipt.Code}: {receipt.Message}");
+                    Persist(record);
+                }).ConfigureAwait(false));
                 record.GatherBlockedUnits += driver.GatherInventoryBlockedUnits;
                 Check(record);
                 await routeDeadline.RunAsync(async t => { await driver.RequireRetainerListAsync(t).ConfigureAwait(false); return true; }).ConfigureAwait(false);
@@ -424,33 +435,48 @@ public sealed class MarketRunExecutor(
         }
     }
 
-    private async Task Mutate(MarketRunRecord record, MarketMutationIntent intent, Func<CancellationToken, Task<MarketMutationOutcome>> action)
+    private async Task Mutate(MarketRunRecord record, MarketMutationIntent intent, Func<CancellationToken, Task<MarketMutationResult>> action)
     {
         Check(record);
-        var receipt = new MarketMutationReceipt { Intent = intent };
+        var receipt = new MarketMutationReceipt { Intent = intent,
+            RetainerName = record.Assignments.FirstOrDefault(a => a.RetainerId == intent.RetainerId)?.RetainerName ?? string.Empty };
         record.Mutations.Add(receipt);
         try { Persist(record); Check(record); } // No dispatch without durable intent and current authority.
         catch (Exception e)
         {
             receipt.Outcome = MarketMutationOutcome.FailedBeforeSend;
+            receipt.Code = "StoppedBeforeSend"; receipt.Message = e.Message;
+            Warn();
+            Add(record, $"{intent.Kind} {intent.ItemName}: {receipt.Code}: {receipt.Message}");
             if (e is OperationCanceledException) throw;
             throw new RunStoppedException(e.Message);
         }
-        try { receipt.Outcome = await deadline.RunAsync(action).ConfigureAwait(false); }
-        catch (RetainerMarketMutationIndeterminateException) { receipt.Outcome = MarketMutationOutcome.Indeterminate; }
-        catch (OperationCanceledException) { receipt.Outcome = MarketMutationOutcome.FailedBeforeSend; }
-        catch (TimeoutException)
+        try
+        {
+            var result = await deadline.RunAsync(action).ConfigureAwait(false);
+            receipt.Outcome = result.Outcome; receipt.Code = result.Code; receipt.Message = result.Message;
+        }
+        catch (RetainerMarketMutationIndeterminateException e)
+        { receipt.Outcome = MarketMutationOutcome.Indeterminate; receipt.Code = e.Code; receipt.Message = e.Message; }
+        catch (OperationCanceledException e)
+        { receipt.Outcome = MarketMutationOutcome.FailedBeforeSend; receipt.Code = "MutationCancelledBeforeSend"; receipt.Message = e.Message; }
+        catch (TimeoutException e)
         {
             driverUnsettled = true;
             receipt.Outcome = MarketMutationOutcome.Indeterminate;
+            receipt.Code = "MutationDeadlineExpired"; receipt.Message = e.Message;
+            Warn();
+            Add(record, $"{intent.Kind} {intent.ItemName}: {receipt.Code}: {receipt.Message}");
             record.NeedsCheck.Add(intent.RetainerId);
             Persist(record);
             throw new InvalidOperationException("Mutation deadline expired without a settled driver; stopped to prevent overlapping requests.");
         }
-        catch
+        catch (Exception e)
         {
             receipt.Outcome = MarketMutationOutcome.Indeterminate;
+            receipt.Code = "MutationFaulted"; receipt.Message = e.Message;
         }
+        if (receipt.Outcome != MarketMutationOutcome.Committed) Warn();
         // A failed reprice has no three-way primitive outcome; verify the exact
         // expected after-state before classifying it, without ever sending again.
         if (intent.Kind != "Reprice" && receipt.Outcome == MarketMutationOutcome.Indeterminate && !record.NeedsCheck.Contains(intent.RetainerId))
@@ -476,10 +502,12 @@ public sealed class MarketRunExecutor(
         }
         if (receipt.Outcome == MarketMutationOutcome.Indeterminate && !record.NeedsCheck.Contains(intent.RetainerId)) record.NeedsCheck.Add(intent.RetainerId);
         Persist(record);
-        Add(record, $"{intent.Kind} {intent.ItemName} × {intent.Quantity}: {receipt.Outcome}{(intent.Kind == "Pull" && receipt.Outcome == MarketMutationOutcome.Committed ? " (player inventory)" : string.Empty)}");
+        Add(record, $"{intent.Kind} {intent.ItemName} × {intent.Quantity}: {receipt.Outcome} · {receipt.Code}: {receipt.Message}{(intent.Kind == "Pull" && receipt.Outcome == MarketMutationOutcome.Committed ? " (player inventory)" : string.Empty)}");
         if (receipt.Outcome == MarketMutationOutcome.Indeterminate && intent.Kind != "Reprice")
             throw new RunStoppedException("Needs a check: inventory mutation outcome unknown.");
         if (receipt.Outcome != MarketMutationOutcome.Committed) throw new RetainerStoppedException();
+
+        void Warn() => warning?.Invoke($"{intent.Kind} {intent.ItemName} at {record.Assignments.FirstOrDefault(a => a.RetainerId == intent.RetainerId)?.RetainerName ?? intent.RetainerId.ToString()}: {receipt.Code}: {receipt.Message}");
     }
 
     private Task<bool> Step(Func<CancellationToken, Task> action) => deadline.RunAsync(async t => { await action(t).ConfigureAwait(false); return true; });

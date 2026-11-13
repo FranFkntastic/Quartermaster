@@ -49,6 +49,7 @@ public interface IRetainerTransferDriver
 public sealed class TransferCoordinator : IRetrievalOperationExecutor
 {
     private readonly OperationJournal journal;
+    private readonly Action<string>? warning;
     private readonly IRetainerTransferDriver driver;
     private readonly RetainerCacheRepository cache;
     private readonly Func<OwnerScope> currentOwner;
@@ -75,9 +76,11 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         Func<DateTime>? utcNow = null,
         AutoRetainerSuppression? autoRetainerSuppression = null,
         TimeSpan? autoRetainerWait = null,
-        TimeSpan? autoRetainerPoll = null)
+        TimeSpan? autoRetainerPoll = null,
+        Action<string>? warning = null)
     {
         this.journal = journal;
+        this.warning = warning;
         this.driver = driver;
         this.cache = cache;
         this.currentOwner = currentOwner;
@@ -277,11 +280,11 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                                 return VerifiedMutationAttempt<RetrievalResult, RetainerVariantObservation>.Unchanged(
                                     new(false, 0, "LeaseLost", "The caller no longer owns the automation lease."));
                             movementAttempted = true;
-                            var result = await driver.RetrieveAsync(
+                            var result = await DiagnoseMutationAsync(operationId, "Retrieval", itemName, candidate.Route.RetainerName, () => driver.RetrieveAsync(
                                 stack,
                                 quantity,
                                 liveVariantQuantities.GetValueOrDefault(variantKey),
-                                mutationToken).ConfigureAwait(false);
+                                mutationToken)).ConfigureAwait(false);
                             if (!result.Success)
                             {
                                 return result.MovementMayHaveOccurred
@@ -304,13 +307,14 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                                         attempt.Evidence != VerifiedMutationEvidence.Unchanged;
                     if (!result.Success)
                     {
+                        warning?.Invoke($"Retrieval {itemName} at {candidate.Route.RetainerName}: {result.Code}: {result.Message}");
+                        journal.RecordWarning(operationId, result.Code, result.Message);
                         if (borrowedLease is not null && !result.MovementMayHaveOccurred)
                         {
                             movementAttempted = false;
                             if (result.Code == "GatherCancelled") throw new OperationCanceledException();
                             if (result.Code is "InventoryFull" or "SourceSlotChanged")
                             {
-                                journal.RecordWarning(operationId, result.Code, result.Message);
                                 continue;
                             }
                         }
@@ -502,11 +506,9 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     : (await driver.ScanPlayerInventoryAsync(wanted, token).ConfigureAwait(false))
                         .Concat(await driver.ScanPlayerCrystalsAsync(wanted, token).ConfigureAwait(false))
                         .ToArray();
-                var depositedSinceScan = new Dictionary<string, int>(StringComparer.Ordinal);
                 foreach (var stack in stacks)
                 {
                     token.ThrowIfCancellationRequested();
-                    var variantKey = OperationJournal.VariantKey(stack.ItemId, stack.IsHighQuality);
                     var stackRemaining = stack.Quantity;
                     var matchingLines = operation.Lines
                         .Where(line => line.ItemId == stack.ItemId && line.IsHighQuality == stack.IsHighQuality)
@@ -537,25 +539,26 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                                 (bool Success, int Transferred, string Code, string Message) result;
                                 if (stack.Container == FFXIVClientStructs.FFXIV.Client.Game.InventoryType.Crystals)
                                 {
-                                    var crystal = await driver.DepositCrystalAsync(stack, quantity, mutationToken).ConfigureAwait(false);
+                                    var crystal = await DiagnoseMutationAsync(operationId, "Deposit", itemName, candidate.RetainerName,
+                                        () => driver.DepositCrystalAsync(stack, quantity, mutationToken)).ConfigureAwait(false);
                                     result = (crystal.Success, crystal.Transferred, crystal.Code, crystal.Message);
                                 }
                                 else
                                 {
-                                    var item = await driver.DepositAsync(stack, quantity, mutationToken).ConfigureAwait(false);
+                                    var item = await DiagnoseMutationAsync(operationId, "Deposit", itemName, candidate.RetainerName,
+                                        () => driver.DepositAsync(stack, quantity, mutationToken)).ConfigureAwait(false);
                                     result = (item.Success, item.Transferred, item.Code, item.Message);
                                 }
                                 if (!result.Success)
                                 {
                                     if (result.Code == "NoCapacity")
                                         return VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Unchanged(result);
-                                    if (result.Code == "DepositNotObserved" &&
-                                        await PlayerVariantUnchangedAsync(stacks, depositedSinceScan, variantKey, stack.ItemId, mutationToken).ConfigureAwait(false))
-                                        return VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Unchanged(result);
                                     return VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Indeterminate(result);
                                 }
                                 if (result.Transferred <= 0)
-                                    return VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Unchanged(result);
+                                    return result.Code == "NoCapacity"
+                                        ? VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Unchanged(result)
+                                        : VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Indeterminate(result);
                                 var observation = await ObserveVariantAsync(
                                     candidate.RetainerId,
                                     stack.ItemId,
@@ -566,23 +569,24 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                             },
                             token).ConfigureAwait(false);
                         var result = attempt.Result;
+                        if (!result.Success || result.Transferred <= 0)
+                        {
+                            warning?.Invoke($"Deposit {itemName} at {candidate.RetainerName}: {result.Code}: {result.Message}");
+                            journal.RecordWarning(operationId, result.Code, result.Message);
+                        }
                         movementAttempted = previousMovementAttempted ||
                                             attempt.Evidence != VerifiedMutationEvidence.Unchanged;
                         if (!result.Success &&
                             attempt.Evidence == VerifiedMutationEvidence.Unchanged &&
-                            result.Code is "NoCapacity" or "DepositNotObserved")
+                            result.Code == "NoCapacity")
                         {
-                            if (result.Code == "DepositNotObserved")
-                                candidateCapacity[key] = 0;
                             journal.RecordWarning(
                                 operationId,
-                                result.Code == "NoCapacity" ? "DepositSkippedNoCapacity" : "DepositSkippedUnobserved",
-                                result.Code == "NoCapacity"
-                                    ? $"{candidate.RetainerName} reported no live capacity for {itemName}; its remaining quantity will try other candidates."
-                                    : $"Deposit of {itemName} at {candidate.RetainerName} could not be observed and the player stack is provably unchanged; its remaining quantity will try other candidates.");
+                                "DepositSkippedNoCapacity",
+                                $"{candidate.RetainerName} reported no live capacity for {itemName}; its remaining quantity will try other candidates. {result.Code}: {result.Message}");
                             continue;
                         }
-                        if (!result.Success)
+                        if (!result.Success || attempt.Evidence == VerifiedMutationEvidence.Indeterminate)
                             throw new InvalidOperationException(result.Message);
                         if (result.Transferred == 0)
                         {
@@ -605,7 +609,6 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                                 $"{candidate.RetainerName} accepted only {result.Transferred:N0} of the requested {quantity:N0} {itemName}; later stacks may still merge into any compatible capacity that remains.");
                         }
                         stackRemaining -= result.Transferred;
-                        depositedSinceScan[variantKey] = depositedSinceScan.GetValueOrDefault(variantKey) + result.Transferred;
                         transferred += result.Transferred;
                         if (legacyCrystalDeposit)
                             journal.RecordTransfer(operationId, stack.ItemId, candidate.RetainerId, result.Transferred, result.Code, result.Message);
@@ -899,23 +902,16 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         }
     }
 
-    private async Task<bool> PlayerVariantUnchangedAsync(
-        IReadOnlyList<DalamudInventoryStack> scanStacks,
-        IReadOnlyDictionary<string, int> depositedSinceScan,
-        string variantKey,
-        uint itemId,
-        CancellationToken cancellationToken)
+    private async Task<T> DiagnoseMutationAsync<T>(string operationId, string kind, string item, string retainer, Func<Task<T>> action)
     {
-        var scanned = scanStacks
-            .Where(stack => OperationJournal.VariantKey(stack.ItemId, stack.IsHighQuality) == variantKey)
-            .Sum(stack => stack.Quantity);
-        var expected = scanned - depositedSinceScan.GetValueOrDefault(variantKey);
-        var itemIds = new HashSet<uint> { itemId };
-        var current = (await driver.ScanPlayerInventoryAsync(itemIds, cancellationToken).ConfigureAwait(false))
-            .Concat(await driver.ScanPlayerCrystalsAsync(itemIds, cancellationToken).ConfigureAwait(false))
-            .Where(stack => OperationJournal.VariantKey(stack.ItemId, stack.IsHighQuality) == variantKey)
-            .Sum(stack => stack.Quantity);
-        return current == expected;
+        try { return await action().ConfigureAwait(false); }
+        catch (Exception exception)
+        {
+            var code = kind + "Faulted";
+            warning?.Invoke($"{kind} {item} at {retainer}: {code}: {exception.Message}");
+            journal.RecordWarning(operationId, code, exception.Message);
+            throw;
+        }
     }
 
     private async Task<RetainerVariantObservation> RecoverStockObservationAsync(RetainerStockMutationIntent intent)
