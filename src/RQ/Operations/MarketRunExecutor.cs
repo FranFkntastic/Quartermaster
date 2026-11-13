@@ -49,13 +49,11 @@ public sealed class MarketRunDeadline(TimeSpan timeout) : IMarketRunDeadline
 {
     // Bell routing has its own two-minute budget; leave room for opening the list.
     public static readonly TimeSpan RetainerListTimeout = TimeSpan.FromSeconds(150);
-    // Franthropy's reprice recovers pre-send selection failures for up to 40 attempts, each
-    // bounded in frames (backoff 10, surface release <=360, quiet wait <=360, menu wait <=360,
-    // label settle ~26). With the final release, the post-Adjust-Price editor wait (~360) and
-    // the confirm observation (~360), the worst case is about 45,900 frames: ~12.8 min at
-    // 60 fps, ~25.5 min at 30 fps. Forty minutes stays above that down to about 19 fps, so
-    // this deadline never turns a pre-send recovery into an Indeterminate timeout.
-    public static readonly TimeSpan RepriceTimeout = TimeSpan.FromMinutes(40);
+    // Franthropy bounds a reprice in wall-clock time: pre-send recovery is capped at 45 s, the
+    // editor gets 5 s to appear and the confirm 6 s to be observed, so with frame overshoot the
+    // worst case is about 60 s. 75 s leaves a margin, so this deadline never turns a pre-send
+    // recovery into an Indeterminate timeout.
+    public static readonly TimeSpan RepriceTimeout = TimeSpan.FromSeconds(75);
     internal static readonly AsyncLocal<ConcurrentBag<Task>?> Calls = new();
     internal static bool HasUnsettled => Calls.Value?.Any(t => !t.IsCompleted) == true;
     public async Task<T> RunAsync<T>(Func<CancellationToken, Task<T>> action)

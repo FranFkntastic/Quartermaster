@@ -96,16 +96,18 @@ internal sealed class MarketRunLiveDriver(
     /// <summary>
     /// FailedBeforeSend codes are returned before the Adjust Price callback fires (policy checks,
     /// list, row selection, recovery) or, for NativeCapabilityUnavailable, before the editor's
-    /// confirm click. RetainerRepriceRecoveryExhausted means every pre-dispatch selection attempt
-    /// failed. Fail closed: RetainerSellingListingSelectionIndeterminate (after the Adjust Price
-    /// callback), RetainerMarketPriceUpdateIndeterminate (after the confirm click),
+    /// confirm click. RetainerRepriceRecoveryExhausted means pre-send recovery ran out of attempts
+    /// or wall-clock budget; RetainerRepriceEditorAbandonedUnsent means the editor was closed
+    /// unconfirmed and the listing was proven unchanged. Fail closed:
+    /// RetainerSellingListingSelectionIndeterminate (nothing-sent could not be proven),
+    /// RetainerMarketPriceUpdateIndeterminate (after the confirm click),
     /// UnexpectedRetainerMarketConfirmation (returned both before and after the click) and any
     /// unknown code stay Indeterminate.
     /// </summary>
     internal static MarketMutationOutcome ClassifyReprice(RetainerAutomationResult result) => result.Success
         ? MarketMutationOutcome.Committed : result.Code is "InvalidObservedMarketUnitPrice" or "InvalidMarketUnitPrice" or
             "MarketUnitPriceUnchanged" or "InvalidMarketListing" or "RetainerSellingListingTimeout" or "RetainerSellingListingSelectionFailed" or
-            "RetainerRepriceRecoveryExhausted" or "RetainerSellingListTimeout" or "RetainerIdentityMismatch" or
+            "RetainerRepriceRecoveryExhausted" or "RetainerRepriceEditorAbandonedUnsent" or "RetainerSellingListTimeout" or "RetainerIdentityMismatch" or
             "RetainerMarketUnavailable" or "RetainerMarketListingChanged" or "RetainerMenuUnavailable" or "RetainerCommandUnavailable" or
             "NativeCapabilityUnavailable"
             ? MarketMutationOutcome.FailedBeforeSend : MarketMutationOutcome.Indeterminate;
