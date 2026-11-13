@@ -12,7 +12,8 @@ internal sealed class MarketRunLiveDriver(
     IRetainerAutomationSession session, RetainerLiveDriver transferDriver,
     OperationJournal journal, RetainerCacheRepository cache, PlayerInventoryCacheRepository playerCache,
     AutomationLease automation, Func<OwnerScope> currentOwner, Func<uint, string> itemName,
-    Action<string>? warning = null) : IMarketRunDriver
+    Action<string>? warning = null, ISaddlebagRetrievalDriver? saddlebag = null,
+    Func<IReadOnlyDictionary<uint, int>>? cachedSaddlebag = null, Action<string>? information = null) : IMarketRunDriver
 {
     private readonly Action<string>? logWarning = warning;
     private static readonly InventoryType[] Bags = [InventoryType.Inventory1, InventoryType.Inventory2, InventoryType.Inventory3, InventoryType.Inventory4];
@@ -76,14 +77,39 @@ internal sealed class MarketRunLiveDriver(
     }
     public async Task<MarketMutationResult> RepriceAsync(RetainerMarketListingTarget listing, uint price, CancellationToken token)
     {
-        RequireSessionAuthority();
-        var result = await session.UpdateSellingListingPriceAsync(listing, price, token).ConfigureAwait(false);
+        RetainerAutomationResult result;
+        try
+        {
+            RequireSessionAuthority();
+            result = await session.UpdateSellingListingPriceAsync(listing, price, token).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is not RetainerMarketMutationIndeterminateException and not OperationCanceledException)
+        {
+            // Franthropy catches every exception once the price request may have been sent and
+            // returns RetainerMarketPriceUpdateIndeterminate, so an exception escaping it was raised
+            // before dispatch. Cancellation keeps its own classification in the executor.
+            return new(MarketMutationOutcome.FailedBeforeSend, "RepriceFaultedBeforeSend", e.Message);
+        }
         return new(ClassifyReprice(result), result.Code, result.Message);
     }
+
+    /// <summary>
+    /// FailedBeforeSend codes are returned before the Adjust Price callback fires (policy checks,
+    /// list, row selection, recovery) or, for NativeCapabilityUnavailable, before the editor's
+    /// confirm click. RetainerRepriceRecoveryExhausted means pre-send recovery ran out of attempts
+    /// or wall-clock budget; RetainerRepriceEditorAbandonedUnsent means the editor was closed
+    /// unconfirmed and the listing was proven unchanged. Fail closed:
+    /// RetainerSellingListingSelectionIndeterminate (nothing-sent could not be proven),
+    /// RetainerMarketPriceUpdateIndeterminate (after the confirm click),
+    /// UnexpectedRetainerMarketConfirmation (returned both before and after the click) and any
+    /// unknown code stay Indeterminate.
+    /// </summary>
     internal static MarketMutationOutcome ClassifyReprice(RetainerAutomationResult result) => result.Success
         ? MarketMutationOutcome.Committed : result.Code is "InvalidObservedMarketUnitPrice" or "InvalidMarketUnitPrice" or
             "MarketUnitPriceUnchanged" or "InvalidMarketListing" or "RetainerSellingListingTimeout" or "RetainerSellingListingSelectionFailed" or
-            "RetainerSellingListTimeout" or "RetainerIdentityMismatch" or "RetainerMarketUnavailable" or "RetainerMarketListingChanged"
+            "RetainerRepriceRecoveryExhausted" or "RetainerRepriceEditorAbandonedUnsent" or "RetainerSellingListTimeout" or "RetainerIdentityMismatch" or
+            "RetainerMarketUnavailable" or "RetainerMarketListingChanged" or "RetainerMenuUnavailable" or "RetainerCommandUnavailable" or
+            "NativeCapabilityUnavailable"
             ? MarketMutationOutcome.FailedBeforeSend : MarketMutationOutcome.Indeterminate;
     public async Task<MarketMutationResult> PullAsync(RetainerMarketListingTarget listing, CancellationToken token)
     {
@@ -122,7 +148,13 @@ internal sealed class MarketRunLiveDriver(
             var operation = journal.CreateManual(owner, [new TargetPlanItem { ItemId = target.ItemId, ItemName = target.ItemName,
                 Quality = target.Quality, TargetQuantity = target.Units }]);
             var coordinator = new TransferCoordinator(journal, guarded, cache, currentOwner,
-                () => new Dictionary<uint, int> { [target.ItemId] = held }, automation, warning: logWarning);
+                () => new Dictionary<uint, int> { [target.ItemId] = held }, automation, warning: logWarning,
+                saddlebagDriver: target.AllowSaddlebag ? saddlebag : null, cachedSaddlebag: cachedSaddlebag, information: information,
+                // The same mutation authority GatherDriver.RetrieveAsync enforces: run cancel and
+                // plan or owner change refuse every saddlebag dispatch from that point on. It is a
+                // predicate, not a token, so an already-dispatched move is still observed to its end.
+                callerAuthority: () => { try { check(); return HasSessionAuthority(); } catch { return false; } },
+                saddlebagAttempt: attempt => receiptChanged?.Invoke(SaddlebagReceipt(attempt)));
             check();
             await coordinator.ExecuteRetrievalUnderLeaseAsync(operation.OperationId, lease, token).ConfigureAwait(false);
             var outcome = journal.Get(operation.OperationId);
@@ -150,6 +182,24 @@ internal sealed class MarketRunLiveDriver(
         }
         return reports;
     }
+    internal const string SaddlebagKind = "SaddlebagRetrieval";
+
+    /// <summary>
+    /// One terminal saddlebag attempt as a run receipt, so the run's no-repeat rules see it.
+    /// A move that may have happened without a proven arrival is Indeterminate.
+    /// </summary>
+    private static MarketMutationReceipt SaddlebagReceipt(SaddlebagAttemptReport attempt) => new()
+    {
+        Intent = new(SaddlebagKind, 0, attempt.ItemName, null, attempt.Source, attempt.Quantity, 0),
+        RetainerName = "Saddlebag",
+        Outcome = attempt.Outcome == InventoryMoveOutcome.Retrieved ? MarketMutationOutcome.Committed
+            : attempt.MayHaveMoved ? MarketMutationOutcome.Indeterminate
+            : attempt.Outcome == InventoryMoveOutcome.NotEnqueued ? MarketMutationOutcome.Unchanged
+            : MarketMutationOutcome.FailedBeforeSend,
+        Code = attempt.Code,
+        Message = attempt.Message,
+    };
+
     private static void Require(RetainerAutomationResult result)
     { if (!result.Success) throw new InvalidOperationException($"{result.Code}: {result.Message}"); }
 

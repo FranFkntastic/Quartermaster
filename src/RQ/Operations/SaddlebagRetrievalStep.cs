@@ -26,6 +26,20 @@ public sealed record SaddlebagMoveResult(
     DalamudInventoryStack? StagedPiece = null,
     DalamudInventoryStack? Destination = null);
 
+/// <summary>
+/// Terminal result of one saddlebag stack attempt, reported to the caller. <paramref name="MayHaveMoved"/>
+/// is true when items may have left the source slot without a proven arrival.
+/// </summary>
+public sealed record SaddlebagAttemptReport(
+    uint ItemId,
+    string ItemName,
+    DalamudInventoryStack Source,
+    int Quantity,
+    InventoryMoveOutcome Outcome,
+    string Code,
+    string Message,
+    bool MayHaveMoved);
+
 public interface ISaddlebagRetrievalDriver
 {
     Task<SaddlebagInventoryRead> ReadAsync(CancellationToken cancellationToken);
@@ -51,7 +65,8 @@ internal sealed class SaddlebagRetrievalStep(
     OperationJournal journal,
     Func<IReadOnlyDictionary<uint, int>>? cachedSaddlebag,
     Action<string>? warning,
-    Action<string>? information)
+    Action<string>? information,
+    Action<SaddlebagAttemptReport>? attempted = null)
 {
     private static readonly IReadOnlySet<InventoryMoveOutcome> StopsLeg = new HashSet<InventoryMoveOutcome>
     {
@@ -126,6 +141,17 @@ internal sealed class SaddlebagRetrievalStep(
             var mayHaveMoved = false;
             foreach (var (stack, quantity) in sources)
             {
+                // No new stack starts once the caller's authority is gone (run cancelled, plan
+                // changed, lease lost). Moves already dispatched were observed to an outcome above.
+                if (!stillAuthorized())
+                {
+                    Report(operationId, "SaddlebagRetrievalStopped", nameof(InventoryMoveOutcome.NotAuthorized), line.ItemName, line.ItemId, line.Quality, quantity,
+                        "caller authority ended (run cancelled, plan changed or lease lost); no further saddlebag stack is started.");
+                    attempted?.Invoke(new(line.ItemId, line.ItemName, stack, quantity, InventoryMoveOutcome.NotAuthorized,
+                        nameof(InventoryMoveOutcome.NotAuthorized), "Caller authority ended before this stack; nothing dispatched.", false));
+                    stop = true;
+                    break;
+                }
                 dispatched = true;
                 var result = await RetrieveOneAsync(operationId, line, stack, quantity, stillAuthorized, token).ConfigureAwait(false);
                 verified += result.Retrieved;
@@ -180,9 +206,15 @@ internal sealed class SaddlebagRetrievalStep(
     {
         var first = await driver.RetrieveAsync(stack, quantity, stillAuthorized, token).ConfigureAwait(false);
         if (first.Outcome == InventoryMoveOutcome.Retrieved)
+        {
+            Attempted(line, stack, quantity, first, mayHaveMoved: false);
             return new(Complete(operationId, line, stack, quantity, first), null);
+        }
         if (first.Outcome != InventoryMoveOutcome.Staged)
+        {
+            Attempted(line, stack, quantity, first, MayHaveMoved(first.Outcome));
             return new(0, Fail(operationId, line, stack, quantity, first, staged: false), MayHaveMoved(first.Outcome));
+        }
 
         information?.Invoke(Describe("SaddlebagRetrievalStaged", first.Code, line, stack, quantity,
             $"split to {Slot(first.StagedPiece)}; retrieving that piece once."));
@@ -194,13 +226,17 @@ internal sealed class SaddlebagRetrievalStep(
                 Code = "StagedPieceUnexpected",
                 Message = $"Staged piece {Slot(first.StagedPiece)} x{first.StagedPiece?.Quantity ?? 0} does not match requested {quantity:N0}. {first.Message}",
             };
+            Attempted(line, stack, quantity, unexpected, mayHaveMoved: true);
             return new(0, Fail(operationId, line, stack, quantity, unexpected, staged: true));
         }
 
         // Exactly one follow-up: the staged piece as a whole stack.
         var second = await driver.RetrieveAsync(piece, piece.Quantity, stillAuthorized, token).ConfigureAwait(false);
         if (second.Outcome == InventoryMoveOutcome.Retrieved)
+        {
+            Attempted(line, piece, piece.Quantity, second, mayHaveMoved: false);
             return new(Complete(operationId, line, piece, piece.Quantity, second), null);
+        }
         if (second.Outcome == InventoryMoveOutcome.Staged)
             second = second with
             {
@@ -208,8 +244,12 @@ internal sealed class SaddlebagRetrievalStep(
                 Code = "StagedTwice",
                 Message = $"A whole-stack retrieval of the staged piece staged again. {second.Message}",
             };
+        Attempted(line, piece, piece.Quantity, second, MayHaveMoved(second.Outcome));
         return new(0, Fail(operationId, line, piece, piece.Quantity, second, staged: true));
     }
+
+    private void Attempted(PlanLine line, DalamudInventoryStack source, int quantity, SaddlebagMoveResult result, bool mayHaveMoved) =>
+        attempted?.Invoke(new(line.ItemId, line.ItemName, source, quantity, result.Outcome, result.Code, result.Message, mayHaveMoved));
 
     private int Complete(string operationId, PlanLine line, DalamudInventoryStack source, int quantity, SaddlebagMoveResult result)
     {

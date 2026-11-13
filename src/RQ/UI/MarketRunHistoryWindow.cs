@@ -105,6 +105,7 @@ internal sealed class MarketRunHistoryWindow(MarketRunHistoryStore history, Func
     internal static string Summary(MarketRunRecord result)
     {
         int Count(string kind) => result.Mutations.Count(m => m.Intent.Kind == kind && m.Outcome == MarketMutationOutcome.Committed);
-        return $"Posted {Count("Post")} · Repriced {Count("Reprice")} · Pulled {Count("Pull")} listings · Still short {(result.ListingSummaryComplete ? result.StillShort.ToString("N0") : "unknown")} listings · No slot {result.NoSlot} listings · Inventory blocked {result.NoInventorySpace} listings · Gather blocked {result.GatherBlockedUnits} units · Split stacks {result.SplitStacks}";
+        return $"Posted {Count("Post")} · Repriced {Count("Reprice")} · Pulled {Count("Pull")} listings · Still short {(result.ListingSummaryComplete ? result.StillShort.ToString("N0") : "unknown")} listings · No slot {result.NoSlot} listings · Inventory blocked {result.NoInventorySpace} listings · Gather blocked {result.GatherBlockedUnits} units · Split stacks {result.SplitStacks}" +
+            (result.TopUpShortfall > 0 ? $" · Top-up posted {result.Mutations.Count(m => m.TopUp && m.Intent.Kind == "Post" && m.Outcome == MarketMutationOutcome.Committed)} of {result.TopUpShortfall} listings" : string.Empty);
     }
 }
