@@ -263,7 +263,7 @@ public sealed class PlayerInventoryCacheRepository : IDisposable
                 return;
             // Observe() can replace an entry in place, so hand off a private dictionary.
             // Entries themselves are never mutated once they are in the cache.
-            store.SaveInBackground(new Dictionary<ulong, CachedPlayerInventory>(cache), Revision);
+            _ = store.SaveInBackground(new Dictionary<ulong, CachedPlayerInventory>(cache), Revision);
             persistenceDirty = false;
         }
     }

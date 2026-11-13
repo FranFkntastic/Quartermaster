@@ -28,8 +28,9 @@ internal sealed class RetainerStockMutationPersistence(
     {
         if (mutation.RetainerId != intent.RetainerId)
             throw new InvalidOperationException("Verified stock evidence belongs to a different retainer.");
-        cache.ReplaceObservedVariant(mutation);
-        return ValueTask.CompletedTask;
+        // The journal marker is resolved right after this returns, so success must mean
+        // the committed stock is durable; a failed write keeps the marker for recovery.
+        return new ValueTask(cache.ReplaceObservedVariantDurablyAsync(mutation));
     }
 
     public async ValueTask InvalidateAsync(RetainerStockMutationIntent intent)

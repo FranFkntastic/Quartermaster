@@ -48,7 +48,9 @@ public sealed record CacheWriteFailure(
 /// Persists whole-cache snapshots off the calling thread. Only the latest handed-off
 /// snapshot is written, and snapshots must not be mutated after handoff. Every write
 /// runs under the supplied write gate so owners can serialize synchronous rewrites
-/// (and discard queued snapshots) against the worker.
+/// (and discard queued snapshots) against the worker. Each handoff returns an
+/// acknowledgment that completes once a snapshot at or after its revision is durable,
+/// and faults when that write fails or cannot finish before shutdown.
 /// </summary>
 internal sealed class CoalescingCacheWriter<TValue> : IDisposable
 {
@@ -57,6 +59,7 @@ internal sealed class CoalescingCacheWriter<TValue> : IDisposable
     private readonly SemaphoreSlim writeGate;
     private readonly object gate = new();
     private readonly CancellationTokenSource shutdown = new();
+    private readonly List<(long Revision, TaskCompletionSource Completion)> waiters = [];
     private IReadOnlyDictionary<ulong, TValue>? pending;
     private long pendingRevision;
     private Channel<bool>? signals;
@@ -71,7 +74,11 @@ internal sealed class CoalescingCacheWriter<TValue> : IDisposable
 
     public event Action<CacheWriteFailure>? WriteFailed;
 
-    public void Enqueue(IReadOnlyDictionary<ulong, TValue> snapshot, long revision)
+    /// <summary>
+    /// Queues the snapshot. The returned task completes when this revision (or a later
+    /// one) is durable and faults if that write fails; callers may ignore it.
+    /// </summary>
+    public Task Enqueue(IReadOnlyDictionary<ulong, TValue> snapshot, long revision)
     {
         lock (gate)
         {
@@ -79,9 +86,12 @@ internal sealed class CoalescingCacheWriter<TValue> : IDisposable
             {
                 pending = snapshot;
                 pendingRevision = revision;
+                // Continuations must not run on the worker while it holds the write gate.
+                var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                waiters.Add((revision, completion));
                 EnsureWorker();
                 signals!.Writer.TryWrite(true);
-                return;
+                return completion.Task;
             }
         }
 
@@ -89,7 +99,8 @@ internal sealed class CoalescingCacheWriter<TValue> : IDisposable
         writeGate.Wait();
         try
         {
-            WriteOrReport(snapshot, revision, attempt: 1, retryAllowed: false);
+            WriteOrReport(snapshot, revision, attempt: 1, retryAllowed: false, out var failure);
+            return failure is null ? Task.CompletedTask : Task.FromException(failure);
         }
         finally
         {
@@ -103,6 +114,12 @@ internal sealed class CoalescingCacheWriter<TValue> : IDisposable
         lock (gate)
             pending = null;
     }
+
+    /// <summary>Acknowledges every waiter at or before a revision another write made durable.</summary>
+    public void MarkPersisted(long revision) => Resolve(revision, failure: null);
+
+    /// <summary>Faults every waiter at or before a revision whose write failed.</summary>
+    public void MarkFailed(long revision, Exception failure) => Resolve(revision, failure);
 
     public void Dispose()
     {
@@ -120,6 +137,8 @@ internal sealed class CoalescingCacheWriter<TValue> : IDisposable
         if (running is null || running.Wait(DisposeFlushTimeout))
         {
             shutdown.Dispose();
+            // Nothing should remain once the worker drained; never leave a waiter hanging.
+            Resolve(long.MaxValue, new InvalidOperationException("The cache writer shut down before this snapshot was persisted."));
             return;
         }
 
@@ -130,14 +149,27 @@ internal sealed class CoalescingCacheWriter<TValue> : IDisposable
             unwritten = pending;
             revision = pendingRevision;
         }
-        WriteFailed?.Invoke(new(
-            store.Path,
-            revision,
-            unwritten?.Count ?? -1,
-            0,
-            false,
-            new TimeoutException(
-                $"Cache write did not finish within {DisposeFlushTimeout.TotalSeconds:0}s of shutdown; the latest snapshot may not be durable.")));
+        var timeout = new TimeoutException(
+            $"Cache write did not finish within {DisposeFlushTimeout.TotalSeconds:0}s of shutdown; the latest snapshot may not be durable.");
+        Resolve(long.MaxValue, timeout);
+        WriteFailed?.Invoke(new(store.Path, revision, unwritten?.Count ?? -1, 0, false, timeout));
+    }
+
+    private void Resolve(long revision, Exception? failure)
+    {
+        List<TaskCompletionSource> resolved;
+        lock (gate)
+        {
+            resolved = waiters.Where(waiter => waiter.Revision <= revision).Select(waiter => waiter.Completion).ToList();
+            waiters.RemoveAll(waiter => waiter.Revision <= revision);
+        }
+        foreach (var completion in resolved)
+        {
+            if (failure is null)
+                completion.TrySetResult();
+            else
+                completion.TrySetException(failure);
+        }
     }
 
     private void EnsureWorker()
@@ -177,7 +209,7 @@ internal sealed class CoalescingCacheWriter<TValue> : IDisposable
                         pending = null;
                         stopping = disposed;
                     }
-                    if (snapshot is not null && WriteOrReport(snapshot, revision, attempt, retryAllowed: !stopping))
+                    if (snapshot is not null && WriteOrReport(snapshot, revision, attempt, retryAllowed: !stopping, out _))
                     {
                         retry = true;
                         lock (gate)
@@ -211,19 +243,32 @@ internal sealed class CoalescingCacheWriter<TValue> : IDisposable
         }
     }
 
-    /// <summary>Writes the snapshot; returns true when a failed write should be retried.</summary>
-    private bool WriteOrReport(IReadOnlyDictionary<ulong, TValue> snapshot, long revision, int attempt, bool retryAllowed)
+    /// <summary>
+    /// Writes the snapshot and resolves its waiters; returns true when a failed write
+    /// should be retried. Waiters fail on the first failed attempt so a durability
+    /// acknowledgment is never held open by an unbounded retry loop.
+    /// </summary>
+    private bool WriteOrReport(
+        IReadOnlyDictionary<ulong, TValue> snapshot,
+        long revision,
+        int attempt,
+        bool retryAllowed,
+        out Exception? failure)
     {
         try
         {
             store.Save(snapshot.ToDictionary(entry => entry.Key, entry => entry.Value));
+            failure = null;
+            MarkPersisted(revision);
             return false;
         }
         catch (Exception exception)
         {
             // Only filesystem failures are worth retrying; anything else is reported
             // once and the next mutation hands off a fresh snapshot.
+            failure = exception;
             var retry = retryAllowed && exception is IOException or UnauthorizedAccessException;
+            MarkFailed(revision, exception);
             WriteFailed?.Invoke(new(store.Path, revision, snapshot.Count, attempt, retry, exception));
             return retry;
         }
@@ -298,7 +343,7 @@ public sealed class RetainerCacheStore : IDisposable
     /// Hands the snapshot to the background writer; the latest snapshot wins. The
     /// dictionary and its retainers must not be mutated after this call.
     /// </summary>
-    public void SaveInBackground(IReadOnlyDictionary<ulong, CachedRetainer> cache, long revision) =>
+    public Task SaveInBackground(IReadOnlyDictionary<ulong, CachedRetainer> cache, long revision) =>
         cacheWriter.Enqueue(cache, revision);
 
     public void SaveListing(CachedRetainer retainer)
@@ -320,16 +365,29 @@ public sealed class RetainerCacheStore : IDisposable
         }
     }
 
-    public void SaveAfterInvalidation(IReadOnlyDictionary<ulong, CachedRetainer> cache)
+    /// <summary>
+    /// Synchronously rewrites the cache after an invalidation. <paramref name="revision"/> is the
+    /// repository revision <paramref name="cache"/> reflects; it supersedes queued snapshots.
+    /// </summary>
+    public void SaveAfterInvalidation(IReadOnlyDictionary<ulong, CachedRetainer> cache, long revision)
     {
         listingWriteGate.Wait();
         try
         {
             // This rewrite supersedes any queued snapshot, which may predate the invalidation.
             cacheWriter.DiscardPending();
-            File.Delete(Path);
-            if (cache.Count > 0)
-                Save(cache);
+            try
+            {
+                File.Delete(Path);
+                if (cache.Count > 0)
+                    Save(cache);
+            }
+            catch (Exception exception)
+            {
+                cacheWriter.MarkFailed(revision, exception);
+                throw;
+            }
+            cacheWriter.MarkPersisted(revision);
             Dictionary<ulong, RetainerListingCheckpoint>? listingSnapshot = null;
             lock (listingGate)
             {
@@ -508,7 +566,7 @@ public sealed class PlayerInventoryCacheStore : IDisposable
     /// Hands the snapshot to the background writer; the latest snapshot wins. The
     /// dictionary and its entries must not be mutated after this call.
     /// </summary>
-    public void SaveInBackground(IReadOnlyDictionary<ulong, CachedPlayerInventory> cache, long revision) =>
+    public Task SaveInBackground(IReadOnlyDictionary<ulong, CachedPlayerInventory> cache, long revision) =>
         writer.Enqueue(cache, revision);
 
     public void Dispose() => writer.Dispose();

@@ -94,7 +94,7 @@ public sealed class RetainerCacheRepository : IDisposable
         {
             var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [retainer.RetainerId] = retainer };
             cache = candidate;
-            store.SaveInBackground(candidate, ++Revision);
+            _ = store.SaveInBackground(candidate, ++Revision);
         }
         Changed?.Invoke(RetainerCacheChangeKind.All);
     }
@@ -147,7 +147,7 @@ public sealed class RetainerCacheRepository : IDisposable
                 candidate[entry.RetainerId] = current;
             }
             cache = candidate;
-            store.SaveInBackground(candidate, ++Revision);
+            _ = store.SaveInBackground(candidate, ++Revision);
         }
         Changed?.Invoke(RetainerCacheChangeKind.All);
     }
@@ -171,7 +171,7 @@ public sealed class RetainerCacheRepository : IDisposable
             updated.UiAccessibilityObservedAtUtc = observedAtUtc;
             var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [retainerId] = updated };
             cache = candidate;
-            store.SaveInBackground(candidate, ++Revision);
+            _ = store.SaveInBackground(candidate, ++Revision);
         }
         Changed?.Invoke(RetainerCacheChangeKind.All);
     }
@@ -206,7 +206,7 @@ public sealed class RetainerCacheRepository : IDisposable
             var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [retainerId] = updated };
             cache = candidate;
             var revision = ++Revision;
-            store.SaveInBackground(candidate, revision);
+            _ = store.SaveInBackground(candidate, revision);
             var domains = RetainerEvidenceDomain.None;
             if (InventoryScanner.RequiredRetainerContainers
                 .Select(container => container.ToString())
@@ -246,14 +246,22 @@ public sealed class RetainerCacheRepository : IDisposable
             var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [retainerId] = updated };
             cache = candidate;
             var revision = ++Revision;
-            store.SaveInBackground(candidate, revision);
+            _ = store.SaveInBackground(candidate, revision);
             receipt = new(revision, retainerId, owner with { }, evidenceSessionId, RetainerEvidenceDomain.Gil, observedAtUtc, "RetainerGilObserved", "Retainer gil evidence was accepted.");
         }
         Changed?.Invoke(RetainerCacheChangeKind.Stock);
         EvidenceAccepted?.Invoke(receipt);
     }
 
-    public void ReplaceObservedVariant(RetainerVariantObservation observation)
+    public void ReplaceObservedVariant(RetainerVariantObservation observation) =>
+        _ = ReplaceObservedVariantDurablyAsync(observation);
+
+    /// <summary>
+    /// Applies the variant like <see cref="ReplaceObservedVariant"/> and returns a task that completes
+    /// once the resulting snapshot is durable (faulting if that write fails). Verified mutation
+    /// commits await it before their recovery marker may be resolved.
+    /// </summary>
+    public Task ReplaceObservedVariantDurablyAsync(RetainerVariantObservation observation)
     {
         if (observation.RetainerId == 0)
             throw new ArgumentOutOfRangeException(nameof(observation), "A stable retainer identity is required.");
@@ -267,6 +275,7 @@ public sealed class RetainerCacheRepository : IDisposable
             throw new InvalidOperationException("Observed stacks do not describe one valid item variant.");
         }
 
+        Task persisted;
         lock (gate)
         {
             if (!cache.TryGetValue(observation.RetainerId, out var current))
@@ -308,9 +317,10 @@ public sealed class RetainerCacheRepository : IDisposable
 
             var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [observation.RetainerId] = updated };
             cache = candidate;
-            store.SaveInBackground(candidate, ++Revision);
+            persisted = store.SaveInBackground(candidate, ++Revision);
         }
         Changed?.Invoke(RetainerCacheChangeKind.Stock);
+        return persisted;
     }
 
     public void ReplaceListings(RetainerListingsObservation observation)
@@ -478,7 +488,7 @@ public sealed class RetainerCacheRepository : IDisposable
                 Revision++;
                 changed = true;
             }
-            try { store.SaveAfterInvalidation(candidate); }
+            try { store.SaveAfterInvalidation(candidate, Revision); }
             catch (Exception exception) { persistenceError = exception; }
         }
         if (changed) Changed?.Invoke(RetainerCacheChangeKind.Stock);
@@ -500,7 +510,7 @@ public sealed class RetainerCacheRepository : IDisposable
             }
             try
             {
-                store.SaveAfterInvalidation(candidate);
+                store.SaveAfterInvalidation(candidate, Revision);
             }
             catch (Exception exception)
             {
