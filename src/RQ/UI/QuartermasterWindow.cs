@@ -76,7 +76,8 @@ public sealed class QuartermasterWindow : Window
         Func<GilVendorCatalog>? vendorCatalogSource,
         Func<uint, uint?> resolveWorkshopProject,
         string configDirectory,
-        RQ.Interop.MarketMafiosoSavedJobClient marketImporter)
+        RQ.Interop.MarketMafiosoSavedJobClient marketImporter,
+        Dalamud.Plugin.Services.IPluginLog log)
         : base(MainWindowName, ImGuiWindowFlags.NoScrollbar)
     {
         this.state = state;
@@ -145,7 +146,8 @@ public sealed class QuartermasterWindow : Window
             SearchListableItems,
             Listability,
             retainerRefresh,
-            marketRunPane);
+            marketRunPane,
+            log);
         TransferReviewDialog? transferReview = null;
         VendorProcurementReviewDialog? vendorReview = null;
         transferPlanWorkspace = new(
