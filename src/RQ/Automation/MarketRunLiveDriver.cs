@@ -12,7 +12,8 @@ internal sealed class MarketRunLiveDriver(
     IRetainerAutomationSession session, RetainerLiveDriver transferDriver,
     OperationJournal journal, RetainerCacheRepository cache, PlayerInventoryCacheRepository playerCache,
     AutomationLease automation, Func<OwnerScope> currentOwner, Func<uint, string> itemName,
-    Action<string>? warning = null) : IMarketRunDriver
+    Action<string>? warning = null, ISaddlebagRetrievalDriver? saddlebag = null,
+    Func<IReadOnlyDictionary<uint, int>>? cachedSaddlebag = null, Action<string>? information = null) : IMarketRunDriver
 {
     private readonly Action<string>? logWarning = warning;
     private static readonly InventoryType[] Bags = [InventoryType.Inventory1, InventoryType.Inventory2, InventoryType.Inventory3, InventoryType.Inventory4];
@@ -122,7 +123,8 @@ internal sealed class MarketRunLiveDriver(
             var operation = journal.CreateManual(owner, [new TargetPlanItem { ItemId = target.ItemId, ItemName = target.ItemName,
                 Quality = target.Quality, TargetQuantity = target.Units }]);
             var coordinator = new TransferCoordinator(journal, guarded, cache, currentOwner,
-                () => new Dictionary<uint, int> { [target.ItemId] = held }, automation, warning: logWarning);
+                () => new Dictionary<uint, int> { [target.ItemId] = held }, automation, warning: logWarning,
+                saddlebagDriver: saddlebag, cachedSaddlebag: cachedSaddlebag, information: information);
             check();
             await coordinator.ExecuteRetrievalUnderLeaseAsync(operation.OperationId, lease, token).ConfigureAwait(false);
             var outcome = journal.Get(operation.OperationId);

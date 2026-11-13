@@ -206,6 +206,7 @@ public sealed class Plugin : IDalamudPlugin
             autoRetainerSuppression);
         // Lazy: constructing the mover installs no hooks and reads no native memory.
         inventoryMover = new DalamudInventoryMover(sigScanner, gameInterop, dataManager, log);
+        var saddlebagDriver = new SaddlebagLiveDriver(framework, inventoryMover);
         transfers = new TransferCoordinator(
             journal,
             driver,
@@ -215,13 +216,15 @@ public sealed class Plugin : IDalamudPlugin
             automation,
             autoRetainerSuppression: autoRetainerSuppression,
             warning: message => log.Warning(message),
-            saddlebagDriver: new SaddlebagLiveDriver(framework, inventoryMover),
+            saddlebagDriver: saddlebagDriver,
             cachedSaddlebag: CountCachedSaddlebagItems,
             information: message => log.Information(message));
         var marketRunStore = new MarketRunStore(Path.Combine(configDirectory, "market-run.json"));
         marketRuns = new(new MarketRunLiveDriver(retainerSession, driver, journal, cache, playerInventory,
-                automation, CurrentOwner, id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.Name.ToString() ?? $"Item {id}", message => log.Warning(message)),
-            automation, () => state.Read(s => ListingPlanCatalog.OwnerPlan(s, CurrentOwner())), marketRunStore.Save, autoRetainerSuppression, clear: marketRunStore.Clear, warning: message => log.Warning(message));
+                automation, CurrentOwner, id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.Name.ToString() ?? $"Item {id}", message => log.Warning(message),
+                saddlebagDriver, CountCachedSaddlebagItems, message => log.Information(message)),
+            automation, () => state.Read(s => ListingPlanCatalog.OwnerPlan(s, CurrentOwner())), marketRunStore.Save, autoRetainerSuppression, clear: marketRunStore.Clear, warning: message => log.Warning(message),
+            information: message => log.Information(message));
         marketRuns.Restore(marketRunStore.Load());
         activeMarketRuns = marketRuns;
         automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerSuppression);

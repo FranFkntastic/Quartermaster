@@ -83,6 +83,8 @@ public sealed class MarketRunRecord
     public int NoInventorySpace { get; set; }
     public int GatherBlockedUnits { get; set; }
     public int SplitStacks { get; set; }
+    /// <summary>Listings the end-of-run top-up pass set out to cover, from this run's final scans.</summary>
+    public int TopUpShortfall { get; set; }
     public bool RequiresAcknowledgement => State == "Interrupted" || NeedsCheck.Count > 0 ||
         Mutations.Any(m => m.Outcome is null or MarketMutationOutcome.Indeterminate);
 }
@@ -96,6 +98,8 @@ public sealed class MarketMutationReceipt
     public string Code { get; set; } = string.Empty;
     public string Message { get; set; } = string.Empty;
     public string RetainerName { get; set; } = string.Empty;
+    /// <summary>True when the end-of-run top-up pass dispatched this mutation.</summary>
+    public bool TopUp { get; set; }
 }
 
 public sealed class MarketRunStore(string path)
@@ -133,7 +137,7 @@ public sealed class MarketRunExecutor(
     IMarketRunDriver driver, AutomationLease automation, Func<ListingPlan?> currentPlan,
     Action<MarketRunRecord> persist, AutoRetainerSuppression? suppression = null,
     IMarketRunDeadline? deadlines = null, Action? clear = null, IMarketRunDeadline? routeDeadlines = null,
-    Action<string>? warning = null)
+    Action<string>? warning = null, Action<string>? information = null)
 {
     private readonly IMarketRunDeadline deadline = deadlines ?? new MarketRunDeadline(TimeSpan.FromSeconds(15));
     private readonly IMarketRunDeadline routeDeadline = routeDeadlines ?? new MarketRunDeadline(MarketRunDeadline.RetainerListTimeout);
@@ -142,6 +146,11 @@ public sealed class MarketRunExecutor(
     private bool driverUnsettled;
     private bool persistenceFailed;
     private IDisposable? runLease;
+    // Per run: the latest final-scan shortfall per assignment and the listings that scan saw.
+    // Only these fresh observations drive the top-up pass, never the listing cache.
+    private readonly Dictionary<Guid, int> shortByAssignment = [];
+    private readonly Dictionary<ulong, IReadOnlyList<RetainerMarketListingTarget>> freshListings = [];
+    private bool topUpActive;
     private readonly object persistenceGate = new();
     public bool IsRunning => Volatile.Read(ref running) != 0;
     private bool disposed;
@@ -196,6 +205,9 @@ public sealed class MarketRunExecutor(
             runLease = lease;
             driverUnsettled = false;
             persistenceFailed = false;
+            shortByAssignment.Clear();
+            freshListings.Clear();
+            topUpActive = false;
             var record = new MarketRunRecord { StartedAtUtc = DateTime.UtcNow, PlanId = plan.Id, PlanRevision = plan.Revision, Owner = plan.Owner with { },
                 Assignments = plan.Assignments.Where(a => a.Enabled).Select(ListingPlanCatalog.Copy).ToList() };
             AutoRetainerSuppression.Scope? scope = null;
@@ -222,72 +234,15 @@ public sealed class MarketRunExecutor(
                 var targets = evaluation.Items.Where(i => i.RefillUnits.Value > 0)
                     .Select(i => new MarketGatherTarget(i.ItemId, i.ItemName, i.Quality, i.RefillUnits.Value)).ToArray();
                 // Gather owns per-call deadlines, not a single deadline for a multi-retainer route.
-                record.Results.AddRange(await driver.GatherAsync(targets, lease!, () => Check(record), () => HasSessionAuthority(record), CancellationToken.None, receipt =>
-                {
-                    if (!record.Mutations.Contains(receipt)) record.Mutations.Add(receipt);
-                    if (receipt.Outcome is not null)
-                        Add(record, $"{receipt.Intent.Kind} {receipt.Intent.ItemName} × {receipt.Intent.Quantity}: {receipt.Outcome} · {receipt.Code}: {receipt.Message}");
-                    Persist(record);
-                }).ConfigureAwait(false));
-                record.GatherBlockedUnits += driver.GatherInventoryBlockedUnits;
+                await GatherAsync(record, targets).ConfigureAwait(false);
                 Check(record);
                 await routeDeadline.RunAsync(async t => { await driver.RequireRetainerListAsync(t).ConfigureAwait(false); return true; }).ConfigureAwait(false);
-                foreach (var retainer in record.Assignments.GroupBy(a => a.RetainerId)
-                    .Select(g => new { Id = g.Key, Name = g.Select(a => a.RetainerName).FirstOrDefault(n => !string.IsNullOrWhiteSpace(n)) ?? $"Retainer {g.Key}", Assignments = g.ToArray() })
-                    .OrderBy(g => g.Name, StringComparer.OrdinalIgnoreCase).ThenBy(g => g.Id))
-                {
-                    Check(record);
-                    Status = retainer.Name;
-                    var id = retainer.Id;
-                    var assignments = retainer.Assignments;
-                    var opened = false;
-                    try
-                    {
-                        await Step(t => driver.OpenAsync(id, retainer.Name, t)).ConfigureAwait(false);
-                        opened = true;
-                        await ListRetainer(record, id, retainer.Name, assignments).ConfigureAwait(false);
-                    }
-                    catch (RetainerStoppedException) { }
-                    catch (OperationCanceledException) { throw; }
-                    catch (RunStoppedException) { throw; }
-                    catch (Exception e) when (!persistenceFailed && !driverUnsettled && !MarketRunDeadline.HasUnsettled)
-                    { Add(record, $"{retainer.Name}: {e.Message}"); }
-                    finally
-                    {
-                        // A best-effort final scan is also required for an indeterminate mutation.
-                        try
-                        {
-                            if (opened && CanCleanUp(record))
-                            {
-                                var final = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
-                                if (CanCleanUp(record))
-                                {
-                                    var matches = ListingPlanEvaluator.MatchListings(assignments, Rows(id, retainer.Name, final));
-                                    foreach (var a in assignments)
-                                    {
-                                        var present = matches.Count(m => m.AssignmentId == a.Id && m.Kind is ListingMatchKind.Exact or ListingMatchKind.PriceDiffers or ListingMatchKind.UnknownPrice);
-                                        record.StillShort += Math.Max(0, a.ListingCount - present);
-                                    }
-                                    scannedRetainers.Add(id);
-                                }
-                            }
-                        }
-                        catch (Exception e)
-                        {
-                            Add(record, $"{retainer.Name}: final scan unavailable ({e.Message})");
-                            if (MarketRunDeadline.HasUnsettled)
-                            {
-                                driverUnsettled = true;
-                                throw new RunStoppedException("Final listing scan has not settled; run stopped to prevent overlapping session calls.");
-                            }
-                        }
-                        // Recheck after the final scan: unload or character change can
-                        // happen while that read is in flight, too.
-                        if (CanCleanUp(record))
-                            await Step(driver.ReturnAsync).ConfigureAwait(false);
-                    }
-                    Check(record);
-                }
+                var visits = record.Assignments.GroupBy(a => a.RetainerId)
+                    .Select(g => new RetainerVisit(g.Key, g.Select(a => a.RetainerName).FirstOrDefault(n => !string.IsNullOrWhiteSpace(n)) ?? $"Retainer {g.Key}", g.ToArray()))
+                    .OrderBy(g => g.Name, StringComparer.OrdinalIgnoreCase).ThenBy(g => g.Id).ToArray();
+                foreach (var visit in visits)
+                    await VisitRetainerAsync(record, visit, scannedRetainers, reprice: true).ConfigureAwait(false);
+                await TopUpAsync(record, visits, scannedRetainers).ConfigureAwait(false);
                 record.State = record.NeedsCheck.Count > 0 ? "Stopped" : "Completed";
                 if (record.NeedsCheck.Count > 0) record.Reason = "Needs a check: reprice outcome unknown.";
             }
@@ -328,16 +283,263 @@ public sealed class MarketRunExecutor(
         }
     }
 
-    private async Task ListRetainer(MarketRunRecord record, ulong id, string name, ListingPlanAssignment[] assignments)
+    private sealed record RetainerVisit(ulong Id, string Name, ListingPlanAssignment[] Assignments);
+
+    private async Task GatherAsync(MarketRunRecord record, IReadOnlyList<MarketGatherTarget> targets)
+    {
+        // Gather owns per-call deadlines, not a single deadline for a multi-retainer route.
+        var reports = await driver.GatherAsync(targets, runLease!, () => Check(record), () => HasSessionAuthority(record), CancellationToken.None, receipt =>
+        {
+            if (!record.Mutations.Contains(receipt)) { receipt.TopUp = topUpActive; record.Mutations.Add(receipt); }
+            if (receipt.Outcome is not null)
+                Add(record, $"{receipt.Intent.Kind} {receipt.Intent.ItemName} × {receipt.Intent.Quantity}: {receipt.Outcome} · {receipt.Code}: {receipt.Message}");
+            Persist(record);
+        }).ConfigureAwait(false);
+        foreach (var report in reports) Add(record, report);
+        record.GatherBlockedUnits += driver.GatherInventoryBlockedUnits;
+    }
+
+    private async Task VisitRetainerAsync(MarketRunRecord record, RetainerVisit visit, HashSet<ulong> scannedRetainers, bool reprice)
+    {
+        Check(record);
+        Status = topUpActive ? $"Top-up · {visit.Name}" : visit.Name;
+        var (id, name, assignments) = (visit.Id, visit.Name, visit.Assignments);
+        // A revisit must rescan; a failed rescan leaves the summary incomplete, not stale.
+        scannedRetainers.Remove(id);
+        var opened = false;
+        try
+        {
+            await Step(t => driver.OpenAsync(id, name, t)).ConfigureAwait(false);
+            opened = true;
+            await ListRetainer(record, id, name, assignments, reprice).ConfigureAwait(false);
+        }
+        catch (RetainerStoppedException) { }
+        catch (OperationCanceledException) { throw; }
+        catch (RunStoppedException) { throw; }
+        catch (Exception e) when (!persistenceFailed && !driverUnsettled && !MarketRunDeadline.HasUnsettled)
+        {
+            warning?.Invoke($"MarketRunRetainerVisitEnded: retainer={name}{(topUpActive ? " (top-up)" : string.Empty)}: {e.Message}");
+            Add(record, $"{name}: {e.Message}");
+        }
+        finally
+        {
+            // A best-effort final scan is also required for an indeterminate mutation.
+            try
+            {
+                if (opened && CanCleanUp(record))
+                {
+                    var final = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
+                    if (CanCleanUp(record))
+                    {
+                        var matches = ListingPlanEvaluator.MatchListings(assignments, Rows(id, name, final));
+                        foreach (var a in assignments)
+                        {
+                            var present = matches.Count(m => m.AssignmentId == a.Id && m.Kind is ListingMatchKind.Exact or ListingMatchKind.PriceDiffers or ListingMatchKind.UnknownPrice);
+                            shortByAssignment[a.Id] = Math.Max(0, a.ListingCount - present);
+                        }
+                        // Still short is the latest fresh scan per assignment, so a top-up revisit replaces it.
+                        record.StillShort = shortByAssignment.Values.Sum();
+                        freshListings[id] = final;
+                        scannedRetainers.Add(id);
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Add(record, $"{name}: final scan unavailable ({e.Message})");
+                if (MarketRunDeadline.HasUnsettled)
+                {
+                    driverUnsettled = true;
+                    throw new RunStoppedException("Final listing scan has not settled; run stopped to prevent overlapping session calls.");
+                }
+            }
+            // Recheck after the final scan: unload or character change can
+            // happen while that read is in flight, too.
+            if (CanCleanUp(record))
+                await Step(driver.ReturnAsync).ConfigureAwait(false);
+        }
+        Check(record);
+    }
+
+    private sealed record TopUpLine(RetainerVisit Visit, ListingPlanAssignment Assignment, int Listings)
+    {
+        public int Units => Listings * Assignment.QuantityPerListing;
+        public string Describe => $"{Assignment.ItemName} ({Assignment.Quality}) at {Visit.Name}: short {Listings} listings × {Assignment.QuantityPerListing} = {Units} units";
+    }
+
+    /// <summary>
+    /// One extra gather → post pass for shortfalls this run's own final scans found. Never a
+    /// loop, never after a needs-check, and never a resend: every mutation is a new intent
+    /// that the same verified machinery dispatches and classifies.
+    /// </summary>
+    private async Task TopUpAsync(MarketRunRecord record, IReadOnlyList<RetainerVisit> visits, HashSet<ulong> scannedRetainers)
+    {
+        if (record.NeedsCheck.Count > 0 || record.Mutations.Any(m => m.Outcome is null or MarketMutationOutcome.Indeterminate))
+        {
+            if (record.StillShort > 0)
+            {
+                var reason = $"MarketRunTopUpSkipped: run={record.Id:N} reason=NeedsCheck; a mutation outcome is unknown, so {record.StillShort} short listings are left for the check.";
+                warning?.Invoke(reason);
+                Add(record, $"Top-up skipped: needs a check first ({record.StillShort} short listings left)");
+            }
+            return;
+        }
+        Check(record);
+        // The top-up never repeats work this run already attempted and failed, even when it
+        // failed before send: a post or pull that did not commit rules out its retainer, and a
+        // retrieval that did not commit rules out its item.
+        var failedPosting = record.Mutations.Where(m => m.Intent.Kind is "Post" or "Pull" && m.Outcome != MarketMutationOutcome.Committed)
+            .GroupBy(m => m.Intent.RetainerId).ToDictionary(g => g.Key, g => g.First());
+        var failedRetrieval = record.Mutations.Where(m => m.Intent.Kind == "Retrieval" && m.Outcome != MarketMutationOutcome.Committed && m.Intent.Source is not null)
+            .GroupBy(m => (m.Intent.Source!.ItemId, m.Intent.Source.IsHighQuality)).ToDictionary(g => g.Key, g => g.First());
+        var lines = new List<TopUpLine>();
+        var uncovered = new Dictionary<Guid, string>();
+        foreach (var visit in visits)
+        {
+            var shortHere = visit.Assignments.Where(a => a.QuantityPerListing > 0 && a.ListingCount > 0).ToArray();
+            if (freshListings.ContainsKey(visit.Id))
+            {
+                var excluded = shortHere.Where(a => shortByAssignment.GetValueOrDefault(a.Id) > 0 &&
+                    (failedPosting.ContainsKey(visit.Id) || failedRetrieval.ContainsKey((a.ItemId, a.Quality == ItemQualityPolicy.HqOnly)))).ToArray();
+                foreach (var a in excluded)
+                {
+                    var prior = failedPosting.GetValueOrDefault(visit.Id) ?? failedRetrieval[(a.ItemId, a.Quality == ItemQualityPolicy.HqOnly)];
+                    UncoveredWarning(record, a, visit.Name, shortByAssignment[a.Id], "PriorMutationFailed",
+                        $"{prior.Intent.Kind} {prior.Intent.ItemName} × {prior.Intent.Quantity} at {(prior.RetainerName.Length > 0 ? prior.RetainerName : prior.Intent.RetainerId.ToString())} " +
+                        $"ended {prior.Outcome?.ToString() ?? "unresolved"} ({prior.Code}) earlier this run and is not repeated");
+                }
+                shortHere = shortHere.Except(excluded).ToArray();
+            }
+            if (!freshListings.TryGetValue(visit.Id, out var listings))
+            {
+                // No fresh observation this run: the cache is never a top-up source of truth.
+                if (shortHere.Length > 0)
+                {
+                    warning?.Invoke($"MarketRunTopUpShortfallUncovered: reason=NoFreshObservation retainer={visit.Name} items={string.Join(", ", shortHere.Select(a => a.ItemName).Distinct())}; " +
+                        "the retainer's listings were not scanned at the end of its visit, so its shortfall is unknown and the cache is not used.");
+                    record.Results.Add($"Top-up · uncovered · {visit.Name}: NoFreshObservation");
+                }
+                continue;
+            }
+            var room = Math.Max(0, MarketRunPlanner.ListingCapacity - listings.Count) +
+                MarketRunPlanner.SelectListingsToPull(Rows(visit.Id, visit.Name, listings), visit.Assignments, listings.Count + MarketRunPlanner.ListingCapacity).Count;
+            foreach (var a in shortHere)
+            {
+                var missing = shortByAssignment.GetValueOrDefault(a.Id);
+                if (missing == 0) continue;
+                var fits = Math.Min(missing, room);
+                room -= fits;
+                if (fits < missing)
+                {
+                    uncovered[a.Id] = "NoListingSlot";
+                    UncoveredWarning(record, a, visit.Name, missing - fits, "NoListingSlot", "the retainer has no free or pullable listing slot");
+                }
+                if (fits > 0) lines.Add(new(visit, a, fits));
+            }
+        }
+        if (lines.Count == 0) return;
+
+        topUpActive = true;
+        try
+        {
+            record.TopUpShortfall = lines.Sum(l => l.Listings);
+            Persist(record);
+            var keys = lines.GroupBy(l => (l.Assignment.ItemId, l.Assignment.Quality)).ToArray();
+            int Held(MarketPlayerInventory inventory, uint itemId, ItemQualityPolicy quality) =>
+                inventory.Stacks.Where(s => s.ItemId == itemId && s.IsHighQuality == (quality == ItemQualityPolicy.HqOnly)).Sum(s => s.Quantity);
+            var before = await deadline.RunAsync(driver.PlayerAsync).ConfigureAwait(false);
+            information?.Invoke($"MarketRunTopUpStarted: run={record.Id:N} shortfall={record.TopUpShortfall} listings; " +
+                string.Join("; ", lines.Select(l => l.Describe)) + " | sources: " +
+                string.Join("; ", keys.Select(k =>
+                {
+                    var need = k.Sum(l => l.Units);
+                    var held = Held(before, k.Key.ItemId, k.Key.Quality);
+                    return $"{k.First().Assignment.ItemName} ({k.Key.Quality}) bags {held}/{need}, " +
+                        (held >= need ? "covered by bags" : $"{need - held} units from saddlebag or retainers");
+                })));
+            Add(record, $"Started: {record.TopUpShortfall} short listings from this run's final scans");
+            Status = "Top-up · gathering stock";
+            var retrievalsBefore = record.Mutations.Count;
+            var blockedBefore = record.GatherBlockedUnits;
+            await GatherAsync(record, keys.Select(k => new MarketGatherTarget(k.Key.ItemId, k.First().Assignment.ItemName, k.Key.Quality, k.Sum(l => l.Units))).ToArray())
+                .ConfigureAwait(false);
+            Check(record);
+            var gatherBlocked = record.GatherBlockedUnits - blockedBefore;
+            var after = await deadline.RunAsync(driver.PlayerAsync).ConfigureAwait(false);
+            var stocked = new HashSet<(uint, ItemQualityPolicy)>();
+            foreach (var k in keys)
+            {
+                var need = k.Sum(l => l.Units);
+                var held = Held(after, k.Key.ItemId, k.Key.Quality);
+                if (held > 0) stocked.Add(k.Key);
+                if (held >= need) continue;
+                var (code, detail) = gatherBlocked > 0
+                    ? ("NoInventorySpace", "player inventory had no free slot to gather into")
+                    : ("NoStock", "no further stock was found in the bags, saddlebag or cached retainer inventories");
+                foreach (var l in k) uncovered.TryAdd(l.Assignment.Id, code);
+                warning?.Invoke($"MarketRunTopUpShortfallUncovered: reason={code} item={k.First().Assignment.ItemName} ({k.Key.Quality}) quantity={need - held} units " +
+                    $"(bags {held}/{need}) retainers={string.Join(", ", k.Select(l => l.Visit.Name).Distinct())}; {detail}.");
+            }
+
+            await routeDeadline.RunAsync(async t => { await driver.RequireRetainerListAsync(t).ConfigureAwait(false); return true; }).ConfigureAwait(false);
+            foreach (var visit in lines.Select(l => l.Visit).Distinct())
+            {
+                // A visit with nothing in hand to post would only open and close the retainer.
+                if (!lines.Any(l => l.Visit == visit && stocked.Contains((l.Assignment.ItemId, l.Assignment.Quality)))) continue;
+                await VisitRetainerAsync(record, visit, scannedRetainers, reprice: false).ConfigureAwait(false);
+            }
+
+            var gathered = record.Mutations.Skip(retrievalsBefore)
+                .Where(m => m.Intent.Kind == "Retrieval" && m.Outcome == MarketMutationOutcome.Committed).ToArray();
+            var remaining = 0;
+            var summary = new List<string>();
+            foreach (var l in lines)
+            {
+                var left = Math.Min(l.Listings, shortByAssignment.GetValueOrDefault(l.Assignment.Id));
+                var posted = record.Mutations.Count(m => m.TopUp && m.Intent.Kind == "Post" && m.Outcome == MarketMutationOutcome.Committed &&
+                    m.Intent.RetainerId == l.Visit.Id && m.Intent.ItemName == l.Assignment.ItemName);
+                remaining += left;
+                summary.Add($"{l.Assignment.ItemName} at {l.Visit.Name}: posted {posted}, still short {left}");
+                if (left > 0)
+                    UncoveredWarning(record, l.Assignment, l.Visit.Name, left, uncovered.GetValueOrDefault(l.Assignment.Id) ?? "NotPosted",
+                        "stock was in hand but the visit did not post it; see the run results for the visit's stop reason");
+            }
+            var sources = keys.Select(k =>
+            {
+                var fromRetainers = gathered.Where(m => m.Intent.Source is { } s && s.ItemId == k.Key.ItemId).ToArray();
+                var retainerUnits = fromRetainers.Sum(m => m.Intent.Quantity);
+                var otherUnits = Math.Max(0, Held(after, k.Key.ItemId, k.Key.Quality) - Held(before, k.Key.ItemId, k.Key.Quality) - retainerUnits);
+                return $"{k.First().Assignment.ItemName}: bags {Held(before, k.Key.ItemId, k.Key.Quality)}" +
+                    (otherUnits > 0 ? $", saddlebag {otherUnits}" : string.Empty) +
+                    string.Concat(fromRetainers.GroupBy(m => m.RetainerName).Select(g => $", {g.Key} {g.Sum(m => m.Intent.Quantity)}"));
+            });
+            information?.Invoke($"MarketRunTopUpCompleted: run={record.Id:N} shortfall={record.TopUpShortfall} remaining={remaining}; " +
+                string.Join("; ", summary) + " | sources: " + string.Join("; ", sources));
+            Add(record, $"Completed: {record.TopUpShortfall - remaining} of {record.TopUpShortfall} short listings covered");
+        }
+        finally { topUpActive = false; }
+    }
+
+    private void UncoveredWarning(MarketRunRecord record, ListingPlanAssignment a, string retainer, int listings, string code, string detail)
+    {
+        warning?.Invoke($"MarketRunTopUpShortfallUncovered: reason={code} item={a.ItemName} ({a.Quality}) quantity={listings} listings × {a.QuantityPerListing} retainer={retainer}; {detail}.");
+        record.Results.Add($"Top-up · uncovered · {a.ItemName} at {retainer}: {code} {listings}");
+    }
+
+    private async Task ListRetainer(MarketRunRecord record, ulong id, string name, ListingPlanAssignment[] assignments, bool reprice)
     {
         var listings = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
         int? previousPriceDifferences = null;
-        while (true)
+        // Listings whose reprice was proven not to have been sent this visit. They stay at
+        // their old price; the rest of the visit (other reprices, posts) still runs.
+        var leftUnchanged = new List<RetainerMarketListingTarget>();
+        while (reprice)
         {
             Check(record);
             listings = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
             var priceDifferences = ListingPlanEvaluator.MatchListings(assignments, Rows(id, name, listings))
-                .Where(m => m.Kind == ListingMatchKind.PriceDiffers).ToArray();
+                .Where(m => m.Kind == ListingMatchKind.PriceDiffers &&
+                    !leftUnchanged.Contains(listings.FirstOrDefault(l => l.SlotIndex == m.Listing.SlotIndex)!)).ToArray();
             if (priceDifferences.Length == 0) break;
             // Slot numbers are locations, not listing identities. Fresh work must
             // converge instead of skipping a different listing that reused a slot.
@@ -348,8 +550,16 @@ public sealed class MarketRunExecutor(
             var assignment = assignments.Single(a => a.Id == match.AssignmentId);
             var listing = listings.FirstOrDefault(l => l.SlotIndex == match.Listing.SlotIndex);
             if (listing is null) { Add(record, $"{assignment.ItemName}: no longer present"); break; }
-            await Mutate(record, new("Reprice", id, assignment.ItemName, listing, null, listing.Quantity, (uint)assignment.UnitPrice),
+            var outcome = await Mutate(record, new("Reprice", id, assignment.ItemName, listing, null, listing.Quantity, (uint)assignment.UnitPrice),
                 t => driver.RepriceAsync(listing, (uint)assignment.UnitPrice, t)).ConfigureAwait(false);
+            if (outcome == MarketMutationOutcome.Unchanged)
+            {
+                // Exact original listing re-observed after a pre-send failure: nothing was
+                // dispatched, so the remaining work here is safe. Never resent this visit.
+                leftUnchanged.Add(listing);
+                warning?.Invoke($"MarketRunRepriceSkipped: {assignment.ItemName} × {listing.Quantity} at {name} left at {listing.UnitPrice?.ToString() ?? "unknown"} gil " +
+                    $"(planned {assignment.UnitPrice}); continuing with the rest of this retainer.");
+            }
         }
 
         listings = await deadline.RunAsync(driver.ListingsAsync).ConfigureAwait(false);
@@ -435,11 +645,11 @@ public sealed class MarketRunExecutor(
         }
     }
 
-    private async Task Mutate(MarketRunRecord record, MarketMutationIntent intent, Func<CancellationToken, Task<MarketMutationResult>> action)
+    private async Task<MarketMutationOutcome> Mutate(MarketRunRecord record, MarketMutationIntent intent, Func<CancellationToken, Task<MarketMutationResult>> action)
     {
         Check(record);
         var receipt = new MarketMutationReceipt { Intent = intent,
-            RetainerName = record.Assignments.FirstOrDefault(a => a.RetainerId == intent.RetainerId)?.RetainerName ?? string.Empty };
+            RetainerName = record.Assignments.FirstOrDefault(a => a.RetainerId == intent.RetainerId)?.RetainerName ?? string.Empty, TopUp = topUpActive };
         record.Mutations.Add(receipt);
         try { Persist(record); Check(record); } // No dispatch without durable intent and current authority.
         catch (Exception e)
@@ -505,9 +715,12 @@ public sealed class MarketRunExecutor(
         Add(record, $"{intent.Kind} {intent.ItemName} × {intent.Quantity}: {receipt.Outcome} · {receipt.Code}: {receipt.Message}{(intent.Kind == "Pull" && receipt.Outcome == MarketMutationOutcome.Committed ? " (player inventory)" : string.Empty)}");
         if (receipt.Outcome == MarketMutationOutcome.Indeterminate && intent.Kind != "Reprice")
             throw new RunStoppedException("Needs a check: inventory mutation outcome unknown.");
+        // A reprice proven Unchanged dispatched nothing; the caller keeps working at this retainer.
+        if (intent.Kind == "Reprice" && receipt.Outcome == MarketMutationOutcome.Unchanged) return MarketMutationOutcome.Unchanged;
         if (receipt.Outcome != MarketMutationOutcome.Committed) throw new RetainerStoppedException();
+        return MarketMutationOutcome.Committed;
 
-        void Warn() => warning?.Invoke($"{intent.Kind} {intent.ItemName} at {record.Assignments.FirstOrDefault(a => a.RetainerId == intent.RetainerId)?.RetainerName ?? intent.RetainerId.ToString()}: {receipt.Code}: {receipt.Message}");
+        void Warn() => warning?.Invoke($"{intent.Kind} {intent.ItemName} × {intent.Quantity} at {record.Assignments.FirstOrDefault(a => a.RetainerId == intent.RetainerId)?.RetainerName ?? intent.RetainerId.ToString()}: {receipt.Code}: {receipt.Message}");
     }
 
     private Task<bool> Step(Func<CancellationToken, Task> action) => deadline.RunAsync(async t => { await action(t).ConfigureAwait(false); return true; });
@@ -537,7 +750,7 @@ public sealed class MarketRunExecutor(
             catch (Exception e) { persistenceFailed = true; PersistenceError = $"Market run persistence failed: {e.Message}"; throw; }
         }
     }
-    private static void Add(MarketRunRecord record, string message) => record.Results.Add(message);
+    private void Add(MarketRunRecord record, string message) => record.Results.Add(topUpActive ? $"Top-up · {message}" : message);
     private ListingRow[] Rows(ulong id, string name, IReadOnlyList<RetainerMarketListingTarget> listings) => listings.Select(l =>
         new ListingRow(BrowserScope.RetainerKey(id), id, name, l.SlotIndex, l.ItemId, driver.ItemName(l.ItemId), l.Quantity,
             l.IsHq ? FfxivItemQuality.HQ : FfxivItemQuality.NQ, Evidence.Unknown<decimal>("Not scanned"),

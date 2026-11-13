@@ -206,15 +206,16 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                 "ExecutionStarted",
                 operation.ExecuteImmediately ? "Automatic live retrieval verification started." : "Reviewed live retrieval verification started.");
             var transferred = 0;
-            // Saddlebag leg first: the retainers cover only what it leaves short. Gather
-            // runs under a borrowed market lease keep their own retainer-only contract.
-            if (saddlebag is not null && borrowedLease is null && plan.NeededQuantity > 0)
+            // Saddlebag leg first: the retainers cover only what it leaves short. Under a
+            // borrowed market-run lease every dispatch also requires that the lease is still held.
+            if (saddlebag is not null && plan.NeededQuantity > 0)
             {
                 movementAttempted = true;
                 var leg = await saddlebag.ExecuteAsync(
                     operationId,
                     plan,
-                    () => !token.IsCancellationRequested && operation.Owner.Matches(currentOwner()),
+                    () => !token.IsCancellationRequested && operation.Owner.Matches(currentOwner()) &&
+                        (borrowedLease is null || automation.Owns(borrowedLease)),
                     token).ConfigureAwait(false);
                 movementAttempted = leg.Dispatched;
                 transferred = leg.VerifiedRetrieved;
