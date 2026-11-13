@@ -24,7 +24,8 @@ public sealed record StowageEvaluationLine(
     int RetrieveQuantity,
     int DepositQuantity,
     StowageAction Action,
-    StowageRoutingPolicy Routing);
+    StowageRoutingPolicy Routing,
+    int SaddlebagQuantity = 0);
 
 public sealed record StowageEvaluation(
     Guid PlanId,
@@ -270,12 +271,18 @@ public static class StowageEvaluator
             retrieve,
             deposit,
             retrieve > 0 ? StowageAction.Retrieve : deposit > 0 ? StowageAction.Deposit : StowageAction.None,
-            Copy(rule.Routing));
+            Copy(rule.Routing),
+            SaddlebagQuantity(rule, stock));
     }
 
     public static int PlayerQuantity(TargetPlanItem rule, StockGroup? stock) =>
         stock?.Stacks
             .Where(stack => stack.ScopeKind == BrowserScopeKind.Player && Matches(rule.Quality, stack.Quality))
+            .Sum(stack => stack.Quantity) ?? 0;
+
+    public static int SaddlebagQuantity(TargetPlanItem rule, StockGroup? stock) =>
+        stock?.Stacks
+            .Where(stack => stack.ScopeKind == BrowserScopeKind.Saddlebag && Matches(rule.Quality, stack.Quality))
             .Sum(stack => stack.Quantity) ?? 0;
 
     private static bool Matches(ItemQualityPolicy policy, FfxivItemQuality quality) => policy switch

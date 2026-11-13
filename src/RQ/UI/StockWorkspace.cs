@@ -114,6 +114,13 @@ internal sealed class StockWorkspace
             DrawContextMenu: DrawStockRowContextMenu,
             Id: "player"),
         new(
+            "Saddlebag",
+            72,
+            row => row.Item.SaddlebagQuantity.ToString("N0"),
+            row => row.Item.SaddlebagQuantity,
+            DrawContextMenu: DrawStockRowContextMenu,
+            Id: "saddlebag"),
+        new(
             "Retainers",
             82,
             row => row.AccessibleRetainerQuantity.ToString("N0"),
@@ -369,18 +376,15 @@ internal sealed class StockWorkspace
             var includeCrystals = configuration.IncludeCrystals;
             var includeEquipped = configuration.IncludeEquipped;
             var includeArmoury = configuration.IncludeArmoury;
-            var includeSaddlebag = configuration.IncludeSaddlebag;
             var changed = false;
             changed |= ImGui.Checkbox("Crystals", ref includeCrystals);
             changed |= ImGui.Checkbox("Equipped", ref includeEquipped);
             changed |= ImGui.Checkbox("Armoury", ref includeArmoury);
-            changed |= ImGui.Checkbox("Saddlebags", ref includeSaddlebag);
             if (changed)
             {
                 configuration.IncludeCrystals = includeCrystals;
                 configuration.IncludeEquipped = includeEquipped;
                 configuration.IncludeArmoury = includeArmoury;
-                configuration.IncludeSaddlebag = includeSaddlebag;
                 saveConfiguration();
             }
             ImGui.EndPopup();

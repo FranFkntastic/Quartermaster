@@ -12,7 +12,7 @@ public sealed record RetainerCapture(
     IReadOnlySet<InventoryType> LoadedContainers,
     ulong? Gil,
     IReadOnlyList<CachedMarketListing>? Listings);
-public sealed record PlayerStorageOptions(bool IncludeArmoury, bool IncludeCrystals, bool IncludeEquipped, bool IncludeSaddlebag);
+public sealed record PlayerStorageOptions(bool IncludeArmoury, bool IncludeCrystals, bool IncludeEquipped);
 public sealed record PlayerStorageCapture(IReadOnlyList<InventoryBag> Bags, IReadOnlyList<string> RequestedSources, IReadOnlyList<string> ObservedSources);
 
 public sealed class InventoryScanner
@@ -31,6 +31,18 @@ public sealed class InventoryScanner
         InventoryType.ArmoryHead, InventoryType.ArmoryLegs, InventoryType.ArmoryMainHand, InventoryType.ArmoryNeck,
         InventoryType.ArmoryOffHand, InventoryType.ArmoryRings, InventoryType.ArmoryWrist, InventoryType.ArmorySoulCrystal,
     ];
+
+    // Saddlebag stock is always captured but never counts as carried stock.
+    public static readonly IReadOnlyList<InventoryType> SaddlebagContainers =
+    [
+        InventoryType.SaddleBag1,
+        InventoryType.SaddleBag2,
+        InventoryType.PremiumSaddleBag1,
+        InventoryType.PremiumSaddleBag2,
+    ];
+
+    public static bool IsSaddlebag(string? containerKey) =>
+        containerKey is not null && SaddlebagContainers.Any(type => type.ToString() == containerKey);
 
     public static readonly IReadOnlyList<InventoryType> RetainerContainers =
     [
@@ -55,7 +67,7 @@ public sealed class InventoryScanner
     {
         this.dataManager = dataManager;
         this.log = log;
-        this.storageOptions = storageOptions ?? (() => new(false, true, false, false));
+        this.storageOptions = storageOptions ?? (() => new(false, true, false));
         metadata = new(dataManager, log);
     }
 
@@ -109,10 +121,11 @@ public sealed class InventoryScanner
         .Concat(options.IncludeEquipped ? [InventoryType.EquippedItems] : [])
         .Concat(options.IncludeArmoury ? ArmouryContainers : [])
         .Concat(options.IncludeCrystals ? [InventoryType.Crystals] : [])
-        .Concat(options.IncludeSaddlebag ? [InventoryType.SaddleBag1, InventoryType.SaddleBag2, InventoryType.PremiumSaddleBag1, InventoryType.PremiumSaddleBag2] : [])
+        .Concat(SaddlebagContainers)
         .ToArray();
 
     public IReadOnlyDictionary<uint, int> CountPlayerItems() => ScanPlayerBags()
+        .Where(bag => !IsSaddlebag(bag.BagName))
         .SelectMany(bag => bag.Items)
         .GroupBy(item => item.ItemId)
         .ToDictionary(group => group.Key, group => group.Sum(item => checked((int)item.Quantity)));
@@ -250,7 +263,7 @@ public sealed class InventoryScanner
             return "Equipped";
         if (ArmouryContainers.Contains(type))
             return "Armoury";
-        if (type is InventoryType.SaddleBag1 or InventoryType.SaddleBag2 or InventoryType.PremiumSaddleBag1 or InventoryType.PremiumSaddleBag2)
+        if (SaddlebagContainers.Contains(type))
             return "Saddlebag";
         return "Inventory";
     }
