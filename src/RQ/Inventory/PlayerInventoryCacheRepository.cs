@@ -24,7 +24,7 @@ public sealed record PlayerInventoryCacheChange(
         .ToHashSet();
 }
 
-public sealed class PlayerInventoryCacheRepository
+public sealed class PlayerInventoryCacheRepository : IDisposable
 {
     private readonly object gate = new();
     private readonly PlayerInventoryCacheStore store;
@@ -34,10 +34,12 @@ public sealed class PlayerInventoryCacheRepository
     public PlayerInventoryCacheRepository(PlayerInventoryCacheStore store)
     {
         this.store = store;
+        store.WriteFailed += OnWriteFailed;
         cache = store.Load();
     }
 
     public event Action<PlayerInventoryCacheChange>? Changed;
+    public event Action<CacheWriteFailure>? PersistenceFailed;
     public long Revision { get; private set; }
 
     public PlayerStorageCapture Snapshot(OwnerScope owner, IReadOnlyList<string> requestedSources)
@@ -259,10 +261,21 @@ public sealed class PlayerInventoryCacheRepository
         {
             if (!persistenceDirty)
                 return;
-            store.Save(cache);
+            // Observe() can replace an entry in place, so hand off a private dictionary.
+            // Entries themselves are never mutated once they are in the cache.
+            _ = store.SaveInBackground(new Dictionary<ulong, CachedPlayerInventory>(cache), Revision);
             persistenceDirty = false;
         }
     }
+
+    public void Dispose()
+    {
+        Flush();
+        store.Dispose();
+        store.WriteFailed -= OnWriteFailed;
+    }
+
+    private void OnWriteFailed(CacheWriteFailure failure) => PersistenceFailed?.Invoke(failure);
 
     private static bool Equivalent(CachedPlayerInventory left, CachedPlayerInventory right)
     {

@@ -117,6 +117,7 @@ public sealed class Plugin : IDalamudPlugin
             configuration.IncludeEquipped,
             configuration.IncludeSaddlebag));
         playerInventory = new(new PlayerInventoryCacheStore(playerInventoryCachePath));
+        playerInventory.PersistenceFailed += failure => LogCacheWriteFailure(log, "player inventory", failure);
         playerInventoryReconciler = new(
             playerInventory,
             CurrentOwner,
@@ -125,6 +126,7 @@ public sealed class Plugin : IDalamudPlugin
         cache = new(new RetainerCacheStore(cachePath));
         cache.ListingPersistenceFailed += exception =>
             log.Error(exception, "Quartermaster could not persist its latest retainer listings; the in-memory projection remains current.");
+        cache.CachePersistenceFailed += failure => LogCacheWriteFailure(log, "retainer", failure);
         state = new(new QuartermasterStateStore(statePath));
         workQueue = new();
         var observationPaths = SharedObservationPaths.FromPluginConfigDirectory(configDirectory);
@@ -464,6 +466,15 @@ public sealed class Plugin : IDalamudPlugin
             if (RuntimeChangeNotificationPolicy.TryGetPublishedKind(notice, out var kind))
                 ipc.PublishChanged(snapshots.CreateChanged(kind, notice.OperationId, CurrentOwner()));
         }
+    }
+
+    private static void LogCacheWriteFailure(IPluginLog log, string cacheName, CacheWriteFailure failure)
+    {
+        const string template = "Quartermaster could not persist its {CacheName} cache to {Path} (revision {Revision}, {EntryCount} entries, attempt {Attempt}, retrying: {WillRetry}); the in-memory cache remains current.";
+        if (failure.WillRetry)
+            log.Warning(failure.Exception, template, cacheName, failure.Path, failure.Revision, failure.EntryCount, failure.Attempt, failure.WillRetry);
+        else
+            log.Error(failure.Exception, template, cacheName, failure.Path, failure.Revision, failure.EntryCount, failure.Attempt, failure.WillRetry);
     }
 
     private void FlushPlayerInventoryIfDue()
@@ -879,6 +890,7 @@ public sealed class Plugin : IDalamudPlugin
         retainerRefresh.Dispose();
         observationHost?.Dispose();
         cache.Dispose();
+        playerInventory.Dispose();
         windows.RemoveAllWindows();
     }
 }
