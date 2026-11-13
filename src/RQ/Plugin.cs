@@ -114,8 +114,7 @@ public sealed class Plugin : IDalamudPlugin
         scanner = new(dataManager, log, () => new PlayerStorageOptions(
             configuration.IncludeArmoury,
             configuration.IncludeCrystals,
-            configuration.IncludeEquipped,
-            configuration.IncludeSaddlebag));
+            configuration.IncludeEquipped));
         playerInventory = new(new PlayerInventoryCacheStore(playerInventoryCachePath));
         playerInventory.PersistenceFailed += failure => LogCacheWriteFailure(log, "player inventory", failure);
         playerInventoryReconciler = new(
@@ -388,6 +387,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private IReadOnlyDictionary<uint, int> CountCachedPlayerItems() =>
         playerInventory.Snapshot(CurrentOwner(), scanner.RequestedPlayerStorageSources()).Bags
+            .Where(bag => !InventoryScanner.IsSaddlebag(bag.BagName))
             .SelectMany(bag => bag.Items)
             .GroupBy(item => item.ItemId)
             .ToDictionary(group => group.Key, group => group.Sum(item => checked((int)item.Quantity)));
@@ -402,7 +402,6 @@ public sealed class Plugin : IDalamudPlugin
             target.IncludeArmoury = ReadBoolean(document.RootElement, "IncludeArmoury", target.IncludeArmoury);
             target.IncludeCrystals = ReadBoolean(document.RootElement, "IncludeCrystals", target.IncludeCrystals);
             target.IncludeEquipped = ReadBoolean(document.RootElement, "IncludeEquipped", target.IncludeEquipped);
-            target.IncludeSaddlebag = ReadBoolean(document.RootElement, "IncludeSaddlebag", target.IncludeSaddlebag);
         }
         target.LegacyStorageSettingsImported = true;
     }

@@ -29,7 +29,8 @@ public sealed record PlanLine(
     int MissingQuantity,
     IReadOnlyList<RetainerCandidate> Candidates,
     PlanLineStatus Status,
-    TimeSpan? OldestEvidenceAge);
+    TimeSpan? OldestEvidenceAge,
+    int SaddlebagQuantity = 0);
 
 public sealed record RetrievalPlan(DateTime BuiltAtUtc, IReadOnlyList<PlanLine> Lines)
 {
@@ -72,9 +73,12 @@ public static class RestockPlanner
         DateTime nowUtc,
         BrowserProjection? stock)
     {
-        var player = stock?.Items.FirstOrDefault(item => item.ItemId == row.ItemId)?.Stacks
-            .Where(stack => stack.ScopeKind == BrowserScopeKind.Player && QualityMatches(row.Quality, stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ))
-            .Sum(stack => stack.Quantity) ?? playerInventory.GetValueOrDefault(row.ItemId);
+        var stacks = stock?.Items.FirstOrDefault(item => item.ItemId == row.ItemId)?.Stacks
+            .Where(stack => QualityMatches(row.Quality, stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ))
+            .ToArray();
+        var player = stacks?.Where(stack => stack.ScopeKind == BrowserScopeKind.Player).Sum(stack => stack.Quantity)
+            ?? playerInventory.GetValueOrDefault(row.ItemId);
+        var saddlebag = stacks?.Where(stack => stack.ScopeKind == BrowserScopeKind.Saddlebag).Sum(stack => stack.Quantity) ?? 0;
         var needed = Math.Max(0, row.TargetQuantity - player);
         var candidates = needed == 0
             ? []
@@ -119,7 +123,7 @@ public static class RestockPlanner
                 ? PlanLineStatus.NoCachedStock
                 : missing > 0 ? PlanLineStatus.Partial : PlanLineStatus.Ready;
         TimeSpan? oldestAge = candidates.Length == 0 ? null : nowUtc - candidates.Min(candidate => candidate.ObservedAtUtc);
-        return new(row.Id, row.ItemId, row.ItemName, row.Quality, row.TargetQuantity, player, needed, cached, missing, candidates, status, oldestAge);
+        return new(row.Id, row.ItemId, row.ItemName, row.Quality, row.TargetQuantity, player, needed, cached, missing, candidates, status, oldestAge, saddlebag);
     }
 
     private static bool QualityMatches(ItemQualityPolicy policy, bool isHighQuality) => policy switch

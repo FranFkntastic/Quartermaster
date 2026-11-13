@@ -84,7 +84,7 @@ public static class ListingPlanEvaluator
         var scope = projection.Scopes.FirstOrDefault(candidate => candidate.Key == normalizedScope);
         var scopeRetainerId = scope?.RetainerId;
         var assignments = plan?.Assignments
-            .Where(assignment => assignment.Enabled && scope?.Kind != BrowserScopeKind.Player &&
+            .Where(assignment => assignment.Enabled && scope?.Kind is not (BrowserScopeKind.Player or BrowserScopeKind.Saddlebag) &&
                                  (scopeRetainerId is null || assignment.RetainerId == scopeRetainerId))
             .ToArray() ?? [];
         var scopedListings = projection.GetListings(normalizedScope);

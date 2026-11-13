@@ -9,12 +9,13 @@ using RQ.Inventory;
 
 namespace RQ.Planning;
 
-public enum BrowserScopeKind { All, Player, Retainer }
+public enum BrowserScopeKind { All, Player, Retainer, Saddlebag }
 
 public sealed record BrowserScope(string Key, string Label, BrowserScopeKind Kind, ulong? RetainerId)
 {
     public const string AllKey = "all";
     public const string PlayerKey = "player";
+    public const string SaddlebagKey = "saddlebag";
     public static string RetainerKey(ulong id) => $"retainer:{id.ToString(CultureInfo.InvariantCulture)}";
 }
 
@@ -39,6 +40,7 @@ public sealed record StockGroup(uint ItemId, string ItemName, IReadOnlyList<Stoc
     public int TotalQuantity => Stacks.Sum(stack => stack.Quantity);
     public int PlayerQuantity => Stacks.Where(stack => stack.ScopeKind == BrowserScopeKind.Player).Sum(stack => stack.Quantity);
     public int RetainerQuantity => Stacks.Where(stack => stack.ScopeKind == BrowserScopeKind.Retainer).Sum(stack => stack.Quantity);
+    public int SaddlebagQuantity => Stacks.Where(stack => stack.ScopeKind == BrowserScopeKind.Saddlebag).Sum(stack => stack.Quantity);
     public IReadOnlyCollection<FfxivRetainerKey> Retainers => Stacks.Where(stack => stack.RetainerId is not null).Select(stack => new FfxivRetainerKey(stack.RetainerId!.Value)).Distinct().ToArray();
 }
 
@@ -138,16 +140,19 @@ public static class BrowserProjectionBuilder
         {
             new(BrowserScope.AllKey, "All accessible stock", BrowserScopeKind.All, null),
             new(BrowserScope.PlayerKey, "Player", BrowserScopeKind.Player, null),
+            new(BrowserScope.SaddlebagKey, "Saddlebag", BrowserScopeKind.Saddlebag, null),
         };
         var inventoryCompleteness = new Dictionary<string, bool>(StringComparer.Ordinal)
         {
             [BrowserScope.AllKey] = retainers.All(HasCompleteRetainerInventory),
             [BrowserScope.PlayerKey] = true,
+            [BrowserScope.SaddlebagKey] = true,
         };
         var listingCompleteness = new Dictionary<string, bool>(StringComparer.Ordinal)
         {
             [BrowserScope.AllKey] = retainers.All(HasCompleteRetainerListings),
             [BrowserScope.PlayerKey] = true,
+            [BrowserScope.SaddlebagKey] = true,
         };
         var listings = new List<ListingRow>();
         foreach (var retainer in retainers)
@@ -219,18 +224,20 @@ public static class BrowserProjectionBuilder
         {
             foreach (var itemId in affected)
                 stacks[itemId].RemoveAll(stack =>
-                    stack.ScopeKind == BrowserScopeKind.Player &&
+                    stack.ScopeKind is BrowserScopeKind.Player or BrowserScopeKind.Saddlebag &&
                     stack.Storage == slot.ContainerKey &&
                     stack.SlotIndex == slot.SlotIndex);
 
             if (slot.Current is not { } item || item.ItemId == 0 || item.Quantity == 0)
                 continue;
+            var storage = item.ContainerKey ?? slot.ContainerKey;
+            var (scopeKey, scopeKind, ownerName) = PlayerScope(storage);
             stacks[item.ItemId].Add(new(
-                BrowserScope.PlayerKey,
-                BrowserScopeKind.Player,
+                scopeKey,
+                scopeKind,
                 null,
-                "Player",
-                item.ContainerKey ?? slot.ContainerKey,
+                ownerName,
+                storage,
                 item.SlotIndex,
                 item.ItemId,
                 DisplayName(item.ItemId, item.ItemName),
@@ -281,12 +288,17 @@ public static class BrowserProjectionBuilder
         {
             new(BrowserScope.AllKey, "All accessible stock", BrowserScopeKind.All, null),
             new(BrowserScope.PlayerKey, "Player", BrowserScopeKind.Player, null),
+            new(BrowserScope.SaddlebagKey, "Saddlebag", BrowserScopeKind.Saddlebag, null),
         };
         var stacks = new List<StockStack>();
         var listings = new List<ListingRow>();
         foreach (var bag in playerBags)
             foreach (var item in bag.Items.Where(item => item.ItemId > 0 && item.Quantity > 0))
-                stacks.Add(new(BrowserScope.PlayerKey, BrowserScopeKind.Player, null, "Player", item.ContainerKey ?? bag.Location ?? bag.BagName, item.SlotIndex, item.ItemId, DisplayName(item.ItemId, item.ItemName), checked((int)item.Quantity), item.IsHq ? FfxivItemQuality.HQ : FfxivItemQuality.NQ, null, item.ItemType, item.ConditionPercent is { } condition ? (decimal)condition : null, item.Equipped));
+            {
+                var storage = item.ContainerKey ?? bag.Location ?? bag.BagName;
+                var (scopeKey, scopeKind, ownerName) = PlayerScope(bag.BagName);
+                stacks.Add(new(scopeKey, scopeKind, null, ownerName, storage, item.SlotIndex, item.ItemId, DisplayName(item.ItemId, item.ItemName), checked((int)item.Quantity), item.IsHq ? FfxivItemQuality.HQ : FfxivItemQuality.NQ, null, item.ItemType, item.ConditionPercent is { } condition ? (decimal)condition : null, item.Equipped));
+            }
 
         var retainers = cache.Values
             .Where(retainer => retainer.Owner.Matches(owner) && retainer.IsCurrentlyAssigned is not false)
@@ -298,11 +310,13 @@ public static class BrowserProjectionBuilder
         {
             [BrowserScope.AllKey] = retainers.All(HasCompleteRetainerInventory),
             [BrowserScope.PlayerKey] = true,
+            [BrowserScope.SaddlebagKey] = true,
         };
         var retainerListingsCompleteByScope = new Dictionary<string, bool>(StringComparer.Ordinal)
         {
             [BrowserScope.AllKey] = retainers.All(HasCompleteRetainerListings),
             [BrowserScope.PlayerKey] = true,
+            [BrowserScope.SaddlebagKey] = true,
         };
         foreach (var retainer in retainers)
         {
@@ -347,6 +361,11 @@ public static class BrowserProjectionBuilder
 
     private static bool HasCompleteRetainerListings(CachedRetainer retainer) =>
         retainer.ListingsObservedAtUtc.HasValue;
+
+    private static (string Key, BrowserScopeKind Kind, string OwnerName) PlayerScope(string? container) =>
+        InventoryScanner.IsSaddlebag(container)
+            ? (BrowserScope.SaddlebagKey, BrowserScopeKind.Saddlebag, "Saddlebag")
+            : (BrowserScope.PlayerKey, BrowserScopeKind.Player, "Player");
 
     private static string DisplayName(uint id, string? name) => string.IsNullOrWhiteSpace(name) ? $"Item {id}" : name;
 }
