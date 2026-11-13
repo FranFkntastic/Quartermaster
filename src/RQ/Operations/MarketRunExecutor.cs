@@ -13,7 +13,8 @@ namespace RQ.Operations;
 public enum MarketMutationOutcome { FailedBeforeSend, Committed, Indeterminate, Unchanged }
 public sealed record MarketMutationResult(MarketMutationOutcome Outcome, string Code = "", string Message = "");
 public sealed record MarketPlayerInventory(IReadOnlyList<DalamudInventoryStack> Stacks, int FreeSlots);
-public sealed record MarketGatherTarget(uint ItemId, string ItemName, ItemQualityPolicy Quality, int Units);
+/// <param name="AllowSaddlebag">False when this run already had a failed saddlebag attempt for the item.</param>
+public sealed record MarketGatherTarget(uint ItemId, string ItemName, ItemQualityPolicy Quality, int Units, bool AllowSaddlebag = true);
 internal sealed class MarketGatherIndeterminateException(ulong retainerId, string retainerName, string message) : Exception(message)
 {
     public ulong RetainerId { get; } = retainerId;
@@ -374,7 +375,8 @@ public sealed class MarketRunExecutor(
     /// </summary>
     private async Task TopUpAsync(MarketRunRecord record, IReadOnlyList<RetainerVisit> visits, HashSet<ulong> scannedRetainers)
     {
-        if (record.NeedsCheck.Count > 0 || record.Mutations.Any(m => m.Outcome is null or MarketMutationOutcome.Indeterminate))
+        // An unproven saddlebag move blocks only its item (below); it has no retainer to check.
+        if (record.NeedsCheck.Count > 0 || record.Mutations.Any(m => m.Intent.Kind != MarketRunLiveDriver.SaddlebagKind && m.Outcome is null or MarketMutationOutcome.Indeterminate))
         {
             if (record.StillShort > 0)
             {
@@ -387,11 +389,21 @@ public sealed class MarketRunExecutor(
         Check(record);
         // The top-up never repeats work this run already attempted and failed, even when it
         // failed before send: a post or pull that did not commit rules out its retainer, and a
-        // retrieval that did not commit rules out its item.
+        // retainer retrieval that did not commit rules out its item. A saddlebag move that may
+        // have happened unproven rules out its item; any other failed saddlebag attempt
+        // (refused or not enqueued, nothing moved) rules out only the saddlebag for that item.
         var failedPosting = record.Mutations.Where(m => m.Intent.Kind is "Post" or "Pull" && m.Outcome != MarketMutationOutcome.Committed)
             .GroupBy(m => m.Intent.RetainerId).ToDictionary(g => g.Key, g => g.First());
         var failedRetrieval = record.Mutations.Where(m => m.Intent.Kind == "Retrieval" && m.Outcome != MarketMutationOutcome.Committed && m.Intent.Source is not null)
             .GroupBy(m => (m.Intent.Source!.ItemId, m.Intent.Source.IsHighQuality)).ToDictionary(g => g.Key, g => g.First());
+        // Saddlebag lines may draw either quality, so saddlebag failures are keyed by item.
+        var saddlebagAttempts = record.Mutations.Where(m => m.Intent.Kind == MarketRunLiveDriver.SaddlebagKind && m.Intent.Source is not null).ToArray();
+        var unprovenSaddlebag = saddlebagAttempts.Where(m => m.Outcome is null or MarketMutationOutcome.Indeterminate)
+            .GroupBy(m => m.Intent.Source!.ItemId).ToDictionary(g => g.Key, g => g.First());
+        var failedSaddlebag = saddlebagAttempts.Where(m => m.Outcome is MarketMutationOutcome.FailedBeforeSend or MarketMutationOutcome.Unchanged)
+            .GroupBy(m => m.Intent.Source!.ItemId).ToDictionary(g => g.Key, g => g.First());
+        MarketMutationReceipt? PriorItemFailure(ListingPlanAssignment a) =>
+            failedRetrieval.GetValueOrDefault((a.ItemId, a.Quality == ItemQualityPolicy.HqOnly)) ?? unprovenSaddlebag.GetValueOrDefault(a.ItemId);
         var lines = new List<TopUpLine>();
         var uncovered = new Dictionary<Guid, string>();
         foreach (var visit in visits)
@@ -400,10 +412,10 @@ public sealed class MarketRunExecutor(
             if (freshListings.ContainsKey(visit.Id))
             {
                 var excluded = shortHere.Where(a => shortByAssignment.GetValueOrDefault(a.Id) > 0 &&
-                    (failedPosting.ContainsKey(visit.Id) || failedRetrieval.ContainsKey((a.ItemId, a.Quality == ItemQualityPolicy.HqOnly)))).ToArray();
+                    (failedPosting.ContainsKey(visit.Id) || PriorItemFailure(a) is not null)).ToArray();
                 foreach (var a in excluded)
                 {
-                    var prior = failedPosting.GetValueOrDefault(visit.Id) ?? failedRetrieval[(a.ItemId, a.Quality == ItemQualityPolicy.HqOnly)];
+                    var prior = failedPosting.GetValueOrDefault(visit.Id) ?? PriorItemFailure(a)!;
                     UncoveredWarning(record, a, visit.Name, shortByAssignment[a.Id], "PriorMutationFailed",
                         $"{prior.Intent.Kind} {prior.Intent.ItemName} × {prior.Intent.Quantity} at {(prior.RetainerName.Length > 0 ? prior.RetainerName : prior.Intent.RetainerId.ToString())} " +
                         $"ended {prior.Outcome?.ToString() ?? "unresolved"} ({prior.Code}) earlier this run and is not repeated");
@@ -461,7 +473,14 @@ public sealed class MarketRunExecutor(
             Status = "Top-up · gathering stock";
             var retrievalsBefore = record.Mutations.Count;
             var blockedBefore = record.GatherBlockedUnits;
-            await GatherAsync(record, keys.Select(k => new MarketGatherTarget(k.Key.ItemId, k.First().Assignment.ItemName, k.Key.Quality, k.Sum(l => l.Units))).ToArray())
+            foreach (var k in keys.Where(k => failedSaddlebag.ContainsKey(k.Key.ItemId)))
+            {
+                var prior = failedSaddlebag[k.Key.ItemId];
+                warning?.Invoke($"MarketRunTopUpSaddlebagExcluded: item={k.First().Assignment.ItemName} ({k.Key.Quality}): saddlebag attempt × {prior.Intent.Quantity} " +
+                    $"ended {prior.Outcome} ({prior.Code}) earlier this run and is not repeated; nothing moved, so retainers may still cover this item.");
+            }
+            await GatherAsync(record, keys.Select(k => new MarketGatherTarget(k.Key.ItemId, k.First().Assignment.ItemName, k.Key.Quality, k.Sum(l => l.Units),
+                    AllowSaddlebag: !failedSaddlebag.ContainsKey(k.Key.ItemId))).ToArray())
                 .ConfigureAwait(false);
             Check(record);
             var gatherBlocked = record.GatherBlockedUnits - blockedBefore;
@@ -490,7 +509,7 @@ public sealed class MarketRunExecutor(
             }
 
             var gathered = record.Mutations.Skip(retrievalsBefore)
-                .Where(m => m.Intent.Kind == "Retrieval" && m.Outcome == MarketMutationOutcome.Committed).ToArray();
+                .Where(m => m.Intent.Kind is "Retrieval" or MarketRunLiveDriver.SaddlebagKind && m.Outcome == MarketMutationOutcome.Committed).ToArray();
             var remaining = 0;
             var summary = new List<string>();
             foreach (var l in lines)
@@ -506,12 +525,10 @@ public sealed class MarketRunExecutor(
             }
             var sources = keys.Select(k =>
             {
-                var fromRetainers = gathered.Where(m => m.Intent.Source is { } s && s.ItemId == k.Key.ItemId).ToArray();
-                var retainerUnits = fromRetainers.Sum(m => m.Intent.Quantity);
-                var otherUnits = Math.Max(0, Held(after, k.Key.ItemId, k.Key.Quality) - Held(before, k.Key.ItemId, k.Key.Quality) - retainerUnits);
+                // Committed receipts name each source: "Saddlebag" or the retainer.
+                var moved = gathered.Where(m => m.Intent.Source is { } s && s.ItemId == k.Key.ItemId).ToArray();
                 return $"{k.First().Assignment.ItemName}: bags {Held(before, k.Key.ItemId, k.Key.Quality)}" +
-                    (otherUnits > 0 ? $", saddlebag {otherUnits}" : string.Empty) +
-                    string.Concat(fromRetainers.GroupBy(m => m.RetainerName).Select(g => $", {g.Key} {g.Sum(m => m.Intent.Quantity)}"));
+                    string.Concat(moved.GroupBy(m => m.RetainerName).Select(g => $", {g.Key} {g.Sum(m => m.Intent.Quantity)}"));
             });
             information?.Invoke($"MarketRunTopUpCompleted: run={record.Id:N} shortfall={record.TopUpShortfall} remaining={remaining}; " +
                 string.Join("; ", summary) + " | sources: " + string.Join("; ", sources));

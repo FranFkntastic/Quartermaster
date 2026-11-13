@@ -146,7 +146,12 @@ internal sealed class MarketRunLiveDriver(
                 Quality = target.Quality, TargetQuantity = target.Units }]);
             var coordinator = new TransferCoordinator(journal, guarded, cache, currentOwner,
                 () => new Dictionary<uint, int> { [target.ItemId] = held }, automation, warning: logWarning,
-                saddlebagDriver: saddlebag, cachedSaddlebag: cachedSaddlebag, information: information);
+                saddlebagDriver: target.AllowSaddlebag ? saddlebag : null, cachedSaddlebag: cachedSaddlebag, information: information,
+                // The same mutation authority GatherDriver.RetrieveAsync enforces: run cancel and
+                // plan or owner change refuse every saddlebag dispatch from that point on. It is a
+                // predicate, not a token, so an already-dispatched move is still observed to its end.
+                callerAuthority: () => { try { check(); return HasSessionAuthority(); } catch { return false; } },
+                saddlebagAttempt: attempt => receiptChanged?.Invoke(SaddlebagReceipt(attempt)));
             check();
             await coordinator.ExecuteRetrievalUnderLeaseAsync(operation.OperationId, lease, token).ConfigureAwait(false);
             var outcome = journal.Get(operation.OperationId);
@@ -174,6 +179,24 @@ internal sealed class MarketRunLiveDriver(
         }
         return reports;
     }
+    internal const string SaddlebagKind = "SaddlebagRetrieval";
+
+    /// <summary>
+    /// One terminal saddlebag attempt as a run receipt, so the run's no-repeat rules see it.
+    /// A move that may have happened without a proven arrival is Indeterminate.
+    /// </summary>
+    private static MarketMutationReceipt SaddlebagReceipt(SaddlebagAttemptReport attempt) => new()
+    {
+        Intent = new(SaddlebagKind, 0, attempt.ItemName, null, attempt.Source, attempt.Quantity, 0),
+        RetainerName = "Saddlebag",
+        Outcome = attempt.Outcome == InventoryMoveOutcome.Retrieved ? MarketMutationOutcome.Committed
+            : attempt.MayHaveMoved ? MarketMutationOutcome.Indeterminate
+            : attempt.Outcome == InventoryMoveOutcome.NotEnqueued ? MarketMutationOutcome.Unchanged
+            : MarketMutationOutcome.FailedBeforeSend,
+        Code = attempt.Code,
+        Message = attempt.Message,
+    };
+
     private static void Require(RetainerAutomationResult result)
     { if (!result.Success) throw new InvalidOperationException($"{result.Code}: {result.Message}"); }
 

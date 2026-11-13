@@ -58,6 +58,8 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
     private readonly Func<DateTime> utcNow;
     private readonly RetainerStockMutationPersistence stockMutations;
     private readonly SaddlebagRetrievalStep? saddlebag;
+    // The borrowing caller's mutation authority (run cancel, plan change), checked before every saddlebag dispatch.
+    private readonly Func<bool>? callerAuthority;
     private readonly AutoRetainerSuppression? autoRetainerSuppression;
     private readonly TimeSpan autoRetainerWait;
     private readonly TimeSpan autoRetainerPoll;
@@ -81,8 +83,11 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         Action<string>? warning = null,
         ISaddlebagRetrievalDriver? saddlebagDriver = null,
         Func<IReadOnlyDictionary<uint, int>>? cachedSaddlebag = null,
-        Action<string>? information = null)
+        Action<string>? information = null,
+        Func<bool>? callerAuthority = null,
+        Action<SaddlebagAttemptReport>? saddlebagAttempt = null)
     {
+        this.callerAuthority = callerAuthority;
         this.journal = journal;
         this.warning = warning;
         this.driver = driver;
@@ -97,7 +102,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         stockMutations = new(journal, cache, RecoverStockObservationAsync);
         saddlebag = saddlebagDriver is null
             ? null
-            : new SaddlebagRetrievalStep(saddlebagDriver, journal, cachedSaddlebag, warning, information);
+            : new SaddlebagRetrievalStep(saddlebagDriver, journal, cachedSaddlebag, warning, information, saddlebagAttempt);
     }
 
     public bool IsRunning => Volatile.Read(ref running) != 0;
@@ -215,7 +220,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                     operationId,
                     plan,
                     () => !token.IsCancellationRequested && operation.Owner.Matches(currentOwner()) &&
-                        (borrowedLease is null || automation.Owns(borrowedLease)),
+                        (borrowedLease is null || automation.Owns(borrowedLease)) && (callerAuthority?.Invoke() ?? true),
                     token).ConfigureAwait(false);
                 movementAttempted = leg.Dispatched;
                 transferred = leg.VerifiedRetrieved;
