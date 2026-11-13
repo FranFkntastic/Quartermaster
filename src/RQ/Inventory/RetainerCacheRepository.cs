@@ -69,6 +69,7 @@ public sealed class RetainerCacheRepository : IDisposable
         this.store = store;
         store.ListingWriteFailed += OnListingWriteFailed;
         store.ListingPersisted += OnListingPersisted;
+        store.CacheWriteFailed += OnCacheWriteFailed;
         cache = store.Load();
     }
 
@@ -76,6 +77,7 @@ public sealed class RetainerCacheRepository : IDisposable
     public event Action<RetainerListingCaptureReceipt>? ListingCaptured;
     public event Action<RetainerEvidenceReceipt>? EvidenceAccepted;
     public event Action<Exception>? ListingPersistenceFailed;
+    public event Action<CacheWriteFailure>? CachePersistenceFailed;
     public event Action<RetainerListingPersistenceReceipt>? ListingPersisted;
     public RetainerListingPersistenceReceipt? LastListingPersistence { get; private set; }
     public long Revision { get; private set; }
@@ -91,9 +93,8 @@ public sealed class RetainerCacheRepository : IDisposable
         lock (gate)
         {
             var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [retainer.RetainerId] = retainer };
-            store.Save(candidate);
             cache = candidate;
-            Revision++;
+            store.SaveInBackground(candidate, ++Revision);
         }
         Changed?.Invoke(RetainerCacheChangeKind.All);
     }
@@ -145,9 +146,8 @@ public sealed class RetainerCacheRepository : IDisposable
                 current.RosterObservedAtUtc = observedAtUtc;
                 candidate[entry.RetainerId] = current;
             }
-            store.Save(candidate);
             cache = candidate;
-            Revision++;
+            store.SaveInBackground(candidate, ++Revision);
         }
         Changed?.Invoke(RetainerCacheChangeKind.All);
     }
@@ -170,9 +170,8 @@ public sealed class RetainerCacheRepository : IDisposable
             updated.IsUiAccessible = isAccessible;
             updated.UiAccessibilityObservedAtUtc = observedAtUtc;
             var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [retainerId] = updated };
-            store.Save(candidate);
             cache = candidate;
-            Revision++;
+            store.SaveInBackground(candidate, ++Revision);
         }
         Changed?.Invoke(RetainerCacheChangeKind.All);
     }
@@ -205,9 +204,9 @@ public sealed class RetainerCacheRepository : IDisposable
             updated.RequestedSources = requestedSources.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList();
             updated.ObservedSources = observedSources.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList();
             var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [retainerId] = updated };
-            store.Save(candidate);
             cache = candidate;
             var revision = ++Revision;
+            store.SaveInBackground(candidate, revision);
             var domains = RetainerEvidenceDomain.None;
             if (InventoryScanner.RequiredRetainerContainers
                 .Select(container => container.ToString())
@@ -245,9 +244,10 @@ public sealed class RetainerCacheRepository : IDisposable
             updated.Gil = gil;
             updated.GilObservedAtUtc = observedAtUtc;
             var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [retainerId] = updated };
-            store.Save(candidate);
             cache = candidate;
-            receipt = new(++Revision, retainerId, owner with { }, evidenceSessionId, RetainerEvidenceDomain.Gil, observedAtUtc, "RetainerGilObserved", "Retainer gil evidence was accepted.");
+            var revision = ++Revision;
+            store.SaveInBackground(candidate, revision);
+            receipt = new(revision, retainerId, owner with { }, evidenceSessionId, RetainerEvidenceDomain.Gil, observedAtUtc, "RetainerGilObserved", "Retainer gil evidence was accepted.");
         }
         Changed?.Invoke(RetainerCacheChangeKind.Stock);
         EvidenceAccepted?.Invoke(receipt);
@@ -307,9 +307,8 @@ public sealed class RetainerCacheRepository : IDisposable
             }
 
             var candidate = new Dictionary<ulong, CachedRetainer>(cache) { [observation.RetainerId] = updated };
-            store.Save(candidate);
             cache = candidate;
-            Revision++;
+            store.SaveInBackground(candidate, ++Revision);
         }
         Changed?.Invoke(RetainerCacheChangeKind.Stock);
     }
@@ -391,9 +390,12 @@ public sealed class RetainerCacheRepository : IDisposable
         store.Dispose();
         store.ListingWriteFailed -= OnListingWriteFailed;
         store.ListingPersisted -= OnListingPersisted;
+        store.CacheWriteFailed -= OnCacheWriteFailed;
     }
 
     private void OnListingWriteFailed(Exception exception) => ListingPersistenceFailed?.Invoke(exception);
+
+    private void OnCacheWriteFailed(CacheWriteFailure failure) => CachePersistenceFailed?.Invoke(failure);
 
     private void OnListingPersisted(RetainerListingPersistenceReceipt receipt)
     {
