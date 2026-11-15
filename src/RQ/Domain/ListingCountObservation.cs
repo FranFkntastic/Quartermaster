@@ -12,8 +12,8 @@ public sealed record ListingCountObservation(int GameCount, int CachedCount)
         : $"Game reports {GameCount} listed (cached {CachedCount}) — newer listings not yet seen";
 
     public static ListingCountObservation? From(CachedRetainer retainer) =>
-        retainer.MarketItemCount is > 0 && retainer.RosterObservedAtUtc.HasValue &&
-        (!retainer.ListingsObservedAtUtc.HasValue || retainer.RosterObservedAtUtc > retainer.ListingsObservedAtUtc) &&
+        retainer.MarketItemCount is > 0 && retainer.MarketCountObservedAtUtc.HasValue &&
+        (!retainer.ListingsObservedAtUtc.HasValue || retainer.MarketCountObservedAtUtc > retainer.ListingsObservedAtUtc) &&
         retainer.MarketItemCount.Value != retainer.Listings.Count
             ? new(retainer.MarketItemCount.Value, retainer.Listings.Count) : null;
 }

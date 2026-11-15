@@ -68,6 +68,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly WindowSystem windows = new("RQ");
     private readonly QuartermasterWindow window;
     private readonly RuntimeReconciliationQueue reconciliation = new();
+    private readonly ICondition condition;
     private DateTime nextSnapshotAt;
     private DateTime nextPlayerInventoryFlushAt;
 
@@ -95,6 +96,7 @@ public sealed class Plugin : IDalamudPlugin
         this.commands = commands;
         this.framework = framework;
         this.playerState = playerState;
+        this.condition = condition;
         configuration = pluginInterface.GetPluginConfig() as PluginConfiguration ?? new PluginConfiguration();
         if (string.IsNullOrWhiteSpace(configuration.PluginInstanceId))
             configuration.PluginInstanceId = Guid.NewGuid().ToString("N");
@@ -764,7 +766,8 @@ public sealed class Plugin : IDalamudPlugin
                             retainer.MarketItemCount,
                             retainer.IsGameAvailable))
                         .ToArray(),
-                    observedAtUtc);
+                    observedAtUtc,
+                    condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.OccupiedSummoningBell]);
                 break;
             }
             case ObservationContainerKind.RetainerInventory:

@@ -535,6 +535,7 @@ public static class StowageRouter
         Level = source.Level,
         MarketItemCount = source.MarketItemCount,
         RosterObservedAtUtc = source.RosterObservedAtUtc,
+        MarketCountObservedAtUtc = source.MarketCountObservedAtUtc,
         ObservedAtUtc = source.ObservedAtUtc,
         Gil = source.Gil,
         GilObservedAtUtc = source.GilObservedAtUtc,

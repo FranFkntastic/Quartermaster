@@ -40,10 +40,21 @@ internal static class ListingRetainerProjection
         return rows.Select(row => browser.ListingCountObservations.TryGetValue(row.RetainerId, out var count)
             ? row with
             {
-                State = new(count.Summary, ListingStateTone.Amber, 13, Detail: count.Description),
-                PlanRows = row.PlanRows.Select(p => p.Assignment.Enabled && Complete(p.Assignment)
-                    ? p with { State = new(count.Summary, ListingStateTone.Amber, 13, Detail: count.Description) } : p).ToArray(),
+                State = WithCount(row.State, count),
+                PlanRows = row.PlanRows.Select(p => p with { State = WithCount(p.State, count) }).ToArray(),
             } : row).ToArray();
+    }
+
+    // A newer game count bounds the cached rows; keep the state and say which way it is off.
+    private static ListingStateView WithCount(ListingStateView state, ListingCountObservation count)
+    {
+        var detail = $"{count.Description}.\n\n{Tooltip(state)}";
+        var fewer = count.Bound == ListingCountBound.Upper;
+        if (state.Rank == 12)
+            return fewer ? new(count.Summary, ListingStateTone.Amber, 12, Detail: detail) : state with { Detail = detail };
+        if (fewer && state.Rank is >= 1 and <= 5 && state.Rank != 4 && state.Amount > 0)
+            return state with { Text = AmountText(state.Rank, state.Amount) + "+", Detail = detail };
+        return state with { Text = $"{state.Text} · {(fewer ? "some sold" : "newer listings")}", Detail = detail };
     }
 
     private static void ApplySharedCoverage(ListingRetainerRow[] rows, ListingPlanDraft draft, BrowserProjection browser,

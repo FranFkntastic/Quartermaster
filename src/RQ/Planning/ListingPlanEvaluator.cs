@@ -16,9 +16,6 @@ public enum ListingCoverageState
     Retrievable,
     Missing,
     Unknown,
-    CountDecreased,
-    CountIncreased,
-    CountChanged,
 }
 
 public readonly record struct ListingItemKey(uint ItemId, ItemQualityPolicy Quality);
@@ -288,14 +285,8 @@ public static class ListingPlanEvaluator
         var bounds = projection.ListingCountObservations
             .Where(pair => assignments.Any(a => a.RetainerId == pair.Key) || physical.Any(l => l.RetainerId == pair.Key))
             .Select(pair => pair.Value.Bound).Distinct().ToArray();
+        // Coverage stays numeric; the bound only says which way the numbers may be off.
         var bound = bounds.Length == 0 ? ListingCountBound.Exact : bounds.Length == 1 ? bounds[0] : ListingCountBound.Mixed;
-        if (bound != ListingCountBound.Exact)
-            coverage = bound switch
-            {
-                ListingCountBound.Upper => ListingCoverageState.CountDecreased,
-                ListingCountBound.Lower => ListingCoverageState.CountIncreased,
-                _ => ListingCoverageState.CountChanged,
-            };
         var matches = MatchAssignments(assignments, physical);
         return new(
             itemId,
