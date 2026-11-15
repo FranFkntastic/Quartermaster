@@ -527,8 +527,17 @@ public sealed class MarketRunExecutor(
                 remaining += left;
                 summary.Add($"{l.Assignment.ItemName} at {l.Visit.Name}: posted {posted}, still short {left}");
                 if (left > 0)
-                    UncoveredWarning(record, l.Assignment, l.Visit.Name, left, uncovered.GetValueOrDefault(l.Assignment.Id) ?? "NotPosted",
-                        "stock was in hand but the visit did not post it; see the run results for the visit's stop reason");
+                {
+                    var code = uncovered.GetValueOrDefault(l.Assignment.Id) ?? "NotPosted";
+                    UncoveredWarning(record, l.Assignment, l.Visit.Name, left, code, code switch
+                    {
+                        "NotPosted" => "stock was in hand but the visit did not post it; see the run results for the visit's stop reason",
+                        "NoStock" => "no further stock was found in the bags, saddlebag or cached retainer inventories",
+                        "NoInventorySpace" => "player inventory had no free slot to gather into",
+                        "NoListingSlot" => "the retainer has no free or pullable listing slot",
+                        _ => "see the earlier MarketRunTopUpShortfallUncovered warning for this item",
+                    });
+                }
             }
             var sources = keys.Select(k =>
             {
