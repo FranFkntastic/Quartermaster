@@ -174,6 +174,7 @@ internal sealed class StockWorkspace
             Owner = projection.Owner,
             RetainerInventoryCompleteByScope = projection.RetainerInventoryCompleteByScope,
             RetainerListingsCompleteByScope = projection.RetainerListingsCompleteByScope,
+            ListingCountObservations = projection.ListingCountObservations,
         };
         DrawStockToolbar(projection, availableItems);
         var result = queries.QueryItems(

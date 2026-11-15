@@ -178,7 +178,6 @@ internal sealed class MarketRunLiveDriver(
             }
             else if (guarded.SourceChanged) reports.Add($"{target.ItemName}: source changed; {Math.Max(0, target.Units - held - (outcome?.Lines.Sum(l => l.TransferredQuantity) ?? 0))} units not gathered");
             else if (outcome?.Status != OperationStatuses.Succeeded) reports.Add($"{target.ItemName}: gather {outcome?.Message}");
-            await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
         }
         return reports;
     }

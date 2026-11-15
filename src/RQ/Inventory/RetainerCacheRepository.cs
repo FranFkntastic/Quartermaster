@@ -144,6 +144,16 @@ public sealed class RetainerCacheRepository : IDisposable
                 current.Level = entry.Level;
                 current.MarketItemCount = entry.MarketItemCount;
                 current.RosterObservedAtUtc = observedAtUtc;
+                // A newer zero count proves emptiness, not a loaded-surface capture.
+                // Do not emit an exact listing evidence receipt for this reconciliation.
+                if (entry.MarketItemCount == 0 &&
+                    (!current.ListingsObservedAtUtc.HasValue || observedAtUtc > current.ListingsObservedAtUtc))
+                {
+                    current.HistoricalListings.AddRange(current.Listings.Select(Copy));
+                    current.Listings = [];
+                    current.ListingsObservedAtUtc = observedAtUtc;
+                    store.SaveListing(current);
+                }
                 candidate[entry.RetainerId] = current;
             }
             cache = candidate;
@@ -555,6 +565,7 @@ public sealed class RetainerCacheRepository : IDisposable
         Gil = source.Gil,
         GilObservedAtUtc = source.GilObservedAtUtc,
         ListingsObservedAtUtc = source.ListingsObservedAtUtc,
+        HistoricalListings = source.HistoricalListings.Select(Copy).ToList(),
         RequestedSources = [.. source.RequestedSources],
         ObservedSources = [.. source.ObservedSources],
         Bags = source.Bags.Select(Copy).ToList(),

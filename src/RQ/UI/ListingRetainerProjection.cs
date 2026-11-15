@@ -10,7 +10,7 @@ internal readonly record struct SlotCell(SlotCellKind Kind, string Tooltip);
 internal enum ListingStateTone { Dim, Amber, Green, Info }
 internal enum ListingStateAction { None, FocusStock }
 internal sealed record ListingStateView(string Text, ListingStateTone Tone, int Rank,
-    ListingStateAction Action = ListingStateAction.None, int Amount = 0);
+    ListingStateAction Action = ListingStateAction.None, int Amount = 0, string? Detail = null);
 internal sealed record ListingPlanRowView(ListingPlanAssignment Assignment, ListingStateView State, int MaxStack, int UnlistedCount, int? ListedCount = null);
 internal sealed record ListingObservedGroupView(ListingMatchKind Kind, Guid? AssignmentId, uint ItemId,
     string ItemName, ItemQualityPolicy Quality, int Quantity, FieldEvidence<decimal> UnitPrice,
@@ -37,7 +37,13 @@ internal static class ListingRetainerProjection
         var rows = scopes.Select(scope => BuildRetainer(draft, browser, scope, currentRetainerIds.Contains(scope.RetainerId!.Value),
             resolveMaxStack, listability, destinations)).ToArray();
         ApplySharedCoverage(rows, draft, browser, currentRetainerIds, listability);
-        return rows;
+        return rows.Select(row => browser.ListingCountObservations.TryGetValue(row.RetainerId, out var count)
+            ? row with
+            {
+                State = new(count.Summary, ListingStateTone.Amber, 13, Detail: count.Description),
+                PlanRows = row.PlanRows.Select(p => p.Assignment.Enabled && Complete(p.Assignment)
+                    ? p with { State = new(count.Summary, ListingStateTone.Amber, 13, Detail: count.Description) } : p).ToArray(),
+            } : row).ToArray();
     }
 
     private static void ApplySharedCoverage(ListingRetainerRow[] rows, ListingPlanDraft draft, BrowserProjection browser,
@@ -217,7 +223,7 @@ internal static class ListingRetainerProjection
         4 => "Stock unverified", _ => $"{amount:N0} ready to list",
     };
 
-    internal static string Tooltip(ListingStateView state) => state.Rank switch
+    internal static string Tooltip(ListingStateView state) => state.Detail ?? (state.Rank switch
     {
         0 => "This planned retainer is not in the currently assigned owner roster. Its saved intent is preserved.",
         1 => "Units still missing after the planner accounts for observed listings and known stock. Shared item/quality coverage is counted once across the draft, not once per retainer.",
@@ -233,7 +239,7 @@ internal static class ListingRetainerProjection
         11 => "Unlisted counts are planned listing slots not matched by observations. Unplanned listings are observed listings outside the plan; neither is a count of inventory units.",
         12 => "Observed listings match planned item, quality, units per listing and unit price. Observations are not a fresh live market scan.",
         _ => "Excluded or non-sellable draft rows do not add listing demand.",
-    };
+    });
 
     private static ListingStateView Summary(IEnumerable<ListingStateView> entries)
     {

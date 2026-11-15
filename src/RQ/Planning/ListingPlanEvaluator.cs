@@ -16,6 +16,9 @@ public enum ListingCoverageState
     Retrievable,
     Missing,
     Unknown,
+    CountDecreased,
+    CountIncreased,
+    CountChanged,
 }
 
 public readonly record struct ListingItemKey(uint ItemId, ItemQualityPolicy Quality);
@@ -26,7 +29,10 @@ public sealed record ListingAssignmentEvaluation(
     int UnknownPriceListings,
     int WrongPriceListings,
     int WrongShapeListings,
-    int WrongRetainerListings);
+    int WrongRetainerListings)
+{
+    public ListingCountBound CountBound { get; init; }
+}
 
 public sealed record ListingPlanItemEvaluation(
     uint ItemId,
@@ -48,6 +54,8 @@ public sealed record ListingPlanItemEvaluation(
     IReadOnlyList<ListingRow> UnmanagedPhysicalListings,
     IReadOnlyList<ListingMatch> Matches)
 {
+    // Numeric listing/need fields are directional bounds when this is not Exact.
+    public ListingCountBound ListedUnitsBound { get; init; }
     public bool IsPlanned => Assignments.Count != 0;
     public int PriceExceptions => Assignments.Sum(assignment => assignment.WrongPriceListings);
     public int ShapeExceptions => Assignments.Sum(assignment => assignment.WrongShapeListings);
@@ -277,6 +285,17 @@ public static class ListingPlanEvaluator
                     : ListingCoverageState.ReadyOnPlayer;
         }
 
+        var bounds = projection.ListingCountObservations
+            .Where(pair => assignments.Any(a => a.RetainerId == pair.Key) || physical.Any(l => l.RetainerId == pair.Key))
+            .Select(pair => pair.Value.Bound).Distinct().ToArray();
+        var bound = bounds.Length == 0 ? ListingCountBound.Exact : bounds.Length == 1 ? bounds[0] : ListingCountBound.Mixed;
+        if (bound != ListingCountBound.Exact)
+            coverage = bound switch
+            {
+                ListingCountBound.Upper => ListingCoverageState.CountDecreased,
+                ListingCountBound.Lower => ListingCoverageState.CountIncreased,
+                _ => ListingCoverageState.CountChanged,
+            };
         var matches = MatchAssignments(assignments, physical);
         return new(
             itemId,
@@ -293,10 +312,13 @@ public static class ListingPlanEvaluator
             retrievable,
             missing,
             coverage,
-            matches.Assignments,
+            matches.Assignments.Select(a => a with
+            {
+                CountBound = projection.ListingCountObservations.GetValueOrDefault(a.Assignment.RetainerId)?.Bound ?? ListingCountBound.Exact,
+            }).ToArray(),
             physical,
             matches.UnmanagedListings,
-            matches.Matches);
+            matches.Matches) { ListedUnitsBound = bound };
     }
 
     private sealed record ListingMatchResult(

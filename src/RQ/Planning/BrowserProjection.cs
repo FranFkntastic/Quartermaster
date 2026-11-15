@@ -61,6 +61,8 @@ public sealed record ListingRow(
 
 public sealed class BrowserProjection
 {
+    public IReadOnlyDictionary<ulong, ListingCountObservation> ListingCountObservations { get; init; } =
+        new Dictionary<ulong, ListingCountObservation>();
     public required IReadOnlyList<BrowserScope> Scopes { get; init; }
     public required IReadOnlyList<StockGroup> Items { get; init; }
     public required IReadOnlyList<ListingRow> Listings { get; init; }
@@ -121,6 +123,7 @@ public static class BrowserProjectionBuilder
             Owner = rebuilt.Owner,
             RetainerInventoryCompleteByScope = rebuilt.RetainerInventoryCompleteByScope,
             RetainerListingsCompleteByScope = current.RetainerListingsCompleteByScope,
+            ListingCountObservations = current.ListingCountObservations,
         };
     }
 
@@ -201,6 +204,7 @@ public static class BrowserProjectionBuilder
             Owner = owner,
             RetainerInventoryCompleteByScope = inventoryCompleteness,
             RetainerListingsCompleteByScope = listingCompleteness,
+            ListingCountObservations = CountObservations(retainers),
         };
     }
 
@@ -275,6 +279,7 @@ public static class BrowserProjectionBuilder
             Owner = current.Owner,
             RetainerInventoryCompleteByScope = current.RetainerInventoryCompleteByScope,
             RetainerListingsCompleteByScope = current.RetainerListingsCompleteByScope,
+            ListingCountObservations = current.ListingCountObservations,
         };
     }
 
@@ -351,8 +356,13 @@ public static class BrowserProjectionBuilder
             Owner = owner,
             RetainerInventoryCompleteByScope = retainerInventoryCompleteByScope,
             RetainerListingsCompleteByScope = retainerListingsCompleteByScope,
+            ListingCountObservations = CountObservations(retainers),
         };
     }
+
+    private static IReadOnlyDictionary<ulong, ListingCountObservation> CountObservations(IEnumerable<CachedRetainer> retainers) =>
+        retainers.Select(r => (r.RetainerId, Count: ListingCountObservation.From(r)))
+            .Where(r => r.Count is not null).ToDictionary(r => r.RetainerId, r => r.Count!);
 
     private static bool HasCompleteRetainerInventory(CachedRetainer retainer) =>
         InventoryScanner.RequiredRetainerContainers

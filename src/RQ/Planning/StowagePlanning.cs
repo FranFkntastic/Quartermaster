@@ -539,6 +539,7 @@ public static class StowageRouter
         Gil = source.Gil,
         GilObservedAtUtc = source.GilObservedAtUtc,
         ListingsObservedAtUtc = source.ListingsObservedAtUtc,
+        HistoricalListings = source.HistoricalListings.ToList(),
         RequestedSources = [.. source.RequestedSources],
         ObservedSources = [.. source.ObservedSources],
         Bags = source.Bags.Select(Copy).ToList(),

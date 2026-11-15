@@ -46,6 +46,7 @@ public sealed class CachedRetainer
     public List<string> ObservedSources { get; set; } = [];
     public List<CachedBag> Bags { get; set; } = [];
     public List<CachedMarketListing> Listings { get; set; } = [];
+    public List<CachedMarketListing> HistoricalListings { get; set; } = [];
 }
 
 public sealed class CachedBag
