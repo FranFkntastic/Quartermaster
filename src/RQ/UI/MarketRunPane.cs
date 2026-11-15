@@ -1,3 +1,4 @@
+using Franthropy.Dalamud.UI.Inputs;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using RQ.Domain;
@@ -87,7 +88,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
                 var reserve = draft.Reserves.FirstOrDefault(r => r.ItemId == item.ItemId && r.Quality == item.Quality);
                 var units = reserve?.ReserveUnits ?? 0;
                 ImGui.SetNextItemWidth(-1);
-                if (ImGui.InputInt("##reserve", ref units, 0))
+                if (DalamudGroupedIntegerInput.InputGroupedInt("##reserve", ref units, 0, 0))
                 {
                     reserve ??= session.AddReserve(item.ItemId, item.ItemName, item.Quality);
                     session.SetReserveUnits(reserve.Id, Math.Clamp(units, 0, ListingReserveRule.MaxReserveUnits).ToString());

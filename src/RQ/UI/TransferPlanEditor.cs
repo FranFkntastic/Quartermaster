@@ -1,3 +1,4 @@
+using Franthropy.Dalamud.UI.Inputs;
 using System.Globalization;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
@@ -364,7 +365,7 @@ internal sealed class TransferPlanEditor
         ImGui.TextDisabled("Player target");
         ImGui.SameLine();
         ImGui.SetNextItemWidth(80);
-        if (ImGui.InputInt("##stowagebulktarget", ref bulkStowageTarget)) bulkStowageTarget = Math.Max(0, bulkStowageTarget);
+        if (DalamudGroupedIntegerInput.InputGroupedInt("##stowagebulktarget", ref bulkStowageTarget, 1, 100)) bulkStowageTarget = Math.Max(0, bulkStowageTarget);
         ImGui.SameLine();
         ImGui.TextDisabled("Quality");
         ImGui.SameLine();
@@ -599,7 +600,7 @@ internal sealed class TransferPlanEditor
         var extra = contribution?.Quantity.IsKnown == true ? contribution.Quantity.Value : 0;
         var target = checked(row.Rule.TargetQuantity + extra);
         ImGui.SetNextItemWidth(-1);
-        if (ImGui.InputInt($"##drafttarget{row.Rule.Id}", ref target))
+        if (DalamudGroupedIntegerInput.InputGroupedInt($"##drafttarget{row.Rule.Id}", ref target, 1, 100))
             row.Rule.TargetQuantity = Math.Max(0, target - extra);
         if (contribution is not null)
         {
