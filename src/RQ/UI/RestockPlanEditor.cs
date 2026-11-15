@@ -1,3 +1,4 @@
+using Franthropy.Dalamud.UI.Inputs;
 using System.Globalization;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
@@ -339,7 +340,7 @@ internal sealed class RestockPlanEditor
         ImGui.TextDisabled("Target");
         ImGui.SameLine();
         ImGui.SetNextItemWidth(80);
-        ImGui.InputInt("##restockbulktarget", ref bulkRestockTarget);
+        DalamudGroupedIntegerInput.InputGroupedInt("##restockbulktarget", ref bulkRestockTarget, 1, 100);
         ImGui.SameLine();
         ImGui.TextDisabled("Quality");
         ImGui.SameLine();
@@ -425,7 +426,7 @@ internal sealed class RestockPlanEditor
     {
         var target = item.TargetQuantity;
         ImGui.SetNextItemWidth(-1);
-        if (ImGui.InputInt($"##draftrestocktarget{item.Id}", ref target))
+        if (DalamudGroupedIntegerInput.InputGroupedInt($"##draftrestocktarget{item.Id}", ref target, 1, 100))
             item.TargetQuantity = Math.Max(0, target);
     }
 

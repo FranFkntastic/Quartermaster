@@ -1,3 +1,4 @@
+using Franthropy.Dalamud.UI.Inputs;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Franthropy.Dalamud.AgentBridge;
@@ -181,7 +182,7 @@ internal sealed class TransferPlanWorkspace
             ? row.Rule.TargetQuantity + listingShortfall
             : row.Rule.TargetQuantity;
         ImGui.SetNextItemWidth(Math.Min(66, Math.Max(32, ImGui.GetContentRegionAvail().X * .55f)));
-        if (ImGui.InputInt($"##target:{row.Rule.Id}", ref target, 0))
+        if (DalamudGroupedIntegerInput.InputGroupedInt($"##target:{row.Rule.Id}", ref target, 0, 0))
             UpdateTransferRule(row.Owner, row.PlanId, row.Rule.Id, draftRule =>
                 draftRule.TargetQuantity = Math.Max(0, target - listingShortfall));
         var targetHovered = ImGui.IsItemHovered();
