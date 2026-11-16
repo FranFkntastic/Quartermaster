@@ -38,6 +38,8 @@ public sealed class CachedRetainer
     public byte? Level { get; set; }
     public byte? MarketItemCount { get; set; }
     public DateTime? RosterObservedAtUtc { get; set; }
+    /// <summary>When <see cref="MarketItemCount"/> was read during a live summoning-bell session.</summary>
+    public DateTime? MarketCountObservedAtUtc { get; set; }
     public DateTime ObservedAtUtc { get; set; }
     public ulong Gil { get; set; }
     public DateTime? GilObservedAtUtc { get; set; }
@@ -46,6 +48,7 @@ public sealed class CachedRetainer
     public List<string> ObservedSources { get; set; } = [];
     public List<CachedBag> Bags { get; set; } = [];
     public List<CachedMarketListing> Listings { get; set; } = [];
+    public List<CachedMarketListing> HistoricalListings { get; set; } = [];
 }
 
 public sealed class CachedBag

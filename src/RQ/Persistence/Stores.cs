@@ -327,6 +327,8 @@ public sealed class RetainerCacheStore : IDisposable
                 current.Owner = checkpoint.Owner with { };
                 current.ListingsObservedAtUtc = checkpoint.ObservedAtUtc;
                 current.Listings = checkpoint.Listings.Select(Copy).ToList();
+                if (checkpoint.HistoricalListings is not null)
+                    current.HistoricalListings = checkpoint.HistoricalListings.Select(Copy).ToList();
                 var marketSource = FFXIVClientStructs.FFXIV.Client.Game.InventoryType.RetainerMarket.ToString();
                 if (!current.RequestedSources.Contains(marketSource, StringComparer.Ordinal))
                     current.RequestedSources.Add(marketSource);
@@ -356,6 +358,7 @@ public sealed class RetainerCacheStore : IDisposable
             Owner = retainer.Owner with { },
             ObservedAtUtc = retainer.ListingsObservedAtUtc,
             Listings = retainer.Listings.Select(Copy).ToList(),
+            HistoricalListings = retainer.HistoricalListings.Select(Copy).ToList(),
         };
         lock (listingGate)
         {
@@ -538,6 +541,8 @@ public sealed class RetainerCacheStore : IDisposable
         public OwnerScope Owner { get; set; } = new();
         public DateTime? ObservedAtUtc { get; set; }
         public List<CachedMarketListing> Listings { get; set; } = [];
+        // Null preserves history from the whole-cache file for legacy checkpoints.
+        public List<CachedMarketListing>? HistoricalListings { get; set; }
     }
 }
 

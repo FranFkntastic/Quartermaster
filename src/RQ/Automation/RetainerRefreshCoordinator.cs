@@ -191,7 +191,7 @@ public sealed class RetainerRefreshCoordinator : IDisposable
             }
             if (!currentOwner().Matches(owner))
                 return;
-            ReconcileRoster(owner, roster.Retainers, utcNow());
+            ReconcileRoster(owner, roster.Retainers, utcNow(), session.IsRetainerListReady);
             discoveredOwnerKey = OwnerKey(owner);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
@@ -229,7 +229,7 @@ public sealed class RetainerRefreshCoordinator : IDisposable
             }
             if (!roster.Success || !roster.IsComplete)
                 throw new InvalidOperationException($"{roster.Code}: {roster.Message}");
-            ReconcileRoster(owner, roster.Retainers, DateTime.UtcNow);
+            ReconcileRoster(owner, roster.Retainers, DateTime.UtcNow, session.IsRetainerListReady);
 
             var selectedIds = retryRetainerIds is { Count: > 0 }
                 ? retryRetainerIds.ToHashSet()
@@ -253,6 +253,11 @@ public sealed class RetainerRefreshCoordinator : IDisposable
             {
                 list = await EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);
                 RequireSuccess(list);
+                // The first scan may have read last session's sale counts; re-read them
+                // now that the open list guarantees current ones.
+                var current = await session.ScanRetainerRosterAsync(cancellationToken).ConfigureAwait(false);
+                if (current.Success && current.IsComplete)
+                    ReconcileRoster(owner, current.Retainers, DateTime.UtcNow, true);
             }
 
             phase = RetainerRefreshPhase.Refreshing;
@@ -354,10 +359,17 @@ public sealed class RetainerRefreshCoordinator : IDisposable
         {
             RequireSuccess(await session.OpenRetainerAsync(new(target.RetainerId, target.RetainerName), cancellationToken).ConfigureAwait(false));
             cache.ObserveUiAccessibility(owner, target.RetainerId, true, DateTime.UtcNow);
-            RequireSuccess(await session.WaitForCurrentRetainerMenuAsync(cancellationToken).ConfigureAwait(false));
             RequireSuccess(await session.OpenInventoryAsync(cancellationToken).ConfigureAwait(false));
             RequireSuccess(await session.CloseInventoryAsync(cancellationToken).ConfigureAwait(false));
             await WaitForEvidenceAsync(evidence, target.RetainerName, cancellationToken).ConfigureAwait(false);
+            var cached = cache.Snapshot().GetValueOrDefault(target.RetainerId);
+            if (cached is not null && cached.Owner.Matches(owner) && ListingCountObservation.From(cached) is not null)
+            {
+                using var listings = new EvidenceWait(cache, owner, target.RetainerId, evidenceSession.SessionId,
+                    cache.Revision, RetainerEvidenceDomain.Listings);
+                RequireSuccess(await session.OpenSellingListAsync(cancellationToken).ConfigureAwait(false));
+                await WaitForEvidenceAsync(listings, target.RetainerName, cancellationToken).ConfigureAwait(false);
+            }
             RequireSuccess(await session.ReturnToRetainerListAsync(cancellationToken).ConfigureAwait(false));
         }
     }
@@ -370,7 +382,7 @@ public sealed class RetainerRefreshCoordinator : IDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (DateTime.UtcNow >= deadline)
-                throw new InvalidOperationException($"Timed out waiting for complete inventory evidence from {retainerName}; received {evidence.ObservedDomains}.");
+                throw new InvalidOperationException($"Timed out waiting for required retainer evidence from {retainerName}; received {evidence.ObservedDomains}.");
             await framework.DelayTicks(delayTicks, cancellationToken).ConfigureAwait(false);
             delayTicks = Math.Min(delayTicks * 2, 30);
         }
@@ -435,7 +447,7 @@ public sealed class RetainerRefreshCoordinator : IDisposable
             Message = message,
         });
 
-    private void ReconcileRoster(OwnerScope owner, IReadOnlyList<RetainerRosterEntry> roster, DateTime observedAtUtc) =>
+    private void ReconcileRoster(OwnerScope owner, IReadOnlyList<RetainerRosterEntry> roster, DateTime observedAtUtc, bool marketCountsCurrent) =>
         cache.ReconcileRoster(
             owner,
             roster.Select(entry => new RetainerRosterProjectionEntry(
@@ -447,7 +459,8 @@ public sealed class RetainerRefreshCoordinator : IDisposable
                 entry.Level,
                 entry.MarketItemCount,
                 entry.IsGameAvailable)).ToArray(),
-            observedAtUtc);
+            observedAtUtc,
+            marketCountsCurrent);
 
     private void DrawAutoRetainerButton()
     {

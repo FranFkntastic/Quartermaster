@@ -289,6 +289,12 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             var retainerLegMessage = default(string);
             foreach (var candidate in candidates)
             {
+                var wanted = candidate.ItemIds.Where(itemId =>
+                    operation.Lines.Any(line =>
+                        line.ItemId == itemId &&
+                        remaining.GetValueOrDefault(RetrievalKey(line.ItemId, line.Quality)) > 0)).ToHashSet();
+                if (wanted.Count == 0)
+                    continue;
                 if (!retainerSessionOpen)
                 {
                     try
@@ -307,10 +313,6 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                 token.ThrowIfCancellationRequested();
                 retainerOpen = true;
                 await driver.OpenInventoryAsync(token).ConfigureAwait(false);
-                var wanted = candidate.ItemIds.Where(itemId =>
-                    operation.Lines.Any(line =>
-                        line.ItemId == itemId &&
-                        remaining.GetValueOrDefault(RetrievalKey(line.ItemId, line.Quality)) > 0)).ToHashSet();
                 var liveStacks = await driver.ScanRetainerAsync(wanted, token).ConfigureAwait(false);
                 // The route scan is already required to choose physical source stacks.
                 // Reuse its per-variant totals as verification baselines instead of

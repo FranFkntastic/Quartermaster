@@ -102,7 +102,8 @@ public sealed class RetainerCacheRepository : IDisposable
     public void ReconcileRoster(
         OwnerScope owner,
         IReadOnlyList<RetainerRosterProjectionEntry> roster,
-        DateTime observedAtUtc)
+        DateTime observedAtUtc,
+        bool marketCountsCurrent = false)
     {
         if (!owner.HasStableIdentity)
             throw new InvalidOperationException("A stable owner identity is required.");
@@ -144,6 +145,20 @@ public sealed class RetainerCacheRepository : IDisposable
                 current.Level = entry.Level;
                 current.MarketItemCount = entry.MarketItemCount;
                 current.RosterObservedAtUtc = observedAtUtc;
+                // RetainerManager keeps the last bell session's counts; only a read taken
+                // during a live bell session is current enough to contradict listings.
+                if (marketCountsCurrent)
+                    current.MarketCountObservedAtUtc = observedAtUtc;
+                // A newer zero count proves emptiness, not a loaded-surface capture.
+                // Do not emit an exact listing evidence receipt for this reconciliation.
+                if (marketCountsCurrent && entry.MarketItemCount == 0 &&
+                    (!current.ListingsObservedAtUtc.HasValue || observedAtUtc > current.ListingsObservedAtUtc))
+                {
+                    current.HistoricalListings.AddRange(current.Listings.Select(Copy));
+                    current.Listings = [];
+                    current.ListingsObservedAtUtc = observedAtUtc;
+                    store.SaveListing(current);
+                }
                 candidate[entry.RetainerId] = current;
             }
             cache = candidate;
@@ -551,10 +566,12 @@ public sealed class RetainerCacheRepository : IDisposable
         Level = source.Level,
         MarketItemCount = source.MarketItemCount,
         RosterObservedAtUtc = source.RosterObservedAtUtc,
+        MarketCountObservedAtUtc = source.MarketCountObservedAtUtc,
         ObservedAtUtc = source.ObservedAtUtc,
         Gil = source.Gil,
         GilObservedAtUtc = source.GilObservedAtUtc,
         ListingsObservedAtUtc = source.ListingsObservedAtUtc,
+        HistoricalListings = source.HistoricalListings.Select(Copy).ToList(),
         RequestedSources = [.. source.RequestedSources],
         ObservedSources = [.. source.ObservedSources],
         Bags = source.Bags.Select(Copy).ToList(),
