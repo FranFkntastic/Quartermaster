@@ -8,6 +8,7 @@ namespace RQ.AgentBridge;
 public sealed class AgentBridgeHost : IDisposable
 {
     private readonly PluginConfiguration configuration;
+    private readonly bool isDevPlugin;
     private readonly Func<Action, CancellationToken, Task> dispatchOnFramework;
     private readonly QuartermasterBridgeProvider provider;
     private readonly Func<string, AgentBridgeUiCaptureTransactionHandle> beginCapturePresentation;
@@ -23,6 +24,7 @@ public sealed class AgentBridgeHost : IDisposable
 
     public AgentBridgeHost(
         PluginConfiguration configuration,
+        bool isDevPlugin,
         string configDirectory,
         string mainDllPath,
         Action saveConfiguration,
@@ -34,6 +36,7 @@ public sealed class AgentBridgeHost : IDisposable
         Func<bool, CancellationToken, Task<AgentBridgeCaptureReceipt>> captureViewport)
     {
         this.configuration = configuration;
+        this.isDevPlugin = isDevPlugin;
         this.dispatchOnFramework = dispatchOnFramework;
         this.provider = provider;
         this.beginCapturePresentation = beginCapturePresentation;
@@ -70,9 +73,10 @@ public sealed class AgentBridgeHost : IDisposable
 
     public void Tick()
     {
-        // Off by default; `/rq bridge on` opts in. Deployed builds are Release, so the
-        // opt-in must hold there too (as it does for MarketMafioso).
-        if (configuration.EnableAgentBridge)
+        // On for dev-loaded installs (every fleet deploy) unless explicitly turned off;
+        // public installs stay opt-in via `/rq bridge on`. Loopback + DPAPI token guard it either way.
+        var enabled = !configuration.AgentBridgeDisabledByUser && (configuration.EnableAgentBridge || isDevPlugin);
+        if (enabled)
             host.Start();
         else
             host.Stop();

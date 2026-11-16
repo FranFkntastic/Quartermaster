@@ -335,6 +335,7 @@ public sealed class Plugin : IDalamudPlugin
             textureReadbackProvider);
         agentBridge = new(
             configuration,
+            pluginInterface.IsDev,
             configDirectory,
             pluginInterface.AssemblyLocation.FullName,
             SaveConfiguration,
@@ -363,10 +364,7 @@ public sealed class Plugin : IDalamudPlugin
             journal.OperationChanged += OnOperationChanged;
             submissions.OperationChanged += OnSubmittedOperationChanged;
             deposits.OperationChanged += OnSubmittedOperationChanged;
-            var commandHelp = "Open Quartermaster.";
-#if DEBUG
-            commandHelp += " Use '/rq bridge on|off' to control the local development bridge.";
-#endif
+            var commandHelp = "Open Quartermaster. Use '/rq bridge on|off' to control the local agent bridge.";
             commands.AddHandler(Command, new CommandInfo((_, arguments) => HandleCommand(arguments)) { HelpMessage = commandHelp });
             pluginInterface.UiBuilder.Draw += DrawWindows;
             pluginInterface.UiBuilder.OpenMainUi += OpenMainUi;
@@ -556,16 +554,16 @@ public sealed class Plugin : IDalamudPlugin
 
     private void HandleCommand(string arguments)
     {
-#if DEBUG
         var normalized = arguments.Trim();
         if (normalized.Equals("bridge on", StringComparison.OrdinalIgnoreCase) ||
             normalized.Equals("bridge off", StringComparison.OrdinalIgnoreCase))
         {
-            configuration.EnableAgentBridge = normalized.EndsWith("on", StringComparison.OrdinalIgnoreCase);
+            var on = normalized.EndsWith("on", StringComparison.OrdinalIgnoreCase);
+            configuration.EnableAgentBridge = on;
+            configuration.AgentBridgeDisabledByUser = !on;
             SaveConfiguration();
             return;
         }
-#endif
         reconciliation.Request(RuntimeDomain.All, "opened");
         window.IsOpen = true;
     }
