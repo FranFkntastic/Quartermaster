@@ -1290,7 +1290,8 @@ internal sealed class TransferPlanWorkspace
                     var player = TransferPlanEvaluation.PlayerQuantity(
                         runtime.Browser,
                         new TargetPlanItem { ItemId = itemId, Quality = quality });
-                    first ??= StowagePlanCatalog.AddBalancedRule(draft, itemId, name, quality, player).Id;
+                    var added = StowagePlanCatalog.AddBalancedRule(draft, itemId, name, quality, player);
+                    first ??= added.Id;
                 }
                 StowagePlanCatalog.Apply(document, runtime.Owner, draft);
                 return first;
