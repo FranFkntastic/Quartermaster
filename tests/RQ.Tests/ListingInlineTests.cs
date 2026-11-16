@@ -45,8 +45,9 @@ public sealed class ListingInlineTests
         public ListingPlanAssignment Add(int count = 1)
         {
             var runtime = Runtime(); Session.Ensure(runtime);
-            var a = Session.Add(10, "Retainer 10", 1, "Item 1", ItemQualityPolicy.NqOnly, runtime.Browser);
-            Session.SetListingCount(a.Id, count.ToString()); Session.SetUnitPrice(a.Id, "100"); return a;
+            var plan = new ListingSlotPlan(1, "Item 1", ItemQualityPolicy.NqOnly, 1, 100, true);
+            var keys = Session.RewriteSlots(10, "Retainer 10", Enumerable.Range(0, count).Select(i => (ListingSlotKey.Free(i), (ListingSlotPlan?)plan)).ToArray())!;
+            return Session.Draft!.Assignments.Single(a => a.Id == keys[0].AssignmentId);
         }
         public void Dispose() { Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools(); Directory.Delete(directory, true); }
     }
@@ -55,7 +56,7 @@ public sealed class ListingInlineTests
     public void ConflictBaselineIsBoundToTheMergedRevision()
     {
         using var f = new Fixture(); var a = f.Add(); f.Session.Save(f.Runtime());
-        f.Session.SetUnitPrice(a.Id, "200");
+        f.Session.RewriteSlots(10, "Retainer 10", [(ListingSlotKey.Planned(a.Id, 0), ListingSlotPlan.Of(a) with { Price = 200 })]);
         f.Repository.Mutate(s => { s.ListingPlans[0].Assignments[0].UnitPrice = 300; s.ListingPlans[0].Revision++; });
         f.Session.Save(f.Runtime());
         Assert.Equal(1, f.Session.ConflictCount); Assert.Equal(300, f.Session.Draft!.BaselineAssignments[0].UnitPrice);
