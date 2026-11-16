@@ -60,7 +60,9 @@ internal sealed class ListingWorkspace
     private readonly DalamudSuggestionInputState bulkItemInput = new();
     private string? bulkUnits;
     private string? bulkPrice;
+    // The popup's target lives until the popup closes; the open request is one frame only.
     private (uint ItemId, string Name)? slotMenuItem;
+    private (uint ItemId, string Name)? slotMenuRequest;
 
     public ListingWorkspace(WorkbenchState workbench, ListingNavigationCoordinator navigation,
         AgentBridgeUiReviewRegistry registry, ListingPlanDraftSession session,
@@ -328,7 +330,7 @@ internal sealed class ListingWorkspace
             var picked = retainer.Slots.Where(s => slotSelection.IsSelected(s.Key)).ToArray();
             if (picked.Length > 0) DrawBulkBar(runtime, retainer, picked);
         }
-        slotMenuItem = null;
+        slotMenuRequest = null;
         if (slotTable.Begin($"RQSlots{retainer.RetainerId}", DalamudTableLayout.FitContent(
             ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.BordersOuterH)))
         {
@@ -345,13 +347,14 @@ internal sealed class ListingWorkspace
             }
             finally { slotTable.End(); }
         }
-        if (slotMenuItem is not null) ImGui.OpenPopup("RQSlotItemMenu");
+        if (slotMenuRequest is not null) { slotMenuItem = slotMenuRequest; ImGui.OpenPopup("RQSlotItemMenu"); }
         if (ImGui.BeginPopup("RQSlotItemMenu"))
         {
             if (ItemClient is not null && slotMenuItem is { } item && ImGui.MenuItem($"Open item search · {item.Name}"))
                 itemOpenStatus = ItemClient.Open(item.ItemId);
             ImGui.EndPopup();
         }
+        else slotMenuItem = null;
         if (retainer.RetainerId == workbench.SelectedListingRetainerId) workbench.ScrollToListingDetail = null;
     }
 
@@ -437,7 +440,7 @@ internal sealed class ListingWorkspace
         // The row target is the last item here; right-click offers item search for this slot's item.
         if (ItemClient is not null && ImGui.IsItemHovered() && ImGui.IsMouseReleased(ImGuiMouseButton.Right) &&
             (slot.Assignment?.ItemId ?? slot.Listing?.ItemId) is { } itemId)
-            slotMenuItem = (itemId, slot.Assignment?.ItemName ?? slot.Listing!.ItemName);
+            slotMenuRequest = (itemId, slot.Assignment?.ItemName ?? slot.Listing!.ItemName);
         if (drawingRetainerId == workbench.SelectedListingRetainerId && workbench.ScrollToListingDetail is { } key &&
             (Is(slot.Assignment, key) || Is(slot.Listing, key)))
         { ImGui.SetScrollHereY(.25f); workbench.ScrollToListingDetail = null; }
