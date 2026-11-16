@@ -70,14 +70,12 @@ public sealed class AgentBridgeHost : IDisposable
 
     public void Tick()
     {
-#if DEBUG
+        // Off by default; `/rq bridge on` opts in. Deployed builds are Release, so the
+        // opt-in must hold there too (as it does for MarketMafioso).
         if (configuration.EnableAgentBridge)
             host.Start();
         else
             host.Stop();
-#else
-        host.Stop();
-#endif
         UpdateRefreshOperation();
     }
 
