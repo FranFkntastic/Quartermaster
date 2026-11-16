@@ -1607,8 +1607,6 @@ internal sealed class TransferPlanWorkspace
         var retrievalLines = retrieval.Lines.ToDictionary(line => line.PlanItemId);
         var vendorLines = vendor.Lines.ToDictionary(line => line.RuleId);
         var vendorPreviewLines = vendorPreview.Lines.ToDictionary(line => line.RuleId);
-        var movements = evaluated.Values.Count(line =>
-            line.Action is StowageAction.Retrieve or StowageAction.Deposit);
         var rows = rules
             .Select(rule =>
             {
@@ -1657,6 +1655,8 @@ internal sealed class TransferPlanWorkspace
                     vendorPreviewLine);
             })
             .ToArray();
+        // Count lines that will actually move something, from the same projection the rows show.
+        var movements = rows.Count(row => row.Projection.Retrieve > 0 || row.Projection.Stow > 0);
         transferWorkbenchProjection = new(
             runtime.Revision,
             plan.Id,
