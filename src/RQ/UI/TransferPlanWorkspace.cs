@@ -1,8 +1,11 @@
-using Franthropy.Dalamud.UI.Inputs;
+using System.Globalization;
 using System.Numerics;
+using System.Text.Json;
 using Dalamud.Bindings.ImGui;
 using Franthropy.Dalamud.AgentBridge;
+using Franthropy.Dalamud.Automation.Vendors;
 using Franthropy.Dalamud.Automation.Vendors.Coordination;
+using Franthropy.Dalamud.UI.Inputs;
 using Franthropy.Dalamud.UI.Tables;
 using Franthropy.Filtering.Evaluation;
 using RQ.Automation;
@@ -18,30 +21,76 @@ namespace RQ.UI;
 internal sealed record TransferPlanWorkspaceSnapshot(int ProjectionBuildCount, int RenderedRowCount);
 
 /// <summary>
-/// Owns the Transfer Plan workspace, projection cache, route editing, and review entry points.
+/// Owns the Transfer Plan workspace: the only plan editor. Every edit applies to the saved
+/// plan through <see cref="StowagePlanCatalog"/>; there is no separate draft or modal.
 /// </summary>
 internal sealed class TransferPlanWorkspace
 {
+    private static readonly Vector4 ErrorColor = new(1f, .45f, .4f, 1f);
+    private static readonly Vector4 AmberColor = new(1f, .7f, .3f, 1f);
+    private static readonly Vector4 VendorColor = new(.92f, .72f, .35f, 1f);
+    private static readonly Vector4 PausedRowColor = new(.13f, .15f, .17f, .42f);
+    private const string AddSuggestionsPopup = "##RQPlanAddSuggestions";
+    private const ImGuiWindowFlags SuggestionWindowFlags =
+        ImGuiWindowFlags.NoTitleBar |
+        ImGuiWindowFlags.NoResize |
+        ImGuiWindowFlags.NoMove |
+        ImGuiWindowFlags.NoSavedSettings |
+        ImGuiWindowFlags.NoFocusOnAppearing |
+        ImGuiWindowFlags.NoNav |
+        ImGuiWindowFlags.NoDocking |
+        ImGuiWindowFlags.AlwaysAutoResize;
+    private const int FocusGiveUpFrames = 120;
+
+    private sealed record RemovedLines(
+        Guid PlanId,
+        string Label,
+        IReadOnlyList<TargetPlanItem> Rules,
+        IReadOnlyList<TransferPlanListingLink> Links);
+
+    private sealed record AddSuggestion(string Label, ItemChoice? Item, ItemGroup? Group);
+
     private readonly StateRepository state;
     private readonly QuartermasterRuntimeSnapshotSource runtimeSnapshots;
     private readonly TransferCoordinator transfers;
     private readonly RetainerRefreshCoordinator retainerRefresh;
     private readonly TransferVendorProcurementService vendorProcurement;
     private readonly WorkbenchState workbench;
-    private readonly TransferPlanEditor transferPlanEditor;
+    private readonly ItemGroupWorkspace itemGroupWorkspace;
     private readonly TransferExecutionController transferExecution;
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
+    private readonly Func<string, int, IReadOnlyList<ItemChoice>> searchItems;
+    private readonly Func<GilVendorCatalog>? vendorCatalogSource;
     private readonly Action<Guid, string> requestTransferReview;
     private readonly Action<TransferVendorProcurementReview> requestVendorReview;
     private readonly Action<StowagePlan, OwnerScope> requestDeletePlan;
     private readonly DalamudTableProjection<TransferWorkbenchRow> transferWorkbenchTable;
+    private readonly TableSelectionModel<Guid> selection = new();
+    private readonly Dictionary<Guid, string> lineErrors = [];
     private TransferWorkbenchProjection? transferWorkbenchProjection;
     private int transferProjectionBuildCount;
     private int renderedTransferRowCount;
     private object? dismissedVendorRun;
-    private string scratchName = string.Empty;
-    private bool saveScratchRequested;
     private string vendorStatus = string.Empty;
+
+    private Guid? renamingPlanId;
+    private string renameText = string.Empty;
+    private bool renameFocusRequested;
+
+    private string bulkTarget = string.Empty;
+    private ItemQualityPolicy? bulkQuality;
+    private StowageRoutingMode? bulkRoutingMode;
+    private StowageOverflowPolicy? bulkOverflow;
+
+    private string addText = string.Empty;
+    private string cachedItemSearch = string.Empty;
+    private IReadOnlyList<ItemChoice> cachedItemChoices = [];
+
+    private Guid? focusTargetRuleId;
+    private int focusTargetFrames;
+    private Guid? noteRuleId;
+    private string noteBuffer = string.Empty;
+    private RemovedLines? lastRemoved;
 
     public TransferPlanWorkspace(
         StateRepository state,
@@ -50,9 +99,11 @@ internal sealed class TransferPlanWorkspace
         RetainerRefreshCoordinator retainerRefresh,
         TransferVendorProcurementService vendorProcurement,
         WorkbenchState workbench,
-        TransferPlanEditor transferPlanEditor,
+        ItemGroupWorkspace itemGroupWorkspace,
         TransferExecutionController transferExecution,
         AgentBridgeUiReviewRegistry reviewRegistry,
+        Func<string, int, IReadOnlyList<ItemChoice>> searchItems,
+        Func<GilVendorCatalog>? vendorCatalogSource,
         Action<Guid, string> requestTransferReview,
         Action<TransferVendorProcurementReview> requestVendorReview,
         Action<StowagePlan, OwnerScope> requestDeletePlan)
@@ -63,9 +114,11 @@ internal sealed class TransferPlanWorkspace
         this.retainerRefresh = retainerRefresh;
         this.vendorProcurement = vendorProcurement;
         this.workbench = workbench;
-        this.transferPlanEditor = transferPlanEditor;
+        this.itemGroupWorkspace = itemGroupWorkspace;
         this.transferExecution = transferExecution;
         this.reviewRegistry = reviewRegistry;
+        this.searchItems = searchItems;
+        this.vendorCatalogSource = vendorCatalogSource;
         this.requestTransferReview = requestTransferReview;
         this.requestVendorReview = requestVendorReview;
         this.requestDeletePlan = requestDeletePlan;
@@ -82,92 +135,776 @@ internal sealed class TransferPlanWorkspace
             ? document.StowagePlans.FirstOrDefault(plan => plan.Id == selectedId && plan.Owner.Matches(owner))
             : null;
 
+    /// <summary>
+    /// Keeps an owner's Unsaved plan present and the selection pointing at one of the owner's plans.
+    /// </summary>
+    public void EnsureSelection(QuartermasterRuntimeSnapshot runtime)
+    {
+        var owner = runtime.Owner;
+        if (!owner.HasStableIdentity)
+            return;
+        var selectedId = workbench.SelectedStowagePlanId;
+        var (hasScratch, selectedValid) = state.Read(document => (
+            document.StowagePlans.Any(plan => plan.IsEphemeral && plan.Owner.Matches(owner)),
+            selectedId is { } id && document.StowagePlans.Any(plan => plan.Id == id && plan.Owner.Matches(owner))));
+        if (!hasScratch)
+            state.Mutate(document => StowagePlanCatalog.EnsureScratch(document, owner));
+        if (!selectedValid)
+            workbench.SelectedStowagePlanId = state.Read(document =>
+                document.StowagePlans.First(plan => plan.IsEphemeral && plan.Owner.Matches(owner)).Id);
+    }
+
+    /// <summary>Adds stock-browser selections to the selected plan (or the Unsaved plan).</summary>
+    public void AddStock(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, bool stow, ulong? retainerId = null)
+    {
+        if (!runtime.Owner.HasStableIdentity)
+            return;
+        EnsureSelection(runtime);
+        var planId = workbench.SelectedStowagePlanId!.Value;
+        state.Mutate(document =>
+        {
+            var draft = StowagePlanCatalog.Draft(document, runtime.Owner, planId);
+            foreach (var item in items)
+                StowagePlanCatalog.SetStockRule(draft, item.ItemId, item.ItemName, item.PlayerQuantity, stow, retainerId);
+            StowagePlanCatalog.Apply(document, runtime.Owner, draft);
+        });
+    }
+
+    /// <summary>Raises the selected plan's target for a listing shortfall and focuses its row.</summary>
+    public void PrepareListingTarget(QuartermasterRuntimeSnapshot runtime, ListingPlanItemEvaluation demand)
+    {
+        if (!runtime.Owner.HasStableIdentity)
+            return;
+        EnsureSelection(runtime);
+        if (workbench.SelectedStowagePlanId is not { } planId)
+            return;
+        if (!demand.MovementNeedUnits.IsKnown)
+        {
+            transferExecution.ReportInlineError("Listing observations are unavailable; the target was not changed.");
+            return;
+        }
+        var need = Math.Max(0, demand.MovementNeedUnits.Value);
+        try
+        {
+            var ruleId = state.Mutate(document =>
+            {
+                if (document.TransferPlanListingLinks.Any(link =>
+                        link.StowagePlanId == planId && link.ItemId == demand.ItemId && link.Quality == demand.Quality))
+                    throw new InvalidOperationException("This item already uses a live listing-demand link in this plan.");
+                var draft = StowagePlanCatalog.Draft(document, runtime.Owner, planId);
+                if (draft.Rules.Any(rule => rule.ItemId == demand.ItemId && rule.Quality == ItemQualityPolicy.Any))
+                    throw new InvalidOperationException("This item has an Any-quality target. Choose NQ or HQ on its line before preparing exact-quality listings.");
+                var rule = draft.Rules.FirstOrDefault(candidate => candidate.ItemId == demand.ItemId && candidate.Quality == demand.Quality);
+                if (rule is null)
+                {
+                    rule = new TargetPlanItem
+                    {
+                        StowagePlanId = planId,
+                        ItemId = demand.ItemId,
+                        ItemName = demand.ItemName,
+                        Quality = demand.Quality,
+                        TargetQuantity = need,
+                    };
+                    draft.Rules.Add(rule);
+                }
+                rule.TargetQuantity = Math.Max(rule.TargetQuantity, need);
+                rule.Enabled = true;
+                StowagePlanCatalog.Apply(document, runtime.Owner, draft);
+                return rule.Id;
+            });
+            RequestTargetFocus(ruleId);
+            workbench.View = WorkbenchView.Stowage;
+            transferExecution.ClearInlineError();
+        }
+        catch (Exception exception)
+        {
+            transferExecution.ReportInlineError(exception.Message);
+        }
+    }
 
     private DalamudTableProjection<TransferWorkbenchRow> CreateTable() => new(
     [
         new(
+            "##select",
+            22,
+            _ => string.Empty,
+            Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoSort | ImGuiTableColumnFlags.NoResize |
+                   ImGuiTableColumnFlags.NoHeaderLabel | ImGuiTableColumnFlags.NoHide,
+            Draw: DrawSelectCell,
+            Id: "select"),
+        new(
             "Item",
-            1.5f,
-            row => $"{row.Rule.ItemName} {QualityLabel(row.Rule.Quality)}",
+            1.4f,
+            row => row.Rule.ItemName,
             row => row.Rule.ItemName,
             ImGuiTableColumnFlags.WidthStretch | ImGuiTableColumnFlags.NoHide,
-            Draw: row =>
-            {
-                ImGui.TextUnformatted(row.Rule.ItemName);
-                ImGui.SameLine();
-                ImGui.TextDisabled(QualityLabel(row.Rule.Quality));
-            },
+            Draw: DrawItemCell,
             Id: "item"),
         new(
             "On player",
-            82,
+            72,
             row => row.PlayerQuantity.ToString("N0"),
             row => row.PlayerQuantity,
+            Draw: row =>
+            {
+                ImGui.AlignTextToFramePadding();
+                ImGui.TextUnformatted(row.PlayerQuantity.ToString("N0"));
+            },
             Id: "player"),
         new(
             "Target",
-            108,
+            118,
             TransferTargetText,
             row => row.ListingContribution.IsKnown ? row.Line?.DesiredPlayerQuantity ?? row.Rule.TargetQuantity : row.Rule.TargetQuantity,
             Draw: DrawTransferTarget,
             Id: "target",
             HeaderTooltip: "Desired player quantity with its signed delta from current player stock."),
         new(
-            "Accessible storage",
-            128,
-            row => row.AccessibleStorageQuantity.ToString("N0"),
-            row => row.AccessibleStorageQuantity,
-            Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.DefaultHide,
-            Id: "accessible-storage",
-            HeaderTooltip: "Current matching quantity in accessible retainer storage."),
-        new(
-            "Saddlebag",
-            82,
-            row => (row.Line?.SaddlebagQuantity ?? 0).ToString("N0"),
-            row => row.Line?.SaddlebagQuantity ?? 0,
-            Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.DefaultHide,
-            Id: "saddlebag",
-            HeaderTooltip: "Current matching quantity in the saddlebag; retrieved before retainer storage."),
-        new(
             "Outcome",
-            100,
-            row => TransferOutcome(row).Text,
-            row => TransferOutcome(row).Text,
-            Draw: DrawTransferOutcome,
-            Id: "outcome",
-            HeaderTooltip: "Executable result under the stock and capacity evidence currently available."),
+            1.3f,
+            OutcomeText,
+            OutcomeText,
+            ImGuiTableColumnFlags.WidthStretch,
+            Draw: DrawOutcome,
+            Id: "outcome"),
         new(
-            "Vendor",
-            148,
-            VendorProcurementText,
-            row => row.VendorLine?.ApprovedQuantity ?? 0,
-            Draw: DrawVendorProcurement,
-            Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.DefaultHide,
-            Id: "vendor",
-            HeaderTooltip: "Reviewed ordinary-gil coverage for the shortage left after accessible retainer stock."),
-        new(
-            "Route",
-            1.1f,
-            row => TransferPresentation.RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Owner),
-            row => TransferPresentation.RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Owner),
-            ImGuiTableColumnFlags.WidthStretch | ImGuiTableColumnFlags.DefaultHide,
-            Draw: row => DrawInlineTransferRoute(row.Owner, row.PlanId, row.Rule, row.Runtime),
-            Id: "route"),
-        new(
-            "Listing shortfall",
-            118,
-            TransferListingShortfall,
-            row => row.ListingContribution.IsKnown ? row.ListingContribution.Value : -1,
-            ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.DefaultHide,
-            Id: "listing-shortfall",
-            HeaderTooltip: "Units still needed by the linked Listing Plan."),
-        new("##remove", 28, _ => string.Empty, Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoHide, Draw: row =>
-        {
-            if (ImGui.SmallButton($"X##remove-transfer:{row.Rule.Id}"))
-                RemoveTransferRule(row.Owner, row.PlanId, row.Rule.Id);
-        }, Id: "remove"),
+            "##line-menu",
+            28,
+            _ => string.Empty,
+            Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoSort | ImGuiTableColumnFlags.NoResize |
+                   ImGuiTableColumnFlags.NoHeaderLabel | ImGuiTableColumnFlags.NoHide,
+            Draw: DrawLineMenu,
+            Id: "line-menu"),
     ]);
 
+    public void Draw(QuartermasterRuntimeSnapshot runtime)
+    {
+        var owner = runtime.Owner;
+        var selected = ResolveSelectedStowagePlan(runtime.State, owner);
+        var projection = selected is null ? null : ResolveProjection(runtime, selected);
+
+        DrawHeader(runtime, selected, projection);
+
+        if (selected is null || projection is null)
+        {
+            transferExecution.ClearInlineErrorContext();
+            ImGui.Spacing();
+            ImGui.TextUnformatted("No Transfer Plans yet.");
+            return;
+        }
+        transferExecution.EnsureInlineErrorContext(owner, selected.Id);
+
+        var recovery = runtime.State.TransferPlanRecovery;
+        var hasCurrentRecovery = recovery is not null &&
+            recovery.Owner.Matches(owner) &&
+            recovery.PlanId == selected.Id &&
+            recovery.PlanRevision == selected.Revision;
+        var planProgress = hasCurrentRecovery && retainerRefresh.IsRefreshing
+            ? retainerRefresh.Status
+            : string.Empty;
+        var planNotice = !string.IsNullOrWhiteSpace(transferExecution.InlineError)
+            ? transferExecution.InlineError
+            : hasCurrentRecovery && !string.IsNullOrWhiteSpace(recovery!.FailureMessage)
+                ? recovery.FailureMessage
+                : hasCurrentRecovery && !retainerRefresh.IsRefreshing
+                    ? "Retainer evidence refresh did not complete. Retry plan to continue."
+                    : string.Empty;
+        DrawTransferPlanNotice(selected, hasCurrentRecovery, planProgress, planNotice);
+        DrawVendorRunStatus();
+
+        ImGui.Separator();
+        selection.Retain(projection.Rules.Select(rule => rule.Id));
+        if (selection.Count >= 2)
+            DrawBulkBar(owner, selected, projection);
+        else
+            DrawSummary(projection);
+        DrawUndoStrip(owner, selected);
+        DrawTable(runtime, selected, projection);
+    }
+
+    // ---- Header -------------------------------------------------------------------------
+
+    private void DrawHeader(
+        QuartermasterRuntimeSnapshot runtime,
+        StowagePlan? selected,
+        TransferWorkbenchProjection? projection)
+    {
+        var owner = runtime.Owner;
+        var style = ImGui.GetStyle();
+        float ButtonWidth(string label) =>
+            ImGui.CalcTextSize(label.Split("##")[0]).X + (style.FramePadding.X * 2f);
+
+        var movements = projection?.Movements ?? 0;
+        var executeLabel = movements > 0
+            ? $"Execute plan · {movements:N0} move{(movements == 1 ? string.Empty : "s")}###RQTransferExecute"
+            : "Execute plan###RQTransferExecute";
+        var vendor = projection?.Vendor;
+        var maximumGil = vendor?.MaximumGil ?? 0;
+        var buyLabel = maximumGil > 0
+            ? $"Buy from vendor · {maximumGil:N0} gil###RQTransferVendorBuy"
+            : "Buy from vendor###RQTransferVendorBuy";
+        const string menuLabel = "…##RQTransferPlanMenu";
+        var trailing = ButtonWidth(menuLabel) + ButtonWidth(executeLabel) + ButtonWidth(buyLabel) +
+                       (style.ItemSpacing.X * 3f);
+        var selectorWidth = Math.Max(120f, ImGui.GetContentRegionAvail().X - trailing);
+
+        if (selected is not null && renamingPlanId == selected.Id)
+            DrawRenameInput(owner, selected, selectorWidth);
+        else
+            DrawPlanSelector(runtime, selected, selectorWidth);
+
+        ImGui.SameLine();
+        DrawPlanMenu(runtime, selected, projection, menuLabel);
+
+        var availability = TransferExecutionPolicy.ForExplicitRun(
+            projection is not null && (projection.HasMovement || projection.HasUnknownListingDemand),
+            owner.HasStableIdentity,
+            transfers.CanStart,
+            retainerRefresh.IsRefreshing || retainerRefresh.IsQueued);
+        var canExecute = selected is not null && availability.CanExecute;
+        UiLayout.SameLineIfFits(executeLabel);
+        ImGui.BeginDisabled(!canExecute);
+        if (ImGui.Button(executeLabel) && selected is not null)
+            requestTransferReview(selected.Id, selected.Name);
+        ImGui.EndDisabled();
+        if (!canExecute && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled) &&
+            !string.IsNullOrWhiteSpace(availability.BlockReason))
+            ImGui.SetTooltip(availability.BlockReason);
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.transfer.execute",
+            "Review and execute the selected Transfer Plan",
+            canExecute,
+            () =>
+            {
+                var current = runtimeSnapshots.Current;
+                var currentPlan = ResolveSelectedStowagePlan(current.State, current.Owner);
+                if (currentPlan is not null)
+                    requestTransferReview(currentPlan.Id, currentPlan.Name);
+            },
+            canExecute
+                ? projection!.HasUnknownListingDemand ? "Listing demand will be verified first" : $"{movements:N0} movements"
+                : availability.BlockReason);
+
+        var canReviewVendor = vendor is not null &&
+                              projection is not null &&
+                              vendor.CanStart &&
+                              !projection.HasUnknownListingDemand &&
+                              !vendorProcurement.HasActiveRun &&
+                              transfers.CanStart &&
+                              !retainerRefresh.IsRefreshing &&
+                              !retainerRefresh.IsQueued;
+        var vendorBlockReason = vendorProcurement.HasActiveRun
+            ? "A vendor run is already active"
+            : projection?.HasUnknownListingDemand == true
+                ? "Listing demand must be verified first"
+                : "No reviewed vendor-purchasable shortfall";
+        UiLayout.SameLineIfFits(buyLabel);
+        ImGui.BeginDisabled(!canReviewVendor);
+        if (ImGui.Button(buyLabel) && vendor is not null)
+            requestVendorReview(vendor);
+        ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.vendor.review",
+            "Review vendor coverage for the selected Transfer Plan",
+            canReviewVendor,
+            () =>
+            {
+                var current = runtimeSnapshots.Current;
+                var currentPlan = ResolveSelectedStowagePlan(current.State, current.Owner);
+                if (currentPlan is null)
+                    return;
+                requestVendorReview(ResolveProjection(current, currentPlan).Vendor);
+            },
+            canReviewVendor
+                ? $"{vendor!.ApprovedQuantity:N0} units · maximum {vendor.MaximumGil:N0} gil"
+                : vendorBlockReason);
+    }
+
+    private void DrawPlanSelector(QuartermasterRuntimeSnapshot runtime, StowagePlan? selected, float width)
+    {
+        var owner = runtime.Owner;
+        ImGui.SetNextItemWidth(width);
+        if (!ImGui.BeginCombo("##RQTransferPlan", selected?.Name ?? "Choose a Transfer Plan"))
+            return;
+        var plans = runtime.State.StowagePlans
+            .Where(plan => plan.IsEphemeral && plan.Owner.Matches(owner))
+            .Concat(StowagePlanCatalog.OwnerPlans(runtime.State, owner));
+        foreach (var plan in plans)
+        {
+            if (!ImGui.Selectable($"{plan.Name}##transfer:{plan.Id}", selected?.Id == plan.Id))
+                continue;
+            if (selected?.Id != plan.Id)
+            {
+                selection.Clear();
+                renamingPlanId = null;
+            }
+            workbench.SelectedStowagePlanId = plan.Id;
+        }
+        ImGui.EndCombo();
+    }
+
+    private void DrawRenameInput(OwnerScope owner, StowagePlan plan, float width)
+    {
+        ImGui.SetNextItemWidth(width);
+        if (renameFocusRequested)
+        {
+            ImGui.SetKeyboardFocusHere();
+            renameFocusRequested = false;
+        }
+        var committed = ImGui.InputTextWithHint(
+            "##RQTransferPlanRename",
+            plan.IsEphemeral ? "Name this plan" : "Plan name",
+            ref renameText,
+            80,
+            ImGuiInputTextFlags.EnterReturnsTrue | ImGuiInputTextFlags.AutoSelectAll);
+        var deactivated = ImGui.IsItemDeactivated();
+        var canPromote = plan.IsEphemeral && !string.IsNullOrWhiteSpace(renameText);
+        if (plan.IsEphemeral)
+            reviewRegistry.RegisterLastButton(
+                "quartermaster.transfer.scratch.promote",
+                "Save as a named plan",
+                canPromote,
+                () => CommitRename(owner, plan),
+                canPromote ? "Available" : "Name required");
+        if (ImGui.IsKeyPressed(ImGuiKey.Escape))
+        {
+            renamingPlanId = null;
+            return;
+        }
+        if (committed || deactivated)
+            CommitRename(owner, plan);
+    }
+
+    private void StartRename(Guid planId, string initialName)
+    {
+        renamingPlanId = planId;
+        renameText = initialName;
+        renameFocusRequested = true;
+    }
+
+    private void CommitRename(OwnerScope owner, StowagePlan plan)
+    {
+        var name = renameText.Trim();
+        renamingPlanId = null;
+        if (name.Length == 0 || (!plan.IsEphemeral && string.Equals(name, plan.Name, StringComparison.Ordinal)))
+            return;
+        try
+        {
+            // Naming the Unsaved plan promotes it to a saved plan (the same transition as
+            // "Save as"); a fresh Unsaved plan replaces it and the renamed plan stays selected.
+            workbench.SelectedStowagePlanId = state.Mutate(document =>
+            {
+                if (plan.IsEphemeral)
+                    return StowagePlanCatalog.PromoteScratch(document, owner, plan.Id, name).Id;
+                var draft = StowagePlanCatalog.Draft(document, owner, plan.Id);
+                draft.Name = name;
+                return StowagePlanCatalog.Apply(document, owner, draft).Id;
+            });
+            transferExecution.ClearInlineError();
+        }
+        catch (Exception exception)
+        {
+            transferExecution.ReportInlineError(exception.Message);
+        }
+    }
+
+    private void DrawPlanMenu(
+        QuartermasterRuntimeSnapshot runtime,
+        StowagePlan? selected,
+        TransferWorkbenchProjection? projection,
+        string menuLabel)
+    {
+        var owner = runtime.Owner;
+        var stable = owner.HasStableIdentity;
+        if (ImGui.Button(menuLabel))
+            ImGui.OpenPopup("RQTransferPlanMenu");
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.transfer.plan.new",
+            "Create a new Transfer Plan",
+            stable,
+            () => NewPlan(runtimeSnapshots.Current.Owner),
+            stable ? "Available" : "Owner identity unavailable");
+        if (selected?.IsEphemeral == true)
+        {
+            var planId = selected.Id;
+            reviewRegistry.RegisterLastButton(
+                "quartermaster.transfer.scratch.save-as",
+                "Name the unsaved plan",
+                true,
+                () => StartRename(planId, string.Empty),
+                "Available");
+            var hasLines = projection?.Rules.Count > 0;
+            reviewRegistry.RegisterLastButton(
+                "quartermaster.transfer.scratch.clear",
+                "Clear the unsaved plan",
+                hasLines,
+                () => ClearPlan(runtimeSnapshots.Current.Owner, planId),
+                hasLines ? "Available" : "Plan is empty");
+        }
+
+        if (!ImGui.BeginPopup("RQTransferPlanMenu"))
+            return;
+        if (MenuItem("New plan", stable))
+            NewPlan(owner);
+        if (selected is not null)
+        {
+            if (MenuItem(selected.IsEphemeral ? "Save as…" : "Rename"))
+                StartRename(selected.Id, selected.IsEphemeral ? string.Empty : selected.Name);
+            if (MenuItem("Duplicate", stable))
+                DuplicatePlan(owner, selected);
+            if (MenuItem("Clear", projection?.Rules.Count > 0))
+                ClearPlan(owner, selected.Id);
+            var selectedRules = projection?.Rules.Where(rule => selection.IsSelected(rule.Id)).ToArray() ?? [];
+            if (MenuItem(
+                    selectedRules.Length > 0 ? $"Save {selectedRules.Length:N0} selected as @group…" : "Save selected as @group…",
+                    selectedRules.Length > 0))
+            {
+                itemGroupWorkspace.OpenNewWorkspaceDraft(selectedRules);
+                workbench.View = WorkbenchView.ItemGroups;
+            }
+            if (!selected.IsEphemeral)
+            {
+                ImGui.Separator();
+                if (MenuItem("Delete plan"))
+                    requestDeletePlan(selected, owner);
+            }
+        }
+        ImGui.EndPopup();
+    }
+
+    private static bool MenuItem(string label, bool enabled = true)
+    {
+        if (!enabled)
+            ImGui.BeginDisabled();
+        var clicked = ImGui.MenuItem(label);
+        if (!enabled)
+            ImGui.EndDisabled();
+        return clicked && enabled;
+    }
+
+    private void NewPlan(OwnerScope owner)
+    {
+        if (!owner.HasStableIdentity)
+            return;
+        try
+        {
+            var (id, name) = state.Mutate(document =>
+            {
+                var plan = StowagePlanCatalog.Create(document, owner);
+                return (plan.Id, plan.Name);
+            });
+            workbench.SelectedStowagePlanId = id;
+            selection.Clear();
+            StartRename(id, name);
+            transferExecution.ClearInlineError();
+        }
+        catch (Exception exception)
+        {
+            transferExecution.ReportInlineError(exception.Message);
+        }
+    }
+
+    private void DuplicatePlan(OwnerScope owner, StowagePlan source)
+    {
+        try
+        {
+            var (id, name) = state.Mutate(document =>
+            {
+                var plan = StowagePlanCatalog.Duplicate(document, owner, source.Id);
+                return (plan.Id, plan.Name);
+            });
+            workbench.SelectedStowagePlanId = id;
+            selection.Clear();
+            StartRename(id, name);
+            transferExecution.ClearInlineError();
+        }
+        catch (Exception exception)
+        {
+            transferExecution.ReportInlineError(exception.Message);
+        }
+    }
+
+    private void ClearPlan(OwnerScope owner, Guid planId)
+    {
+        var ruleIds = state.Read(document => document.PlanItems
+            .Where(rule => rule.StowagePlanId == planId)
+            .Select(rule => rule.Id)
+            .ToArray());
+        RemoveRules(owner, planId, ruleIds);
+    }
+
+    // ---- Summary / bulk / undo ------------------------------------------------------------
+
+    private static void DrawSummary(TransferWorkbenchProjection projection)
+    {
+        var totals = TransferWorkbenchPresentation.Totals(projection.Rows.Select(row => row.Projection));
+        var first = true;
+        void Clause(string text, Vector4? color)
+        {
+            if (!first)
+            {
+                ImGui.SameLine(0, 0);
+                var width = ImGui.CalcTextSize($" · {text}").X;
+                if (ImGui.GetContentRegionAvail().X < width)
+                    ImGui.NewLine();
+                else
+                {
+                    ImGui.TextDisabled(" · ");
+                    ImGui.SameLine(0, 0);
+                }
+            }
+            first = false;
+            if (color is { } value)
+                ImGui.TextColored(value, text);
+            else
+                ImGui.TextUnformatted(text);
+        }
+
+        ImGui.AlignTextToFramePadding();
+        Clause($"{totals.Lines:N0} line{(totals.Lines == 1 ? string.Empty : "s")}", null);
+        if (projection.HasUnknownListingDemand)
+        {
+            Clause("Verifying listing demand…", AmberColor);
+            return;
+        }
+        if (totals.Retrieve > 0)
+            Clause($"Retrieve {totals.Retrieve:N0}", TransferPresentation.ActionColor(StowageAction.Retrieve));
+        if (totals.Stow > 0)
+            Clause($"Stow {totals.Stow:N0}", TransferPresentation.ActionColor(StowageAction.Deposit));
+        if (totals.Vendor > 0)
+            Clause($"Vendor {totals.Vendor:N0}", VendorColor);
+        if (totals.Short > 0)
+            Clause($"{totals.Short:N0} short", ErrorColor);
+        if (totals.NoRoom > 0)
+            Clause($"no room for {totals.NoRoom:N0}", ErrorColor);
+        if (totals.StockUnverified)
+            Clause("Retainer stock unverified", AmberColor);
+    }
+
+    private void DrawBulkBar(OwnerScope owner, StowagePlan plan, TransferWorkbenchProjection projection)
+    {
+        var selectedIds = projection.Rules
+            .Where(rule => selection.IsSelected(rule.Id))
+            .Select(rule => rule.Id)
+            .ToArray();
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextUnformatted($"{selectedIds.Length:N0} selected");
+
+        ImGui.SameLine();
+        ImGui.TextDisabled("Target");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(72);
+        if (ImGui.InputTextWithHint("##RQBulkTarget", "—", ref bulkTarget, 9, ImGuiInputTextFlags.CharsDecimal))
+            bulkTarget = new string(bulkTarget.Where(char.IsAsciiDigit).ToArray());
+
+        ImGui.SameLine();
+        ImGui.TextDisabled("Quality");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(84);
+        if (ImGui.BeginCombo("##RQBulkQuality", bulkQuality is { } quality ? QualityLabel(quality) : "—"))
+        {
+            if (ImGui.Selectable("—##bulk-quality", bulkQuality is null))
+                bulkQuality = null;
+            foreach (var value in Enum.GetValues<ItemQualityPolicy>())
+                if (ImGui.Selectable(QualityLabel(value), bulkQuality == value))
+                    bulkQuality = value;
+            ImGui.EndCombo();
+        }
+
+        SameLineIfRoom(ImGui.CalcTextSize("Destination").X + ImGui.GetStyle().ItemSpacing.X + 150);
+        ImGui.TextDisabled("Destination");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(150);
+        var destinationParts = new[]
+        {
+            bulkRoutingMode is { } mode ? TransferPresentation.RoutingModeLabel(mode) : null,
+            bulkOverflow is { } overflow ? TransferPresentation.OverflowLabel(overflow) : null,
+        }.Where(part => part is not null).ToArray();
+        if (ImGui.BeginCombo("##RQBulkDestination", destinationParts.Length == 0 ? "—" : string.Join(" · ", destinationParts)))
+        {
+            ImGui.TextDisabled("Placement");
+            if (ImGui.Selectable("—##bulk-mode", bulkRoutingMode is null, ImGuiSelectableFlags.DontClosePopups))
+                bulkRoutingMode = null;
+            foreach (var value in Enum.GetValues<StowageRoutingMode>())
+                if (ImGui.Selectable(TransferPresentation.RoutingModeLabel(value), bulkRoutingMode == value, ImGuiSelectableFlags.DontClosePopups))
+                    bulkRoutingMode = value;
+            ImGui.Separator();
+            ImGui.TextDisabled("Overflow");
+            if (ImGui.Selectable("—##bulk-overflow", bulkOverflow is null, ImGuiSelectableFlags.DontClosePopups))
+                bulkOverflow = null;
+            foreach (var value in Enum.GetValues<StowageOverflowPolicy>())
+                if (ImGui.Selectable(TransferPresentation.OverflowLabel(value), bulkOverflow == value, ImGuiSelectableFlags.DontClosePopups))
+                    bulkOverflow = value;
+            ImGui.EndCombo();
+        }
+
+        int? target = bulkTarget.Length > 0 &&
+                      int.TryParse(bulkTarget, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : null;
+        var canApply = target.HasValue || bulkQuality.HasValue || bulkRoutingMode.HasValue || bulkOverflow.HasValue;
+        UiLayout.SameLineIfFits("Apply");
+        ImGui.BeginDisabled(!canApply);
+        if (ImGui.Button("Apply##RQBulk"))
+        {
+            var applyQuality = bulkQuality;
+            var applyMode = bulkRoutingMode;
+            var applyOverflow = bulkOverflow;
+            if (MutateRules(owner, plan.Id, selectedIds, rule =>
+                {
+                    if (target is { } value)
+                        rule.TargetQuantity = Math.Max(0, value);
+                    if (applyQuality is { } q)
+                        rule.Quality = q;
+                    if (applyMode is { } m)
+                        rule.Routing.Mode = m;
+                    if (applyOverflow is { } o)
+                        rule.Routing.Overflow = o;
+                }))
+            {
+                bulkTarget = string.Empty;
+                bulkQuality = null;
+                bulkRoutingMode = null;
+                bulkOverflow = null;
+            }
+        }
+        ImGui.EndDisabled();
+        ImGui.SameLine();
+        if (ImGui.Button("Remove##RQBulk"))
+            RemoveRules(owner, plan.Id, selectedIds);
+        ImGui.SameLine();
+        if (ImGui.Button("Clear##RQBulk"))
+        {
+            selection.Clear();
+            bulkTarget = string.Empty;
+            bulkQuality = null;
+            bulkRoutingMode = null;
+            bulkOverflow = null;
+        }
+    }
+
+    private static void SameLineIfRoom(float width)
+    {
+        ImGui.SameLine();
+        if (ImGui.GetContentRegionAvail().X < width)
+            ImGui.NewLine();
+    }
+
+    private void DrawUndoStrip(OwnerScope owner, StowagePlan plan)
+    {
+        if (lastRemoved is not { } removed || removed.PlanId != plan.Id)
+            return;
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextDisabled(removed.Label);
+        ImGui.SameLine(0, 0);
+        ImGui.TextDisabled(" · ");
+        ImGui.SameLine(0, 0);
+        if (ImGui.SmallButton("Undo##RQTransferUndo"))
+            UndoRemoval(owner, removed);
+        ImGui.SameLine();
+        if (ImGui.SmallButton("x##RQTransferUndoDismiss"))
+            lastRemoved = null;
+    }
+
+    // ---- Table ----------------------------------------------------------------------------
+
+    private void DrawTable(QuartermasterRuntimeSnapshot runtime, StowagePlan plan, TransferWorkbenchProjection projection)
+    {
+        var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
+                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
+                    ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.Sortable;
+        renderedTransferRowCount = 0;
+        if (!transferWorkbenchTable.Begin(
+                "RQTransferWorkbenchV4",
+                new DalamudTableLayout(
+                    new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y)),
+                    flags,
+                    FreezeRows: 1)))
+            return;
+
+        IReadOnlyList<TransferWorkbenchRow> rows;
+        unsafe
+        {
+            rows = transferWorkbenchTable.Apply(projection.Rows, ImGui.TableGetSortSpecs());
+        }
+
+        var focusPending = focusTargetRuleId is { } focusId && rows.Any(row => row.Rule.Id == focusId);
+        if (focusTargetRuleId is not null && !focusPending && ++focusTargetFrames > FocusGiveUpFrames)
+            focusTargetRuleId = null;
+        if (focusPending)
+        {
+            // Draw every row this frame so the new line's target input exists to take focus.
+            for (var index = 0; index < rows.Count; index++)
+                DrawRow(rows, index);
+            renderedTransferRowCount = rows.Count;
+        }
+        else
+        {
+            renderedTransferRowCount = transferWorkbenchTable.DrawClippedRows(rows, (_, index) => DrawRow(rows, index));
+        }
+
+        ImGui.TableNextRow();
+        ImGui.TableNextColumn();
+        if (ImGui.TableNextColumn())
+            DrawAddInput(runtime, plan);
+        transferWorkbenchTable.End();
+    }
+
+    private void DrawRow(IReadOnlyList<TransferWorkbenchRow> rows, int index)
+    {
+        var row = rows[index];
+        ImGui.PushID(row.Rule.Id.ToString());
+        transferWorkbenchTable.DrawSaneRow(
+            rows,
+            index,
+            $"transfer:{row.Rule.Id}",
+            row.Rule.Enabled ? null : PausedRowColor,
+            selectable: false);
+        ImGui.PopID();
+    }
+
+    private void DrawSelectCell(TransferWorkbenchRow row)
+    {
+        var selected = selection.IsSelected(row.Rule.Id);
+        if (ImGui.Checkbox("##select", ref selected))
+            selection.SetSelected(row.Rule.Id, selected);
+    }
+
+    private void DrawItemCell(TransferWorkbenchRow row)
+    {
+        var rule = row.Rule;
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextUnformatted(rule.ItemName);
+        if (rule.Quality != ItemQualityPolicy.Any)
+            Tag(QualityLabel(rule.Quality));
+        if (!IsDefaultRouting(rule.Routing))
+            Tag($"-> {TransferPresentation.RouteSummary(rule.Routing, row.Runtime.Retainers, row.Owner)}");
+        if (!string.IsNullOrWhiteSpace(rule.Notes))
+        {
+            Tag("note");
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(rule.Notes);
+        }
+        if (!rule.Enabled)
+            Tag("paused");
+        if (lineErrors.TryGetValue(rule.Id, out var error))
+        {
+            ImGui.PushTextWrapPos(0);
+            ImGui.TextColored(ErrorColor, error);
+            ImGui.PopTextWrapPos();
+        }
+
+        static void Tag(string text)
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled(text);
+        }
+    }
+
+    private static bool IsDefaultRouting(StowageRoutingPolicy routing) =>
+        routing.Mode == StowageRoutingMode.ConsolidateFirst &&
+        routing.Overflow == StowageOverflowPolicy.AnyOwnerRetainer &&
+        routing.PreferredRetainerIds.Count == 0;
 
     private static string TransferTargetText(TransferWorkbenchRow row) =>
         TransferWorkbenchPresentation.Target(
@@ -182,13 +919,21 @@ internal sealed class TransferPlanWorkspace
             ? row.Rule.TargetQuantity + listingShortfall
             : row.Rule.TargetQuantity;
         ImGui.SetNextItemWidth(Math.Min(66, Math.Max(32, ImGui.GetContentRegionAvail().X * .55f)));
-        if (DalamudGroupedIntegerInput.InputGroupedInt($"##target:{row.Rule.Id}", ref target, 0, 0))
-            UpdateTransferRule(row.Owner, row.PlanId, row.Rule.Id, draftRule =>
-                draftRule.TargetQuantity = Math.Max(0, target - listingShortfall));
+        if (focusTargetRuleId == row.Rule.Id)
+        {
+            ImGui.SetScrollHereY(.5f);
+            ImGui.SetKeyboardFocusHere();
+            focusTargetRuleId = null;
+        }
+        if (DalamudGroupedIntegerInput.InputGroupedInt("##target", ref target, 0, 0))
+        {
+            var independent = Math.Max(0, target - listingShortfall);
+            MutateRules(row.Owner, row.PlanId, [row.Rule.Id], draftRule => draftRule.TargetQuantity = independent);
+        }
         var targetHovered = ImGui.IsItemHovered();
         if (ImGui.GetContentRegionAvail().X > 52) ImGui.SameLine();
         if (!row.ListingContribution.IsKnown)
-            ImGui.TextColored(new Vector4(1f, .7f, .3f, 1f), "(+?)");
+            ImGui.TextColored(AmberColor, "(+?)");
         else
             ImGui.TextColored(
                 TransferPresentation.ActionColor(row.Line?.Action),
@@ -204,17 +949,14 @@ internal sealed class TransferPlanWorkspace
     private void DrawTransferSource(TransferWorkbenchRow row)
     {
         if (row.ListingLink is null)
-        {
-            ImGui.TextDisabled("Independent");
             return;
-        }
         var contribution = row.ListingContribution.IsKnown
             ? row.ListingContribution.Value.ToString("N0")
             : "?";
         ImGui.TextDisabled($"Plan +{contribution}");
         ImGui.TextDisabled($"Independent {row.Rule.TargetQuantity:N0}");
         ImGui.SameLine();
-        if (!ImGui.SmallButton($"Unlink##transfer-listing:{row.ListingLink.Id}"))
+        if (!ImGui.SmallButton("Unlink##transfer-listing"))
             return;
         try
         {
@@ -233,313 +975,469 @@ internal sealed class TransferPlanWorkspace
         }
     }
 
-    private static string TransferListingShortfall(TransferWorkbenchRow row) =>
-        row.ListingLink is null
-            ? "—"
-            : row.ListingContribution.IsKnown
-                ? row.ListingContribution.Value.ToString("N0")
-                : "Unknown";
-
-    private static TransferOutcomePresentation TransferOutcome(TransferWorkbenchRow row)
+    private static string OutcomeText(TransferWorkbenchRow row)
     {
-        if (!row.Rule.Enabled)
-            return new("Off");
-        if (!row.ListingContribution.IsKnown)
-            return new("Verify listing shortfall");
-        var action = row.Line?.Action ?? StowageAction.None;
-        return TransferWorkbenchPresentation.Outcome(
-            action,
-            Math.Abs(row.Difference),
-            row.AccessibleStorageQuantity,
-            row.RoutedDepositQuantity,
-            row.Line?.SaddlebagQuantity ?? 0);
+        var projection = row.Projection;
+        return projection.Kind switch
+        {
+            TransferLineKind.Paused => "Paused",
+            TransferLineKind.VerifyListing => "Verify listing shortfall",
+            TransferLineKind.Balanced => "Balanced",
+            TransferLineKind.Stow => string.Join(" · ", new[]
+            {
+                projection.Stow > 0 ? $"Stow {projection.Stow:N0}" : null,
+                projection.NoRoom > 0 ? $"no room for {projection.NoRoom:N0}" : null,
+            }.Where(part => part is not null)),
+            _ => string.Join(" · ", new[]
+            {
+                projection.FromSaddlebag > 0 ? $"Saddlebag {projection.FromSaddlebag:N0}" : null,
+                projection.FromRetainers > 0 ? $"Retainers {projection.FromRetainers:N0}" : null,
+                projection.Vendor > 0 ? $"Vendor {projection.Vendor:N0}" : null,
+                projection.Short > 0 ? $"{projection.Short:N0} short" : null,
+            }.Where(part => part is not null)),
+        };
     }
 
-    private static void DrawTransferOutcome(TransferWorkbenchRow row)
+    private void DrawOutcome(TransferWorkbenchRow row)
     {
-        var outcome = TransferOutcome(row);
-        var primaryColor = !row.Rule.Enabled
-            ? ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]
-            : !row.ListingContribution.IsKnown
-                ? new Vector4(1f, .7f, .3f, 1f)
-                : TransferPresentation.ActionColor(row.Line?.Action);
-        ImGui.TextColored(primaryColor, outcome.Primary);
-        if (!string.IsNullOrWhiteSpace(outcome.Source))
+        var projection = row.Projection;
+        ImGui.AlignTextToFramePadding();
+        var first = true;
+        void Part(string text, Vector4 color)
         {
+            if (!first)
+            {
+                ImGui.SameLine(0, 0);
+                ImGui.TextDisabled(" · ");
+                ImGui.SameLine(0, 0);
+            }
+            first = false;
+            ImGui.TextColored(color, text);
+        }
+
+        var retrieveColor = TransferPresentation.ActionColor(StowageAction.Retrieve);
+        switch (projection.Kind)
+        {
+            case TransferLineKind.Paused:
+                ImGui.TextDisabled("Paused");
+                return;
+            case TransferLineKind.VerifyListing:
+                ImGui.TextColored(AmberColor, "Verify listing shortfall");
+                return;
+            case TransferLineKind.Balanced:
+                ImGui.TextColored(TransferPresentation.ActionColor(null), "Balanced");
+                return;
+            case TransferLineKind.Stow:
+                if (projection.Stow > 0)
+                    Part($"Stow {projection.Stow:N0}", TransferPresentation.ActionColor(StowageAction.Deposit));
+                if (projection.NoRoom > 0)
+                    Part($"no room for {projection.NoRoom:N0}", ErrorColor);
+                return;
+        }
+
+        if (projection.FromSaddlebag > 0)
+            Part($"Saddlebag {projection.FromSaddlebag:N0}", retrieveColor);
+        if (projection.FromRetainers > 0)
+            Part($"Retainers {projection.FromRetainers:N0}", retrieveColor);
+        if (projection.Short > 0)
+            Part($"{projection.Short:N0} short", ErrorColor);
+        if (projection.StockUnverified)
+            Part("stock unverified", AmberColor);
+        DrawVendorChip(row, ref first);
+    }
+
+    private void DrawVendorChip(TransferWorkbenchRow row, ref bool first)
+    {
+        var projection = row.Projection;
+        if (projection.Kind != TransferLineKind.Retrieve ||
+            projection.Missing <= 0 ||
+            projection.StockUnverified ||
+            row.Rule.Quality != ItemQualityPolicy.Any)
+            return;
+        var allowed = row.Rule.AllowVendorPurchase;
+        var line = (allowed ? row.VendorLine : null) ?? row.VendorPreview;
+        if (line is null || line.Candidates.Count == 0)
+            return;
+        var candidate = line.SelectedCandidate ?? line.Candidates[0];
+        var quantity = allowed && projection.Vendor > 0 ? projection.Vendor : projection.Missing;
+
+        if (!first)
             ImGui.SameLine();
-            ImGui.TextDisabled($"· {outcome.Source}");
+        first = false;
+        if (allowed)
+        {
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(.55f, .40f, .16f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(.65f, .48f, .2f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(.72f, .54f, .24f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, .94f, .82f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.Border, VendorColor);
         }
-        if (string.IsNullOrWhiteSpace(outcome.Constraint))
-            return;
-        ImGui.SameLine();
-        ImGui.TextColored(new Vector4(.65f, .76f, .88f, 1f), $"· {outcome.Constraint}");
-    }
-
-    private static string VendorProcurementText(TransferWorkbenchRow row)
-    {
-        var line = row.VendorLine;
-        if (!row.Rule.AllowVendorPurchase)
-            return "Off";
-        if (line is null)
-            return "Not needed";
-        return line.IsReady
-            ? $"Buy {line.ApprovedQuantity:N0} · {line.SelectedCandidate!.Offer.UnitPriceGil:N0} ea"
-            : line.State switch
-            {
-                TransferVendorProcurementState.ExactQualityUnsupported => "Any quality required",
-                TransferVendorProcurementState.OfferNotCataloged => "No gil vendor",
-                _ => "Vendor unavailable",
-            };
-    }
-
-    private static void DrawVendorProcurement(TransferWorkbenchRow row)
-    {
-        var text = VendorProcurementText(row);
-        ImGui.TextColored(
-            row.VendorLine?.IsReady == true
-                ? new Vector4(.92f, .72f, .35f, 1f)
-                : ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled],
-            text);
-        if (row.VendorLine is { } line && ImGui.IsItemHovered())
+        else
+        {
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0f, 0f, 0f, 0f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(.3f, .24f, .12f, .6f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(.4f, .3f, .14f, .8f));
+            ImGui.PushStyleColor(ImGuiCol.Text, VendorColor);
+            ImGui.PushStyleColor(ImGuiCol.Border, VendorColor);
+        }
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameBorderSize, 1f);
+        var clicked = ImGui.SmallButton($"Vendor {quantity:N0} · {candidate.Offer.UnitPriceGil:N0} ea##vendor-chip");
+        ImGui.PopStyleVar();
+        ImGui.PopStyleColor(5);
+        if (ImGui.IsItemHovered() && !string.IsNullOrWhiteSpace(line.Message))
             ImGui.SetTooltip(line.Message);
-    }
-
-
-    private void DrawTableColumnsToolbar<TRow>(
-        DalamudTableProjection<TRow> table,
-        string id,
-        string context)
-    {
-
-        var buttonWidth = ImGui.CalcTextSize("Columns").X + (ImGui.GetStyle().FramePadding.X * 2f);
-        ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - buttonWidth));
-        table.DrawColumnMenuButton(id);
-        reviewRegistry.RegisterLastButton(
-            $"quartermaster.{id}.columns",
-            $"Manage {context.ToLowerInvariant()} columns",
-            true,
-            table.RequestColumnMenu,
-            "Available");
-    }
-
-
-    public void Draw(QuartermasterRuntimeSnapshot runtime)
-    {
-        var owner = runtime.Owner;
-        var plans = StowagePlanCatalog.OwnerPlans(runtime.State, owner);
-        var selected = ResolveSelectedStowagePlan(runtime.State, owner);
-
-        ImGui.SetNextItemWidth(-1);
-        if (ImGui.BeginCombo("##RQTransferPlan", selected?.Name ?? "Choose a Transfer Plan"))
-        {
-            foreach (var plan in runtime.State.StowagePlans.Where(p => p.IsEphemeral && p.Owner.Matches(owner)).Concat(plans))
+        if (clicked)
+            MutateRules(row.Owner, row.PlanId, [row.Rule.Id], rule =>
             {
-                if (ImGui.Selectable($"{plan.Name}##transfer:{plan.Id}", selected?.Id == plan.Id))
-                {
-                    workbench.SelectedStowagePlanId = plan.Id;
-                    selected = plan;
-                }
-            }
-            ImGui.EndCombo();
-        }
-        if (!owner.HasStableIdentity)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("New"))
-            transferPlanEditor.Open(StowagePlanCatalog.NewDraft(state.Snapshot(), owner));
-        if (!owner.HasStableIdentity)
-            ImGui.EndDisabled();
+                rule.AllowVendorPurchase = !allowed;
+                if (allowed)
+                    rule.PreferredVendorNpcId = null;
+            });
+    }
 
-        ImGui.SameLine();
-        if (selected is null)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Duplicate") && selected is not null)
-            transferPlanEditor.Open(StowagePlanCatalog.DuplicateDraft(state.Snapshot(), owner, selected.Id));
-        if (selected is null)
-            ImGui.EndDisabled();
-
-        ImGui.SameLine();
-        if (ImGui.Button("…##RQTransferPlanMenu"))
-            ImGui.OpenPopup("RQTransferPlanMenu");
-        if (ImGui.BeginPopup("RQTransferPlanMenu"))
+    private void DrawLineMenu(TransferWorkbenchRow row)
+    {
+        var rule = row.Rule;
+        if (ImGui.SmallButton("…##line-menu"))
         {
-            if (selected is null)
-                ImGui.BeginDisabled();
-            if (ImGui.Selectable("Rename or edit details") && selected is not null)
-                transferPlanEditor.Open(selected.Id, owner);
-            if (selected?.IsEphemeral != true && ImGui.Selectable("Delete plan") && selected is not null)
-                requestDeletePlan(selected, owner);
-            if (selected is null)
-                ImGui.EndDisabled();
-            ImGui.EndPopup();
+            noteRuleId = rule.Id;
+            noteBuffer = rule.Notes;
+            ImGui.OpenPopup("line-menu");
         }
-
-        selected = ResolveSelectedStowagePlan(runtime.State, owner);
-        if (selected is null)
-        {
-            transferExecution.ClearInlineErrorContext();
-            ImGui.Spacing();
-            ImGui.TextUnformatted("No Transfer Plans yet.");
-
+        if (!ImGui.BeginPopup("line-menu"))
             return;
+        Guid[] ids = [rule.Id];
+        ImGui.Dummy(new Vector2(280, 0));
+
+        ImGui.TextDisabled("Quality");
+        var firstQuality = true;
+        foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
+        {
+            if (!firstQuality)
+                ImGui.SameLine();
+            firstQuality = false;
+            if (ImGui.RadioButton(QualityLabel(quality), rule.Quality == quality) && rule.Quality != quality)
+                MutateRules(row.Owner, row.PlanId, ids, draftRule => draftRule.Quality = quality);
         }
-        transferExecution.EnsureInlineErrorContext(owner, selected.Id);
 
-        var projection = ResolveProjection(runtime, selected);
-        var ownerRules = projection.Rules;
-        var retrieval = projection.Retrieval;
-        var surplusBatch = projection.Deposit;
-        var movements = projection.Movements;
-        var hasMovement = projection.HasMovement;
-        var availability = TransferExecutionPolicy.ForExplicitRun(
-            hasMovement || projection.HasUnknownListingDemand,
-            owner.HasStableIdentity,
-            transfers.CanStart,
-            retainerRefresh.IsRefreshing || retainerRefresh.IsQueued);
-        var canExecute = availability.CanExecute;
-
-        UiLayout.SameLineIfFits("Execute plan");
-        if (!canExecute)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Execute plan"))
-            requestTransferReview(selected.Id, selected.Name);
-        if (!canExecute)
-            ImGui.EndDisabled();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.transfer.execute",
-            "Review and execute the selected Transfer Plan",
-            canExecute,
-            () =>
-            {
-                var current = runtimeSnapshots.Current;
-                var currentPlan = ResolveSelectedStowagePlan(current.State, current.Owner);
-                if (currentPlan is not null)
-                    requestTransferReview(currentPlan.Id, currentPlan.Name);
-            },
-            canExecute
-                ? projection.HasUnknownListingDemand ? "Listing demand will be verified first" : $"{movements:N0} movements"
-                : availability.BlockReason);
-
-        var vendor = projection.Vendor;
-        var recovery = runtime.State.TransferPlanRecovery;
-        var hasCurrentRecovery = recovery is not null &&
-            recovery.Owner.Matches(owner) &&
-            recovery.PlanId == selected.Id &&
-            recovery.PlanRevision == selected.Revision;
-
-        DrawScratchActions(runtime, selected);
         ImGui.Separator();
-        ImGui.TextWrapped($"{ownerRules.Count:N0} items · {movements:N0} movements · " +
-            (projection.HasUnknownListingDemand ? "Verifying listing demand..." : $"Retrieve {retrieval.NeededQuantity:N0} · Stow {surplusBatch.RequestedQuantity:N0}"));
-        var stockUnverified = retrieval.Lines.Any(line => line.Status == PlanLineStatus.StockUnverified);
-        var remainingShort = Math.Max(0, retrieval.Lines.Where(line => line.Status != PlanLineStatus.StockUnverified)
-            .Sum(line => line.MissingQuantity) - vendor.ApprovedQuantity);
-        if (!projection.HasUnknownListingDemand && (remainingShort > 0 || stockUnverified || surplusBatch.RemainingQuantity > 0))
-            ImGui.TextWrapped($"{remainingShort:N0} known short{(stockUnverified ? " · Retainer stock unverified" : string.Empty)} · No room for {surplusBatch.RemainingQuantity:N0}");
-        var canReviewVendor = vendor.CanStart &&
-                              !projection.HasUnknownListingDemand &&
-                              !vendorProcurement.HasActiveRun &&
-                              transfers.CanStart &&
-                              !retainerRefresh.IsRefreshing &&
-                              !retainerRefresh.IsQueued;
-        if (vendor.Lines.Count > 0)
-        {
-            if (!canReviewVendor)
-                ImGui.BeginDisabled();
-            if (ImGui.Button($"Review vendor buy ({vendor.ApprovedQuantity:N0})"))
-                requestVendorReview(vendor);
-            if (!canReviewVendor)
-                ImGui.EndDisabled();
-            reviewRegistry.RegisterLastButton(
-                "quartermaster.vendor.review",
-                "Review vendor coverage for the selected Transfer Plan",
-                canReviewVendor,
-                () =>
-                {
-                    var current = runtimeSnapshots.Current;
-                    var currentPlan = ResolveSelectedStowagePlan(current.State, current.Owner);
-                    if (currentPlan is null)
-                        return;
-                    var currentProjection = ResolveProjection(current, currentPlan);
-                    requestVendorReview(currentProjection.Vendor);
-                },
-                canReviewVendor
-                    ? $"{vendor.ApprovedQuantity:N0} units · maximum {vendor.MaximumGil:N0} gil"
-                    : vendorProcurement.HasActiveRun
-                        ? "A vendor run is already active"
-                        : projection.HasUnknownListingDemand
-                            ? "Listing demand must be verified first"
-                            : "No reviewed vendor-purchasable shortfall");
-        }
-        var planProgress = hasCurrentRecovery && retainerRefresh.IsRefreshing
-            ? retainerRefresh.Status
-            : string.Empty;
-        var planNotice = !string.IsNullOrWhiteSpace(transferExecution.InlineError)
-            ? transferExecution.InlineError
-            : hasCurrentRecovery && !string.IsNullOrWhiteSpace(recovery!.FailureMessage)
-                ? recovery.FailureMessage
-                : hasCurrentRecovery && !retainerRefresh.IsRefreshing
-                    ? "Retainer evidence refresh did not complete. Retry plan to continue."
-                    : string.Empty;
-        DrawTransferPlanNotice(selected, hasCurrentRecovery, planProgress, planNotice);
-        DrawVendorRunStatus();
-        DrawTableColumnsToolbar(transferWorkbenchTable, "RQTransferColumns", "Plan quantities use the latest accessible stock.");
-
-        var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
-                     ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
-                     ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.Sortable |
-                     ImGuiTableFlags.Reorderable | ImGuiTableFlags.Hideable;
-        var footerHeight = ImGui.GetTextLineHeightWithSpacing() + 4;
-        IReadOnlyList<TransferWorkbenchRow> transferRows = projection.Rows;
-        renderedTransferRowCount = 0;
-        if (transferWorkbenchTable.Begin(
-                "RQTransferWorkbenchV3",
-                new DalamudTableLayout(
-                    new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y - footerHeight)),
-                    flags)))
-        {
-            unsafe
+        ImGui.TextDisabled("Vendor");
+        var vendorSupported = rule.Quality == ItemQualityPolicy.Any;
+        ImGui.BeginDisabled(!vendorSupported);
+        if (ImGui.Selectable("Retainers only", !rule.AllowVendorPurchase, ImGuiSelectableFlags.DontClosePopups))
+            MutateRules(row.Owner, row.PlanId, ids, draftRule =>
             {
-                transferRows = transferWorkbenchTable.Apply(transferRows, ImGui.TableGetSortSpecs());
-            }
-            renderedTransferRowCount = transferWorkbenchTable.DrawClippedRows(
-                transferRows,
-                (row, index) =>
-                {
-                    transferWorkbenchTable.DrawSaneRow(transferRows, index, $"transfer:{row.Rule.Id}",
-                        row.Rule.Enabled ? null : new Vector4(.13f, .15f, .17f, .42f));
-                });
-            transferWorkbenchTable.End();
-        }
-
-
-    }
-
-    private void DrawScratchActions(QuartermasterRuntimeSnapshot runtime, StowagePlan plan)
-    {
-        if (!plan.IsEphemeral) return;
-        UiLayout.SameLineIfFits("Save as plan...");
-        void RequestSave() { scratchName = string.Empty; saveScratchRequested = true; }
-        if (ImGui.Button("Save as plan...")) RequestSave();
-        reviewRegistry.RegisterLastButton("quartermaster.transfer.scratch.save-as", "Name the unsaved plan", true, RequestSave, "Available");
-        UiLayout.SameLineIfFits("Clear plan");
-        void Clear() => state.Mutate(s => { var d = StowagePlanCatalog.Draft(s, runtime.Owner, plan.Id); d.Rules.Clear(); StowagePlanCatalog.Apply(s, runtime.Owner, d); });
-        if (ImGui.Button("Clear plan")) Clear();
-        reviewRegistry.RegisterLastButton("quartermaster.transfer.scratch.clear", "Clear the unsaved plan", true, Clear, "Available");
-        if (saveScratchRequested) { ImGui.OpenPopup("Save as plan"); saveScratchRequested = false; }
-        if (!ImGui.BeginPopup("Save as plan")) return;
-        ImGui.InputText("Name", ref scratchName, 80);
-        var canSave = !string.IsNullOrWhiteSpace(scratchName);
-        void Promote()
+                draftRule.AllowVendorPurchase = false;
+                draftRule.PreferredVendorNpcId = null;
+            });
+        if (ImGui.Selectable(
+                "Cheapest reachable",
+                rule.AllowVendorPurchase && rule.PreferredVendorNpcId is null,
+                ImGuiSelectableFlags.DontClosePopups))
+            MutateRules(row.Owner, row.PlanId, ids, draftRule =>
+            {
+                draftRule.AllowVendorPurchase = true;
+                draftRule.PreferredVendorNpcId = null;
+            });
+        foreach (var offer in vendorCatalogSource?.Invoke().FindOffers(rule.ItemId) ?? [])
         {
-            workbench.SelectedStowagePlanId = state.Mutate(s => { StowagePlanCatalog.PromoteScratch(s, runtime.Owner, plan.Id, scratchName); return StowagePlanCatalog.EnsureScratch(s, runtime.Owner).Id; });
-            transferPlanEditor.Forget(plan.Id);
+            var npcId = offer.NpcId;
+            if (ImGui.Selectable(
+                    $"{offer.NpcName} · {offer.UnitPriceGil:N0} ea##offer:{offer.NpcId}:{offer.ShopId}:{offer.ShopRowIndex}",
+                    rule.AllowVendorPurchase && rule.PreferredVendorNpcId == npcId,
+                    ImGuiSelectableFlags.DontClosePopups))
+                MutateRules(row.Owner, row.PlanId, ids, draftRule =>
+                {
+                    draftRule.AllowVendorPurchase = true;
+                    draftRule.PreferredVendorNpcId = npcId;
+                });
         }
-        ImGui.BeginDisabled(!canSave);
-        if (ImGui.Button("Save")) { Promote(); ImGui.CloseCurrentPopup(); }
         ImGui.EndDisabled();
-        reviewRegistry.RegisterLastButton("quartermaster.transfer.scratch.promote", "Save as a named plan", canSave, Promote, "Available");
+
+        ImGui.Separator();
+        ImGui.TextDisabled("Destination");
+        var routing = StowagePlanCatalog.CopyRule(rule, row.PlanId, false).Routing;
+        var before = JsonSerializer.Serialize(routing);
+        RoutingPolicyEditor.DrawDestination(routing, row.Runtime);
+        ImGui.TextDisabled("Overflow");
+        RoutingPolicyEditor.DrawOverflow(routing);
+        if (before != JsonSerializer.Serialize(routing))
+            MutateRules(row.Owner, row.PlanId, ids, draftRule => draftRule.Routing = routing);
+
+        ImGui.Separator();
+        ImGui.TextDisabled("Note");
+        if (noteRuleId != rule.Id)
+        {
+            noteRuleId = rule.Id;
+            noteBuffer = rule.Notes;
+        }
+        ImGui.SetNextItemWidth(-1);
+        ImGui.InputText("##note", ref noteBuffer, 160);
+        if (ImGui.IsItemDeactivatedAfterEdit() && !string.Equals(noteBuffer.Trim(), rule.Notes, StringComparison.Ordinal))
+        {
+            var note = noteBuffer.Trim();
+            MutateRules(row.Owner, row.PlanId, ids, draftRule => draftRule.Notes = note);
+        }
+
+        ImGui.Separator();
+        var enabled = rule.Enabled;
+        if (ImGui.Selectable(enabled ? "Pause line" : "Resume line"))
+            MutateRules(row.Owner, row.PlanId, ids, draftRule => draftRule.Enabled = !enabled);
+        if (ImGui.Selectable("Remove"))
+            RemoveRules(row.Owner, row.PlanId, ids);
         ImGui.EndPopup();
     }
+
+    // ---- Add path -------------------------------------------------------------------------
+
+    private void DrawAddInput(QuartermasterRuntimeSnapshot runtime, StowagePlan plan)
+    {
+        ImGui.SetNextItemWidth(-1);
+        var entered = ImGui.InputTextWithHint(
+            "##RQPlanAddItem",
+            "+ Add item or @group…",
+            ref addText,
+            96,
+            ImGuiInputTextFlags.EnterReturnsTrue);
+        var active = ImGui.IsItemActive();
+        var inputMin = ImGui.GetItemRectMin();
+        var inputMax = ImGui.GetItemRectMax();
+        var suggestions = AddSuggestions(runtime.State, addText);
+        if (entered && suggestions.Count > 0)
+        {
+            AddSuggestionToPlan(runtime, plan, suggestions[0]);
+            suggestions = [];
+        }
+        else if (active && suggestions.Count > 0)
+        {
+            ImGui.OpenPopup(AddSuggestionsPopup);
+        }
+
+        ImGui.SetNextWindowPos(new Vector2(inputMin.X, inputMax.Y), ImGuiCond.Always);
+        ImGui.SetNextWindowSizeConstraints(
+            new Vector2(Math.Clamp(inputMax.X - inputMin.X, 240f, 620f), 0),
+            new Vector2(620f, 360f));
+        if (!ImGui.BeginPopup(AddSuggestionsPopup, SuggestionWindowFlags))
+            return;
+        if (suggestions.Count == 0)
+        {
+            ImGui.CloseCurrentPopup();
+            ImGui.EndPopup();
+            return;
+        }
+        for (var index = 0; index < suggestions.Count; index++)
+        {
+            if (!ImGui.Selectable($"{suggestions[index].Label}##add-suggestion:{index}", index == 0))
+                continue;
+            AddSuggestionToPlan(runtime, plan, suggestions[index]);
+            ImGui.CloseCurrentPopup();
+            break;
+        }
+        ImGui.EndPopup();
+    }
+
+    private IReadOnlyList<AddSuggestion> AddSuggestions(QuartermasterState document, string text)
+    {
+        var needle = text.Trim();
+        if (needle.Length == 0)
+            return [];
+        var groups = ItemGroupCatalog.All(document);
+        if (needle.StartsWith('@'))
+        {
+            var groupNeedle = needle[1..].Trim();
+            return groups
+                .Where(group => groupNeedle.Length == 0 || group.Name.Contains(groupNeedle, StringComparison.OrdinalIgnoreCase))
+                .Take(8)
+                .Select(GroupSuggestion)
+                .ToArray();
+        }
+        if (needle.Length < 2)
+            return [];
+        if (!string.Equals(needle, cachedItemSearch, StringComparison.Ordinal))
+        {
+            cachedItemSearch = needle;
+            cachedItemChoices = searchItems(needle, 8);
+        }
+        return cachedItemChoices
+            .Select(choice => new AddSuggestion(choice.Label, choice, null))
+            .Concat(groups
+                .Where(group => group.Name.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                .Take(4)
+                .Select(GroupSuggestion))
+            .ToArray();
+
+        static AddSuggestion GroupSuggestion(ItemGroup group) =>
+            new($"@{group.Name} · {group.Items.Count:N0} item{(group.Items.Count == 1 ? string.Empty : "s")}", null, group);
+    }
+
+    private void AddSuggestionToPlan(QuartermasterRuntimeSnapshot runtime, StowagePlan plan, AddSuggestion suggestion)
+    {
+        (uint ItemId, string Name, ItemQualityPolicy Quality)[] entries = suggestion.Item is { } item
+            ? [(item.ItemId, item.Name, ItemQualityPolicy.Any)]
+            : suggestion.Group?.Items.Select(member => (member.ItemId, member.ItemName, member.Quality)).ToArray() ?? [];
+        addText = string.Empty;
+        if (entries.Length == 0)
+            return;
+        try
+        {
+            var firstId = state.Mutate(document =>
+            {
+                var draft = StowagePlanCatalog.Draft(document, runtime.Owner, plan.Id);
+                Guid? first = null;
+                foreach (var (itemId, name, quality) in entries)
+                {
+                    // New lines start balanced (target = carried) so they move nothing until a target is set.
+                    var player = TransferPlanEvaluation.PlayerQuantity(
+                        runtime.Browser,
+                        new TargetPlanItem { ItemId = itemId, Quality = quality });
+                    var added = StowagePlanCatalog.AddBalancedRule(draft, itemId, name, quality, player);
+                    first ??= added.Id;
+                }
+                StowagePlanCatalog.Apply(document, runtime.Owner, draft);
+                return first;
+            });
+            workbench.SelectedStowagePlanId = plan.Id;
+            if (firstId is { } id)
+                RequestTargetFocus(id);
+            transferExecution.ClearInlineError();
+        }
+        catch (Exception exception)
+        {
+            transferExecution.ReportInlineError(exception.Message);
+        }
+    }
+
+    private void RequestTargetFocus(Guid ruleId)
+    {
+        focusTargetRuleId = ruleId;
+        focusTargetFrames = 0;
+    }
+
+    // ---- Mutations ------------------------------------------------------------------------
+
+    private bool MutateRules(
+        OwnerScope owner,
+        Guid planId,
+        IReadOnlyCollection<Guid> ruleIds,
+        Action<TargetPlanItem> update)
+    {
+        try
+        {
+            workbench.SelectedStowagePlanId = state.Mutate(document =>
+            {
+                var draft = StowagePlanCatalog.Draft(document, owner, planId);
+                foreach (var rule in draft.Rules.Where(rule => ruleIds.Contains(rule.Id)))
+                    update(rule);
+                var duplicate = draft.Rules
+                    .GroupBy(rule => (rule.ItemId, rule.Quality))
+                    .FirstOrDefault(group => group.Count() > 1);
+                if (duplicate is not null)
+                    throw new InvalidOperationException(
+                        $"{duplicate.First().ItemName} ({QualityLabel(duplicate.Key.Quality)}) is already in this plan.");
+                return StowagePlanCatalog.Apply(document, owner, draft).Id;
+            });
+            foreach (var id in ruleIds)
+                lineErrors.Remove(id);
+            transferExecution.ClearInlineError();
+            return true;
+        }
+        catch (Exception exception)
+        {
+            if (ruleIds.Count == 1)
+                lineErrors[ruleIds.First()] = exception.Message;
+            else
+                transferExecution.ReportInlineError(exception.Message);
+            return false;
+        }
+    }
+
+    private void RemoveRules(OwnerScope owner, Guid planId, IReadOnlyCollection<Guid> ruleIds)
+    {
+        if (ruleIds.Count == 0)
+            return;
+        try
+        {
+            RemovedLines? removed = null;
+            workbench.SelectedStowagePlanId = state.Mutate(document =>
+            {
+                var draft = StowagePlanCatalog.Draft(document, owner, planId);
+                var rules = draft.Rules
+                    .Where(rule => ruleIds.Contains(rule.Id))
+                    .Select(rule => StowagePlanCatalog.CopyRule(rule, planId, false))
+                    .ToArray();
+                var linksBefore = document.TransferPlanListingLinks
+                    .Where(link => link.StowagePlanId == planId)
+                    .ToArray();
+                draft.Rules.RemoveAll(rule => ruleIds.Contains(rule.Id));
+                var plan = StowagePlanCatalog.Apply(document, owner, draft);
+                var dropped = linksBefore
+                    .Where(link => !document.TransferPlanListingLinks.Contains(link))
+                    .Select(CopyLink)
+                    .ToArray();
+                var label = rules.Length == 1
+                    ? $"Removed {rules[0].ItemName}"
+                    : $"Removed {rules.Length:N0} lines";
+                removed = new RemovedLines(planId, label, rules, dropped);
+                return plan.Id;
+            });
+            lastRemoved = removed;
+            foreach (var id in ruleIds)
+            {
+                selection.SetSelected(id, false);
+                lineErrors.Remove(id);
+            }
+            transferExecution.ClearInlineError();
+        }
+        catch (Exception exception)
+        {
+            transferExecution.ReportInlineError(exception.Message);
+        }
+    }
+
+    private void UndoRemoval(OwnerScope owner, RemovedLines removed)
+    {
+        try
+        {
+            workbench.SelectedStowagePlanId = state.Mutate(document =>
+            {
+                var draft = StowagePlanCatalog.Draft(document, owner, removed.PlanId);
+                foreach (var rule in removed.Rules)
+                {
+                    if (!draft.Rules.Any(existing =>
+                            existing.Id == rule.Id ||
+                            (existing.ItemId == rule.ItemId && existing.Quality == rule.Quality)))
+                        draft.Rules.Add(StowagePlanCatalog.CopyRule(rule, removed.PlanId, false));
+                }
+                var plan = StowagePlanCatalog.Apply(document, owner, draft);
+                foreach (var link in removed.Links)
+                {
+                    if (document.TransferPlanListingLinks.Any(existing => existing.Id == link.Id))
+                        continue;
+                    if (document.PlanItems.Any(rule => rule.StowagePlanId == plan.Id && rule.Enabled &&
+                                                       rule.ItemId == link.ItemId && rule.Quality == link.Quality))
+                        document.TransferPlanListingLinks.Add(CopyLink(link));
+                }
+                return plan.Id;
+            });
+            lastRemoved = null;
+            transferExecution.ClearInlineError();
+        }
+        catch (Exception exception)
+        {
+            transferExecution.ReportInlineError(exception.Message);
+        }
+    }
+
+    private static TransferPlanListingLink CopyLink(TransferPlanListingLink link) => new()
+    {
+        Id = link.Id,
+        StowagePlanId = link.StowagePlanId,
+        ListingPlanId = link.ListingPlanId,
+        ItemId = link.ItemId,
+        Quality = link.Quality,
+    };
+
+    // ---- Notices / vendor run -------------------------------------------------------------
 
     private void DrawVendorRunStatus()
     {
@@ -590,7 +1488,7 @@ internal sealed class TransferPlanWorkspace
             ImGui.PopStyleColor();
         }
         if (!string.IsNullOrWhiteSpace(vendorStatus))
-            DrawWrappedStatus(vendorStatus, ListingWorkspace.Color(ListingStateTone.Info));
+            DrawWrappedStatus(vendorStatus, ErrorColor);
         if (!string.IsNullOrWhiteSpace(vendorProcurement.CoordinationWarning))
             DrawWrappedStatus(vendorProcurement.CoordinationWarning, ListingWorkspace.Color(ListingStateTone.Info));
     }
@@ -628,10 +1526,10 @@ internal sealed class TransferPlanWorkspace
                 : notice;
         var accent = isProgress
             ? new Vector4(.52f, .79f, .94f, 1f)
-            : new Vector4(.65f, .76f, .88f, 1f);
+            : ErrorColor;
         var background = isProgress
             ? new Vector4(.06f, .13f, .17f, .92f)
-            : new Vector4(.07f, .11f, .16f, .92f);
+            : new Vector4(.17f, .08f, .08f, .92f);
 
         var flags = ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.BordersInnerV;
         if (!ImGui.BeginTable("RQTransferPlanNotice", 2, flags))
@@ -667,6 +1565,8 @@ internal sealed class TransferPlanWorkspace
         ImGui.EndTable();
     }
 
+    // ---- Projection -----------------------------------------------------------------------
+
     public TransferWorkbenchProjection ResolveProjection(
         QuartermasterRuntimeSnapshot runtime,
         StowagePlan plan)
@@ -691,30 +1591,53 @@ internal sealed class TransferPlanWorkspace
             plan.Id);
         var retrieval = BuildTransferRetrievalEvaluation(runtime, effectiveRules);
         var vendor = vendorProcurement.BuildReview(runtime, plan, effectiveRules, retrieval);
+        // What each line would get from a vendor if buying were on: drives the vendor chip
+        // with the same planner, catalog, and access eligibility as the real review.
+        var vendorPreview = vendorProcurement.BuildReview(
+            runtime,
+            plan,
+            effectiveRules.Select(rule =>
+            {
+                var copy = StowagePlanCatalog.CopyRule(rule, plan.Id, false);
+                copy.AllowVendorPurchase = true;
+                return copy;
+            }).ToArray(),
+            retrieval);
         var deposit = TransferPlanEvaluation.BuildSurplusBatch(runtime, stowage);
         var evaluated = stowage?.Lines.ToDictionary(line => line.RuleId) ?? [];
         var retrievalLines = retrieval.Lines.ToDictionary(line => line.PlanItemId);
         var vendorLines = vendor.Lines.ToDictionary(line => line.RuleId);
-        var movements = evaluated.Values.Count(line =>
-            line.Action is StowageAction.Retrieve or StowageAction.Deposit);
+        var vendorPreviewLines = vendorPreview.Lines.ToDictionary(line => line.RuleId);
         var rows = rules
             .Select(rule =>
             {
                 evaluated.TryGetValue(rule.Id, out var line);
                 retrievalLines.TryGetValue(rule.Id, out var retrievalLine);
                 vendorLines.TryGetValue(rule.Id, out var vendorLine);
+                vendorPreviewLines.TryGetValue(rule.Id, out var vendorPreviewLine);
                 var routedDepositQuantity = deposit.Routes
                     .Where(route => route.Request.SourceRuleId == rule.Id)
                     .Sum(route => route.RoutedQuantity);
-                var playerQuantity = StowageEvaluator.PlayerQuantity(
-                    rule,
-                    runtime.Browser.Items.FirstOrDefault(item => item.ItemId == rule.ItemId));
+                var stock = runtime.Browser.Items.FirstOrDefault(item => item.ItemId == rule.ItemId);
+                var playerQuantity = StowageEvaluator.PlayerQuantity(rule, stock);
                 var accessibleStorageQuantity = TransferWorkbenchPresentation.AccessibleStorageQuantity(
-                    runtime.Browser.Items.FirstOrDefault(item => item.ItemId == rule.ItemId),
+                    stock,
                     rule.Quality,
                     runtime.Retainers,
                     runtime.Owner);
                 listingContributions.TryGetValue((rule.ItemId, rule.Quality), out var listingContribution);
+                var listingQuantity = listingContribution?.Quantity ?? Evidence.Known(0);
+                var difference = (line?.DesiredPlayerQuantity ?? rule.TargetQuantity) - playerQuantity;
+                var lineProjection = TransferWorkbenchPresentation.Project(
+                    rule.Enabled,
+                    listingQuantity.IsKnown,
+                    line?.Action ?? StowageAction.None,
+                    Math.Abs(difference),
+                    accessibleStorageQuantity,
+                    routedDepositQuantity,
+                    line?.SaddlebagQuantity ?? 0,
+                    vendorLine?.IsReady == true ? vendorLine.ApprovedQuantity : 0,
+                    retrievalLine?.Status == PlanLineStatus.StockUnverified);
                 return new TransferWorkbenchRow(
                     rule,
                     line,
@@ -723,14 +1646,18 @@ internal sealed class TransferPlanWorkspace
                     routedDepositQuantity,
                     playerQuantity,
                     accessibleStorageQuantity,
-                    (line?.DesiredPlayerQuantity ?? rule.TargetQuantity) - playerQuantity,
-                    listingContribution?.Quantity ?? Evidence.Known(0),
+                    difference,
+                    listingQuantity,
                     listingContribution?.Link,
                     runtime.Owner,
                     plan.Id,
-                    runtime);
+                    runtime,
+                    lineProjection,
+                    vendorPreviewLine);
             })
             .ToArray();
+        // Count lines that will actually move something, from the same projection the rows show.
+        var movements = rows.Count(row => row.Projection.Retrieve > 0 || row.Projection.Stow > 0);
         transferWorkbenchProjection = new(
             runtime.Revision,
             plan.Id,
@@ -765,66 +1692,12 @@ internal sealed class TransferPlanWorkspace
         requestVendorReview(ResolveProjection(current, plan).Vendor);
     }
 
-    private void DrawInlineTransferRoute(OwnerScope owner, Guid planId, TargetPlanItem rule, QuartermasterRuntimeSnapshot runtime)
-    {
-        var routing = StowagePlanCatalog.CopyRule(rule, planId, false).Routing;
-        var before = System.Text.Json.JsonSerializer.Serialize(routing);
-        ImGui.PushID(rule.Id.ToString());
-        RoutingPolicyEditor.DrawDestination(routing, runtime, () => RoutingPolicyEditor.DrawOverflow(routing));
-        ImGui.PopID();
-        if (before != System.Text.Json.JsonSerializer.Serialize(routing))
-            UpdateTransferRule(owner, planId, rule.Id, r => r.Routing = routing);
-    }
-
-    private void UpdateTransferRule(
-        OwnerScope owner,
-        Guid planId,
-        Guid ruleId,
-        Action<TargetPlanItem> update)
-    {
-        try
-        {
-            workbench.SelectedStowagePlanId = state.Mutate(document =>
-            {
-                var draft = StowagePlanCatalog.Draft(document, owner, planId);
-                var draftRule = draft.Rules.Single(rule => rule.Id == ruleId);
-                update(draftRule);
-                return StowagePlanCatalog.Apply(document, owner, draft).Id;
-            });
-            transferExecution.ClearInlineError();
-        }
-        catch (Exception exception)
-        {
-            transferExecution.ReportInlineError(exception.Message);
-        }
-    }
-
-    private void RemoveTransferRule(OwnerScope owner, Guid planId, Guid ruleId)
-    {
-        try
-        {
-            workbench.SelectedStowagePlanId = state.Mutate(document =>
-            {
-                var draft = StowagePlanCatalog.Draft(document, owner, planId);
-                draft.Rules.RemoveAll(rule => rule.Id == ruleId);
-                return StowagePlanCatalog.Apply(document, owner, draft).Id;
-            });
-            transferExecution.ClearInlineError();
-        }
-        catch (Exception exception)
-        {
-            transferExecution.ReportInlineError(exception.Message);
-        }
-    }
-
-
     private static string QualityLabel(ItemQualityPolicy quality) => quality switch
     {
         ItemQualityPolicy.NqOnly => "NQ",
         ItemQualityPolicy.HqOnly => "HQ",
         _ => "Any",
     };
-
 
     private static RetrievalPlan BuildTransferRetrievalEvaluation(
         QuartermasterRuntimeSnapshot runtime,
