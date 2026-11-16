@@ -5,6 +5,15 @@ using RQ.Runtime;
 
 namespace RQ.UI;
 
+/// <summary>What one market slot plans; slots with equal plans collapse into one assignment.</summary>
+internal sealed record ListingSlotPlan(uint ItemId, string ItemName, ItemQualityPolicy Quality, int Units, int Price, bool Enabled)
+{
+    public static ListingSlotPlan Of(ListingPlanAssignment a) => new(a.ItemId, a.ItemName, a.Quality, a.QuantityPerListing, a.UnitPrice, a.Enabled);
+    public static ListingSlotPlan Of(ListingRow listing) => new(listing.ItemId, listing.ItemName, ListingRetainerProjection.Quality(listing), listing.Quantity,
+        listing.UnitPrice.IsKnown ? (int)Math.Clamp(listing.UnitPrice.Value, 0, ListingPlanInput.MaxUnitPrice) : 0, true);
+    public (uint, ItemQualityPolicy, int, int, bool) Shape => (ItemId, Quality, Units, Price, Enabled);
+}
+
 /// <summary>Window-lifetime editing intent. Only Save writes canonical state.</summary>
 internal sealed class ListingPlanDraftSession(
     StateRepository state,
@@ -20,8 +29,6 @@ internal sealed class ListingPlanDraftSession(
     public int ConflictCount { get; private set; }
     public bool MergedElsewhere { get; private set; }
     public string? Error { get; private set; }
-    public Guid? PriceEchoAssignmentId { get; set; }
-    public Guid? FocusListingsAssignmentId { get; set; }
     internal Action? BeforeSaveMutate { get; set; }
 
     public void Ensure(QuartermasterRuntimeSnapshot runtime) => Ensure(runtime.Owner, runtime.State, runtime.Browser);
@@ -57,7 +64,6 @@ internal sealed class ListingPlanDraftSession(
         ConflictCount = 0;
         MergedElsewhere = false;
         Error = null;
-        FocusListingsAssignmentId = null;
         Changed();
     }
 
@@ -80,7 +86,6 @@ internal sealed class ListingPlanDraftSession(
     private void Changed()
     {
         Version++;
-        PriceEchoAssignmentId = null;
         ChangeCount = ChangedIds().Count;
     }
 
@@ -135,64 +140,105 @@ internal sealed class ListingPlanDraftSession(
     public int MaxStack(BrowserProjection browser, uint itemId) => Math.Max(1, resolveMaxStack(browser, itemId));
     public bool CanBeHq(uint itemId) => canBeHq(itemId);
 
-    public ListingPlanAssignment Add(ulong retainerId, string retainerName, uint itemId, string itemName,
-        ItemQualityPolicy quality, BrowserProjection browser)
+    /// <summary>
+    /// Rewrites individual slots of one retainer: each key gets a new plan, or null to free it.
+    /// The retainer's assignments are re-derived from its slots in plan order, so equal plans merge
+    /// (summed ListingCount) and partially edited assignments split. An assignment keeps its identity
+    /// when its slots are untouched or a regrouped set still matches it, else the largest unclaimed contributor is reused.
+    /// Returns the rewritten slots' new keys (freed slots omitted), or null when the edit would
+    /// exceed the retainer's listing capacity.
+    /// </summary>
+    public IReadOnlyList<ListingSlotKey>? RewriteSlots(ulong retainerId, string retainerName,
+        IReadOnlyList<(ListingSlotKey Key, ListingSlotPlan? Plan)> rewrites)
     {
-        if (Draft is null || Free(retainerId) == 0 || Draft.Assignments.Count(a => a.RetainerId == retainerId) >= MarketRunPlanner.ListingCapacity)
-            throw new InvalidOperationException("No planned capacity remains on this retainer.");
-        var assignment = new ListingPlanAssignment { RetainerId = retainerId, RetainerName = retainerName,
-            ItemId = itemId, ItemName = itemName, Quality = quality, ListingCount = 0,
-            QuantityPerListing = MaxStack(browser, itemId) == 1 ? 1 : 0, UnitPrice = 0 };
-        Draft.Assignments.Add(assignment);
-        FocusListingsAssignmentId = assignment.Id;
+        if (Draft is null || rewrites.Count == 0) return null;
+        var targets = rewrites.GroupBy(r => r.Key).ToDictionary(g => g.Key, g => g.Last().Plan);
+        var own = Draft.Assignments.Where(a => a.RetainerId == retainerId).ToArray();
+        var entries = new List<(ListingSlotPlan Plan, Guid Source, ListingSlotKey? Key)>();
+        foreach (var a in own)
+            for (var n = 0; n < a.ListingCount; n++)
+            {
+                var key = ListingSlotKey.Planned(a.Id, n);
+                if (!targets.TryGetValue(key, out var plan)) entries.Add((ListingSlotPlan.Of(a), a.Id, null));
+                else if (plan is not null) entries.Add((plan, a.Id, key));
+            }
+        foreach (var (key, plan) in targets)
+            if (key.Source != ListingSlotSource.Planned && plan is not null) entries.Add((plan, Guid.Empty, key));
+        var before = own.Where(a => a.Enabled).Sum(a => a.ListingCount);
+        var after = entries.Count(e => e.Plan.Enabled);
+        if (after > MarketRunPlanner.ListingCapacity && after > before) return null;
+
+        var originals = own.ToDictionary(a => a.Id);
+        // Untouched slots stay in their own assignment (even beside an identically shaped one), so an
+        // edit never rewrites intent the user did not touch. Touched slots join the first group of the
+        // same shape, else form a new group.
+        var groups = new List<((uint, ItemQualityPolicy, int, int, bool) Shape, Guid Fixed, List<(int Order, (ListingSlotPlan Plan, Guid Source, ListingSlotKey? Key) Entry)> Items)>();
+        for (var i = 0; i < entries.Count; i++)
+        {
+            if (entries[i].Key is not null) continue;
+            var g = groups.FindIndex(x => x.Fixed == entries[i].Source);
+            if (g < 0) { groups.Add((entries[i].Plan.Shape, entries[i].Source, [])); g = groups.Count - 1; }
+            groups[g].Items.Add((i, entries[i]));
+        }
+        for (var i = 0; i < entries.Count; i++)
+        {
+            if (entries[i].Key is null) continue;
+            var g = groups.FindIndex(x => Equals(x.Shape, entries[i].Plan.Shape));
+            if (g < 0) { groups.Add((entries[i].Plan.Shape, Guid.Empty, [])); g = groups.Count - 1; }
+            groups[g].Items.Add((i, entries[i]));
+        }
+        var claimed = groups.Where(g => g.Fixed != Guid.Empty).Select(g => g.Fixed).ToHashSet();
+        var rebuilt = new List<ListingPlanAssignment>();
+        var moved = new Dictionary<ListingSlotKey, ListingSlotKey>();
+        foreach (var raw in groups.OrderBy(g => g.Items.Min(x => x.Order)))
+        {
+            var group = raw.Items.OrderBy(x => x.Order).Select(x => x.Entry).ToArray();
+            var id = raw.Fixed;
+            if (id == Guid.Empty)
+            {
+                // Prefer a source whose original shape this group still is, then the biggest contributor;
+                // the identity follows the intent that stayed, so Save's merge-by-id sees no false edit.
+                var sources = group.Where(e => e.Source != Guid.Empty && !claimed.Contains(e.Source))
+                    .GroupBy(e => e.Source).OrderByDescending(s => s.Count()).Select(s => s.Key).ToArray();
+                id = sources.FirstOrDefault(s => Equals(ListingSlotPlan.Of(originals[s]).Shape, raw.Shape));
+                if (id == Guid.Empty) id = sources.FirstOrDefault();
+                if (id == Guid.Empty) id = Guid.NewGuid();
+                claimed.Add(id);
+            }
+            var plan = group.First().Plan;
+            rebuilt.Add(new ListingPlanAssignment
+            {
+                Id = id, RetainerId = retainerId, RetainerName = originals.GetValueOrDefault(id)?.RetainerName ?? retainerName,
+                ItemId = plan.ItemId, ItemName = plan.ItemName, Quality = plan.Quality, ListingCount = group.Count(),
+                QuantityPerListing = plan.Units, UnitPrice = plan.Price, Enabled = plan.Enabled,
+            });
+            var ordinal = 0;
+            foreach (var entry in group)
+            {
+                if (entry.Key is { } key) moved[key] = ListingSlotKey.Planned(id, ordinal);
+                ordinal++;
+            }
+        }
+        var index = Draft.Assignments.FindIndex(a => a.RetainerId == retainerId);
+        Draft.Assignments.RemoveAll(a => a.RetainerId == retainerId);
+        Draft.Assignments.InsertRange(index < 0 ? Draft.Assignments.Count : index, rebuilt);
         Changed();
-        return assignment;
+        return rewrites.Select(r => r.Key).Distinct().Where(moved.ContainsKey).Select(k => moved[k]).ToArray();
     }
 
-    private ListingPlanAssignment? Find(Guid id) => Draft?.Assignments.FirstOrDefault(a => a.Id == id);
-    public void SetListingCount(Guid id, string text) { if (Find(id) is { } a) { a.ListingCount = ListingPlanInput.Commit(text, Free(a.RetainerId, id)); Changed(); } }
-    public void SetQuantity(Guid id, string text, BrowserProjection browser) { if (Find(id) is { } a) { a.QuantityPerListing = ListingPlanInput.Commit(text, MaxStack(browser, a.ItemId)); Changed(); } }
-    public void SetUnitPrice(Guid id, string text) { if (Find(id) is { } a) { a.UnitPrice = ListingPlanInput.Commit(text, ListingPlanInput.MaxUnitPrice); Changed(); } }
-    public void EndUnitPriceEdit(Guid id, int valueAtActivation) { if (Find(id) is { UnitPrice: > 0 } a && a.UnitPrice != valueAtActivation) PriceEchoAssignmentId = id; }
-    public void SetEnabled(Guid id, bool enabled, BrowserProjection browser)
-    {
-        if (Find(id) is not { } a) return;
-        a.Enabled = enabled;
-        if (enabled)
-        {
-            a.ListingCount = Math.Clamp(a.ListingCount, 0, Free(a.RetainerId, id));
-            a.QuantityPerListing = MaxStack(browser, a.ItemId) == 1 ? 1 : Math.Clamp(a.QuantityPerListing, 0, MaxStack(browser, a.ItemId));
-            a.UnitPrice = Math.Clamp(a.UnitPrice, 0, ListingPlanInput.MaxUnitPrice);
-        }
-        Changed();
-    }
-    public void Remove(Guid id) { if (Draft?.Assignments.RemoveAll(a => a.Id == id) > 0) Changed(); }
-    public bool CanAdopt(IReadOnlyList<ListingRow> listings, IReadOnlySet<ulong> currentRetainerIds) =>
-        Draft is not null && listings.Count > 0 && currentRetainerIds.Contains(listings[0].RetainerId) &&
-        listings.Count <= Free(listings[0].RetainerId) && Draft.Assignments.Count(a => a.RetainerId == listings[0].RetainerId) < MarketRunPlanner.ListingCapacity;
-    public void Adopt(IReadOnlyList<ListingRow> listings, IReadOnlySet<ulong> currentRetainerIds)
-    {
-        if (!CanAdopt(listings, currentRetainerIds)) return;
-        var a = ListingPlanCatalog.AssignmentFromListings(listings);
-        Draft!.Assignments.Add(a);
-        FocusListingsAssignmentId = a.Id;
-        Changed();
-    }
+    /// <summary>
+    /// The single gate for adopting an observed listing as a slot's plan. Today it is
+    /// Replan's guard; listing-specific proof (for example price evidence) belongs here.
+    /// </summary>
+    public bool CanAdoptListed(ulong retainerId, ListingRow listing, BrowserProjection browser, IReadOnlySet<ulong> currentRetainerIds) =>
+        listing.RetainerId == retainerId && CanReplan(retainerId, browser, currentRetainerIds);
+
     public bool CanReplan(ulong retainerId, BrowserProjection browser, IReadOnlySet<ulong> currentRetainerIds) =>
         Draft is not null && currentRetainerIds.Contains(retainerId) &&
         browser.RetainerListingsCompleteByScope.GetValueOrDefault(BrowserScope.RetainerKey(retainerId));
 
     public bool CanReplanAll(BrowserProjection browser, IReadOnlySet<ulong> currentRetainerIds) =>
         currentRetainerIds.Any(id => CanReplan(id, browser, currentRetainerIds));
-
-    public void Replan(ulong retainerId, BrowserProjection browser, IReadOnlySet<ulong> currentRetainerIds)
-    {
-        if (!CanReplan(retainerId, browser, currentRetainerIds)) return;
-        var assignments = AssignmentsFromListings(retainerId, browser);
-        Draft!.Assignments.RemoveAll(a => a.RetainerId == retainerId);
-        Draft.Assignments.AddRange(assignments);
-        Changed();
-    }
 
     public void ReplanAll(BrowserProjection browser, IReadOnlySet<ulong> currentRetainerIds)
     {
@@ -211,16 +257,6 @@ internal sealed class ListingPlanDraftSession(
                 Price = l.UnitPrice.IsKnown ? l.UnitPrice.Value : 0 })
             .Select(g => ListingPlanCatalog.AssignmentFromListings(g.ToArray())).ToArray();
 
-    public IReadOnlyList<ListingPlanAssignment> PriceSiblings(Guid id, IReadOnlySet<ulong> currentRetainerIds) =>
-        Find(id) is not { UnitPrice: > 0 } a ? [] : Draft!.Assignments.Where(b => b.Enabled &&
-            b.RetainerId != a.RetainerId && currentRetainerIds.Contains(b.RetainerId) && b.ItemId == a.ItemId &&
-            b.Quality == a.Quality && b.UnitPrice != a.UnitPrice).ToArray();
-    public void ApplyPriceToSiblings(Guid id, IReadOnlySet<ulong> currentRetainerIds)
-    {
-        if (Find(id) is not { } a) return;
-        foreach (var sibling in PriceSiblings(id, currentRetainerIds)) sibling.UnitPrice = a.UnitPrice;
-        Changed();
-    }
     public ListingReserveRule AddReserve(uint itemId, string itemName, ItemQualityPolicy quality)
     {
         if (Draft is null)

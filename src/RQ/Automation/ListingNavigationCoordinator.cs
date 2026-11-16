@@ -74,6 +74,8 @@ public sealed class ListingNavigationCoordinator : IDisposable
 
     public bool IsRunning => Volatile.Read(ref running) != 0;
     public string Status { get; private set; } = string.Empty;
+    /// <summary>Whether the last completed navigation (including suppression restore) failed.</summary>
+    public bool LastFailed { get; private set; }
     public ListingRefreshTiming? LastRefreshTiming { get; private set; }
 
     public async Task<ListingOpenResult> OpenAsync(
@@ -160,7 +162,10 @@ public sealed class ListingNavigationCoordinator : IDisposable
                 {
                     suppressionScope.Dispose();
                     if (suppressionScope.RestoreFailure is { } restoreFailure)
+                    {
                         Status = $"{Status} AutoRetainer suppression could not be restored: {restoreFailure}";
+                        LastFailed = true;
+                    }
                 }
                 Interlocked.Exchange(ref running, 0);
             }
@@ -243,7 +248,10 @@ public sealed class ListingNavigationCoordinator : IDisposable
                 {
                     suppressionScope.Dispose();
                     if (suppressionScope.RestoreFailure is { } restoreFailure)
+                    {
                         Status = $"{Status} AutoRetainer suppression could not be restored: {restoreFailure}";
+                        LastFailed = true;
+                    }
                 }
                 Interlocked.Exchange(ref running, 0);
             }
@@ -293,7 +301,10 @@ public sealed class ListingNavigationCoordinator : IDisposable
                 {
                     suppressionScope.Dispose();
                     if (suppressionScope.RestoreFailure is { } restoreFailure)
+                    {
                         Status = $"{Status} AutoRetainer suppression could not be restored: {restoreFailure}";
+                        LastFailed = true;
+                    }
                 }
                 Interlocked.Exchange(ref running, 0);
             }
@@ -435,6 +446,7 @@ public sealed class ListingNavigationCoordinator : IDisposable
     private ListingOpenResult Complete(bool started, bool success, string message)
     {
         Status = message;
+        LastFailed = !success;
         return new(started, success, message);
     }
 

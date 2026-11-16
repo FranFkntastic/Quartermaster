@@ -5,18 +5,28 @@ using RQ.Planning;
 
 namespace RQ.UI;
 
-internal enum SlotCellKind { Free, Listed, Differs, Planned, PlannedUnknown, Unplanned }
-internal readonly record struct SlotCell(SlotCellKind Kind, string Tooltip);
+internal enum ListingSlotSource { Planned, Observed, Free }
+/// <summary>Stable slot identity: assignment + ordinal, an off-plan listing's game slot, or a free-row ordinal.</summary>
+internal readonly record struct ListingSlotKey(ListingSlotSource Source, Guid AssignmentId, int Index)
+{
+    public static ListingSlotKey Planned(Guid assignmentId, int ordinal) => new(ListingSlotSource.Planned, assignmentId, ordinal);
+    public static ListingSlotKey Observed(int slotIndex) => new(ListingSlotSource.Observed, Guid.Empty, slotIndex);
+    public static ListingSlotKey Free(int ordinal) => new(ListingSlotSource.Free, Guid.Empty, ordinal);
+}
+internal enum ListingSlotListed { None, Match, UnknownPrice, PriceDiffers, ShapeDiffers, NotListed, Other }
+/// <summary>One retainer market slot. Number is 1-based for capacity rows and 0 for excluded plan rows.</summary>
+internal sealed record ListingSlotView(ListingSlotKey Key, int Number, ListingPlanAssignment? Assignment,
+    ListingRow? Listing, ListingSlotListed Listed, bool Continuation, bool GroupStart);
 internal enum ListingStateTone { Dim, Amber, Green, Info }
 internal enum ListingStateAction { None, FocusStock }
 internal sealed record ListingStateView(string Text, ListingStateTone Tone, int Rank,
     ListingStateAction Action = ListingStateAction.None, int Amount = 0);
-internal sealed record ListingPlanRowView(ListingPlanAssignment Assignment, ListingStateView State, int MaxStack, int UnlistedCount, int? ListedCount = null);
+internal sealed record ListingPlanRowView(ListingPlanAssignment Assignment, ListingStateView State, int UnlistedCount);
 internal sealed record ListingObservedGroupView(ListingMatchKind Kind, Guid? AssignmentId, uint ItemId,
     string ItemName, ItemQualityPolicy Quality, int Quantity, FieldEvidence<decimal> UnitPrice,
     IReadOnlyList<ListingRow> Listings, ListingStateView State);
 internal sealed record ListingRetainerRow(ulong RetainerId, string RetainerName, bool Available,
-    bool ListingsObserved, IReadOnlyList<SlotCell> Cells, int PlannedSlots, int UnplannedSlots,
+    bool ListingsObserved, IReadOnlyList<ListingSlotView> Slots, int PlannedSlots, int UnplannedSlots,
     ListingStateView State, IReadOnlyList<ListingPlanRowView> PlanRows,
     IReadOnlyList<ListingObservedGroupView> ObservedGroups);
 
@@ -26,7 +36,7 @@ internal static class ListingRetainerProjection
     public static ItemQualityPolicy Quality(ListingRow row) => row.Quality == FfxivItemQuality.HQ ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly;
 
     public static IReadOnlyList<ListingRetainerRow> Build(ListingPlanDraft draft, BrowserProjection browser,
-        IReadOnlySet<ulong> currentRetainerIds, Func<uint, int> resolveMaxStack, Func<uint, bool?> listability,
+        IReadOnlySet<ulong> currentRetainerIds, Func<uint, bool?> listability,
         IReadOnlySet<uint>? savedDemandItemIds = null)
     {
         var scopes = browser.Scopes.Where(s => s.Kind == BrowserScopeKind.Retainer && s.RetainerId.HasValue).ToList();
@@ -35,7 +45,7 @@ internal static class ListingRetainerProjection
             if (known.Add(a.RetainerId)) scopes.Add(new(BrowserScope.RetainerKey(a.RetainerId), a.RetainerName, BrowserScopeKind.Retainer, a.RetainerId));
         var destinations = browser.Items.Select(i => i.ItemId).Concat(savedDemandItemIds ?? new HashSet<uint>()).ToHashSet();
         var rows = scopes.Select(scope => BuildRetainer(draft, browser, scope, currentRetainerIds.Contains(scope.RetainerId!.Value),
-            resolveMaxStack, listability, destinations)).ToArray();
+            listability, destinations)).ToArray();
         ApplySharedCoverage(rows, draft, browser, currentRetainerIds, listability);
         return rows;
     }
@@ -92,7 +102,7 @@ internal static class ListingRetainerProjection
     }
 
     private static ListingRetainerRow BuildRetainer(ListingPlanDraft draft, BrowserProjection browser, BrowserScope scope,
-        bool available, Func<uint, int> maxStack, Func<uint, bool?> listability, IReadOnlySet<uint> destinations)
+        bool available, Func<uint, bool?> listability, IReadOnlySet<uint> destinations)
     {
         var id = scope.RetainerId!.Value;
         var observed = browser.RetainerListingsCompleteByScope.GetValueOrDefault(scope.Key);
@@ -103,22 +113,21 @@ internal static class ListingRetainerProjection
         var matches = evaluation.Items.SelectMany(i => i.Matches).ToArray();
         var reserved = new HashSet<ListingRow>();
         var incomplete = assignments.Where(a => a.Enabled && !Complete(a) && a.ListingCount > 0).ToArray();
-        var reservationCounts = incomplete.ToDictionary(a => a.Id, _ => 0);
+        var reservations = incomplete.ToDictionary(a => a.Id, _ => new List<ListingRow>());
         // Reserve unknown/known-price siblings consistently across all rows before the broad pass.
         foreach (var preferred in new[] { true, false })
         foreach (var a in incomplete)
         foreach (var m in matches.Where(m => m.Kind == ListingMatchKind.Unplanned).OrderBy(m => m.Listing.SlotIndex))
         {
             var row = m.Listing;
-            if (reservationCounts[a.Id] >= a.ListingCount || reserved.Contains(row) || row.ItemId != a.ItemId || Quality(row) != a.Quality ||
+            if (reservations[a.Id].Count >= a.ListingCount || reserved.Contains(row) || row.ItemId != a.ItemId || Quality(row) != a.Quality ||
                 (a.QuantityPerListing > 0 && row.Quantity != a.QuantityPerListing)) continue;
             if (preferred && (a.UnitPrice == 0 ? row.UnitPrice.IsKnown : !row.UnitPrice.IsKnown || row.UnitPrice.Value != a.UnitPrice)) continue;
             reserved.Add(row);
-            reservationCounts[a.Id]++;
+            reservations[a.Id].Add(row);
         }
 
         var planRows = new List<ListingPlanRowView>();
-        var cells = new List<SlotCell>();
         foreach (var a in assignments)
         {
             var item = evaluation.Find(a.ItemId, a.Quality);
@@ -126,21 +135,7 @@ internal static class ListingRetainerProjection
             var siblings = enabled.Where(b => b.ItemId == a.ItemId && b.Quality == a.Quality).ToArray();
             var coverageRow = siblings.FirstOrDefault(b => (item?.Assignments.FirstOrDefault(e => e.Assignment.Id == b.Id)?.ExactListings ?? 0) < b.ListingCount) ?? siblings.FirstOrDefault();
             var state = State(a, available, observed, listability(a.ItemId), item, e, coverageRow?.Id == a.Id, siblings, browser, destinations);
-            planRows.Add(new(a, state, maxStack(a.ItemId), e is null ? a.ListingCount : Remaining(e),
-                !observed ? null : e is null ? reservationCounts.GetValueOrDefault(a.Id) :
-                e.ExactListings + e.UnknownPriceListings + e.WrongPriceListings + e.WrongShapeListings));
-            if (!a.Enabled) continue;
-            var exact = e?.ExactListings ?? 0;
-            var differs = (e?.UnknownPriceListings ?? 0) + (e?.WrongPriceListings ?? 0) + (e?.WrongShapeListings ?? 0);
-            // Only 20 cells are rendered even when a preserved merge is over capacity.
-            var visibleCells = Math.Min(a.ListingCount, 20 - cells.Count);
-            for (var n = 0; n < visibleCells; n++)
-            {
-                var kind = !observed ? SlotCellKind.PlannedUnknown : !Complete(a) ? SlotCellKind.Planned :
-                    n < exact ? SlotCellKind.Listed : n < exact + differs ? SlotCellKind.Differs : SlotCellKind.Planned;
-                var label = kind switch { SlotCellKind.Listed => "listed", SlotCellKind.Differs => "differs", _ => "planned" };
-                cells.Add(new(kind, $"{a.ItemName} · {label}"));
-            }
+            planRows.Add(new(a, state, e is null ? a.ListingCount : Remaining(e)));
         }
         var groups = matches.Where(m => m.Kind != ListingMatchKind.Exact && !reserved.Contains(m.Listing))
             .GroupBy(m => new { m.Kind, m.AssignmentId, m.Listing.ItemId, m.Listing.Quality, m.Listing.Quantity,
@@ -149,14 +144,73 @@ internal static class ListingRetainerProjection
                 g.First().Listing.ItemName, Quality(g.First().Listing), g.Key.Quantity, g.First().Listing.UnitPrice,
                 g.Select(m => m.Listing).ToArray(), ObservedState(g.Key.Kind))).ToArray();
         var unplanned = groups.Where(g => g.Kind == ListingMatchKind.Unplanned).Sum(g => g.Listings.Count);
-        foreach (var group in groups.Where(g => observed && g.Kind == ListingMatchKind.Unplanned))
-            for (var n = 0; n < group.Listings.Count && cells.Count < 20; n++) cells.Add(new(SlotCellKind.Unplanned, $"{group.ItemName} · unplanned"));
-        while (cells.Count < 20) cells.Add(new(SlotCellKind.Free, "Free"));
+        var slots = Slots(assignments, observed ? enabled : [], matches, observed ? reservations : new Dictionary<Guid, List<ListingRow>>(), observed ? groups : []);
         var summary = !available ? new ListingStateView("Retainer unavailable", ListingStateTone.Amber, 0) :
             !observed ? new("Listings unknown", ListingStateTone.Dim, 9) : Summary(planRows.Select(r => r.State).Concat(groups.Select(g => g.State)));
-        return new(id, scope.Label, available, observed, cells, assignments.Where(a => a.Enabled).Sum(a => a.ListingCount),
+        return new(id, scope.Label, available, observed, slots, assignments.Where(a => a.Enabled).Sum(a => a.ListingCount),
             unplanned, summary, planRows, groups);
     }
+
+    // Projects the plan onto market slots in plan order: enabled assignments, off-plan
+    // listings, free slots, then excluded assignments outside the 20-slot capacity.
+    // A slot's listing is the evaluator's match for its assignment, never a second match pass.
+    // Without a complete observation nothing is evaluated, so planned slots stay unknown, not "Not listed".
+    private static IReadOnlyList<ListingSlotView> Slots(IReadOnlyList<ListingPlanAssignment> assignments,
+        IReadOnlyList<ListingPlanAssignment> evaluated, IReadOnlyList<ListingMatch> matches,
+        IReadOnlyDictionary<Guid, List<ListingRow>> reservations, IReadOnlyList<ListingObservedGroupView> groups)
+    {
+        var byAssignment = matches.Where(m => m.AssignmentId is not null && m.Kind is not (ListingMatchKind.Unplanned or ListingMatchKind.WrongRetainer))
+            .GroupBy(m => m.AssignmentId!.Value)
+            .ToDictionary(g => g.Key, g => g.OrderBy(m => m.Kind).ThenBy(m => m.Listing.SlotIndex ?? int.MaxValue).ToArray());
+        var evaluatedIds = evaluated.Select(a => a.Id).ToHashSet();
+        var rows = new List<(ListingSlotKey Key, ListingPlanAssignment? A, ListingRow? L, ListingSlotListed Listed, Guid Group, bool Capacity)>();
+        foreach (var a in assignments.Where(a => a.Enabled))
+            for (var n = 0; n < a.ListingCount; n++)
+            {
+                ListingRow? listing = null;
+                var listed = ListingSlotListed.None;
+                if (evaluatedIds.Contains(a.Id))
+                {
+                    var own = byAssignment.GetValueOrDefault(a.Id) ?? [];
+                    (listing, listed) = n < own.Length ? (own[n].Listing, Listed(own[n].Kind)) : (null, ListingSlotListed.NotListed);
+                }
+                else if (reservations.TryGetValue(a.Id, out var held))
+                    (listing, listed) = n < held.Count ? (held[n], Listed(Reserved(a, held[n]))) : (null, ListingSlotListed.NotListed);
+                rows.Add((ListingSlotKey.Planned(a.Id, n), a, listing, listed, a.Id, true));
+            }
+        var offPlan = groups.Where(g => g.Kind == ListingMatchKind.Unplanned).SelectMany(g => g.Listings).ToArray();
+        var ownRows = Math.Max(0, MarketRunPlanner.ListingCapacity - rows.Count);
+        for (var i = 0; i < offPlan.Length && i < ownRows; i++)
+            rows.Add((ListingSlotKey.Observed(offPlan[i].SlotIndex ?? 1000 + i), null, offPlan[i], ListingSlotListed.Other, Guid.Empty, true));
+        // Off-plan listings beyond free capacity physically occupy planned-but-unlisted slots.
+        using (var overflow = offPlan.Skip(ownRows).GetEnumerator())
+            for (var i = 0; i < rows.Count; i++)
+                if (rows[i].Listed is ListingSlotListed.NotListed or ListingSlotListed.None && overflow.MoveNext())
+                    rows[i] = rows[i] with { L = overflow.Current, Listed = ListingSlotListed.Other };
+        for (var free = 0; rows.Count < MarketRunPlanner.ListingCapacity; free++)
+            rows.Add((ListingSlotKey.Free(free), null, null, ListingSlotListed.None, Guid.Empty, true));
+        foreach (var a in assignments.Where(a => !a.Enabled))
+            for (var n = 0; n < a.ListingCount; n++)
+                rows.Add((ListingSlotKey.Planned(a.Id, n), a, null, ListingSlotListed.None, a.Id, false));
+        var number = 0;
+        return rows.Select((r, i) =>
+        {
+            var same = i > 0 && rows[i - 1].Group == r.Group && rows[i - 1].Capacity == r.Capacity;
+            return new ListingSlotView(r.Key, r.Capacity ? ++number : 0, r.A, r.L, r.Listed, same && r.A is not null, i > 0 && !same);
+        }).ToArray();
+    }
+
+    private static ListingSlotListed Listed(ListingMatchKind kind) => kind switch
+    {
+        ListingMatchKind.Exact => ListingSlotListed.Match, ListingMatchKind.UnknownPrice => ListingSlotListed.UnknownPrice,
+        ListingMatchKind.PriceDiffers => ListingSlotListed.PriceDiffers, _ => ListingSlotListed.ShapeDiffers,
+    };
+
+    // The reservation pass already required item, quality and any planned units; it only names the difference.
+    private static ListingMatchKind Reserved(ListingPlanAssignment a, ListingRow row) =>
+        !row.UnitPrice.IsKnown ? ListingMatchKind.UnknownPrice :
+        a.UnitPrice != row.UnitPrice.Value ? ListingMatchKind.PriceDiffers :
+        a.QuantityPerListing != row.Quantity ? ListingMatchKind.ShapeDiffers : ListingMatchKind.Exact;
 
     private static int Remaining(ListingAssignmentEvaluation e) => Math.Max(0, e.Assignment.ListingCount - e.ExactListings - e.UnknownPriceListings - e.WrongPriceListings - e.WrongShapeListings);
     private static ListingStateView State(ListingPlanAssignment a, bool available, bool observed, bool? listable,
