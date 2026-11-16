@@ -61,7 +61,8 @@ internal sealed class ListingWorkspace
     private string? bulkUnits;
     private string? bulkPrice;
     // The popup's target lives until the popup closes; the open request is one frame only.
-    private (uint ItemId, string Name)? slotMenuItem;
+    // Several retainers can be expanded, so the target is bound to the retainer whose popup owns it.
+    private (ulong RetainerId, uint ItemId, string Name)? slotMenuItem;
     private (uint ItemId, string Name)? slotMenuRequest;
 
     public ListingWorkspace(WorkbenchState workbench, ListingNavigationCoordinator navigation,
@@ -347,14 +348,14 @@ internal sealed class ListingWorkspace
             }
             finally { slotTable.End(); }
         }
-        if (slotMenuRequest is not null) { slotMenuItem = slotMenuRequest; ImGui.OpenPopup("RQSlotItemMenu"); }
+        if (slotMenuRequest is { } request) { slotMenuItem = (retainer.RetainerId, request.ItemId, request.Name); ImGui.OpenPopup("RQSlotItemMenu"); }
         if (ImGui.BeginPopup("RQSlotItemMenu"))
         {
-            if (ItemClient is not null && slotMenuItem is { } item && ImGui.MenuItem($"Open item search · {item.Name}"))
+            if (ItemClient is not null && slotMenuItem is { } item && item.RetainerId == retainer.RetainerId && ImGui.MenuItem($"Open item search · {item.Name}"))
                 itemOpenStatus = ItemClient.Open(item.ItemId);
             ImGui.EndPopup();
         }
-        else slotMenuItem = null;
+        else if (slotMenuItem?.RetainerId == retainer.RetainerId) slotMenuItem = null;
         if (retainer.RetainerId == workbench.SelectedListingRetainerId) workbench.ScrollToListingDetail = null;
     }
 
