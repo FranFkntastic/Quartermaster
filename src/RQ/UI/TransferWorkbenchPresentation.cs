@@ -4,10 +4,37 @@ using RQ.Planning;
 
 namespace RQ.UI;
 
-internal readonly record struct TransferOutcomePresentation(string Primary, string? Constraint = null, string? Source = null)
+internal enum TransferLineKind
 {
-    public string Text => string.Join(" · ", new[] { Primary, Source, Constraint }.Where(part => !string.IsNullOrWhiteSpace(part)));
+    Paused,
+    VerifyListing,
+    Retrieve,
+    Stow,
+    Balanced,
 }
+
+internal readonly record struct TransferLineProjection(
+    TransferLineKind Kind,
+    int FromSaddlebag = 0,
+    int FromRetainers = 0,
+    int Stow = 0,
+    int NoRoom = 0,
+    int Missing = 0,
+    int Vendor = 0,
+    bool StockUnverified = false)
+{
+    public int Retrieve => FromSaddlebag + FromRetainers;
+    public int Short => Math.Max(0, Missing - Vendor);
+}
+
+internal readonly record struct TransferPlanTotals(
+    int Lines,
+    int Retrieve,
+    int Stow,
+    int Vendor,
+    int Short,
+    int NoRoom,
+    bool StockUnverified);
 
 internal static class TransferWorkbenchPresentation
 {
@@ -42,45 +69,62 @@ internal static class TransferWorkbenchPresentation
             ? $"{desiredPlayerQuantity.ToString("N0", CultureInfo.CurrentCulture)} ({Signed(desiredPlayerQuantity - playerQuantity)})"
             : $"{desiredPlayerQuantity.ToString("N0", CultureInfo.CurrentCulture)} (+?)";
 
-    public static TransferOutcomePresentation Outcome(
+    /// <summary>
+    /// The single per-line projection the plan rows and the plan summary both read.
+    /// </summary>
+    public static TransferLineProjection Project(
+        bool enabled,
+        bool listingDemandKnown,
         StowageAction action,
         int requestedQuantity,
         int accessibleStorageQuantity,
-        int routedDepositQuantity = 0,
-        int saddlebagQuantity = 0)
+        int routedDepositQuantity,
+        int saddlebagQuantity,
+        int vendorApprovedQuantity,
+        bool stockUnverified)
     {
-        requestedQuantity = Math.Max(0, requestedQuantity);
-        return action switch
+        if (!enabled)
+            return new(TransferLineKind.Paused);
+        if (!listingDemandKnown)
+            return new(TransferLineKind.VerifyListing);
+        var requested = Math.Max(0, requestedQuantity);
+        switch (action)
         {
-            StowageAction.Retrieve => Retrieval(requestedQuantity, accessibleStorageQuantity, saddlebagQuantity),
-            StowageAction.Deposit => Deposit(requestedQuantity, routedDepositQuantity),
-            _ => new("On target"),
-        };
+            case StowageAction.Retrieve:
+            {
+                var fromSaddlebag = Math.Min(requested, Math.Max(0, saddlebagQuantity));
+                var fromRetainers = Math.Min(requested - fromSaddlebag, Math.Max(0, accessibleStorageQuantity));
+                var missing = requested - fromSaddlebag - fromRetainers;
+                var vendor = Math.Min(missing, Math.Max(0, vendorApprovedQuantity));
+                return new(TransferLineKind.Retrieve, fromSaddlebag, fromRetainers, Missing: missing, Vendor: vendor,
+                    StockUnverified: stockUnverified);
+            }
+            case StowageAction.Deposit:
+            {
+                var stow = Math.Min(requested, Math.Max(0, routedDepositQuantity));
+                return new(TransferLineKind.Stow, Stow: stow, NoRoom: requested - stow);
+            }
+            default:
+                return new(TransferLineKind.Balanced);
+        }
     }
 
-    private static TransferOutcomePresentation Retrieval(int requested, int accessible, int saddlebag)
+    public static TransferPlanTotals Totals(IEnumerable<TransferLineProjection> lines)
     {
-        var fromSaddlebag = Math.Min(requested, Math.Max(0, saddlebag));
-        var retrievable = fromSaddlebag + Math.Min(requested - fromSaddlebag, Math.Max(0, accessible));
-        var missing = requested - retrievable;
-        var source = fromSaddlebag > 0 ? $"{fromSaddlebag:N0} saddlebag" : null;
-        return missing switch
+        var count = 0;
+        int retrieve = 0, stow = 0, vendor = 0, shortQuantity = 0, noRoom = 0;
+        var unverified = false;
+        foreach (var line in lines)
         {
-            <= 0 => new($"Retrieve {retrievable:N0}", Source: source),
-            _ => new($"Retrieve {retrievable:N0}", $"short {missing:N0}", source),
-        };
-    }
-
-    private static TransferOutcomePresentation Deposit(int requested, int routed)
-    {
-        var stowable = Math.Min(requested, Math.Max(0, routed));
-        var withoutCapacity = requested - stowable;
-        return withoutCapacity switch
-        {
-            <= 0 => new($"Stow {stowable:N0}"),
-            _ when stowable == 0 => new("Stow 0", $"no room for {withoutCapacity:N0}"),
-            _ => new($"Stow {stowable:N0}", $"no room for {withoutCapacity:N0}"),
-        };
+            count++;
+            retrieve += line.Retrieve;
+            stow += line.Stow;
+            vendor += line.Vendor;
+            shortQuantity += line.Short;
+            noRoom += line.NoRoom;
+            unverified |= line.StockUnverified;
+        }
+        return new(count, retrieve, stow, vendor, shortQuantity, noRoom, unverified);
     }
 
     private static string Signed(int quantity) => quantity > 0

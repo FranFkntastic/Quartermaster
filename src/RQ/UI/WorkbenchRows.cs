@@ -54,11 +54,9 @@ internal sealed record TransferWorkbenchRow(
     TransferPlanListingLink? ListingLink,
     OwnerScope Owner,
     Guid PlanId,
-    QuartermasterRuntimeSnapshot Runtime);
-
-internal sealed record StowageDraftRow(
-    TargetPlanItem Rule,
-    QuartermasterRuntimeSnapshot Runtime);
+    QuartermasterRuntimeSnapshot Runtime,
+    TransferLineProjection Projection,
+    TransferVendorProcurementLine? VendorPreview);
 
 internal sealed record TransferReviewRow(
     TargetPlanItem Rule,

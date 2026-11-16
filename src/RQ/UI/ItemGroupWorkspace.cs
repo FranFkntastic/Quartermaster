@@ -529,6 +529,13 @@ internal sealed class ItemGroupWorkspace
         editorTable.End();
     }
 
+    /// <summary>Starts a new workspace Item Group draft seeded with plan lines.</summary>
+    public void OpenNewWorkspaceDraft(IEnumerable<TargetPlanItem> rules)
+    {
+        OpenNewWorkspaceDraft();
+        draft = ItemGroupCatalog.NewDraft(state.Snapshot(), "Item group", rules);
+    }
+
     private void OpenNewWorkspaceDraft()
     {
         draft = ItemGroupCatalog.NewDraft(state.Snapshot());

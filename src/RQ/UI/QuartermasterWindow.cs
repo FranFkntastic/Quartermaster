@@ -34,7 +34,6 @@ public sealed class QuartermasterWindow : Window
     private readonly ItemGroupWorkspace itemGroupWorkspace;
     private readonly RestockPlanEditor restockPlanEditor;
     private readonly StockWorkspace stockWorkspace;
-    private readonly TransferPlanEditor transferPlanEditor;
     private readonly TransferPlanWorkspace transferPlanWorkspace;
     private readonly ListingPlanDraftSession listingSession;
     private readonly Dictionary<uint, bool?> listability = [];
@@ -87,7 +86,6 @@ public sealed class QuartermasterWindow : Window
         marketRunPane = new(resolveWorkshopProject, configDirectory, marketImporter);
         historyDialog = new(journal);
         RestockPlanEditor? restockEditor = null;
-        TransferPlanEditor? transferEditor = null;
         itemGroupWorkspace = new(
             state,
             reviewRegistry,
@@ -97,33 +95,35 @@ public sealed class QuartermasterWindow : Window
             {
                 if (origin == ItemGroupEditorOrigin.Restock)
                     restockEditor?.SelectItemGroup(groupId);
-                else
-                    transferEditor?.SelectItemGroup(groupId);
             },
-            groupId =>
-            {
-                restockEditor?.ClearItemGroup(groupId);
-                transferEditor?.ClearItemGroup(groupId);
-            });
-        transferPlanEditor = transferEditor = new(
-            state,
-            workbench,
-            itemGroupWorkspace,
-            reviewRegistry,
-            SearchItems,
-            () => restockEditor?.Close(),
-            () => requestedView = WorkbenchView.Stowage,
-            vendorCatalogSource);
+            groupId => restockEditor?.ClearItemGroup(groupId));
         restockPlanEditor = restockEditor = new(
             state,
             workbench,
             itemGroupWorkspace,
             reviewRegistry,
             SearchItems,
-            transferPlanEditor.Close,
+            () => { },
             () => requestedView = WorkbenchView.Restock);
         listingSession = new(state, ResolveListingMaxStack, id => dataManager.GetExcelSheet<Item>().GetRowOrDefault(id)?.CanBeHq == true);
         transferExecution = new(state, runtimeSnapshots, journal, transfers, retainerRefresh);
+        TransferReviewDialog? transferReview = null;
+        VendorProcurementReviewDialog? vendorReview = null;
+        transferPlanWorkspace = new(
+            state,
+            runtimeSnapshots,
+            transfers,
+            retainerRefresh,
+            vendorProcurement,
+            workbench,
+            itemGroupWorkspace,
+            transferExecution,
+            reviewRegistry,
+            SearchItems,
+            vendorCatalogSource,
+            (planId, planName) => transferReview?.Request(planId, planName),
+            review => vendorReview?.Request(review),
+            RequestDeleteStowagePlan);
         stockWorkspace = new(
             state,
             runtimeSnapshots,
@@ -133,7 +133,7 @@ public sealed class QuartermasterWindow : Window
             saveConfiguration,
             workbench,
             itemGroupWorkspace,
-            transferPlanEditor,
+            transferPlanWorkspace,
             listingSession,
             (runtime, key) => { listingWorkspace!.Focus(runtime, key); deferredView = WorkbenchView.Listings; },
             reviewRegistry,
@@ -148,21 +148,6 @@ public sealed class QuartermasterWindow : Window
             retainerRefresh,
             marketRunPane,
             log);
-        TransferReviewDialog? transferReview = null;
-        VendorProcurementReviewDialog? vendorReview = null;
-        transferPlanWorkspace = new(
-            state,
-            runtimeSnapshots,
-            transfers,
-            retainerRefresh,
-            vendorProcurement,
-            workbench,
-            transferPlanEditor,
-            transferExecution,
-            reviewRegistry,
-            (planId, planName) => transferReview?.Request(planId, planName),
-            review => vendorReview?.Request(review),
-            RequestDeleteStowagePlan);
         transferReviewDialog = transferReview = new(
             () => runtimeSnapshots.Current,
             transferPlanWorkspace.ResolveProjection,
@@ -215,7 +200,6 @@ public sealed class QuartermasterWindow : Window
         var selectedEvaluation = selectedPlan is null
             ? null
             : StowageEvaluator.BuildPlan(runtime.State, runtime.Browser, runtime.Owner, selectedPlan.Id);
-        var transferEditor = transferPlanEditor.Snapshot(document, runtime.Owner);
         var restockEditor = restockPlanEditor.Snapshot(document, runtime.Owner);
         var transferWorkspace = transferPlanWorkspace.Snapshot();
         var stock = stockWorkspace.Snapshot();
@@ -240,9 +224,8 @@ public sealed class QuartermasterWindow : Window
             PlanDrawMilliseconds,
             ReviewFinalizeMilliseconds,
             "mixed",
-            IsOpen && (restockEditor.IsOpen || transferEditor.IsOpen),
-            restockEditor.HasUnsavedChanges ||
-            transferEditor.HasUnsavedChanges,
+            IsOpen && restockEditor.IsOpen,
+            restockEditor.HasUnsavedChanges,
             itemGroups.SelectedGroupId,
             itemGroups.SelectedGroupName,
             itemGroups.WorkspaceEditorOpen,
@@ -251,7 +234,7 @@ public sealed class QuartermasterWindow : Window
             selectedPlan?.Name,
             selectedEvaluation?.RetrieveQuantity ?? 0,
             selectedEvaluation?.DepositQuantity ?? 0,
-            IsOpen && transferEditor.IsOpen);
+            false);
     }
 
     public override void Draw()
@@ -410,7 +393,7 @@ public sealed class QuartermasterWindow : Window
         workbench.EnsureScope(runtime.Browser);
         workbench.EnsureListingOwner(runtime.Owner);
         listingSession.Ensure(runtime);
-        transferPlanEditor.Ensure(runtime);
+        transferPlanWorkspace.EnsureSelection(runtime);
         if (requestedView == WorkbenchView.Activity)
         { historyDialog.RequestOpen(); requestedView = null; }
         ImGui.TextUnformatted(runtime.Owner.HasStableIdentity
@@ -472,7 +455,6 @@ public sealed class QuartermasterWindow : Window
             ImGui.EndTabBar();
             requestedView = null;
         }
-        transferPlanEditor.Draw(runtime);
         transferReviewDialog.Draw();
         vendorReviewDialog.Draw();
         confirmationDialog.Draw();
@@ -573,14 +555,12 @@ public sealed class QuartermasterWindow : Window
                     StowagePlanCatalog.ClearStaleRecovery(document);
                     return (Guid?)StowagePlanCatalog.EnsureScratch(document, owner).Id;
                 });
-                transferPlanEditor.Forget(planId);
             });
     }
 
     private void ClosePlanEditors()
     {
         restockPlanEditor.Close();
-        transferPlanEditor.Close();
         transferReviewDialog.Clear();
         vendorReviewDialog.Clear();
     }

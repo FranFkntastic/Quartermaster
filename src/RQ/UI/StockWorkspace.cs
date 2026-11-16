@@ -34,7 +34,7 @@ internal sealed class StockWorkspace
     private readonly Action saveConfiguration;
     private readonly WorkbenchState workbench;
     private readonly ItemGroupWorkspace itemGroupWorkspace;
-    private readonly TransferPlanEditor transferPlanEditor;
+    private readonly TransferPlanWorkspace transferPlans;
     private readonly ListingPlanDraftSession listingSession;
     private readonly Action<QuartermasterRuntimeSnapshot, ListingItemKey> showInListings;
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
@@ -43,7 +43,6 @@ internal sealed class StockWorkspace
     private readonly TableSelectionModel<uint> stockSelection = new();
     private readonly DalamudTableProjection<StockWorkbenchRow> stockTable;
     private StockWorkbenchProjection? stockWorkbenchProjection;
-    private int projectedDraftSignature;
     private long stockSelectionRevision = -1;
     private int stockProjectionBuildCount;
     private int visibleStockCount;
@@ -60,7 +59,7 @@ internal sealed class StockWorkspace
         Action saveConfiguration,
         WorkbenchState workbench,
         ItemGroupWorkspace itemGroupWorkspace,
-        TransferPlanEditor transferPlanEditor,
+        TransferPlanWorkspace transferPlans,
         ListingPlanDraftSession listingSession,
         Action<QuartermasterRuntimeSnapshot, ListingItemKey> showInListings,
         AgentBridgeUiReviewRegistry reviewRegistry,
@@ -74,7 +73,7 @@ internal sealed class StockWorkspace
         this.saveConfiguration = saveConfiguration;
         this.workbench = workbench;
         this.itemGroupWorkspace = itemGroupWorkspace;
-        this.transferPlanEditor = transferPlanEditor;
+        this.transferPlans = transferPlans;
         this.listingSession = listingSession;
         this.showInListings = showInListings;
         this.reviewRegistry = reviewRegistry;
@@ -275,23 +274,19 @@ internal sealed class StockWorkspace
         IReadOnlyList<StockGroup> queryItems,
         StowagePlan? selectedPlan)
     {
-        var draft = transferPlanEditor.Draft;
-        var signature = new HashCode();
-        signature.Add(draft?.PlanId);
-        signature.Add(transferPlanEditor.HasChanges);
-        foreach (var rule in draft?.Rules ?? [])
-        { signature.Add(rule.Id); signature.Add(rule.TargetQuantity); signature.Add(rule.Quality); signature.Add(rule.Enabled); }
-        var draftSignature = signature.ToHashCode();
         if (stockWorkbenchProjection is { } cached &&
-            projectedDraftSignature == draftSignature && cached.RuntimeRevision == runtime.Revision &&
+            cached.RuntimeRevision == runtime.Revision &&
             cached.PlanId == selectedPlan?.Id &&
             cached.QueryItems.Select(item => item.ItemId).SequenceEqual(queryItems.Select(item => item.ItemId)))
             return cached.Rows;
 
-        projectedDraftSignature = draftSignature;
-        var rules = (draft?.Rules ?? []).GroupBy(rule => rule.ItemId)
-            .ToDictionary(group => group.Key, group => group.First());
-        var evaluated = selectedPlan is null || transferPlanEditor.HasChanges
+        var rules = selectedPlan is null
+            ? new Dictionary<uint, TargetPlanItem>()
+            : runtime.State.PlanItems
+                .Where(rule => rule.StowagePlanId == selectedPlan.Id)
+                .GroupBy(rule => rule.ItemId)
+                .ToDictionary(group => group.Key, group => group.First());
+        var evaluated = selectedPlan is null
             ? new Dictionary<Guid, StowageEvaluationLine>()
             : StowageEvaluator.BuildPlan(runtime.State, runtime.Browser, runtime.Owner, selectedPlan.Id)?
                 .Lines.ToDictionary(line => line.RuleId) ?? [];
@@ -564,9 +559,9 @@ internal sealed class StockWorkspace
                     ImGui.TextDisabled($"Linked to {transferPlan!.Name}");
                 else if (transferPlan?.IsEphemeral is not true)
                 {
-                    var destination = transferPlanEditor.Draft?.Name ?? "Transfer plan";
+                    var destination = transferPlan?.Name ?? "Transfer plan";
                     if (ImGui.SmallButton($"Prepare target in {destination}"))
-                        transferPlanEditor.Prepare(runtime, selectedDemand);
+                        transferPlans.PrepareListingTarget(runtime, selectedDemand);
                 }
             }
             else if (navigationQualities.Length > 0)
@@ -634,7 +629,7 @@ internal sealed class StockWorkspace
 
     private void DrawStowDestinations(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items)
     {
-        void Add(ulong? id) { try { transferPlanEditor.AddStock(runtime, items, true, id); stockSelection.Clear(); } catch (Exception exception) { transferExecution.ReportInlineError(exception.Message); } }
+        void Add(ulong? id) { try { transferPlans.AddStock(runtime, items, true, id); stockSelection.Clear(); } catch (Exception exception) { transferExecution.ReportInlineError(exception.Message); } }
         if (ImGui.MenuItem("Any retainer")) Add(null);
         reviewRegistry.RegisterLastButton("quartermaster.stock.stow.any", "Stow in any retainer", items.Count > 0, () => Add(null), "Available");
         foreach (var retainer in runtime.Retainers.Values.Where(r => r.Owner.Matches(runtime.Owner) && r.IsCurrentlyAssigned is not false && r.IsUiAccessible is not false).OrderBy(r => r.RetainerName))
@@ -652,7 +647,7 @@ internal sealed class StockWorkspace
     {
         if (!runtime.Owner.HasStableIdentity || items.Count == 0)
             return;
-        try { transferPlanEditor.AddStock(runtime, items, stowCarried); transferExecution.ClearInlineError(); }
+        try { transferPlans.AddStock(runtime, items, stowCarried); transferExecution.ClearInlineError(); }
         catch (Exception exception) { transferExecution.ReportInlineError(exception.Message); }
     }
 

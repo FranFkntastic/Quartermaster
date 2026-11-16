@@ -60,6 +60,33 @@ public static class StowagePlanCatalog
         }
     }
 
+    /// <summary>
+    /// Adds a line that starts balanced: its target equals the quantity currently carried,
+    /// so it moves nothing until the user sets a target. Returns the existing line when the
+    /// item and quality are already planned.
+    /// </summary>
+    public static TargetPlanItem AddBalancedRule(
+        StowagePlanDraft draft,
+        uint itemId,
+        string name,
+        ItemQualityPolicy quality,
+        int playerQuantity)
+    {
+        var rule = draft.Rules.FirstOrDefault(r => r.ItemId == itemId && r.Quality == quality);
+        if (rule is not null)
+            return rule;
+        rule = new TargetPlanItem
+        {
+            StowagePlanId = draft.PlanId,
+            ItemId = itemId,
+            ItemName = name,
+            Quality = quality,
+            TargetQuantity = Math.Max(0, playerQuantity),
+        };
+        draft.Rules.Add(rule);
+        return rule;
+    }
+
     public static IReadOnlyList<StowagePlan> OwnerPlans(QuartermasterState state, OwnerScope owner) =>
         state.StowagePlans
             .Where(plan => !plan.IsEphemeral && plan.Owner.Matches(owner))
@@ -300,6 +327,7 @@ public static class StowagePlanCatalog
             PreferredRetainerIds = source.Routing?.PreferredRetainerIds.ToList() ?? [],
         },
         AllowVendorPurchase = source.AllowVendorPurchase,
+        PreferredVendorNpcId = source.PreferredVendorNpcId,
         Notes = source.Notes,
         Enabled = source.Enabled,
     };
@@ -317,6 +345,7 @@ public static class StowagePlanCatalog
             pair.First.TargetQuantity == pair.Second.TargetQuantity &&
             pair.First.Quality == pair.Second.Quality &&
             pair.First.AllowVendorPurchase == pair.Second.AllowVendorPurchase &&
+            pair.First.PreferredVendorNpcId == pair.Second.PreferredVendorNpcId &&
             pair.First.Notes == pair.Second.Notes &&
             pair.First.Enabled == pair.Second.Enabled &&
             pair.First.Routing.Mode == pair.Second.Routing.Mode &&
@@ -485,36 +514,6 @@ public static class ItemGroupCatalog
         group.Items = items;
         group.Revision = checked(group.Revision + 1);
         state.Schema = "gooseworks-quartermaster-state/v5";
-    }
-
-    public static int AddMissing(ItemGroup group, StowagePlanDraft draft)
-    {
-        var existing = draft.Rules
-            .Select(rule => (rule.ItemId, rule.Quality))
-            .ToHashSet();
-        var added = 0;
-        foreach (var item in group.Items.Where(item => existing.Add((item.ItemId, item.Quality))))
-        {
-            draft.Rules.Add(new TargetPlanItem
-            {
-                StowagePlanId = draft.PlanId,
-                ItemId = item.ItemId,
-                ItemName = item.ItemName,
-                Quality = item.Quality,
-                TargetQuantity = 0,
-            });
-            added++;
-        }
-        return added;
-    }
-
-    public static IReadOnlySet<Guid> MatchingRuleIds(ItemGroup group, StowagePlanDraft draft)
-    {
-        var members = group.Items.Select(item => (item.ItemId, item.Quality)).ToHashSet();
-        return draft.Rules
-            .Where(rule => members.Contains((rule.ItemId, rule.Quality)))
-            .Select(rule => rule.Id)
-            .ToHashSet();
     }
 
     public static int AddMissing(ItemGroup group, RestockPlanDraft draft)
