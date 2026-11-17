@@ -1419,7 +1419,7 @@ internal sealed class TransferPlanWorkspace
         var active = ImGui.IsItemActive();
         var inputMin = ImGui.GetItemRectMin();
         var inputMax = ImGui.GetItemRectMax();
-        ImGui.SameLine();
+        ImGui.SetCursorScreenPos(new Vector2(inputMax.X + ImGui.GetStyle().ItemSpacing.X, inputMin.Y));
         addHelp.Draw(reviewRegistry);
         if (addHelp.IsOpen)
         {

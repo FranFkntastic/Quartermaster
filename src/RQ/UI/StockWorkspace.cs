@@ -367,14 +367,16 @@ internal sealed class StockWorkspace
             return;
         }
         var context = queries.EnsureItemContext(sourceItems, projection.Owner, scopeKey, isEditing, runtime.Revision);
-        var trailingWidth = 190f;
+        var spacing = ImGui.GetStyle().ItemSpacing.X;
+        var trailingWidth = SearchReference.ButtonWidth + spacing + ScopeComboWidth() + spacing +
+            ImGui.CalcTextSize("…").X + (ImGui.GetStyle().FramePadding.X * 2f) + spacing;
         var filterBeforeDraw = workbench.ItemFilterState.Expression;
         DalamudFilterAutocompleteRenderer.Draw(
             "RQStockWorkbench",
             "Search stock — try ilvl>=690 job:WHM slot:body",
             context,
             workbench.ItemFilterState,
-            Math.Max(100, ImGui.GetContentRegionAvail().X - trailingWidth - SearchReference.ButtonWidth - ImGui.GetStyle().ItemSpacing.X));
+            Math.Max(100, ImGui.GetContentRegionAvail().X - trailingWidth));
         if (!string.Equals(filterBeforeDraw, workbench.ItemFilterState.Expression, StringComparison.Ordinal))
             workbench.FocusedStockItemId = null;
         reviewRegistry.RegisterLastAction(
