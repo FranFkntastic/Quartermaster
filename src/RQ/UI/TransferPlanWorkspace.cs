@@ -1326,7 +1326,10 @@ internal sealed class TransferPlanWorkspace
         var rowBottom = ImGui.GetItemRectMax().Y + padding;
         ImGui.SameLine();
         var mouseY = ImGui.GetMousePos().Y;
-        var rowHovered = ImGui.IsWindowHovered() && mouseY >= rowTop && mouseY < rowBottom;
+        // Pressing the button makes it the active item, which a plain IsWindowHovered treats as
+        // "not hovered"; the button would vanish mid-click and the release would never land.
+        var rowHovered = ImGui.IsWindowHovered(ImGuiHoveredFlags.AllowWhenBlockedByActiveItem) &&
+                         mouseY >= rowTop && mouseY < rowBottom;
         var ruleId = row.Rule.Id;
         var owner = row.Owner;
         var planId = row.PlanId;
