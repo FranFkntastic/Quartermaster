@@ -64,14 +64,10 @@ internal static class SearchReference
         {
             if (!IsOpen) return false;
             var anchor = ImGui.GetItemRectMax();
-            var viewport = ImGui.GetWindowViewport();
-            var left = Math.Max(viewport.WorkPos.X, ImGui.GetWindowPos().X);
-            var right = Math.Min(viewport.WorkPos.X + viewport.WorkSize.X,
-                ImGui.GetWindowPos().X + ImGui.GetWindowSize().X);
-            var width = Math.Min(540f, Math.Max(1f, right - left));
-            ImGui.SetNextWindowPos(new Vector2(Math.Clamp(anchor.X - width, left, right - width), anchor.Y));
-            ImGui.SetNextWindowSizeConstraints(new Vector2(width, 0),
-                new Vector2(width, viewport.WorkSize.Y));
+            var windowPos = ImGui.GetWindowPos();
+            var width = Math.Min(540f, Math.Max(200f, ImGui.GetWindowSize().X));
+            ImGui.SetNextWindowPos(new Vector2(Math.Max(windowPos.X, anchor.X - width), anchor.Y));
+            ImGui.SetNextWindowSizeConstraints(new Vector2(width, 0), new Vector2(width, float.MaxValue));
             return ImGui.BeginPopup(id);
         }
 
