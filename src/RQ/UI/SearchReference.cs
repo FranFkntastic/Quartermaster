@@ -88,12 +88,14 @@ internal static class SearchReference
                 var available = reference.Fields.Where(field => field.IsAvailable).ToArray();
                 fields = available.Select(field => new FieldRow(
                     string.Join(", ", new[] { field.PreferredName }.Concat(field.Aliases).Distinct()),
-                    string.Join(" ", field.Operators) +
+                    string.Join(" ", field.Operators.Where(op => op is not ("==" or "!==" or "!="))) +
                         (field.ValueKind is FilterValueKind.Integer or FilterValueKind.Decimal ? " .." : ""),
-                    field.Values.Count > 0
-                        ? string.Join(", ", field.Values.Take(4).Select(value => value.DisplayName)) +
+                    field.Key == "item.name" ? "item names"
+                    : field.Values.Count > 0
+                        ? string.Join(", ", field.Values.Take(4).Select(value =>
+                              value.Aliases.Count > 0 ? value.Aliases[0] : value.DisplayName)) +
                           (field.Values.Count > 4 ? ", …" : "")
-                        : field.Key == "item.name" ? "item names" : field.ValueKind switch
+                        : field.ValueKind switch
                         {
                             FilterValueKind.Integer or FilterValueKind.Decimal => "number",
                             FilterValueKind.Boolean => "yes / no",
@@ -109,12 +111,14 @@ internal static class SearchReference
                 Add("job:(PLD|WAR)", "Either job", "item.job");
                 if (reference.Predicates.Any(predicate => predicate.Qualifier == "is" && predicate.Specifier == "hq"))
                     Add("is:hq", "High quality only", null);
-                Add("category:Ingredient OR category:Seafood", "Either category", "item.uiCategory");
+                var categories = available.FirstOrDefault(field => field.Key == "item.uiCategory");
+                if (categories is { Values.Count: > 1 })
+                    Add($"category:{Quote(categories.Values[0].DisplayName)} OR category:{Quote(categories.Values[1].DisplayName)}",
+                        "Either category", "item.uiCategory");
                 var retainer = available.FirstOrDefault(field => field.Key == "ownership.retainer");
                 if (retainer is { Values.Count: > 0 })
                 {
-                    var name = retainer.Values[0].DisplayName.Replace("\\", "\\\\").Replace("\"", "\\\"");
-                    Add($"retainer:\"{name}\"", "Held by that retainer", "ownership.retainer");
+                    Add($"retainer:{Quote(retainer.Values[0].DisplayName, always: true)}", "Held by that retainer", "ownership.retainer");
                 }
                 Add("tradable:false", "Untradable items", "item.tradable");
                 examples = rows.ToArray();
@@ -244,6 +248,11 @@ internal static class SearchReference
         ImGui.PopTextWrapPos();
         ImGui.PopStyleColor();
     }
+
+    private static string Quote(string value, bool always = false) =>
+        always || value.Any(c => char.IsWhiteSpace(c) || c is '"' or '(' or ')' or ':' or '|')
+            ? $"\"{value.Replace("\\", "\\\\").Replace("\"", "\\\"")}\""
+            : value;
 
     private static void Tooltip(string description)
     {
