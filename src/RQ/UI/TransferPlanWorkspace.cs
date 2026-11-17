@@ -75,6 +75,12 @@ internal sealed class TransferPlanWorkspace
     private readonly Action<StowagePlan, OwnerScope> requestDeletePlan;
     private readonly DalamudTableProjection<TransferWorkbenchRow> transferWorkbenchTable;
     private readonly TableSelectionModel<Guid> selection = new();
+    private Guid[]? drawingRowKeys;
+    private IReadOnlyList<TransferWorkbenchRow>? drawingRowKeysSource;
+    private int drawingRowIndex;
+    private bool drawingRows;
+    private TransferWorkbenchProjection? retainedProjection;
+    private int retainedSelectionCount = -1;
     private readonly Dictionary<Guid, string> lineErrors = [];
     private TransferWorkbenchProjection? transferWorkbenchProjection;
     private int transferProjectionBuildCount;
@@ -348,14 +354,6 @@ internal sealed class TransferPlanWorkspace
     private DalamudTableProjection<TransferWorkbenchRow> CreateTable() => new(
     [
         new(
-            "##select",
-            22,
-            _ => string.Empty,
-            Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoSort | ImGuiTableColumnFlags.NoResize |
-                   ImGuiTableColumnFlags.NoHeaderLabel | ImGuiTableColumnFlags.NoHide,
-            Draw: DrawSelectCell,
-            Id: "select"),
-        new(
             "Item",
             1.4f,
             row => row.Rule.ItemName,
@@ -373,13 +371,14 @@ internal sealed class TransferPlanWorkspace
                 ImGui.AlignTextToFramePadding();
                 ImGui.TextUnformatted(row.PlayerQuantity.ToString("N0"));
             },
-            Id: "player"),
+            Id: "player",
+            SelectionTargetFraction: 1),
         new(
             "Target",
             118,
             TransferTargetText,
             row => row.ListingContribution.IsKnown ? row.Line?.DesiredPlayerQuantity ?? row.Rule.TargetQuantity : row.Rule.TargetQuantity,
-            Draw: DrawTransferTarget,
+            Draw: WithRowSpace(DrawTransferTarget, "target"),
             Id: "target",
             HeaderTooltip: "Desired player quantity with its signed delta from current player stock."),
         new(
@@ -388,7 +387,7 @@ internal sealed class TransferPlanWorkspace
             OutcomeText,
             OutcomeText,
             ImGuiTableColumnFlags.WidthStretch,
-            Draw: DrawOutcome,
+            Draw: WithRowSpace(DrawOutcome, "outcome"),
             Id: "outcome"),
         new(
             "##line-menu",
@@ -396,9 +395,29 @@ internal sealed class TransferPlanWorkspace
             _ => string.Empty,
             Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoSort | ImGuiTableColumnFlags.NoResize |
                    ImGuiTableColumnFlags.NoHeaderLabel | ImGuiTableColumnFlags.NoHide,
-            Draw: DrawLineMenu,
+            Draw: WithRowSpace(DrawLineMenu, "line-menu"),
             Id: "line-menu"),
-    ]);
+    ], DalamudTableSelection<TransferWorkbenchRow>.Multi(selection, row => row.Rule.Id));
+
+    /// <summary>
+    /// Cells with widgets get their row-selection target after the widgets, in the space they leave.
+    /// ImGui gives the hover to the first item submitted, so a target under a widget would take its clicks.
+    /// </summary>
+    private Action<TransferWorkbenchRow> WithRowSpace(Action<TransferWorkbenchRow> draw, string cell) => row =>
+    {
+        draw(row);
+        if (!drawingRows || drawingRowKeys is not { } keys || (uint)drawingRowIndex >= (uint)keys.Length || keys[drawingRowIndex] != row.Rule.Id)
+            return;
+        ImGui.SameLine();
+        var width = ImGui.GetContentRegionAvail().X;
+        if (width >= 1f)
+            DalamudTableSelectionRenderer.DrawRow(
+                selection,
+                keys,
+                drawingRowIndex,
+                $"row-space:{cell}",
+                new Vector2(width, ImGui.GetFrameHeight()));
+    };
 
     public void Draw(QuartermasterRuntimeSnapshot runtime)
     {
@@ -442,16 +461,17 @@ internal sealed class TransferPlanWorkspace
             return;
         }
         ApplyPendingSelection(projection);
-        selection.Retain(projection.Rules.Select(rule => rule.Id));
+        // Pruning hashes every line, so only redo it when the lines or the selection changed.
+        if (!ReferenceEquals(retainedProjection, projection) || retainedSelectionCount != selection.Count)
+        {
+            selection.Retain(projection.Rules.Select(rule => rule.Id));
+            retainedProjection = projection;
+            retainedSelectionCount = selection.Count;
+        }
         if (selection.Count >= 2)
             DrawBulkBar(owner, selected, projection);
         else
             DrawSummary(projection);
-        UiLayout.SameLineIfFits("Placement");
-        if (ImGui.Button("Placement##RQTransferPlacement"))
-            OpenPlacement(null);
-        reviewRegistry.RegisterLastButton("quartermaster.transfer.placement.open", "Edit placement for this plan's lines", true,
-            () => OpenPlacement(null), $"lines={projection.Rules.Count:N0}");
         DrawUndoStrip(owner, selected);
         DrawTable(runtime, selected, projection);
     }
@@ -515,9 +535,14 @@ internal sealed class TransferPlanWorkspace
         var buyLabel = maximumGil > 0
             ? $"Buy from vendor · {maximumGil:N0} gil###RQTransferVendorBuy"
             : "Buy from vendor###RQTransferVendorBuy";
+        var lines = projection?.Rules.Count ?? 0;
+        var placed = projection?.Rules.Count(rule => rule.Routing.AnySpace || rule.Routing.PreferredRetainerIds.Count > 0) ?? 0;
+        var placementLabel = placed > 0
+            ? $"Placement · {placed:N0} of {lines:N0} line{(lines == 1 ? string.Empty : "s")}###RQTransferPlacement"
+            : "Placement###RQTransferPlacement";
         const string menuLabel = "…##RQTransferPlanMenu";
-        var trailing = ButtonWidth(menuLabel) + ButtonWidth(executeLabel) + ButtonWidth(buyLabel) +
-                       (style.ItemSpacing.X * 3f);
+        var trailing = ButtonWidth(menuLabel) + ButtonWidth(placementLabel) + ButtonWidth(executeLabel) + ButtonWidth(buyLabel) +
+                       (style.ItemSpacing.X * 4f);
         var selectorWidth = Math.Max(120f, ImGui.GetContentRegionAvail().X - trailing);
 
         if (selected is not null && renamingPlanId == selected.Id)
@@ -527,6 +552,15 @@ internal sealed class TransferPlanWorkspace
 
         ImGui.SameLine();
         DrawPlanMenu(runtime, selected, projection, menuLabel);
+
+        var canPlace = selected is not null && projection is not null && !showPlacement;
+        UiLayout.SameLineIfFits(placementLabel);
+        ImGui.BeginDisabled(!canPlace);
+        if (ImGui.Button(placementLabel))
+            OpenPlacement(null);
+        ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton("quartermaster.transfer.placement.open", "Edit placement for this plan's lines", canPlace,
+            () => OpenPlacement(null), $"lines={lines:N0} placed={placed:N0}");
 
         var availability = TransferExecutionPolicy.ForExplicitRun(
             projection is not null && (projection.HasMovement || projection.HasUnknownListingDemand),
@@ -962,6 +996,13 @@ internal sealed class TransferPlanWorkspace
         {
             rows = transferWorkbenchTable.Apply(projection.Rows, ImGui.TableGetSortSpecs());
         }
+        // Apply returns the same list until the lines, sort or filters change; reuse the keys with it.
+        if (!ReferenceEquals(drawingRowKeysSource, rows) || drawingRowKeys is null)
+        {
+            drawingRowKeys = rows.Select(row => row.Rule.Id).ToArray();
+            drawingRowKeysSource = rows;
+        }
+        drawingRows = true;
 
         var focusPending = focusTargetRuleId is { } focusId && rows.Any(row => row.Rule.Id == focusId);
         if (focusTargetRuleId is not null && !focusPending && ++focusTargetFrames > FocusGiveUpFrames)
@@ -982,6 +1023,8 @@ internal sealed class TransferPlanWorkspace
         ImGui.TableNextColumn();
         if (ImGui.TableNextColumn())
             DrawAddInput(runtime, plan);
+        drawingRows = false;
+        DalamudTableSelectionRenderer.EndRows(selection);
         transferWorkbenchTable.End();
     }
 
@@ -989,20 +1032,20 @@ internal sealed class TransferPlanWorkspace
     {
         var row = rows[index];
         ImGui.PushID(row.Rule.Id.ToString());
+        drawingRowIndex = index;
         transferWorkbenchTable.DrawSaneRow(
             rows,
             index,
             $"transfer:{row.Rule.Id}",
-            row.Rule.Enabled ? null : PausedRowColor,
-            selectable: false);
+            row.Rule.Enabled ? null : PausedRowColor);
         ImGui.PopID();
-    }
-
-    private void DrawSelectCell(TransferWorkbenchRow row)
-    {
-        var selected = selection.IsSelected(row.Rule.Id);
-        if (ImGui.Checkbox("##select", ref selected))
-            selection.SetSelected(row.Rule.Id, selected);
+        var ruleId = row.Rule.Id;
+        reviewRegistry.RegisterLastButton(
+            $"quartermaster.transfer.line.select.{ruleId:N}",
+            $"Select {row.Rule.ItemName} for bulk actions",
+            true,
+            () => selection.SetSelected(ruleId, !selection.IsSelected(ruleId)),
+            selection.IsSelected(ruleId) ? "Selected" : "Available");
     }
 
     private void DrawItemCell(TransferWorkbenchRow row)

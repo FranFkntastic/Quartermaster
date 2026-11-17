@@ -338,8 +338,9 @@ internal sealed class ItemGroupWorkspace
                     ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
                     ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp)))
         {
-            foreach (var member in currentDraft.Items.ToArray())
-                workspaceTable.DrawRow(member, id: $"item-group-workspace:{member.ItemId}:{member.GetHashCode()}");
+            var members = currentDraft.Items.ToArray();
+            for (var index = 0; index < members.Length; index++)
+                workspaceTable.DrawSaneRow(members, index, $"item-group-workspace:{members[index].ItemId}:{members[index].GetHashCode()}");
             workspaceTable.End();
         }
 
@@ -525,12 +526,7 @@ internal sealed class ItemGroupWorkspace
         for (var index = 0; index < items.Length; index++)
         {
             var item = items[index];
-            editorTable.DrawSelectableRow(
-                item,
-                selectedItems,
-                items,
-                index,
-                $"##selectgroupitem:{item.ItemId}:{item.GetHashCode()}");
+            editorTable.DrawSaneRow(items, index, $"##selectgroupitem:{item.ItemId}:{item.GetHashCode()}");
         }
         DalamudTableSelectionRenderer.EndRows(selectedItems);
         editorTable.End();
@@ -787,7 +783,7 @@ internal sealed class ItemGroupWorkspace
             draft?.Items.Remove(item);
             selectedItems.SetSelected(item, false);
         }),
-    ]);
+    ], DalamudTableSelection<ItemGroupItem>.Multi(selectedItems, item => item));
 
     private static void DrawItemQuality(ItemGroupItem item)
     {
