@@ -107,7 +107,7 @@ internal sealed class RestockPlanEditor
             ImGuiTableColumnFlags.WidthStretch,
             TextColor: _ => ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]),
         new("", 28, _ => string.Empty, Draw: DrawRestockDraftRemove),
-    ]);
+    ], DalamudTableSelection<RestockPlanItem>.Multi(selectedRestockItemIds, item => item.Id));
 
 
     public void Open(RestockPlanDraft draft)
@@ -406,17 +406,8 @@ internal sealed class RestockPlanEditor
             restockDraftTable.DrawMessageRow(draft.Items.Count == 0
                 ? "No items yet. Search by name above or add a selected Stock item."
                 : "No items match this filter.");
-        var rowKeys = filtered.Select(item => item.Id).ToArray();
         for (var index = 0; index < filtered.Count; index++)
-        {
-            var item = filtered[index];
-            restockDraftTable.DrawSelectableRow(
-                item,
-                selectedRestockItemIds,
-                rowKeys,
-                index,
-                $"##selectrestock:{item.Id}");
-        }
+            restockDraftTable.DrawSaneRow(filtered, index, $"##selectrestock:{filtered[index].Id}");
         DalamudTableSelectionRenderer.EndRows(selectedRestockItemIds);
         restockDraftTable.End();
     }
