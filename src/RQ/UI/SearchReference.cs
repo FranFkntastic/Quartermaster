@@ -56,13 +56,7 @@ internal static class SearchReference
             if (clicked || requested)
             {
                 requested = false;
-                if (ImGui.BeginPopup(id))
-                {
-                    ImGui.CloseCurrentPopup();
-                    ImGui.EndPopup();
-                }
-                else
-                    ImGui.OpenPopup(id);
+                ImGui.OpenPopup(id);
             }
         }
 
