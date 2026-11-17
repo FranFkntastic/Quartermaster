@@ -98,6 +98,8 @@ internal sealed class TransferPlanWorkspace
     private bool showPlacement;
 
     private string addText = string.Empty;
+    private bool focusAddInput;
+    private readonly SearchReference.Button addHelp = new("quartermaster.plan.addHelp", "Plan add syntax");
     private string cachedItemSearch = string.Empty;
     private IReadOnlyList<ItemChoice> cachedItemChoices = [];
 
@@ -1402,16 +1404,32 @@ internal sealed class TransferPlanWorkspace
 
     private void DrawAddInput(QuartermasterRuntimeSnapshot runtime, StowagePlan plan)
     {
-        ImGui.SetNextItemWidth(-1);
+        ImGui.SetNextItemWidth(Math.Max(1, ImGui.GetContentRegionAvail().X - SearchReference.ButtonWidth - ImGui.GetStyle().ItemSpacing.X));
+        if (focusAddInput)
+        {
+            ImGui.SetKeyboardFocusHere();
+            focusAddInput = false;
+        }
         var entered = ImGui.InputTextWithHint(
             "##RQPlanAddItem",
-            "+ Add item, @group or #category…",
+            "+ Add item, @group, #category or >craft…",
             ref addText,
             96,
             ImGuiInputTextFlags.EnterReturnsTrue);
         var active = ImGui.IsItemActive();
         var inputMin = ImGui.GetItemRectMin();
         var inputMax = ImGui.GetItemRectMax();
+        ImGui.SetCursorScreenPos(new Vector2(inputMax.X + ImGui.GetStyle().ItemSpacing.X, inputMin.Y));
+        addHelp.Draw(reviewRegistry);
+        if (addHelp.IsOpen)
+        {
+            if (addHelp.DrawPlan() is { } prefix)
+            {
+                addText = prefix;
+                focusAddInput = true;
+            }
+            return;
+        }
         var suggestions = AddSuggestions(runtime.State, addText);
         if (entered && suggestions.Count > 0)
         {
