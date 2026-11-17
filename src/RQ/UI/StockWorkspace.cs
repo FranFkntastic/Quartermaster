@@ -46,6 +46,14 @@ internal sealed class StockWorkspace
     private readonly TableSelectionModel<uint> stockSelection = new();
     private readonly DalamudTableProjection<StockWorkbenchRow> stockTable;
     private StockWorkbenchProjection? stockWorkbenchProjection;
+    private long availableStockRevision = -1;
+    private string? availableStockScopeKey;
+    private IReadOnlyList<StockGroup> availableStockItems = [];
+    private IReadOnlyList<StockGroup>? focusedStockSource;
+    private uint? focusedStockItemId;
+    private IReadOnlyList<StockGroup> focusedStockItems = [];
+    private long listingEvaluationRevision = -1;
+    private ListingPlanEvaluation? stockListingEvaluation;
     private long stockSelectionRevision = -1;
     private int stockProjectionBuildCount;
     private int visibleStockCount;
@@ -177,24 +185,26 @@ internal sealed class StockWorkspace
             return;
         }
         var projection = runtime.Browser;
-        var availableItems = StockItemsWithListingDemand(runtime, workbench.ScopeKey);
-        var queryProjection = new BrowserProjection
-        {
-            Scopes = projection.Scopes,
-            Items = availableItems,
-            Listings = projection.Listings,
-            Owner = projection.Owner,
-            RetainerInventoryCompleteByScope = projection.RetainerInventoryCompleteByScope,
-            RetainerListingsCompleteByScope = projection.RetainerListingsCompleteByScope,
-        };
-        DrawStockToolbar(projection, availableItems);
+        var availableItems = GetStockItemsWithListingDemand(runtime, workbench.ScopeKey);
+        // The toolbar runs first and updates IsInputActive. Use the same editing
+        // snapshot for both cache lookups so a focus transition cannot rebuild twice.
+        var isEditing = workbench.ItemFilterState.IsInputActive;
+        var scopeKey = workbench.ScopeKey;
+        DrawStockToolbar(runtime, availableItems, scopeKey, isEditing);
         var result = queries.QueryItems(
-            queryProjection,
+            projection,
             workbench.ItemFilterState.Expression,
-            BrowserScope.AllKey,
-            workbench.ItemFilterState.IsInputActive,
-            runtime.Revision);
-        var visibleItems = ListingPlanPresentation.ApplyStockItemFocus(result.Items, workbench.FocusedStockItemId);
+            scopeKey,
+            isEditing,
+            runtime.Revision,
+            availableItems);
+        if (!ReferenceEquals(focusedStockSource, result.Items) || focusedStockItemId != workbench.FocusedStockItemId)
+        {
+            focusedStockSource = result.Items;
+            focusedStockItemId = workbench.FocusedStockItemId;
+            focusedStockItems = ListingPlanPresentation.ApplyStockItemFocus(result.Items, focusedStockItemId);
+        }
+        var visibleItems = focusedStockItems;
         visibleStockCount = visibleItems.Count;
         if (!result.Filter.IsValid)
             ImGui.TextColored(
@@ -228,7 +238,6 @@ internal sealed class StockWorkspace
             {
                 rows = stockTable.Apply(sourceRows, ImGui.TableGetSortSpecs());
             }
-            var rowKeys = rows.Select(row => row.Item.ItemId).ToArray();
             renderedStockRowCount = stockTable.DrawClippedRows(
                 rows,
                 (row, rowIndex) =>
@@ -248,6 +257,17 @@ internal sealed class StockWorkspace
             stockTable.End();
         }
         stockDrawMilliseconds = Stopwatch.GetElapsedTime(drawStarted).TotalMilliseconds;
+    }
+
+    private IReadOnlyList<StockGroup> GetStockItemsWithListingDemand(QuartermasterRuntimeSnapshot runtime, string scopeKey)
+    {
+        if (availableStockRevision != runtime.Revision || availableStockScopeKey != scopeKey)
+        {
+            availableStockItems = StockItemsWithListingDemand(runtime, scopeKey);
+            availableStockRevision = runtime.Revision;
+            availableStockScopeKey = scopeKey;
+        }
+        return availableStockItems;
     }
 
     internal static IReadOnlyList<StockGroup> StockItemsWithListingDemand(QuartermasterRuntimeSnapshot runtime, string scopeKey)
@@ -290,7 +310,8 @@ internal sealed class StockWorkspace
         if (stockWorkbenchProjection is { } cached &&
             cached.RuntimeRevision == runtime.Revision &&
             cached.PlanId == selectedPlan?.Id &&
-            cached.QueryItems.Select(item => item.ItemId).SequenceEqual(queryItems.Select(item => item.ItemId)))
+            (ReferenceEquals(cached.QueryItems, queryItems) ||
+             cached.QueryItems.Select(item => item.ItemId).SequenceEqual(queryItems.Select(item => item.ItemId))))
             return cached.Rows;
 
         var rules = selectedPlan is null
@@ -303,9 +324,7 @@ internal sealed class StockWorkspace
             ? new Dictionary<Guid, StowageEvaluationLine>()
             : StowageEvaluator.BuildPlan(runtime.State, runtime.Browser, runtime.Owner, selectedPlan.Id)?
                 .Lines.ToDictionary(line => line.RuleId) ?? [];
-        var listingEvaluation = ListingPlanEvaluator.Evaluate(
-            ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner),
-            runtime.Browser);
+        var listingEvaluation = ResolveStockListingEvaluation(runtime);
         var rows = queryItems
             .Select(item =>
             {
@@ -325,8 +344,20 @@ internal sealed class StockWorkspace
         return rows;
     }
 
-    private void DrawStockToolbar(BrowserProjection projection, IReadOnlyList<StockGroup> sourceItems)
+    private ListingPlanEvaluation ResolveStockListingEvaluation(QuartermasterRuntimeSnapshot runtime)
     {
+        if (stockListingEvaluation is null || listingEvaluationRevision != runtime.Revision)
+        {
+            stockListingEvaluation = ListingPlanEvaluator.Evaluate(
+                ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner), runtime.Browser);
+            listingEvaluationRevision = runtime.Revision;
+        }
+        return stockListingEvaluation;
+    }
+
+    private void DrawStockToolbar(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> sourceItems, string scopeKey, bool isEditing)
+    {
+        var projection = runtime.Browser;
         if (catalogMode)
         {
             catalogPicker.DrawSearch(Math.Max(100, ImGui.GetContentRegionAvail().X - 150 - ImGui.GetStyle().ItemSpacing.X));
@@ -334,7 +365,7 @@ internal sealed class StockWorkspace
             DrawScopeCombo(projection);
             return;
         }
-        var context = BrowserQueryController.CreateItemContext(sourceItems, projection.Owner);
+        var context = queries.EnsureItemContext(sourceItems, projection.Owner, scopeKey, isEditing, runtime.Revision);
         var trailingWidth = 190f;
         var filterBeforeDraw = workbench.ItemFilterState.Expression;
         DalamudFilterAutocompleteRenderer.Draw(
@@ -482,7 +513,7 @@ internal sealed class StockWorkspace
 
     private void DrawCatalog(QuartermasterRuntimeSnapshot runtime)
     {
-        DrawStockToolbar(runtime.Browser, []);
+        DrawStockToolbar(runtime, [], workbench.ScopeKey, workbench.ItemFilterState.IsInputActive);
         var groupTarget = workbench.View == WorkbenchView.ItemGroups;
         var count = catalogPicker.SelectedCount;
         var amount = count > 0 ? $" {count:N0}" : string.Empty;
@@ -527,7 +558,7 @@ internal sealed class StockWorkspace
 
     private void DrawStockSelectionBar(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> availableItems)
     {
-        var selected = availableItems
+        var selected = stockSelection.Count == 0 ? Array.Empty<StockGroup>() : availableItems
             .Where(item => stockSelection.IsSelected(item.ItemId))
             .ToArray();
         if (selected.Length != stockSelection.Count)
@@ -555,7 +586,7 @@ internal sealed class StockWorkspace
             () =>
             {
                 var current = runtimeSnapshots.Current;
-                var currentItems = StockItemsWithListingDemand(current, workbench.ScopeKey)
+                var currentItems = GetStockItemsWithListingDemand(current, workbench.ScopeKey)
                     .Where(item => stockSelection.IsSelected(item.ItemId))
                     .ToArray();
                 UpsertSelectedStockRules(current, currentItems, stowCarried: false);
@@ -623,7 +654,7 @@ internal sealed class StockWorkspace
                 if (ImGui.SmallButton("Show in Market")) showInListings(runtime, new(itemId, quality));
             }
             var listingPlan = ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner);
-            var demand = ListingPlanEvaluator.Evaluate(listingPlan, runtime.Browser).Items
+            var demand = ResolveStockListingEvaluation(runtime).Items
                 .Where(item => item.ItemId == selected[0].ItemId && item.IsPlanned)
                 .ToArray();
             if (listingPlan is not null && demand.Length > 0)

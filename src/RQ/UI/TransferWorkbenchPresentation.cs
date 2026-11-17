@@ -43,15 +43,27 @@ internal static class TransferWorkbenchPresentation
         StockGroup? stock,
         ItemQualityPolicy quality,
         IReadOnlyDictionary<ulong, CachedRetainer> retainers,
-        OwnerScope owner)
-    {
-        var accessibleRetainerIds = retainers.Values
+        OwnerScope owner) =>
+        AccessibleStorageQuantity(stock, quality, AccessibleRetainerIds(retainers, owner));
+
+    /// <summary>The owner's retainers whose storage a run can currently reach.</summary>
+    public static HashSet<ulong> AccessibleRetainerIds(
+        IReadOnlyDictionary<ulong, CachedRetainer> retainers,
+        OwnerScope owner) =>
+        retainers.Values
             .Where(retainer =>
                 retainer.Owner.Matches(owner) &&
                 retainer.IsCurrentlyAssigned is not false &&
                 retainer.IsUiAccessible is not false)
             .Select(retainer => retainer.RetainerId)
             .ToHashSet();
+
+    /// <summary>Use with <see cref="AccessibleRetainerIds"/> when summing many items at once.</summary>
+    public static int AccessibleStorageQuantity(
+        StockGroup? stock,
+        ItemQualityPolicy quality,
+        IReadOnlySet<ulong> accessibleRetainerIds)
+    {
         return stock?.Stacks
             .Where(stack =>
                 stack.ScopeKind == BrowserScopeKind.Retainer &&

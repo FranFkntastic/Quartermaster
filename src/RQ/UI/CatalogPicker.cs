@@ -45,6 +45,8 @@ internal sealed class CatalogPicker
     private int expansionVersion;
     private RowsKey? rowsKey;
     private IReadOnlyList<PickerRow> rows = [];
+    private bool allExpanded;
+    private uint? rangeAnchor;
 
     public CatalogPicker(GameItemCatalog catalog, AgentBridgeUiReviewRegistry reviewRegistry)
     {
@@ -117,14 +119,14 @@ internal sealed class CatalogPicker
             return;
         haveRevision = runtime.Revision;
         have.Clear();
+        var accessibleRetainers = TransferWorkbenchPresentation.AccessibleRetainerIds(runtime.Retainers, runtime.Owner);
         foreach (var item in runtime.Browser.GetItems(BrowserScope.AllKey))
         {
             var quantity = item.PlayerQuantity + item.SaddlebagQuantity +
                            TransferWorkbenchPresentation.AccessibleStorageQuantity(
                                item,
                                ItemQualityPolicy.Any,
-                               runtime.Retainers,
-                               runtime.Owner);
+                               accessibleRetainers);
             if (quantity > 0)
                 have[item.ItemId] = quantity;
         }
@@ -158,7 +160,6 @@ internal sealed class CatalogPicker
         if (ImGui.IsItemDeactivatedAfterEdit())
             levelMax = Math.Clamp(levelMax, Math.Clamp(levelMin, floor, ceiling), ceiling);
 
-        var allExpanded = rows.Count > 0 && rows.Where(row => row.Item is null).All(row => IsOpen(row.Category.Id));
         var label = allExpanded ? "Collapse all###RQCatalogExpand" : "Expand all###RQCatalogExpand";
         var width = ImGui.CalcTextSize(allExpanded ? "Collapse all" : "Expand all").X + (ImGui.GetStyle().FramePadding.X * 2f);
         ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - width));
@@ -236,6 +237,7 @@ internal sealed class CatalogPicker
 
         var built = new List<PickerRow>();
         var visibleCount = 0;
+        var everyCategoryOpen = true;
         foreach (var category in snapshot.Categories)
         {
             var categoryMatches = needle.Length == 0 || category.Name.Contains(needle, StringComparison.OrdinalIgnoreCase);
@@ -250,12 +252,18 @@ internal sealed class CatalogPicker
             visibleCount += visible.Length;
             built.Add(new PickerRow(category, null, visible.Select(item => item.ItemId).ToArray()));
             if (!IsOpen(category.Id))
+            {
+                everyCategoryOpen = false;
                 continue;
+            }
             foreach (var item in visible)
                 built.Add(new PickerRow(category, item, []));
         }
         rows = built;
         rowsKey = key;
+        // Cached with the rows: scanning ~50k expanded rows every frame for this label was the
+        // picker's main steady per-frame cost.
+        allExpanded = built.Count > 0 && everyCategoryOpen;
         VisibleCount = visibleCount;
         return rows;
     }
@@ -282,7 +290,7 @@ internal sealed class CatalogPicker
             {
                 ImGui.TableNextRow(ImGuiTableRowFlags.None, rowHeight);
                 if (row.Item is { } item)
-                    DrawItemRow(item, hasContextMenu, drawContextMenu);
+                    DrawItemRow(visible, item, hasContextMenu, drawContextMenu);
                 else
                     DrawCategoryRow(row);
             });
@@ -349,6 +357,7 @@ internal sealed class CatalogPicker
     }
 
     private void DrawItemRow(
+        IReadOnlyList<PickerRow> visible,
         GameCatalogItem item,
         Func<GameCatalogItem, bool> hasContextMenu,
         Action<GameCatalogItem> drawContextMenu)
@@ -362,23 +371,29 @@ internal sealed class CatalogPicker
                 selected,
                 ImGuiSelectableFlags.SpanAllColumns | ImGuiSelectableFlags.AllowItemOverlap,
                 new Vector2(0, ImGui.GetFrameHeight())))
-            Toggle(item.ItemId);
+        {
+            if (ImGui.GetIO().KeyShift && rangeAnchor is { } anchor && anchor != item.ItemId)
+                SelectRange(visible, anchor, item.ItemId);
+            else
+                Toggle(item.ItemId);
+            rangeAnchor = item.ItemId;
+        }
+        reviewRegistry.RegisterLastSelectable(
+            $"quartermaster.catalog.select.{item.ItemId}",
+            $"Select {item.Name}",
+            true,
+            selected,
+            () => Toggle(item.ItemId),
+            selected ? "Selected" : "Available");
         if (hasContextMenu(item) && ImGui.BeginPopupContextItem("##context"))
         {
             drawContextMenu(item);
             ImGui.EndPopup();
         }
-        ImGui.SetCursorPos(cursor + new Vector2(ImGui.GetFrameHeight(), 0));
-        selected = selection.Contains(item.ItemId);
-        if (ImGui.Checkbox("##check", ref selected))
-            Toggle(item.ItemId);
-        reviewRegistry.RegisterLastButton(
-            $"quartermaster.catalog.select.{item.ItemId}",
-            $"Select {item.Name}",
-            true,
-            () => Toggle(item.ItemId),
-            selection.Contains(item.ItemId) ? "Selected" : "Available");
-        ImGui.SameLine();
+        // Line the name up under its category's label (past the category checkbox and arrow).
+        ImGui.SetCursorPos(cursor + new Vector2(
+            ImGui.GetFrameHeight() + ImGui.GetStyle().ItemSpacing.X + ImGui.GetTreeNodeToLabelSpacing(),
+            0));
         ImGui.AlignTextToFramePadding();
         ImGui.TextUnformatted(item.Name);
         ImGui.PopID();
@@ -396,6 +411,29 @@ internal sealed class CatalogPicker
     {
         if (!selection.Remove(itemId))
             selection.Add(itemId);
+    }
+
+    /// <summary>Shift-click: selects every visible item between the last clicked row and this one.</summary>
+    private void SelectRange(IReadOnlyList<PickerRow> visible, uint fromId, uint toId)
+    {
+        int from = -1, to = -1;
+        for (var index = 0; index < visible.Count && (from < 0 || to < 0); index++)
+        {
+            if (visible[index].Item is not { } candidate)
+                continue;
+            if (candidate.ItemId == fromId)
+                from = index;
+            if (candidate.ItemId == toId)
+                to = index;
+        }
+        if (from < 0 || to < 0)
+        {
+            Toggle(toId);
+            return;
+        }
+        for (var index = Math.Min(from, to); index <= Math.Max(from, to); index++)
+            if (visible[index].Item is { } item)
+                selection.Add(item.ItemId);
     }
 
     private void DrawFooter(
