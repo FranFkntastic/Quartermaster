@@ -21,6 +21,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
     private MarketRunEvaluation run = new(null, 0, [], [], []);
     private MarketRunCraftExportResult export = new(null, [], []);
     private string? status;
+    private bool forceReorganize;
     private IReadOnlyList<MarketRunItem> items = [];
     internal MarketRunExecutor? Executor { get; set; }
     internal MarketRunHistoryWindow? History { get; set; }
@@ -46,6 +47,18 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         if (cacheKey == key && ReferenceEquals(cachedDraft, draft)) return;
         cacheKey = key; cachedDraft = draft;
         run = MarketRunPlanner.Evaluate(MarketRunPresentation.PlanView(draft), runtime.Browser);
+        if (forceReorganize)
+        {
+            var plan = MarketRunPresentation.PlanView(draft);
+            var bags = MarketRunPlanner.StowRequests(plan.Id, draft.Reserves, runtime.Browser.Items.SelectMany(i => i.Stacks)
+                .Where(s => s.ScopeKind == BrowserScopeKind.Player)
+                .Select(s => (s.ItemId, s.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ, s.Quantity)));
+            var requests = MarketRunPlanner.RelocationRequests(plan.Id, draft.Reserves, runtime.Retainers, runtime.Owner);
+            var batch = StowageRouter.BuildBatch(bags.Concat(requests), runtime.Retainers, runtime.Owner,
+                id => session.MaxStack(runtime.Browser, id), DateTime.UtcNow);
+            run = run with { MoveUnits = batch.Routes.Skip(bags.Count).Sum(r => r.RoutedQuantity) };
+        }
+        else run = run with { StowUnits = 0 };
         items = MarketRunPresentation.DisplayItems(run, draft);
         export = MarketRunCraftExport.Export($"Market run {DateTime.Today:yyyy-MM-dd}", run.CraftQueue,
             resolveWorkshopProject, DateTime.UtcNow);
@@ -177,16 +190,18 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
             if (ImGui.Button("Cancel")) executor.Cancel();
             return;
         }
-        var hasWork = run.StowUnits > 0 || run.Retainers.Any(r => r.Assignments.Any(a => a.ShortListings is { IsKnown: true, Value: > 0 } || a.RepriceListings is { IsKnown: true, Value: > 0 }));
+        var hasWork = forceReorganize && run.StowUnits + run.MoveUnits > 0 || run.Retainers.Any(r => r.Assignments.Any(a => a.ShortListings is { IsKnown: true, Value: > 0 } || a.RepriceListings is { IsKnown: true, Value: > 0 }));
         var reason = session.IsDirty ? "Save plan changes first." : !run.IsComplete ? "Observations incomplete." :
             executor.PersistenceError is not null ? executor.PersistenceError :
             executor.Result?.RequiresAcknowledgement == true ? "Blocked until you confirm the last run's unconfirmed moves (Review…)" :
             !hasWork ? "Nothing to do." : !executor.CanStart ? "Automation busy." : null;
         ImGui.BeginDisabled(reason is not null);
         if (ImGui.Button("Start run") && ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner) is { } plan)
-            _ = executor.RunAsync(plan, run, session.IsDirty);
+            _ = executor.RunAsync(plan, run, session.IsDirty, forceReorganize);
         ImGui.EndDisabled();
         if (reason is not null && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) ImGui.SetTooltip(reason);
+        ImGui.SameLine();
+        if (ImGui.Checkbox("Force reorganize", ref forceReorganize)) { cachedDraft = null; Update(runtime, session); }
         if (executor.PersistenceError is not null) ImGui.TextWrapped(executor.PersistenceError);
         if (ImGui.SmallButton("Run summaries")) History?.Open();
         if (History?.Warning is { } historyWarning) ImGui.TextWrapped(historyWarning);

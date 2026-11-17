@@ -61,6 +61,7 @@ public sealed record MarketRunEvaluation(
     IReadOnlyList<MarketRunCraftLine> CraftQueue)
 {
     public int StowUnits { get; init; }
+    public int MoveUnits { get; init; }
     /// <summary>False when any listing or stock number the run depends on is unknown.</summary>
     public bool IsComplete =>
         Retainers.All(retainer => retainer.ListingsComplete) &&
@@ -78,9 +79,13 @@ public sealed record MarketRunEvaluation(
 public static class MarketRunPlanner
 {
     public static IReadOnlyList<StowageDepositRequest> StowRequests(Guid planId,
-        IEnumerable<ListingReserveRule> reserves, IEnumerable<(uint ItemId, bool Hq, int Quantity)> stacks)
+        IEnumerable<ListingReserveRule> reserves, IEnumerable<(uint ItemId, bool Hq, int Quantity)> stacks,
+        IReadOnlyDictionary<(uint ItemId, bool Hq), int>? baseline = null)
     {
         var remaining = stacks.GroupBy(s => (s.ItemId, s.Hq)).ToDictionary(g => g.Key, g => g.Sum(s => s.Quantity));
+        if (baseline is not null)
+            foreach (var key in remaining.Keys.ToArray())
+                remaining[key] = Math.Clamp(remaining[key] - baseline.GetValueOrDefault(key), 0, remaining[key]);
         var requests = new List<StowageDepositRequest>();
         foreach (var reserve in reserves.Where(r => r.Enabled && r.ItemId > 0 &&
                      (r.Location.AnySpace || r.Location.PreferredRetainerIds.Count > 0)))
@@ -93,6 +98,28 @@ public static class MarketRunPlanner
             requests.Add(new(planId, reserve.Id, reserve.ItemId, reserve.ItemName, hq, quantity,
                 StowageRoutingPolicy.CopyOf(reserve.Location)));
             remaining[key] = 0; // Overlapping policies must not authorize the same units twice.
+        }
+        return requests;
+    }
+
+    public static IReadOnlyList<StowageDepositRequest> RelocationRequests(Guid planId,
+        IEnumerable<ListingReserveRule> reserves, IReadOnlyDictionary<ulong, CachedRetainer> cache, OwnerScope owner)
+    {
+        var requests = new List<StowageDepositRequest>();
+        var seen = new HashSet<(uint, bool)>();
+        foreach (var reserve in reserves.Where(r => r.Enabled && r.ItemId > 0 &&
+                     (r.Location.AnySpace || r.Location.PreferredRetainerIds.Count > 0)))
+        foreach (var hq in new[] { false, true })
+        {
+            if (reserve.Quality == ItemQualityPolicy.NqOnly && hq || reserve.Quality == ItemQualityPolicy.HqOnly && !hq) continue;
+            if (!seen.Add((reserve.ItemId, hq)) || reserve.Location.AnySpace) continue;
+            var quantity = cache.Values.Where(r => r.Owner.Matches(owner) && r.IsCurrentlyAssigned is not false &&
+                    r.IsUiAccessible is not false && !reserve.Location.PreferredRetainerIds.Contains(r.RetainerId))
+                .SelectMany(r => r.Bags.Where(b => b.BagName.StartsWith("RetainerPage", StringComparison.Ordinal)))
+                .SelectMany(b => b.Items).Where(i => i.ItemId == reserve.ItemId && i.IsHq == hq)
+                .Sum(i => checked((int)i.Quantity));
+            if (quantity > 0) requests.Add(new(planId, reserve.Id, reserve.ItemId, reserve.ItemName, hq,
+                quantity, StowageRoutingPolicy.CopyOf(reserve.Location)));
         }
         return requests;
     }
