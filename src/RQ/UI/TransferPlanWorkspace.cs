@@ -1020,7 +1020,6 @@ internal sealed class TransferPlanWorkspace
         }
 
         ImGui.TableNextRow();
-        ImGui.TableNextColumn();
         if (ImGui.TableNextColumn())
             DrawAddInput(runtime, plan);
         drawingRows = false;
