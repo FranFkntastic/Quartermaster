@@ -360,7 +360,7 @@ internal sealed class StockWorkspace
         var projection = runtime.Browser;
         if (catalogMode)
         {
-            catalogPicker.DrawSearch(Math.Max(100, ImGui.GetContentRegionAvail().X - 150 - ImGui.GetStyle().ItemSpacing.X));
+            catalogPicker.DrawSearch(Math.Max(100, ImGui.GetContentRegionAvail().X - ScopeComboWidth() - ImGui.GetStyle().ItemSpacing.X));
             ImGui.SameLine();
             DrawScopeCombo(projection);
             return;
@@ -468,9 +468,12 @@ internal sealed class StockWorkspace
         }
     }
 
+    private static float ScopeComboWidth() =>
+        Math.Max(150, ImGui.CalcTextSize(CatalogPicker.ScopeLabel).X + ImGui.GetFrameHeight() + (ImGui.GetStyle().FramePadding.X * 2f));
+
     private void DrawScopeCombo(BrowserProjection projection)
     {
-        ImGui.SetNextItemWidth(Math.Max(150, ImGui.CalcTextSize(CatalogPicker.ScopeLabel).X + ImGui.GetFrameHeight() + (ImGui.GetStyle().FramePadding.X * 2f)));
+        ImGui.SetNextItemWidth(ScopeComboWidth());
         var selectedScope = projection.Scopes.First(scope => scope.Key == workbench.ScopeKey);
         if (ImGui.BeginCombo("##RQStockScope", catalogMode ? CatalogPicker.ScopeLabel : selectedScope.Label))
         {
