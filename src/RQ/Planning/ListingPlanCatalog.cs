@@ -327,12 +327,7 @@ public static class ListingPlanCatalog
         Enabled = source.Enabled,
     };
 
-    public static StowageRoutingPolicy CopyLocation(StowageRoutingPolicy? source) => new()
-    {
-        Mode = source?.Mode ?? StowageRoutingMode.ConsolidateFirst,
-        Overflow = source?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
-        PreferredRetainerIds = source?.PreferredRetainerIds.ToList() ?? [],
-    };
+    public static StowageRoutingPolicy CopyLocation(StowageRoutingPolicy? source) => StowageRoutingPolicy.CopyOf(source);
 
     public static bool ReserveEquals(ListingReserveRule left, ListingReserveRule right) =>
         left.Id == right.Id && left.ItemId == right.ItemId && left.ItemName == right.ItemName &&
@@ -476,9 +471,8 @@ public static class ListingPlanCatalog
 
         public bool Equals(StowageRoutingPolicy? left, StowageRoutingPolicy? right) =>
             ReferenceEquals(left, right) ||
-            (left is not null && right is not null && left.Mode == right.Mode && left.Overflow == right.Overflow &&
-             left.PreferredRetainerIds.SequenceEqual(right.PreferredRetainerIds));
+            (left is not null && left.SameAs(right));
 
-        public int GetHashCode(StowageRoutingPolicy value) => HashCode.Combine(value.Mode, value.Overflow, value.PreferredRetainerIds.Count);
+        public int GetHashCode(StowageRoutingPolicy value) => HashCode.Combine(value.AnySpace, value.PreferredRetainerIds.Count);
     }
 }

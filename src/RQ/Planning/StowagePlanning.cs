@@ -68,7 +68,7 @@ public static class StowagePlanMigration
             foreach (var rule in state.PlanItems.Where(rule => rule.StowagePlanId == Guid.Empty))
             {
                 rule.StowagePlanId = plan.Id;
-                rule.Routing ??= new StowageRoutingPolicy();
+                rule.Routing ??= new StowageRoutingPolicy { AnySpace = true };
             }
 
             if (state.StowageMigrations.All(record =>
@@ -292,12 +292,7 @@ public static class StowageEvaluator
         _ => true,
     };
 
-    private static StowageRoutingPolicy Copy(StowageRoutingPolicy? routing) => new()
-    {
-        Mode = routing?.Mode ?? StowageRoutingMode.ConsolidateFirst,
-        Overflow = routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
-        PreferredRetainerIds = routing?.PreferredRetainerIds.ToList() ?? [],
-    };
+    private static StowageRoutingPolicy Copy(StowageRoutingPolicy? routing) => StowageRoutingPolicy.CopyOf(routing);
 }
 
 public sealed record StowageDepositRequest(
@@ -368,49 +363,47 @@ public static class StowageRouter
         if (request.Quantity <= 0 || maxStackSize <= 0)
             return new(request, [], 0, Math.Max(0, request.Quantity));
 
-        var preferred = request.Routing.PreferredRetainerIds
-            .Distinct()
-            .Select((id, index) => (id, index))
-            .ToDictionary(entry => entry.id, entry => entry.index);
         var capacities = cache.Values
             .Where(retainer => retainer.Owner.Matches(owner))
             .Where(retainer => retainer.IsCurrentlyAssigned is not false)
             .Where(retainer => retainer.IsUiAccessible is not false)
             .Where(retainer => request.DestinationOverride is null ||
                                retainer.RetainerId == request.DestinationOverride)
-            .Where(retainer => request.DestinationOverride is not null ||
-                               request.Routing.Overflow == StowageOverflowPolicy.AnyOwnerRetainer ||
-                               preferred.ContainsKey(retainer.RetainerId))
             .Select(retainer => Capacity(retainer, request.ItemId, request.IsHighQuality, maxStackSize))
             .Where(candidate => candidate.TotalCapacity > 0)
             .ToArray();
 
-        IOrderedEnumerable<RetainerStowageCapacity> ordered;
+        var ordered = new List<RetainerStowageCapacity>();
         if (request.DestinationOverride is not null)
         {
-            ordered = capacities
-                .OrderBy(candidate => candidate.RetainerId == request.DestinationOverride ? 0 : 1)
-                .ThenBy(candidate => candidate.RetainerName, StringComparer.OrdinalIgnoreCase)
-                .ThenBy(candidate => candidate.RetainerId);
-        }
-        else if (request.Routing.Mode == StowageRoutingMode.HomeFirst && preferred.Count > 0)
-        {
-            ordered = capacities
-                .OrderBy(candidate => preferred.GetValueOrDefault(candidate.RetainerId, int.MaxValue))
-                .ThenByDescending(candidate => candidate.PartialStackCapacity > 0)
-                .ThenByDescending(candidate => candidate.TotalCapacity)
-                .ThenBy(candidate => candidate.RetainerName, StringComparer.OrdinalIgnoreCase)
-                .ThenBy(candidate => candidate.RetainerId);
+            ordered.AddRange(capacities
+                .OrderBy(candidate => candidate.RetainerName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(candidate => candidate.RetainerId));
         }
         else
         {
-            ordered = capacities
-                .OrderByDescending(candidate => candidate.PartialStackCapacity > 0)
-                .ThenBy(candidate => preferred.GetValueOrDefault(candidate.RetainerId, int.MaxValue))
-                .ThenByDescending(candidate => candidate.PartialStackCapacity)
-                .ThenByDescending(candidate => candidate.TotalCapacity)
-                .ThenBy(candidate => candidate.RetainerName, StringComparer.OrdinalIgnoreCase)
-                .ThenBy(candidate => candidate.RetainerId);
+            // Listed retainers strictly in list order; never an unlisted one unless AnySpace.
+            var byId = new Dictionary<ulong, RetainerStowageCapacity>();
+            foreach (var candidate in capacities)
+                byId.TryAdd(candidate.RetainerId, candidate);
+            var listed = request.Routing.PreferredRetainerIds.Distinct().ToArray();
+            foreach (var retainerId in listed)
+            {
+                if (byId.TryGetValue(retainerId, out var candidate))
+                    ordered.Add(candidate);
+            }
+
+            if (request.Routing.AnySpace)
+            {
+                var listedIds = listed.ToHashSet();
+                ordered.AddRange(capacities
+                    .Where(candidate => !listedIds.Contains(candidate.RetainerId))
+                    .OrderByDescending(candidate => candidate.PartialStackCapacity > 0)
+                    .ThenByDescending(candidate => candidate.PartialStackCapacity)
+                    .ThenByDescending(candidate => candidate.TotalCapacity)
+                    .ThenBy(candidate => candidate.RetainerName, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(candidate => candidate.RetainerId));
+            }
         }
 
         var remaining = request.Quantity;
@@ -564,6 +557,18 @@ public static class StowageRouter
             Equipped = item.Equipped,
         }).ToList(),
     };
+
+    /// <summary>Empty retainer inventory slots, or null while any inventory page is unobserved.</summary>
+    public static int? FreeInventorySlots(CachedRetainer retainer)
+    {
+        if (RetainerPageNames.Any(page => !retainer.ObservedSources.Contains(page, StringComparer.Ordinal)))
+            return null;
+        var used = retainer.Bags
+            .Where(bag => RetainerPageNames.Contains(bag.BagName, StringComparer.Ordinal))
+            .SelectMany(bag => bag.Items)
+            .Count(item => item.ItemId > 0 && item.Quantity > 0);
+        return Math.Max(0, 175 - used);
+    }
 
     public static RetainerStowageCapacity Capacity(
         CachedRetainer retainer,

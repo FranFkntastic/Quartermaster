@@ -53,9 +53,8 @@ public static class StowagePlanCatalog
             rule.TargetQuantity = 0;
             rule.Routing = new StowageRoutingPolicy
             {
-                Mode = retainerId.HasValue ? StowageRoutingMode.HomeFirst : StowageRoutingMode.ConsolidateFirst,
                 PreferredRetainerIds = retainerId.HasValue ? [retainerId.Value] : [],
-                Overflow = retainerId.HasValue ? StowageOverflowPolicy.HoldOnPlayer : StowageOverflowPolicy.AnyOwnerRetainer,
+                AnySpace = !retainerId.HasValue,
             };
         }
     }
@@ -320,12 +319,7 @@ public static class StowagePlanCatalog
         ItemName = source.ItemName,
         TargetQuantity = Math.Max(0, source.TargetQuantity),
         Quality = source.Quality,
-        Routing = new StowageRoutingPolicy
-        {
-            Mode = source.Routing?.Mode ?? StowageRoutingMode.ConsolidateFirst,
-            Overflow = source.Routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
-            PreferredRetainerIds = source.Routing?.PreferredRetainerIds.ToList() ?? [],
-        },
+        Routing = StowageRoutingPolicy.CopyOf(source.Routing),
         AllowVendorPurchase = source.AllowVendorPurchase,
         PreferredVendorNpcId = source.PreferredVendorNpcId,
         Notes = source.Notes,
@@ -348,9 +342,7 @@ public static class StowagePlanCatalog
             pair.First.PreferredVendorNpcId == pair.Second.PreferredVendorNpcId &&
             pair.First.Notes == pair.Second.Notes &&
             pair.First.Enabled == pair.Second.Enabled &&
-            pair.First.Routing.Mode == pair.Second.Routing.Mode &&
-            pair.First.Routing.Overflow == pair.Second.Routing.Overflow &&
-            pair.First.Routing.PreferredRetainerIds.SequenceEqual(pair.Second.Routing.PreferredRetainerIds));
+            pair.First.Routing.SameAs(pair.Second.Routing));
     }
 }
 

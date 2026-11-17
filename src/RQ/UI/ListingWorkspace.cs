@@ -35,6 +35,8 @@ internal sealed class ListingWorkspace
     private readonly Func<uint, bool?> listability;
     private readonly RetainerRefreshCoordinator refresh;
     private readonly MarketRunPane runPane;
+    private readonly PlacementMatrix<(uint ItemId, ItemQualityPolicy Quality)> placement;
+    private bool placementView;
     private readonly Dalamud.Plugin.Services.IPluginLog log;
     private bool openFirstRegistered;
     private string? duplicateRowsWarned;
@@ -73,6 +75,9 @@ internal sealed class ListingWorkspace
         this.log = log;
         this.workbench = workbench; this.navigation = navigation; this.registry = registry; this.session = session;
         this.searchItems = searchItems; this.listability = listability; this.refresh = refresh; this.runPane = runPane;
+        placement = new("quartermaster.listings.placement", "Spare", registry);
+        runPane.OpenPlacement = OpenPlacement;
+        runPane.Registry = registry;
         retainerTable = new(
         [
             new("Retainer", 1, r => r.RetainerName, r => r.RetainerName,
@@ -178,6 +183,11 @@ internal sealed class ListingWorkspace
         var all = Resolve(runtime);
         DrawRefresh(all.Count == 0);
         DrawNavigationStatus();
+        if (placementView)
+        {
+            DrawPlacement(runtime, search);
+            return;
+        }
         retainerTable.DrawColumnMenuButton("RQMarketRetainerColumns");
         var visible = all.Where(r => string.IsNullOrWhiteSpace(search) ||
             r.PlanRows.Any(a => a.Assignment.ItemName.Contains(search, StringComparison.OrdinalIgnoreCase)) ||
@@ -230,6 +240,50 @@ internal sealed class ListingWorkspace
         if (ImGui.BeginChild("RQMarketRun", new Vector2(runWidth, height), false))
             runPane.Draw(runtime, session, all, workbench.SelectedListingRetainerId);
         ImGui.EndChild();
+    }
+
+    /// <summary>Swaps the retainer list for the placement matrix; an item name filters it to that item.</summary>
+    private void OpenPlacement(string? itemName)
+    {
+        placementView = true;
+        placement.ClearSelection();
+        if (itemName is not null) workbench.ListingFilterState.SetExpression(itemName);
+    }
+
+    private void DrawPlacement(QuartermasterRuntimeSnapshot runtime, string search)
+    {
+        if (ImGui.SmallButton("Return to retainer list##RQPlacementReturn")) placementView = false;
+        registry.RegisterLastButton("quartermaster.listings.placement.return", "Return to retainer list", true,
+            () => placementView = false, "Ready");
+        if (session.Draft is not { } draft) return;
+        var items = runPane.Items(runtime, session);
+        var rows = items.Select(item =>
+        {
+            var reserve = draft.Reserves.FirstOrDefault(r => r.ItemId == item.ItemId && r.Quality == item.Quality);
+            return new PlacementMatrixRow<(uint, ItemQualityPolicy)>(
+                (item.ItemId, item.Quality),
+                $"{item.ItemId}-{item.Quality}",
+                $"{item.ItemName} {QualityLabel(item.Quality)}",
+                MarketRunPresentation.Number(item.SpareUnits),
+                reserve?.Location ?? new StowageRoutingPolicy(),
+                PlacementMatrixData.Holdings(runtime, item.ItemId, item.Quality));
+        }).ToArray();
+        var visible = rows.Where(row => string.IsNullOrWhiteSpace(search) ||
+            row.Label.Contains(search.Trim(), StringComparison.OrdinalIgnoreCase)).ToArray();
+        var columns = PlacementMatrixData.Columns(runtime, rows.Select(row => row.Routing));
+        placement.Draw(rows, visible, columns, changes =>
+        {
+            foreach (var (key, routing) in changes)
+            {
+                var item = items.FirstOrDefault(i => i.ItemId == key.ItemId && i.Quality == key.Quality);
+                if (item is null) continue;
+                // Placing an item without a reserve rule creates the rule, as typing a level does.
+                var reserve = draft.Reserves.FirstOrDefault(r => r.ItemId == key.ItemId && r.Quality == key.Quality)
+                    ?? session.AddReserve(item.ItemId, item.ItemName, item.Quality);
+                session.SetReserveLocation(reserve.Id, routing);
+            }
+            return true;
+        });
     }
 
     private void DrawRefresh(bool empty)

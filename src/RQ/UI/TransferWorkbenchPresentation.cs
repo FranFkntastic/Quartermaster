@@ -21,7 +21,8 @@ internal readonly record struct TransferLineProjection(
     int NoRoom = 0,
     int Missing = 0,
     int Vendor = 0,
-    bool StockUnverified = false)
+    bool StockUnverified = false,
+    int KeptInBags = 0)
 {
     public int Retrieve => FromSaddlebag + FromRetainers;
     public int Short => Math.Max(0, Missing - Vendor);
@@ -81,7 +82,8 @@ internal static class TransferWorkbenchPresentation
         int routedDepositQuantity,
         int saddlebagQuantity,
         int vendorApprovedQuantity,
-        bool stockUnverified)
+        bool stockUnverified,
+        bool hasDestinations = true)
     {
         if (!enabled)
             return new(TransferLineKind.Paused);
@@ -101,6 +103,9 @@ internal static class TransferWorkbenchPresentation
             }
             case StowageAction.Deposit:
             {
+                // No destinations is an ordinary choice: the surplus stays in bags, not "no room".
+                if (!hasDestinations)
+                    return new(TransferLineKind.Stow, KeptInBags: requested);
                 var stow = Math.Min(requested, Math.Max(0, routedDepositQuantity));
                 return new(TransferLineKind.Stow, Stow: stow, NoRoom: requested - stow);
             }
