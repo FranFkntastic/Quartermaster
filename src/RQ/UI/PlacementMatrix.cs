@@ -2,6 +2,7 @@ using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Utility;
 using Franthropy.Dalamud.AgentBridge;
+using Franthropy.Dalamud.UI.Tables;
 using RQ.Domain;
 using RQ.Inventory;
 using RQ.Planning;
@@ -403,19 +404,8 @@ internal sealed class PlacementMatrix<TKey>
                 return;
             }
 
-            // Only rows in view are drawn and registered; spacer rows keep the scroll extent.
-            // Body rows start right under the frozen header rows in content space.
-            var first = Math.Clamp((int)MathF.Floor(ImGui.GetScrollY() / rowHeight) - 1, 0, rows.Count);
-            var count = Math.Min(rows.Count - first, (int)MathF.Ceiling(ImGui.GetWindowHeight() / rowHeight) + 3);
-            if (first > 0)
-            {
-                ImGui.TableNextRow(ImGuiTableRowFlags.None, first * rowHeight);
-            }
-            for (var index = first; index < first + count; index++)
-                DrawRow(rows, index, columns, cellWidth, rowHeight, apply);
-            var after = rows.Count - first - count;
-            if (after > 0)
-                ImGui.TableNextRow(ImGuiTableRowFlags.None, after * rowHeight);
+            // Only rows in view are drawn and registered.
+            DalamudVirtualizedRows.Draw(rows, (_, index) => DrawRow(rows, index, columns, cellWidth, rowHeight, apply));
         }
         finally
         {
