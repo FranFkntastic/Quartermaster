@@ -35,6 +35,7 @@ internal static class SearchReference
         private Row[] examples = [];
         private FieldRow[] fields = [];
         private string fieldsHeading = string.Empty;
+        private float tableWidth;
 
         public Button(string id, string label)
         {
@@ -69,6 +70,8 @@ internal static class SearchReference
             var width = Math.Min(540f, Math.Max(200f, ImGui.GetWindowSize().X));
             ImGui.SetNextWindowPos(new Vector2(Math.Max(windowPos.X, anchor.X - width), anchor.Y));
             ImGui.SetNextWindowSizeConstraints(new Vector2(width, 0), new Vector2(width, float.MaxValue));
+            ImGui.SetNextWindowBgAlpha(0.98f);
+            tableWidth = width - (ImGui.GetStyle().WindowPadding.X * 2f);
             var owner = DalamudOwnedWindowSurface.Capture();
             owner.ApplyToNextWindow();
             if (!ImGui.BeginPopup(id)) return false;
@@ -127,9 +130,9 @@ internal static class SearchReference
                 }
             }
             ImGui.TextColored(CodeColor, "Examples");
-            var selected = DrawRows("examples", examples);
+            var selected = DrawRows("examples", examples, tableWidth);
             ImGui.TextColored(CodeColor, "Combine");
-            if (ImGui.BeginTable("combine", 2))
+            if (BeginTwoColumns("combine", tableWidth))
             {
                 TextRow("a b   AND   &&", "Both");
                 TextRow("OR   |", "Either");
@@ -137,22 +140,21 @@ internal static class SearchReference
                 TextRow("( )   \"…\"", "Group · exact phrase");
                 ImGui.EndTable();
             }
-            if (ImGui.CollapsingHeader(fieldsHeading) && ImGui.BeginTable("fields", 3, ImGuiTableFlags.SizingStretchProp))
+            if (ImGui.CollapsingHeader(fieldsHeading) &&
+                ImGui.BeginTable("fields", 3, ImGuiTableFlags.SizingFixedFit, new Vector2(tableWidth, 0)))
             {
-                ImGui.TableSetupColumn("Field");
-                ImGui.TableSetupColumn("Compare");
-                ImGui.TableSetupColumn("Values");
+                ImGui.TableSetupColumn("Field", ImGuiTableColumnFlags.WidthFixed);
+                ImGui.TableSetupColumn("Compare", ImGuiTableColumnFlags.WidthFixed);
+                ImGui.TableSetupColumn("Values", ImGuiTableColumnFlags.WidthStretch);
                 ImGui.TableHeadersRow();
                 foreach (var field in fields)
                 {
                     ImGui.TableNextRow();
                     ImGui.TableNextColumn();
                     var start = ImGui.GetCursorPos();
-                    var height = ImGui.CalcTextSize(field.Name, false, ImGui.GetContentRegionAvail().X).Y;
-                    ImGui.TableNextColumn();
-                    height = Math.Max(height, ImGui.CalcTextSize(field.Operators, false, ImGui.GetContentRegionAvail().X).Y);
-                    ImGui.TableNextColumn();
-                    height = Math.Max(height, ImGui.CalcTextSize(field.Values, false, ImGui.GetContentRegionAvail().X).Y);
+                    ImGui.TableSetColumnIndex(2);
+                    var height = Math.Max(ImGui.GetTextLineHeight(),
+                        ImGui.CalcTextSize(field.Values, false, Math.Max(1f, ImGui.GetContentRegionAvail().X)).Y);
                     ImGui.TableSetColumnIndex(0);
                     ImGui.PushID(field.Name);
                     ImGui.Selectable("##field", false,
@@ -160,9 +162,9 @@ internal static class SearchReference
                     Tooltip(field.Description);
                     ImGui.PopID();
                     ImGui.SetCursorPos(start);
-                    Wrapped(field.Name, CodeColor);
+                    ImGui.TextColored(CodeColor, field.Name);
                     ImGui.TableNextColumn();
-                    Wrapped(field.Operators, CodeColor);
+                    ImGui.TextColored(CodeColor, field.Operators);
                     ImGui.TableNextColumn();
                     Wrapped(field.Values, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
                 }
@@ -175,7 +177,7 @@ internal static class SearchReference
         public string? DrawPlan()
         {
             if (!Begin()) return null;
-            var selected = DrawRows("add", PlanRows);
+            var selected = DrawRows("add", PlanRows, tableWidth);
             ImGui.EndPopup();
             return selected;
         }
@@ -192,32 +194,34 @@ internal static class SearchReference
         }
     }
 
-    private static string? DrawRows(string id, Row[] rows)
+    private static bool BeginTwoColumns(string id, float width)
+    {
+        if (!ImGui.BeginTable(id, 2, ImGuiTableFlags.SizingFixedFit, new Vector2(width, 0))) return false;
+        ImGui.TableSetupColumn("Code", ImGuiTableColumnFlags.WidthFixed);
+        ImGui.TableSetupColumn("Meaning", ImGuiTableColumnFlags.WidthStretch);
+        return true;
+    }
+
+    private static string? DrawRows(string id, Row[] rows, float width)
     {
         string? selected = null;
-        if (!ImGui.BeginTable(id, 2)) return null;
+        if (!BeginTwoColumns(id, width)) return null;
         foreach (var row in rows)
         {
             ImGui.TableNextRow();
             ImGui.TableNextColumn();
-            var start = ImGui.GetCursorPos();
-            var codeHeight = ImGui.CalcTextSize(row.Code, false, ImGui.GetContentRegionAvail().X).Y;
-            ImGui.TableNextColumn();
-            var descriptionHeight = ImGui.CalcTextSize(row.Description, false, ImGui.GetContentRegionAvail().X).Y;
-            ImGui.TableSetColumnIndex(0);
             ImGui.PushID(row.Code);
-            if (ImGui.Selectable("##row", false, ImGuiSelectableFlags.SpanAllColumns,
-                    new Vector2(0, Math.Max(codeHeight, descriptionHeight))))
+            var start = ImGui.GetCursorPos();
+            if (ImGui.Selectable("##row", false, ImGuiSelectableFlags.SpanAllColumns))
             {
                 selected = row.Value;
                 ImGui.CloseCurrentPopup();
             }
             ImGui.PopID();
             ImGui.SetCursorPos(start);
-            // Hide the selectable's label; the wrapped overlay supplies the code styling.
-            Wrapped(row.Code, CodeColor);
+            ImGui.TextColored(CodeColor, row.Code);
             ImGui.TableNextColumn();
-            Wrapped(row.Description, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+            ImGui.TextDisabled(row.Description);
         }
         ImGui.EndTable();
         return selected;
@@ -227,9 +231,9 @@ internal static class SearchReference
     {
         ImGui.TableNextRow();
         ImGui.TableNextColumn();
-        Wrapped(code, CodeColor);
+        ImGui.TextColored(CodeColor, code);
         ImGui.TableNextColumn();
-        Wrapped(description, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+        ImGui.TextDisabled(description);
     }
 
     private static void Wrapped(string text, Vector4 color)
