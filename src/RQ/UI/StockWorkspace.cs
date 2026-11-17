@@ -8,6 +8,7 @@ using Franthropy.FFXIV.Filtering;
 using Franthropy.Filtering.Evaluation;
 using RQ.Automation;
 using RQ.Domain;
+using RQ.Inventory;
 using RQ.Persistence;
 using RQ.Planning;
 using RQ.Runtime;
@@ -39,6 +40,8 @@ internal sealed class StockWorkspace
     private readonly Action<QuartermasterRuntimeSnapshot, ListingItemKey> showInListings;
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
     private readonly Action requestStockView;
+    private readonly GameItemCatalog gameCatalog;
+    private readonly CatalogPicker catalogPicker;
     private readonly BrowserQueryController queries = new();
     private readonly TableSelectionModel<uint> stockSelection = new();
     private readonly DalamudTableProjection<StockWorkbenchRow> stockTable;
@@ -49,6 +52,7 @@ internal sealed class StockWorkspace
     private int renderedStockRowCount;
     private double stockDrawMilliseconds;
     private bool stowRequested;
+    private bool catalogMode;
 
     public StockWorkspace(
         StateRepository state,
@@ -63,7 +67,8 @@ internal sealed class StockWorkspace
         ListingPlanDraftSession listingSession,
         Action<QuartermasterRuntimeSnapshot, ListingItemKey> showInListings,
         AgentBridgeUiReviewRegistry reviewRegistry,
-        Action requestStockView)
+        Action requestStockView,
+        GameItemCatalog gameCatalog)
     {
         this.state = state;
         this.runtimeSnapshots = runtimeSnapshots;
@@ -78,6 +83,8 @@ internal sealed class StockWorkspace
         this.showInListings = showInListings;
         this.reviewRegistry = reviewRegistry;
         this.requestStockView = requestStockView;
+        this.gameCatalog = gameCatalog;
+        catalogPicker = new CatalogPicker(gameCatalog, reviewRegistry);
         stockTable = CreateTable();
     }
 
@@ -163,6 +170,12 @@ internal sealed class StockWorkspace
     public void Draw(QuartermasterRuntimeSnapshot runtime)
     {
         var drawStarted = Stopwatch.GetTimestamp();
+        if (catalogMode)
+        {
+            DrawCatalog(runtime);
+            stockDrawMilliseconds = Stopwatch.GetElapsedTime(drawStarted).TotalMilliseconds;
+            return;
+        }
         var projection = runtime.Browser;
         var availableItems = StockItemsWithListingDemand(runtime, workbench.ScopeKey);
         var queryProjection = new BrowserProjection
@@ -314,6 +327,13 @@ internal sealed class StockWorkspace
 
     private void DrawStockToolbar(BrowserProjection projection, IReadOnlyList<StockGroup> sourceItems)
     {
+        if (catalogMode)
+        {
+            catalogPicker.DrawSearch(Math.Max(100, ImGui.GetContentRegionAvail().X - 150 - ImGui.GetStyle().ItemSpacing.X));
+            ImGui.SameLine();
+            DrawScopeCombo(projection);
+            return;
+        }
         var context = BrowserQueryController.CreateItemContext(sourceItems, projection.Owner);
         var trailingWidth = 190f;
         var filterBeforeDraw = workbench.ItemFilterState.Expression;
@@ -346,21 +366,7 @@ internal sealed class StockWorkspace
             });
 
         ImGui.SameLine();
-        ImGui.SetNextItemWidth(150);
-        var selectedScope = projection.Scopes.First(scope => scope.Key == workbench.ScopeKey);
-        if (ImGui.BeginCombo("##RQStockScope", selectedScope.Label))
-        {
-            foreach (var scope in projection.Scopes)
-            {
-                if (ImGui.Selectable($"{scope.Label}##stock-scope:{scope.Key}", scope.Key == workbench.ScopeKey))
-                {
-                    workbench.ScopeKey = scope.Key;
-                    workbench.FocusedStockItemId = null;
-                    stockSelection.Clear();
-                }
-            }
-            ImGui.EndCombo();
-        }
+        DrawScopeCombo(projection);
 
         ImGui.SameLine();
         if (ImGui.SmallButton("…##RQStockOptions"))
@@ -429,6 +435,94 @@ internal sealed class StockWorkspace
                 ImGui.EndTooltip();
             }
         }
+    }
+
+    private void DrawScopeCombo(BrowserProjection projection)
+    {
+        ImGui.SetNextItemWidth(150);
+        var selectedScope = projection.Scopes.First(scope => scope.Key == workbench.ScopeKey);
+        if (ImGui.BeginCombo("##RQStockScope", catalogMode ? CatalogPicker.ScopeLabel : selectedScope.Label))
+        {
+            foreach (var scope in projection.Scopes)
+            {
+                if (ImGui.Selectable($"{scope.Label}##stock-scope:{scope.Key}", !catalogMode && scope.Key == workbench.ScopeKey))
+                {
+                    workbench.ScopeKey = scope.Key;
+                    workbench.FocusedStockItemId = null;
+                    stockSelection.Clear();
+                    LeaveCatalog();
+                }
+            }
+            if (ImGui.Selectable($"{CatalogPicker.ScopeLabel}##stock-scope:catalog", catalogMode))
+                EnterCatalog();
+            ImGui.EndCombo();
+        }
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.stock.scope.catalog",
+            $"Browse {CatalogPicker.ScopeLabel.ToLowerInvariant()}",
+            true,
+            EnterCatalog,
+            catalogMode ? "Selected" : "Available");
+    }
+
+    private void EnterCatalog()
+    {
+        if (catalogMode)
+            return;
+        catalogMode = true;
+        stockSelection.Clear();
+        workbench.FocusedStockItemId = null;
+    }
+
+    private void LeaveCatalog()
+    {
+        catalogMode = false;
+        catalogPicker.ClearSelection();
+    }
+
+    private void DrawCatalog(QuartermasterRuntimeSnapshot runtime)
+    {
+        DrawStockToolbar(runtime.Browser, []);
+        var groupTarget = workbench.View == WorkbenchView.ItemGroups;
+        var count = catalogPicker.SelectedCount;
+        var amount = count > 0 ? $" {count:N0}" : string.Empty;
+        var label = groupTarget
+            ? $"Add{amount} to @{itemGroupWorkspace.TargetGroupName(runtime.State)}"
+            : $"Add{amount} to plan";
+        catalogPicker.Draw(
+            runtime,
+            label,
+            groupTarget || runtime.Owner.HasStableIdentity,
+            AddCatalogItems,
+            item => gameCatalog.TryGet()?.MaterialsFor(item.ItemId) is not null,
+            item => DrawMaterialsMenuItem(runtimeSnapshots.Current, item.ItemId));
+        visibleStockCount = catalogPicker.VisibleCount;
+    }
+
+    private void AddCatalogItems(IReadOnlyList<GameCatalogItem> items)
+    {
+        var runtime = runtimeSnapshots.Current;
+        if (workbench.View == WorkbenchView.ItemGroups)
+            AddStockItemsToItemGroup(runtime, items.Select(item => new StockGroup(item.ItemId, item.Name, [])).ToArray());
+        else
+            transferPlans.AddItems(runtime, items.Select(item => (item.ItemId, item.Name)));
+    }
+
+    /// <summary>Offers a craftable item's direct materials to whichever right-hand tab is open.</summary>
+    private void DrawMaterialsMenuItem(QuartermasterRuntimeSnapshot runtime, uint itemId)
+    {
+        if (gameCatalog.TryGet()?.MaterialsFor(itemId) is not { } materials)
+            return;
+        if (workbench.View == WorkbenchView.ItemGroups)
+        {
+            if (ImGui.MenuItem($"Add materials to @{itemGroupWorkspace.TargetGroupName(runtime.State)}"))
+                AddStockItemsToItemGroup(runtime, materials.Select(material => new StockGroup(material.ItemId, material.Name, [])).ToArray());
+            return;
+        }
+        ImGui.BeginDisabled(!runtime.Owner.HasStableIdentity);
+        if (ImGui.MenuItem("Add materials to plan"))
+            transferPlans.AddMaterials(runtime, materials, 1);
+        ImGui.EndDisabled();
     }
 
     private void DrawStockSelectionBar(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> availableItems)
@@ -605,6 +699,8 @@ internal sealed class StockWorkspace
         if (ImGui.MenuItem("Add to item group"))
             AddStockItemsToItemGroup(runtime, [item]);
 
+        DrawMaterialsMenuItem(runtime, item.ItemId);
+
         if (item.PlayerQuantity == 0 || !runtime.Owner.HasStableIdentity)
             ImGui.BeginDisabled();
         if (ImGui.BeginMenu("Stow carried"))
@@ -679,6 +775,7 @@ internal sealed class StockWorkspace
 
     public void FocusFromListings(QuartermasterRuntimeSnapshot runtime, ListingItemKey group)
     {
+        LeaveCatalog();
         stockSelection.Clear();
         stockSelection.SetSelected(group.ItemId, true);
         workbench.SelectedStockListingQuality = group.Quality;

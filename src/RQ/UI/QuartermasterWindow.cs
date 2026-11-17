@@ -12,6 +12,7 @@ using Franthropy.Dalamud.Automation.Vendors.Coordination;
 using Lumina.Excel.Sheets;
 using RQ.Automation;
 using RQ.Domain;
+using RQ.Inventory;
 using RQ.Operations;
 using RQ.Persistence;
 using RQ.Planning;
@@ -84,6 +85,7 @@ public sealed class QuartermasterWindow : Window
         this.dataManager = dataManager;
         this.reviewRegistry = reviewRegistry;
         marketRunPane = new(resolveWorkshopProject, configDirectory, marketImporter);
+        var gameCatalog = new GameItemCatalog(dataManager, log);
         historyDialog = new(journal);
         RestockPlanEditor? restockEditor = null;
         itemGroupWorkspace = new(
@@ -120,6 +122,7 @@ public sealed class QuartermasterWindow : Window
             transferExecution,
             reviewRegistry,
             SearchItems,
+            gameCatalog.TryGet,
             vendorCatalogSource,
             (planId, planName) => transferReview?.Request(planId, planName),
             review => vendorReview?.Request(review),
@@ -137,7 +140,8 @@ public sealed class QuartermasterWindow : Window
             listingSession,
             (runtime, key) => { listingWorkspace!.Focus(runtime, key); deferredView = WorkbenchView.Listings; },
             reviewRegistry,
-            () => deferredView = WorkbenchView.Stock);
+            () => deferredView = WorkbenchView.Stock,
+            gameCatalog);
         listingWorkspace = new(
             workbench,
             listingNavigation,
