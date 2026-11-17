@@ -177,7 +177,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
             if (ImGui.Button("Cancel")) executor.Cancel();
             return;
         }
-        var hasWork = run.Retainers.Any(r => r.Assignments.Any(a => a.ShortListings is { IsKnown: true, Value: > 0 } || a.RepriceListings is { IsKnown: true, Value: > 0 }));
+        var hasWork = run.StowUnits > 0 || run.Retainers.Any(r => r.Assignments.Any(a => a.ShortListings is { IsKnown: true, Value: > 0 } || a.RepriceListings is { IsKnown: true, Value: > 0 }));
         var reason = session.IsDirty ? "Save plan changes first." : !run.IsComplete ? "Observations incomplete." :
             executor.PersistenceError is not null ? executor.PersistenceError :
             executor.Result?.RequiresAcknowledgement == true ? "Blocked until you confirm the last run's unconfirmed moves (Review…)" :

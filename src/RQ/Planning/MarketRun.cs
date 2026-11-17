@@ -60,6 +60,7 @@ public sealed record MarketRunEvaluation(
     IReadOnlyList<MarketRunItem> Items,
     IReadOnlyList<MarketRunCraftLine> CraftQueue)
 {
+    public int StowUnits { get; init; }
     /// <summary>False when any listing or stock number the run depends on is unknown.</summary>
     public bool IsComplete =>
         Retainers.All(retainer => retainer.ListingsComplete) &&
@@ -76,6 +77,26 @@ public sealed record MarketRunEvaluation(
 /// </summary>
 public static class MarketRunPlanner
 {
+    public static IReadOnlyList<StowageDepositRequest> StowRequests(Guid planId,
+        IEnumerable<ListingReserveRule> reserves, IEnumerable<(uint ItemId, bool Hq, int Quantity)> stacks)
+    {
+        var remaining = stacks.GroupBy(s => (s.ItemId, s.Hq)).ToDictionary(g => g.Key, g => g.Sum(s => s.Quantity));
+        var requests = new List<StowageDepositRequest>();
+        foreach (var reserve in reserves.Where(r => r.Enabled && r.ItemId > 0 &&
+                     (r.Location.AnySpace || r.Location.PreferredRetainerIds.Count > 0)))
+        foreach (var hq in new[] { false, true })
+        {
+            if (reserve.Quality == ItemQualityPolicy.NqOnly && hq || reserve.Quality == ItemQualityPolicy.HqOnly && !hq) continue;
+            var key = (reserve.ItemId, hq);
+            var quantity = remaining.GetValueOrDefault(key);
+            if (quantity <= 0) continue;
+            requests.Add(new(planId, reserve.Id, reserve.ItemId, reserve.ItemName, hq, quantity,
+                StowageRoutingPolicy.CopyOf(reserve.Location)));
+            remaining[key] = 0; // Overlapping policies must not authorize the same units twice.
+        }
+        return requests;
+    }
+
     public const int ListingCapacity = 20;
 
     /// <summary>
@@ -278,7 +299,12 @@ public static class MarketRunPlanner
             .Where(item => item.CraftUnits is { IsKnown: true, Value: > 0 })
             .Select(item => new MarketRunCraftLine(item.ItemId, item.ItemName, item.Quality, item.CraftUnits.Value))
             .ToArray();
-        return new(plan.Id, plan.Revision, retainers, orderedItems, craftQueue);
+        return new(plan.Id, plan.Revision, retainers, orderedItems, craftQueue)
+        {
+            StowUnits = StowRequests(plan.Id, plan.Reserves, projection.Items.SelectMany(i => i.Stacks)
+                .Where(s => s.ScopeKind == BrowserScopeKind.Player)
+                .Select(s => (s.ItemId, s.Quality == FfxivItemQuality.HQ, s.Quantity))).Sum(r => r.Quantity),
+        };
     }
 
     private static (FieldEvidence<int> Exact, FieldEvidence<int> Reprice, FieldEvidence<int> Short) Count(
