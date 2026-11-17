@@ -47,7 +47,16 @@ internal sealed class TransferPlanWorkspace
         IReadOnlyList<TargetPlanItem> Rules,
         IReadOnlyList<TransferPlanListingLink> Links);
 
-    private sealed record AddSuggestion(string Label, ItemChoice? Item, ItemGroup? Group);
+    private sealed record AddSuggestion(
+        string Label,
+        ItemChoice? Item,
+        ItemGroup? Group,
+        GameCatalogCategory? Category = null,
+        GameCatalogCraft? Craft = null,
+        int CraftCount = 1);
+
+    /// <summary>One line to add: Quantity null adds a balanced line; a quantity sets a new line's target or raises an existing one.</summary>
+    private sealed record PlanAddEntry(uint ItemId, string Name, ItemQualityPolicy Quality, int? Quantity = null);
 
     private readonly StateRepository state;
     private readonly QuartermasterRuntimeSnapshotSource runtimeSnapshots;
@@ -59,6 +68,7 @@ internal sealed class TransferPlanWorkspace
     private readonly TransferExecutionController transferExecution;
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
     private readonly Func<string, int, IReadOnlyList<ItemChoice>> searchItems;
+    private readonly Func<GameCatalogSnapshot?> gameCatalog;
     private readonly Func<GilVendorCatalog>? vendorCatalogSource;
     private readonly Action<Guid, string> requestTransferReview;
     private readonly Action<TransferVendorProcurementReview> requestVendorReview;
@@ -90,6 +100,9 @@ internal sealed class TransferPlanWorkspace
     private Guid? noteRuleId;
     private string noteBuffer = string.Empty;
     private RemovedLines? lastRemoved;
+    private float hoverRowTop;
+    private Guid[]? pendingSelection;
+    private int pendingSelectionFrames;
 
     public TransferPlanWorkspace(
         StateRepository state,
@@ -102,6 +115,7 @@ internal sealed class TransferPlanWorkspace
         TransferExecutionController transferExecution,
         AgentBridgeUiReviewRegistry reviewRegistry,
         Func<string, int, IReadOnlyList<ItemChoice>> searchItems,
+        Func<GameCatalogSnapshot?> gameCatalog,
         Func<GilVendorCatalog>? vendorCatalogSource,
         Action<Guid, string> requestTransferReview,
         Action<TransferVendorProcurementReview> requestVendorReview,
@@ -117,6 +131,7 @@ internal sealed class TransferPlanWorkspace
         this.transferExecution = transferExecution;
         this.reviewRegistry = reviewRegistry;
         this.searchItems = searchItems;
+        this.gameCatalog = gameCatalog;
         this.vendorCatalogSource = vendorCatalogSource;
         this.requestTransferReview = requestTransferReview;
         this.requestVendorReview = requestVendorReview;
@@ -168,6 +183,115 @@ internal sealed class TransferPlanWorkspace
                 StowagePlanCatalog.SetStockRule(draft, item.ItemId, item.ItemName, item.PlayerQuantity, stow, retainerId);
             StowagePlanCatalog.Apply(document, runtime.Owner, draft);
         });
+    }
+
+    /// <summary>Adds balanced lines for items not already in the selected plan and selects every affected line.</summary>
+    public void AddItems(QuartermasterRuntimeSnapshot runtime, IEnumerable<(uint ItemId, string Name)> items) =>
+        AddToSelectedPlan(runtime, items.Select(item => new PlanAddEntry(item.ItemId, item.Name, ItemQualityPolicy.Any)).ToArray());
+
+    /// <summary>Adds a craft's materials × count: new lines target the amount, existing lines have it added.</summary>
+    public void AddMaterials(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<CraftMaterial> materials, int count) =>
+        AddToSelectedPlan(runtime, MaterialEntries(materials, count));
+
+    private static PlanAddEntry[] MaterialEntries(IReadOnlyList<CraftMaterial> materials, int count)
+    {
+        var multiplier = Math.Clamp(count, 1, CraftQuery.MaxCount);
+        return materials
+            .Select(material => new PlanAddEntry(
+                material.ItemId,
+                material.Name,
+                ItemQualityPolicy.Any,
+                (int)Math.Min(int.MaxValue, (long)material.Quantity * multiplier)))
+            .ToArray();
+    }
+
+    private void AddToSelectedPlan(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<PlanAddEntry> entries)
+    {
+        if (!runtime.Owner.HasStableIdentity || entries.Count == 0)
+            return;
+        EnsureSelection(runtime);
+        if (workbench.SelectedStowagePlanId is not { } planId)
+            return;
+        AddLines(runtime, planId, entries, selectAffected: true);
+    }
+
+    /// <summary>
+    /// Adds lines without duplicating items already planned, then (for multi-item adds) makes the
+    /// affected lines the plan's row selection so the bulk bar applies.
+    /// </summary>
+    private IReadOnlyList<Guid> AddLines(
+        QuartermasterRuntimeSnapshot runtime,
+        Guid planId,
+        IReadOnlyList<PlanAddEntry> entries,
+        bool selectAffected)
+    {
+        try
+        {
+            var affected = state.Mutate(document =>
+            {
+                var draft = StowagePlanCatalog.Draft(document, runtime.Owner, planId);
+                var ids = new List<Guid>();
+                foreach (var entry in entries)
+                {
+                    // An Any-quality add treats any line for the item as already present.
+                    var existing = draft.Rules.FirstOrDefault(rule => rule.ItemId == entry.ItemId && rule.Quality == entry.Quality) ??
+                                   (entry.Quality == ItemQualityPolicy.Any
+                                       ? draft.Rules.FirstOrDefault(rule => rule.ItemId == entry.ItemId)
+                                       : null);
+                    if (existing is null)
+                    {
+                        // New lines start balanced (target = carried) so they move nothing until a target is set.
+                        var player = TransferPlanEvaluation.PlayerQuantity(
+                            runtime.Browser,
+                            new TargetPlanItem { ItemId = entry.ItemId, Quality = entry.Quality });
+                        existing = StowagePlanCatalog.AddBalancedRule(draft, entry.ItemId, entry.Name, entry.Quality, player);
+                        if (entry.Quantity is { } quantity)
+                            existing.TargetQuantity = Math.Max(0, quantity);
+                    }
+                    else if (entry.Quantity is { } quantity)
+                    {
+                        existing.TargetQuantity = (int)Math.Min(int.MaxValue, (long)existing.TargetQuantity + Math.Max(0, quantity));
+                    }
+                    if (!ids.Contains(existing.Id))
+                        ids.Add(existing.Id);
+                }
+                StowagePlanCatalog.Apply(document, runtime.Owner, draft);
+                return ids;
+            });
+            workbench.SelectedStowagePlanId = planId;
+            showPlacement = false;
+            if (selectAffected)
+            {
+                // Applied once the plan projection includes the new lines (see ApplyPendingSelection).
+                selection.Clear();
+                pendingSelection = affected.ToArray();
+                pendingSelectionFrames = 0;
+            }
+            transferExecution.ClearInlineError();
+            return affected;
+        }
+        catch (Exception exception)
+        {
+            transferExecution.ReportInlineError(exception.Message);
+            return [];
+        }
+    }
+
+    private void ApplyPendingSelection(TransferWorkbenchProjection projection)
+    {
+        if (pendingSelection is not { } pending)
+            return;
+        var ruleIds = projection.Rules.Select(rule => rule.Id).ToHashSet();
+        if (!pending.All(ruleIds.Contains))
+        {
+            if (++pendingSelectionFrames > FocusGiveUpFrames)
+                pendingSelection = null;
+            return;
+        }
+        selection.Clear();
+        foreach (var id in pending)
+            selection.SetSelected(id, true);
+        pendingSelection = null;
     }
 
     /// <summary>Raises the selected plan's target for a listing shortfall and focuses its row.</summary>
@@ -269,7 +393,7 @@ internal sealed class TransferPlanWorkspace
             Id: "outcome"),
         new(
             "##line-menu",
-            28,
+            52,
             _ => string.Empty,
             Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoSort | ImGuiTableColumnFlags.NoResize |
                    ImGuiTableColumnFlags.NoHeaderLabel | ImGuiTableColumnFlags.NoHide,
@@ -318,6 +442,7 @@ internal sealed class TransferPlanWorkspace
             DrawPlacement(runtime, owner, selected, projection);
             return;
         }
+        ApplyPendingSelection(projection);
         selection.Retain(projection.Rules.Select(rule => rule.Id));
         if (selection.Count >= 2)
             DrawBulkBar(owner, selected, projection);
@@ -876,6 +1001,7 @@ internal sealed class TransferPlanWorkspace
 
     private void DrawSelectCell(TransferWorkbenchRow row)
     {
+        hoverRowTop = ImGui.GetCursorScreenPos().Y;
         var selected = selection.IsSelected(row.Rule.Id);
         if (ImGui.Checkbox("##select", ref selected))
             selection.SetSelected(row.Rule.Id, selected);
@@ -1114,6 +1240,7 @@ internal sealed class TransferPlanWorkspace
             noteBuffer = rule.Notes;
             ImGui.OpenPopup("line-menu");
         }
+        DrawHoverRemove(row);
         if (!ImGui.BeginPopup("line-menu"))
             return;
         Guid[] ids = [rule.Id];
@@ -1193,6 +1320,40 @@ internal sealed class TransferPlanWorkspace
         ImGui.EndPopup();
     }
 
+    private void DrawHoverRemove(TransferWorkbenchRow row)
+    {
+        ImGui.SameLine();
+        var padding = ImGui.GetStyle().CellPadding.Y;
+        var mouseY = ImGui.GetMousePos().Y;
+        var rowHovered = ImGui.IsWindowHovered() &&
+                         mouseY >= hoverRowTop - padding &&
+                         mouseY < hoverRowTop + ImGui.GetFrameHeight() + padding;
+        var ruleId = row.Rule.Id;
+        var owner = row.Owner;
+        var planId = row.PlanId;
+        if (rowHovered)
+        {
+            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+            ImGui.PushStyleColor(ImGuiCol.Button, Vector4.Zero);
+            var clicked = ImGui.SmallButton("×##remove-line");
+            ImGui.PopStyleColor(2);
+            if (clicked)
+                RemoveRules(owner, planId, [ruleId]);
+        }
+        else
+        {
+            ImGui.Dummy(new Vector2(
+                ImGui.CalcTextSize("×").X + (ImGui.GetStyle().FramePadding.X * 2f),
+                ImGui.GetTextLineHeight()));
+        }
+        reviewRegistry.RegisterLastButton(
+            $"quartermaster.transfer.line.remove.{ruleId:N}",
+            $"Remove {row.Rule.ItemName} from the plan",
+            true,
+            () => RemoveRules(owner, planId, [ruleId]),
+            "Available");
+    }
+
     // ---- Add path -------------------------------------------------------------------------
 
     private void DrawAddInput(QuartermasterRuntimeSnapshot runtime, StowagePlan plan)
@@ -1200,7 +1361,7 @@ internal sealed class TransferPlanWorkspace
         ImGui.SetNextItemWidth(-1);
         var entered = ImGui.InputTextWithHint(
             "##RQPlanAddItem",
-            "+ Add item or @group…",
+            "+ Add item, @group or #category…",
             ref addText,
             96,
             ImGuiInputTextFlags.EnterReturnsTrue);
@@ -1247,6 +1408,34 @@ internal sealed class TransferPlanWorkspace
         if (needle.Length == 0)
             return [];
         var groups = ItemGroupCatalog.All(document);
+        var catalog = gameCatalog();
+        if (needle.StartsWith('#'))
+        {
+            var categoryNeedle = needle[1..].Trim();
+            return catalog?.Categories
+                .Where(category => categoryNeedle.Length == 0 || category.Name.Contains(categoryNeedle, StringComparison.OrdinalIgnoreCase))
+                .Take(8)
+                .Select(CategorySuggestion)
+                .ToArray() ?? [];
+        }
+        if (needle.StartsWith('>'))
+        {
+            var (craftNeedle, count) = CraftQuery.Parse(needle[1..]);
+            if (craftNeedle.Length == 0 || catalog is null)
+                return [];
+            return catalog.Crafts
+                .Where(craft => craft.Item.Name.Contains(craftNeedle, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(craft => craft.Item.Name.StartsWith(craftNeedle, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                .ThenBy(craft => craft.Item.Name, StringComparer.OrdinalIgnoreCase)
+                .Take(8)
+                .Select(craft => new AddSuggestion(
+                    $">{craft.Item.Name} · {craft.Materials.Count:N0} material{(craft.Materials.Count == 1 ? string.Empty : "s")}",
+                    null,
+                    null,
+                    Craft: craft,
+                    CraftCount: count))
+                .ToArray();
+        }
         if (needle.StartsWith('@'))
         {
             var groupNeedle = needle[1..].Trim();
@@ -1265,6 +1454,10 @@ internal sealed class TransferPlanWorkspace
         }
         return cachedItemChoices
             .Select(choice => new AddSuggestion(choice.Label, choice, null))
+            .Concat(catalog?.Categories
+                .Where(category => category.Name.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                .Take(4)
+                .Select(CategorySuggestion) ?? [])
             .Concat(groups
                 .Where(group => group.Name.Contains(needle, StringComparison.OrdinalIgnoreCase))
                 .Take(4)
@@ -1273,43 +1466,30 @@ internal sealed class TransferPlanWorkspace
 
         static AddSuggestion GroupSuggestion(ItemGroup group) =>
             new($"@{group.Name} · {group.Items.Count:N0} item{(group.Items.Count == 1 ? string.Empty : "s")}", null, group);
+
+        static AddSuggestion CategorySuggestion(GameCatalogCategory category) =>
+            new($"#{category.Name} · {category.Items.Count:N0} item{(category.Items.Count == 1 ? string.Empty : "s")}", null, null, category);
     }
 
     private void AddSuggestionToPlan(QuartermasterRuntimeSnapshot runtime, StowagePlan plan, AddSuggestion suggestion)
     {
-        (uint ItemId, string Name, ItemQualityPolicy Quality)[] entries = suggestion.Item is { } item
-            ? [(item.ItemId, item.Name, ItemQualityPolicy.Any)]
-            : suggestion.Group?.Items.Select(member => (member.ItemId, member.ItemName, member.Quality)).ToArray() ?? [];
         addText = string.Empty;
-        if (entries.Length == 0)
+        if (suggestion.Item is { } item)
+        {
+            var added = AddLines(runtime, plan.Id, [new PlanAddEntry(item.ItemId, item.Name, ItemQualityPolicy.Any)], selectAffected: false);
+            if (added.Count > 0)
+                RequestTargetFocus(added[0]);
             return;
-        try
-        {
-            var firstId = state.Mutate(document =>
-            {
-                var draft = StowagePlanCatalog.Draft(document, runtime.Owner, plan.Id);
-                Guid? first = null;
-                foreach (var (itemId, name, quality) in entries)
-                {
-                    // New lines start balanced (target = carried) so they move nothing until a target is set.
-                    var player = TransferPlanEvaluation.PlayerQuantity(
-                        runtime.Browser,
-                        new TargetPlanItem { ItemId = itemId, Quality = quality });
-                    var added = StowagePlanCatalog.AddBalancedRule(draft, itemId, name, quality, player);
-                    first ??= added.Id;
-                }
-                StowagePlanCatalog.Apply(document, runtime.Owner, draft);
-                return first;
-            });
-            workbench.SelectedStowagePlanId = plan.Id;
-            if (firstId is { } id)
-                RequestTargetFocus(id);
-            transferExecution.ClearInlineError();
         }
-        catch (Exception exception)
+        PlanAddEntry[] entries = suggestion switch
         {
-            transferExecution.ReportInlineError(exception.Message);
-        }
+            { Group: { } group } => group.Items.Select(member => new PlanAddEntry(member.ItemId, member.ItemName, member.Quality)).ToArray(),
+            { Category: { } category } => category.Items.Select(member => new PlanAddEntry(member.ItemId, member.Name, ItemQualityPolicy.Any)).ToArray(),
+            { Craft: { } craft } => MaterialEntries(craft.Materials, suggestion.CraftCount),
+            _ => [],
+        };
+        if (entries.Length > 0)
+            AddLines(runtime, plan.Id, entries, selectAffected: true);
     }
 
     private void RequestTargetFocus(Guid ruleId)

@@ -148,6 +148,13 @@ internal sealed class ItemGroupWorkspace
         ImGui.EndTable();
     }
 
+    /// <summary>The group a bulk add will land in: the open draft, else the group the workspace opens first.</summary>
+    public string TargetGroupName(QuartermasterState document) =>
+        draft?.Name ??
+        (selectedGroupId is { } selectedId ? ItemGroupCatalog.All(document).FirstOrDefault(group => group.Id == selectedId)?.Name : null) ??
+        ItemGroupCatalog.All(document).FirstOrDefault()?.Name ??
+        "Item group";
+
     public int AddStockItems(QuartermasterState document, IReadOnlyList<StockGroup> items)
     {
         EnsureWorkspaceDraft(document);
