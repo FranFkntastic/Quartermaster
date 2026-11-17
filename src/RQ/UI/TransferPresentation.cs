@@ -28,37 +28,28 @@ internal static class TransferPresentation
                 StowageAction.Retrieve => Math.Min(row.Line.RetrieveQuantity, row.Line.SaddlebagQuantity) is > 0 and var fromSaddlebag
                     ? $"Retrieve {row.Line.RetrieveQuantity:N0} · {fromSaddlebag:N0} saddlebag"
                     : $"Retrieve {row.Line.RetrieveQuantity:N0}",
-                StowageAction.Deposit => $"Stow {row.Line.DepositQuantity:N0} · {RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner)}",
+                StowageAction.Deposit => RouteSummary(row.Rule.Routing, row.Runtime.Retainers, row.Runtime.Owner) is { Length: > 0 } route
+                    ? $"Stow {row.Line.DepositQuantity:N0} · {route}"
+                    : $"Stays in bags {row.Line.DepositQuantity:N0}",
                 _ => "On target · skip",
             };
 
+    /// <summary>Destinations in order ("Eris → Skrrt → Any space"); empty when there are none.</summary>
     public static string RouteSummary(
         StowageRoutingPolicy routing,
         IReadOnlyDictionary<ulong, CachedRetainer> retainers,
         OwnerScope owner)
     {
         var names = routing.PreferredRetainerIds
+            .Distinct()
             .Select(id => retainers.TryGetValue(id, out var retainer) && retainer.Owner.Matches(owner)
                 ? retainer.RetainerName
                 : $"Retainer {id}")
-            .ToArray();
-        if (names.Length == 0)
-            return routing.Mode == StowageRoutingMode.ConsolidateFirst ? "Consolidate anywhere" : "Preferred first";
-        var preferred = string.Join(" -> ", names);
-        return routing.Overflow == StowageOverflowPolicy.AnyOwnerRetainer
-            ? $"{preferred} -> any"
-            : preferred;
+            .ToList();
+        if (routing.AnySpace)
+            names.Add(AnySpaceLabel);
+        return string.Join(" → ", names);
     }
 
-    public static string RoutingModeLabel(StowageRoutingMode mode) => mode switch
-    {
-        StowageRoutingMode.HomeFirst => "Preferred retainers first",
-        _ => "Consolidate first",
-    };
-
-    public static string OverflowLabel(StowageOverflowPolicy overflow) => overflow switch
-    {
-        StowageOverflowPolicy.HoldOnPlayer => "Keep on player",
-        _ => "Any retainer",
-    };
+    public const string AnySpaceLabel = "Any space";
 }

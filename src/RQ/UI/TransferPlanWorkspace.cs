@@ -1,6 +1,5 @@
 using System.Globalization;
 using System.Numerics;
-using System.Text.Json;
 using Dalamud.Bindings.ImGui;
 using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.Automation.Vendors;
@@ -79,8 +78,8 @@ internal sealed class TransferPlanWorkspace
 
     private string bulkTarget = string.Empty;
     private ItemQualityPolicy? bulkQuality;
-    private StowageRoutingMode? bulkRoutingMode;
-    private StowageOverflowPolicy? bulkOverflow;
+    private readonly PlacementMatrix<Guid> placement;
+    private bool showPlacement;
 
     private string addText = string.Empty;
     private string cachedItemSearch = string.Empty;
@@ -123,6 +122,7 @@ internal sealed class TransferPlanWorkspace
         this.requestVendorReview = requestVendorReview;
         this.requestDeletePlan = requestDeletePlan;
         transferWorkbenchTable = CreateTable();
+        placement = new PlacementMatrix<Guid>("quartermaster.transfer.placement", "Stow", reviewRegistry);
     }
 
     public TransferPlanWorkspaceSnapshot Snapshot() =>
@@ -313,13 +313,61 @@ internal sealed class TransferPlanWorkspace
         DrawVendorRunStatus();
 
         ImGui.Separator();
+        if (showPlacement)
+        {
+            DrawPlacement(runtime, owner, selected, projection);
+            return;
+        }
         selection.Retain(projection.Rules.Select(rule => rule.Id));
         if (selection.Count >= 2)
             DrawBulkBar(owner, selected, projection);
         else
             DrawSummary(projection);
+        UiLayout.SameLineIfFits("Placement");
+        if (ImGui.Button("Placement##RQTransferPlacement"))
+            OpenPlacement(null);
+        reviewRegistry.RegisterLastButton("quartermaster.transfer.placement.open", "Edit placement for this plan's lines", true,
+            () => OpenPlacement(null), $"lines={projection.Rules.Count:N0}");
         DrawUndoStrip(owner, selected);
         DrawTable(runtime, selected, projection);
+    }
+
+    // ---- Placement ------------------------------------------------------------------------
+
+    private void OpenPlacement(Guid? ruleId)
+    {
+        showPlacement = true;
+        placement.ClearSelection();
+        if (ruleId is { } id)
+            placement.Select(id);
+    }
+
+    private void DrawPlacement(
+        QuartermasterRuntimeSnapshot runtime,
+        OwnerScope owner,
+        StowagePlan plan,
+        TransferWorkbenchProjection projection)
+    {
+        if (ImGui.Button("Return to plan##RQTransferPlacementReturn"))
+            showPlacement = false;
+        reviewRegistry.RegisterLastButton("quartermaster.transfer.placement.return", "Return to the plan lines", true,
+            () => showPlacement = false, "Ready");
+        var rows = projection.Rows
+            .Select(row => new PlacementMatrixRow<Guid>(
+                row.Rule.Id,
+                row.Rule.Id.ToString("N"),
+                row.Rule.Quality == ItemQualityPolicy.Any ? row.Rule.ItemName : $"{row.Rule.ItemName} {QualityLabel(row.Rule.Quality)}",
+                (row.Line?.DepositQuantity ?? 0).ToString("N0"),
+                row.Rule.Routing,
+                PlacementMatrixData.Holdings(runtime, row.Rule.ItemId, row.Rule.Quality)))
+            .ToArray();
+        var columns = PlacementMatrixData.Columns(runtime, rows.Select(row => row.Routing));
+        placement.Draw(rows, rows, columns, changes =>
+        {
+            var routing = changes.ToDictionary(change => change.Key, change => change.Routing);
+            return MutateRules(owner, plan.Id, routing.Keys.ToArray(),
+                rule => rule.Routing = routing[rule.Id].Copy());
+        });
     }
 
     // ---- Header -------------------------------------------------------------------------
@@ -711,61 +759,26 @@ internal sealed class TransferPlanWorkspace
             ImGui.EndCombo();
         }
 
-        SameLineIfRoom(ImGui.CalcTextSize("Destination").X + ImGui.GetStyle().ItemSpacing.X + 150);
-        ImGui.TextDisabled("Destination");
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(150);
-        var destinationParts = new[]
-        {
-            bulkRoutingMode is { } mode ? TransferPresentation.RoutingModeLabel(mode) : null,
-            bulkOverflow is { } overflow ? TransferPresentation.OverflowLabel(overflow) : null,
-        }.Where(part => part is not null).ToArray();
-        if (ImGui.BeginCombo("##RQBulkDestination", destinationParts.Length == 0 ? "—" : string.Join(" · ", destinationParts)))
-        {
-            ImGui.TextDisabled("Placement");
-            if (ImGui.Selectable("—##bulk-mode", bulkRoutingMode is null, ImGuiSelectableFlags.DontClosePopups))
-                bulkRoutingMode = null;
-            foreach (var value in Enum.GetValues<StowageRoutingMode>())
-                if (ImGui.Selectable(TransferPresentation.RoutingModeLabel(value), bulkRoutingMode == value, ImGuiSelectableFlags.DontClosePopups))
-                    bulkRoutingMode = value;
-            ImGui.Separator();
-            ImGui.TextDisabled("Overflow");
-            if (ImGui.Selectable("—##bulk-overflow", bulkOverflow is null, ImGuiSelectableFlags.DontClosePopups))
-                bulkOverflow = null;
-            foreach (var value in Enum.GetValues<StowageOverflowPolicy>())
-                if (ImGui.Selectable(TransferPresentation.OverflowLabel(value), bulkOverflow == value, ImGuiSelectableFlags.DontClosePopups))
-                    bulkOverflow = value;
-            ImGui.EndCombo();
-        }
-
         int? target = bulkTarget.Length > 0 &&
                       int.TryParse(bulkTarget, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed)
             ? parsed
             : null;
-        var canApply = target.HasValue || bulkQuality.HasValue || bulkRoutingMode.HasValue || bulkOverflow.HasValue;
+        var canApply = target.HasValue || bulkQuality.HasValue;
         UiLayout.SameLineIfFits("Apply");
         ImGui.BeginDisabled(!canApply);
         if (ImGui.Button("Apply##RQBulk"))
         {
             var applyQuality = bulkQuality;
-            var applyMode = bulkRoutingMode;
-            var applyOverflow = bulkOverflow;
             if (MutateRules(owner, plan.Id, selectedIds, rule =>
                 {
                     if (target is { } value)
                         rule.TargetQuantity = Math.Max(0, value);
                     if (applyQuality is { } q)
                         rule.Quality = q;
-                    if (applyMode is { } m)
-                        rule.Routing.Mode = m;
-                    if (applyOverflow is { } o)
-                        rule.Routing.Overflow = o;
                 }))
             {
                 bulkTarget = string.Empty;
                 bulkQuality = null;
-                bulkRoutingMode = null;
-                bulkOverflow = null;
             }
         }
         ImGui.EndDisabled();
@@ -778,8 +791,6 @@ internal sealed class TransferPlanWorkspace
             selection.Clear();
             bulkTarget = string.Empty;
             bulkQuality = null;
-            bulkRoutingMode = null;
-            bulkOverflow = null;
         }
     }
 
@@ -877,8 +888,9 @@ internal sealed class TransferPlanWorkspace
         ImGui.TextUnformatted(rule.ItemName);
         if (rule.Quality != ItemQualityPolicy.Any)
             Tag(QualityLabel(rule.Quality));
-        if (!IsDefaultRouting(rule.Routing))
-            Tag($"-> {TransferPresentation.RouteSummary(rule.Routing, row.Runtime.Retainers, row.Owner)}");
+        var routeSummary = TransferPresentation.RouteSummary(rule.Routing, row.Runtime.Retainers, row.Owner);
+        if (routeSummary.Length > 0)
+            Tag($"→ {routeSummary}");
         if (!string.IsNullOrWhiteSpace(rule.Notes))
         {
             Tag("note");
@@ -900,11 +912,6 @@ internal sealed class TransferPlanWorkspace
             ImGui.TextDisabled(text);
         }
     }
-
-    private static bool IsDefaultRouting(StowageRoutingPolicy routing) =>
-        routing.Mode == StowageRoutingMode.ConsolidateFirst &&
-        routing.Overflow == StowageOverflowPolicy.AnyOwnerRetainer &&
-        routing.PreferredRetainerIds.Count == 0;
 
     private static string TransferTargetText(TransferWorkbenchRow row) =>
         TransferWorkbenchPresentation.Target(
@@ -987,6 +994,7 @@ internal sealed class TransferPlanWorkspace
             {
                 projection.Stow > 0 ? $"Stow {projection.Stow:N0}" : null,
                 projection.NoRoom > 0 ? $"no room for {projection.NoRoom:N0}" : null,
+                projection.KeptInBags > 0 ? $"stays in bags {projection.KeptInBags:N0}" : null,
             }.Where(part => part is not null)),
             _ => string.Join(" · ", new[]
             {
@@ -1032,6 +1040,8 @@ internal sealed class TransferPlanWorkspace
                     Part($"Stow {projection.Stow:N0}", TransferPresentation.ActionColor(StowageAction.Deposit));
                 if (projection.NoRoom > 0)
                     Part($"no room for {projection.NoRoom:N0}", ErrorColor);
+                if (projection.KeptInBags > 0)
+                    Part($"stays in bags {projection.KeptInBags:N0}", ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
                 return;
         }
 
@@ -1155,14 +1165,9 @@ internal sealed class TransferPlanWorkspace
         ImGui.EndDisabled();
 
         ImGui.Separator();
-        ImGui.TextDisabled("Destination");
-        var routing = StowagePlanCatalog.CopyRule(rule, row.PlanId, false).Routing;
-        var before = JsonSerializer.Serialize(routing);
-        RoutingPolicyEditor.DrawDestination(routing, row.Runtime);
-        ImGui.TextDisabled("Overflow");
-        RoutingPolicyEditor.DrawOverflow(routing);
-        if (before != JsonSerializer.Serialize(routing))
-            MutateRules(row.Owner, row.PlanId, ids, draftRule => draftRule.Routing = routing);
+        var summary = TransferPresentation.RouteSummary(rule.Routing, row.Runtime.Retainers, row.Owner);
+        if (ImGui.Selectable(summary.Length == 0 ? "Placement" : $"Placement · {summary}"))
+            OpenPlacement(rule.Id);
 
         ImGui.Separator();
         ImGui.TextDisabled("Note");
@@ -1637,7 +1642,8 @@ internal sealed class TransferPlanWorkspace
                     routedDepositQuantity,
                     line?.SaddlebagQuantity ?? 0,
                     vendorLine?.IsReady == true ? vendorLine.ApprovedQuantity : 0,
-                    retrievalLine?.Status == PlanLineStatus.StockUnverified);
+                    retrievalLine?.Status == PlanLineStatus.StockUnverified,
+                    rule.Routing.AnySpace || rule.Routing.PreferredRetainerIds.Count > 0);
                 return new TransferWorkbenchRow(
                     rule,
                     line,

@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace RQ.Domain;
@@ -146,23 +148,81 @@ public enum ItemQualityPolicy
     HqOnly,
 }
 
-public enum StowageRoutingMode
+/// <summary>
+/// Where surplus of one item is deposited: the listed retainers in order, then, only when
+/// <see cref="AnySpace"/> is set, any other owner retainer with room. Anything left stays
+/// in the player's bags. An empty list without <see cref="AnySpace"/> deposits nothing.
+/// </summary>
+public sealed class StowageRoutingPolicy : IJsonOnDeserialized
 {
-    ConsolidateFirst,
-    HomeFirst,
-}
+    private bool anySpace;
+    private bool anySpaceRead;
+    private bool legacyShapeRead;
+    private bool? legacyOverflowAnywhere;
 
-public enum StowageOverflowPolicy
-{
-    AnyOwnerRetainer,
-    HoldOnPlayer,
-}
-
-public sealed class StowageRoutingPolicy
-{
-    public StowageRoutingMode Mode { get; set; } = StowageRoutingMode.ConsolidateFirst;
     public List<ulong> PreferredRetainerIds { get; set; } = [];
-    public StowageOverflowPolicy Overflow { get; set; } = StowageOverflowPolicy.AnyOwnerRetainer;
+
+    public bool AnySpace
+    {
+        get => anySpace;
+        set
+        {
+            anySpace = value;
+            anySpaceRead = true;
+        }
+    }
+
+    /// <summary>Pre-matrix placement mode. Read once while loading old data; never written.</summary>
+    [JsonPropertyName("mode")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public JsonElement? LegacyMode
+    {
+        get => null;
+        set => legacyShapeRead |= value is not null;
+    }
+
+    /// <summary>Pre-matrix overflow policy (0/"AnyOwnerRetainer", 1/"HoldOnPlayer"). Read once while loading old data; never written.</summary>
+    [JsonPropertyName("overflow")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public JsonElement? LegacyOverflow
+    {
+        get => null;
+        set
+        {
+            if (value is not { } element)
+                return;
+            legacyShapeRead = true;
+            legacyOverflowAnywhere = element.ValueKind switch
+            {
+                JsonValueKind.Number when element.TryGetInt32(out var number) => number != 1,
+                JsonValueKind.String => !string.Equals(element.GetString(), "HoldOnPlayer", StringComparison.OrdinalIgnoreCase),
+                _ => null,
+            };
+        }
+    }
+
+    void IJsonOnDeserialized.OnDeserialized()
+    {
+        // Old shapes carried the fallback in Overflow, whose default was AnyOwnerRetainer.
+        if (legacyShapeRead && !anySpaceRead)
+            anySpace = legacyOverflowAnywhere ?? true;
+        PreferredRetainerIds ??= [];
+        legacyShapeRead = false;
+        legacyOverflowAnywhere = null;
+    }
+
+    public StowageRoutingPolicy Copy() => new()
+    {
+        PreferredRetainerIds = PreferredRetainerIds.Distinct().ToList(),
+        AnySpace = AnySpace,
+    };
+
+    public bool SameAs(StowageRoutingPolicy? other) =>
+        other is not null && AnySpace == other.AnySpace && PreferredRetainerIds.SequenceEqual(other.PreferredRetainerIds);
+
+    public static StowageRoutingPolicy CopyOf(StowageRoutingPolicy? source) => source?.Copy() ?? new();
 }
 
 public sealed class StowagePlan

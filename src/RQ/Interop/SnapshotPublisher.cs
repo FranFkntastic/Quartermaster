@@ -324,9 +324,11 @@ public sealed class SnapshotPublisher
                                 rule.AllowVendorPurchase,
                                 routing = new
                                 {
-                                    mode = (rule.Routing?.Mode ?? StowageRoutingMode.ConsolidateFirst).ToString(),
+                                    // MarketMafioso parses mode/overflow strictly; keep legal legacy values.
+                                    mode = "HomeFirst",
                                     preferredRetainerIds = rule.Routing?.PreferredRetainerIds ?? [],
-                                    overflow = (rule.Routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer).ToString(),
+                                    overflow = rule.Routing?.AnySpace == true ? "AnyOwnerRetainer" : "HoldOnPlayer",
+                                    anySpace = rule.Routing?.AnySpace == true,
                                 },
                                 rule.Enabled,
                                 evaluated = line is null ? null : new

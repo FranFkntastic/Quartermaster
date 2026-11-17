@@ -76,10 +76,5 @@ internal static class TransferPlanEvaluation
             1,
             int.MaxValue));
 
-    private static StowageRoutingPolicy CopyRouting(StowageRoutingPolicy? routing) => new()
-    {
-        Mode = routing?.Mode ?? StowageRoutingMode.ConsolidateFirst,
-        Overflow = routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
-        PreferredRetainerIds = routing?.PreferredRetainerIds.ToList() ?? [],
-    };
+    private static StowageRoutingPolicy CopyRouting(StowageRoutingPolicy? routing) => StowageRoutingPolicy.CopyOf(routing);
 }

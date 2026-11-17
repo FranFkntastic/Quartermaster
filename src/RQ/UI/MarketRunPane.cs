@@ -1,6 +1,7 @@
 using Franthropy.Dalamud.UI.Inputs;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Franthropy.Dalamud.AgentBridge;
 using RQ.Domain;
 using RQ.Interop;
 using RQ.Planning;
@@ -23,6 +24,15 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
     private IReadOnlyList<MarketRunItem> items = [];
     internal MarketRunExecutor? Executor { get; set; }
     internal MarketRunHistoryWindow? History { get; set; }
+    /// <summary>Opens the Market Placement view, filtered to the named item when given.</summary>
+    internal Action<string?>? OpenPlacement { get; set; }
+    internal AgentBridgeUiReviewRegistry? Registry { get; set; }
+
+    internal IReadOnlyList<MarketRunItem> Items(QuartermasterRuntimeSnapshot runtime, ListingPlanDraftSession session)
+    {
+        Update(runtime, session);
+        return items;
+    }
     internal MarketRunRetainer? Retainer(QuartermasterRuntimeSnapshot runtime, ListingPlanDraftSession session, ulong id)
     {
         Update(runtime, session);
@@ -55,13 +65,20 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         ImGui.TextUnformatted(MarketRunPresentation.Header(run));
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Refill, short, pull and no-slot counts are listing slots; craft is item units. These are projections from the current draft and observations, not completed actions. Reserve table quantities are item units across the evaluated scope, not counts at the selected reserve destination.");
         DrawExecution(runtime, session);
-        ImGui.Separator(); ImGui.TextUnformatted("Reserves");
+        ImGui.Separator(); ImGui.AlignTextToFramePadding(); ImGui.TextUnformatted("Reserves");
+        if (OpenPlacement is { } openPlacement)
+        {
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Placement##RQReservePlacement")) openPlacement(null);
+            Registry?.RegisterLastButton("quartermaster.listings.reserves.placement", "Open the Market placement view", true,
+                () => openPlacement(null), $"items={items.Count:N0}");
+        }
         var width = ImGui.GetContentRegionAvail().X;
         var paneClipMin = ImGui.GetWindowDrawList().GetClipRectMin();
         var paneClipMax = ImGui.GetWindowDrawList().GetClipRectMax();
         var full = width >= 650;
         var listed = width >= 400;
-        if (ImGui.BeginTable("RQMarketReserves", full ? 6 : listed ? 4 : 3,
+        if (ImGui.BeginTable("RQMarketReserves", full ? 7 : listed ? 4 : 3,
             ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.SizingStretchProp))
         {
             ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch);
@@ -70,6 +87,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
             ImGui.TableSetupColumn("Reserve", ImGuiTableColumnFlags.WidthFixed, 65);
             if (full) ImGui.TableSetupColumn("After run", ImGuiTableColumnFlags.WidthFixed, 65);
             ImGui.TableSetupColumn("To craft", ImGuiTableColumnFlags.WidthFixed, 60);
+            if (full) ImGui.TableSetupColumn("Goes to", ImGuiTableColumnFlags.WidthStretch, .6f);
             ImGui.TableHeadersRow();
             foreach (var item in items)
             {
@@ -95,27 +113,19 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
                 }
                 if (full) { ImGui.TableNextColumn(); ImGui.TextUnformatted(MarketRunPresentation.Number(item.ReserveAfterRun)); }
                 ImGui.TableNextColumn(); ImGui.TextUnformatted(MarketRunPresentation.Number(item.CraftUnits));
+                var goesTo = reserve is null ? string.Empty : TransferPresentation.RouteSummary(reserve.Location, runtime.Retainers, runtime.Owner);
+                if (full) { ImGui.TableNextColumn(); DrawGoesTo(item, goesTo, "column"); }
                 if (open)
                 {
                     ImGui.TableNextRow(); ImGui.TableSetColumnIndex(0);
                     // Span columns without escaping the run pane's scrolling clip rectangle.
                     ImGui.PushClipRect(paneClipMin, paneClipMax, false);
-                    if (ImGui.BeginChild("detail", new Vector2(width - 8, ImGui.GetFrameHeightWithSpacing() * (reserve is null ? 2 : 4) + (listed ? 0 : ImGui.GetTextLineHeightWithSpacing()) + (full ? 0 : ImGui.GetTextLineHeightWithSpacing())), false))
+                    if (ImGui.BeginChild("detail", new Vector2(width - 8, ImGui.GetFrameHeightWithSpacing() * ((full ? 0 : 1) + (reserve is null ? 0 : 1)) + ImGui.GetTextLineHeightWithSpacing() * ((listed ? 0 : 1) + (full ? 0 : 1)) + 4), false))
                     {
                         if (!listed) ImGui.TextUnformatted($"Listed {MarketRunPresentation.InPlace(run, item)} / {item.PlannedUnits:N0}");
                         if (!full) ImGui.TextUnformatted($"Spare {MarketRunPresentation.Number(item.SpareUnits)} · After run {MarketRunPresentation.Number(item.ReserveAfterRun)}");
-                        // The location is editable before a level is typed; changing it creates the rule.
-                        var current = reserve?.Location ?? new StowageRoutingPolicy();
-                        var location = ListingPlanCatalog.CopyLocation(current);
-                        RoutingPolicyEditor.DrawDestination(location, runtime);
-                        RoutingPolicyEditor.DrawOverflow(location);
-                        if (location.Mode != current.Mode || location.Overflow != current.Overflow ||
-                            !location.PreferredRetainerIds.SequenceEqual(current.PreferredRetainerIds))
-                        {
-                            reserve ??= session.AddReserve(item.ItemId, item.ItemName, item.Quality);
-                            session.SetReserveLocation(reserve.Id, location);
-                        }
-                        else if (reserve is not null)
+                        if (!full) DrawGoesTo(item, goesTo, "detail");
+                        if (reserve is not null)
                         {
                             var enabled = reserve.Enabled;
                             if (ImGui.Checkbox("Reserve enabled", ref enabled)) session.SetReserveEnabled(reserve.Id, enabled);
@@ -227,6 +237,23 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         { status = $"Could not save craft queue: {ex.Message}"; }
+    }
+
+    /// <summary>Destinations in order; activating it opens Placement filtered to this item.</summary>
+    private void DrawGoesTo(MarketRunItem item, string summary, string where)
+    {
+        if (OpenPlacement is not { } openPlacement)
+        {
+            ImGui.TextUnformatted(summary);
+            return;
+        }
+        ImGui.AlignTextToFramePadding();
+        if (ImGui.Selectable($"{(summary.Length == 0 && where == "detail" ? "—" : summary)}##goes-to-{where}")) openPlacement(item.ItemName);
+        if (ImGui.IsItemHovered() && summary.Length > 0 && ImGui.CalcTextSize(summary).X > ImGui.GetItemRectSize().X)
+            ImGui.SetTooltip(summary);
+        Registry?.RegisterLastButton($"quartermaster.listings.reserves.goes-to.{where}.{item.ItemId}-{item.Quality}",
+            $"Open placement for {Label(item.ItemName, item.Quality)}", true, () => openPlacement(item.ItemName),
+            summary.Length == 0 ? "none" : summary);
     }
 
     private static string Label(string name, ItemQualityPolicy quality) => $"{name} {(quality == ItemQualityPolicy.HqOnly ? "HQ" : "NQ")}";

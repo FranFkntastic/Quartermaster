@@ -638,22 +638,12 @@ public sealed class OperationJournal
         ItemName = item.ItemName,
         TargetQuantity = item.TargetQuantity,
         Quality = item.Quality,
-        Routing = new StowageRoutingPolicy
-        {
-            Mode = item.Routing?.Mode ?? StowageRoutingMode.ConsolidateFirst,
-            Overflow = item.Routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
-            PreferredRetainerIds = item.Routing?.PreferredRetainerIds.ToList() ?? [],
-        },
+        Routing = StowageRoutingPolicy.CopyOf(item.Routing),
         Notes = item.Notes,
         Enabled = item.Enabled,
     };
 
-    private static StowageRoutingPolicy CopyRouting(StowageRoutingPolicy? routing) => new()
-    {
-        Mode = routing?.Mode ?? StowageRoutingMode.ConsolidateFirst,
-        Overflow = routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
-        PreferredRetainerIds = routing?.PreferredRetainerIds.ToList() ?? [],
-    };
+    private static StowageRoutingPolicy CopyRouting(StowageRoutingPolicy? routing) => StowageRoutingPolicy.CopyOf(routing);
 
     public static string VariantKey(uint itemId, bool isHighQuality) =>
         $"{itemId}:{(isHighQuality ? "hq" : "nq")}";

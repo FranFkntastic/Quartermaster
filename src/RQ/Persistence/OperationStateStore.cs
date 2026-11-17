@@ -480,12 +480,7 @@ internal sealed class OperationStateStore
             ItemName = item.ItemName,
             TargetQuantity = item.TargetQuantity,
             Quality = item.Quality,
-            Routing = new StowageRoutingPolicy
-            {
-                Mode = item.Routing?.Mode ?? StowageRoutingMode.ConsolidateFirst,
-                Overflow = item.Routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
-                PreferredRetainerIds = item.Routing?.PreferredRetainerIds.ToList() ?? [],
-            },
+            Routing = StowageRoutingPolicy.CopyOf(item.Routing),
             Notes = item.Notes,
             Enabled = item.Enabled,
         }).ToList(),
@@ -512,12 +507,7 @@ internal sealed class OperationStateStore
             ShortageQuantity = line.ShortageQuantity,
             TransferredQuantity = line.TransferredQuantity,
             MaxStackSize = line.MaxStackSize,
-            Routing = new StowageRoutingPolicy
-            {
-                Mode = line.Routing?.Mode ?? StowageRoutingMode.ConsolidateFirst,
-                Overflow = line.Routing?.Overflow ?? StowageOverflowPolicy.AnyOwnerRetainer,
-                PreferredRetainerIds = line.Routing?.PreferredRetainerIds.ToList() ?? [],
-            },
+            Routing = StowageRoutingPolicy.CopyOf(line.Routing),
         }).ToList(),
     };
 }
