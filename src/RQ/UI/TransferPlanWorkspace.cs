@@ -100,7 +100,6 @@ internal sealed class TransferPlanWorkspace
     private Guid? noteRuleId;
     private string noteBuffer = string.Empty;
     private RemovedLines? lastRemoved;
-    private float hoverRowTop;
     private Guid[]? pendingSelection;
     private int pendingSelectionFrames;
 
@@ -1001,7 +1000,6 @@ internal sealed class TransferPlanWorkspace
 
     private void DrawSelectCell(TransferWorkbenchRow row)
     {
-        hoverRowTop = ImGui.GetCursorScreenPos().Y;
         var selected = selection.IsSelected(row.Rule.Id);
         if (ImGui.Checkbox("##select", ref selected))
             selection.SetSelected(row.Rule.Id, selected);
@@ -1322,12 +1320,13 @@ internal sealed class TransferPlanWorkspace
 
     private void DrawHoverRemove(TransferWorkbenchRow row)
     {
-        ImGui.SameLine();
+        // The line menu button was just drawn in this row; its rect is the row's vertical extent.
         var padding = ImGui.GetStyle().CellPadding.Y;
+        var rowTop = ImGui.GetItemRectMin().Y - padding;
+        var rowBottom = ImGui.GetItemRectMax().Y + padding;
+        ImGui.SameLine();
         var mouseY = ImGui.GetMousePos().Y;
-        var rowHovered = ImGui.IsWindowHovered() &&
-                         mouseY >= hoverRowTop - padding &&
-                         mouseY < hoverRowTop + ImGui.GetFrameHeight() + padding;
+        var rowHovered = ImGui.IsWindowHovered() && mouseY >= rowTop && mouseY < rowBottom;
         var ruleId = row.Rule.Id;
         var owner = row.Owner;
         var planId = row.PlanId;
