@@ -11,14 +11,14 @@ namespace RQ.UI;
 
 /// <summary>
 /// The stock browser's "Every item in the game" scope: the game catalog grouped by item
-/// category, with a selection that survives filtering and one add button for the open
-/// right-hand tab.
+/// category. Selection is the stock browser's shared item selection.
 /// </summary>
 internal sealed class CatalogPicker
 {
     public const string ScopeLabel = "Every item in the game";
 
-    private readonly record struct PickerRow(GameCatalogCategory Category, GameCatalogItem? Item, uint[] VisibleIds);
+    /// <param name="KeyIndex">The item row's index in the displayed item keys; -1 for category rows.</param>
+    private readonly record struct PickerRow(GameCatalogCategory Category, GameCatalogItem? Item, uint[] VisibleIds, int KeyIndex);
 
     private readonly record struct RowsKey(
         GameCatalogSnapshot Catalog,
@@ -31,7 +31,7 @@ internal sealed class CatalogPicker
 
     private readonly GameItemCatalog catalog;
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
-    private readonly HashSet<uint> selection = [];
+    private readonly TableSelectionModel<uint> selection;
     private readonly HashSet<uint> expanded = [];
     private readonly HashSet<uint> searchCollapsed = [];
     private readonly Dictionary<uint, int> have = [];
@@ -45,20 +45,23 @@ internal sealed class CatalogPicker
     private int expansionVersion;
     private RowsKey? rowsKey;
     private IReadOnlyList<PickerRow> rows = [];
+    private uint[] displayedIds = [];
     private bool allExpanded;
-    private uint? rangeAnchor;
 
-    public CatalogPicker(GameItemCatalog catalog, AgentBridgeUiReviewRegistry reviewRegistry)
+    public CatalogPicker(GameItemCatalog catalog, AgentBridgeUiReviewRegistry reviewRegistry, TableSelectionModel<uint> selection)
     {
         this.catalog = catalog;
         this.reviewRegistry = reviewRegistry;
+        this.selection = selection;
     }
-
-    public int SelectedCount => selection.Count;
 
     public int VisibleCount { get; private set; }
 
-    public void ClearSelection() => selection.Clear();
+    /// <summary>Every item matching the search, Owned, and level filters, regardless of category collapse.</summary>
+    public VisibleItemIds Visible { get; } = new();
+
+    /// <summary>Whether search, Owned, or the level range currently narrows the catalog.</summary>
+    public bool NarrowingActive { get; private set; }
 
     public void DrawSearch(float width)
     {
@@ -83,17 +86,8 @@ internal sealed class CatalogPicker
             });
     }
 
-    /// <param name="addLabel">The primary button label, e.g. <c>Add 12 to plan</c>.</param>
-    /// <param name="canAdd">Whether the destination can accept items right now.</param>
-    /// <param name="add">Adds the selected catalog items to the open right-hand destination.</param>
-    /// <param name="drawContextMenu">Draws a catalog row's context menu items, or returns false when it has none.</param>
-    public void Draw(
-        QuartermasterRuntimeSnapshot runtime,
-        string addLabel,
-        bool canAdd,
-        Action<IReadOnlyList<GameCatalogItem>> add,
-        Func<GameCatalogItem, bool> hasContextMenu,
-        Action<GameCatalogItem> drawContextMenu)
+    /// <summary>Draws the Owned and level narrowing row and resolves the rows the table will show.</summary>
+    public void DrawFilters(QuartermasterRuntimeSnapshot runtime)
     {
         var snapshot = catalog.TryGet();
         if (snapshot is not null && !levelsInitialized)
@@ -104,13 +98,50 @@ internal sealed class CatalogPicker
         }
         RefreshHave(runtime);
         DrawNarrowing(snapshot);
+        if (snapshot is not null)
+            ResolveRows(snapshot);
+        else
+        {
+            rows = [];
+            displayedIds = [];
+            rowsKey = null;
+            VisibleCount = 0;
+            NarrowingActive = false;
+            Visible.Set(rows, []);
+        }
+    }
 
-        var style = ImGui.GetStyle();
-        var footerHeight = ImGui.GetFrameHeight() + style.ItemSpacing.Y + style.ItemSpacing.Y + 1f;
-        var tableHeight = Math.Max(120f, ImGui.GetContentRegionAvail().Y - footerHeight);
-        var visible = snapshot is null ? [] : ResolveRows(snapshot);
-        DrawTable(visible, tableHeight, hasContextMenu, drawContextMenu);
-        DrawFooter(snapshot, addLabel, canAdd, add);
+    /// <param name="drawContextMenu">Draws a catalog row's context menu items, or returns false when it has none.</param>
+    public void DrawTable(Func<GameCatalogItem, bool> hasContextMenu, Action<GameCatalogItem> drawContextMenu)
+    {
+        var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY |
+                    ImGuiTableFlags.SizingStretchProp;
+        var height = Math.Max(120f, ImGui.GetContentRegionAvail().Y);
+        if (!ImGui.BeginTable("RQCatalogPicker", 3, flags, new Vector2(0, height)))
+            return;
+        try
+        {
+            ImGui.TableSetupScrollFreeze(0, 1);
+            ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1f);
+            ImGui.TableSetupColumn("Lv", ImGuiTableColumnFlags.WidthFixed, 44);
+            ImGui.TableSetupColumn("Have", ImGuiTableColumnFlags.WidthFixed, 72);
+            ImGui.TableHeadersRow();
+            var rowHeight = ImGui.GetFrameHeight();
+            var visible = rows;
+            DalamudVirtualizedRows.Draw(visible, (row, _) =>
+            {
+                ImGui.TableNextRow(ImGuiTableRowFlags.None, rowHeight);
+                if (row.Item is { } item)
+                    DrawItemRow(item, row.KeyIndex, hasContextMenu, drawContextMenu);
+                else
+                    DrawCategoryRow(row);
+            });
+            DalamudTableSelectionRenderer.EndRows(selection);
+        }
+        finally
+        {
+            ImGui.EndTable();
+        }
     }
 
     private void RefreshHave(QuartermasterRuntimeSnapshot runtime)
@@ -219,7 +250,7 @@ internal sealed class CatalogPicker
             expansionVersion++;
     }
 
-    private IReadOnlyList<PickerRow> ResolveRows(GameCatalogSnapshot snapshot)
+    private void ResolveRows(GameCatalogSnapshot snapshot)
     {
         var needle = search.Trim();
         if (!string.Equals(needle, lastSearch, StringComparison.Ordinal))
@@ -231,12 +262,14 @@ internal sealed class CatalogPicker
         }
         var min = Math.Clamp(levelMin, snapshot.MinItemLevel, snapshot.MaxItemLevel);
         var max = Math.Clamp(levelMax, min, snapshot.MaxItemLevel);
+        NarrowingActive = needle.Length > 0 || owned || min > snapshot.MinItemLevel || max < snapshot.MaxItemLevel;
         var key = new RowsKey(snapshot, needle, owned, min, max, owned ? haveRevision : -1, expansionVersion);
         if (rowsKey == key)
-            return rows;
+            return;
 
         var built = new List<PickerRow>();
-        var visibleCount = 0;
+        var displayed = new List<uint>();
+        var matching = new List<uint>();
         var everyCategoryOpen = true;
         foreach (var category in snapshot.Categories)
         {
@@ -249,63 +282,35 @@ internal sealed class CatalogPicker
                 .ToArray();
             if (visible.Length == 0)
                 continue;
-            visibleCount += visible.Length;
-            built.Add(new PickerRow(category, null, visible.Select(item => item.ItemId).ToArray()));
+            var ids = visible.Select(item => item.ItemId).ToArray();
+            matching.AddRange(ids);
+            built.Add(new PickerRow(category, null, ids, -1));
             if (!IsOpen(category.Id))
             {
                 everyCategoryOpen = false;
                 continue;
             }
             foreach (var item in visible)
-                built.Add(new PickerRow(category, item, []));
+            {
+                built.Add(new PickerRow(category, item, [], displayed.Count));
+                displayed.Add(item.ItemId);
+            }
         }
         rows = built;
         rowsKey = key;
+        displayedIds = displayed.ToArray();
         // Cached with the rows: scanning ~50k expanded rows every frame for this label was the
         // picker's main steady per-frame cost.
         allExpanded = built.Count > 0 && everyCategoryOpen;
-        VisibleCount = visibleCount;
-        return rows;
-    }
-
-    private void DrawTable(
-        IReadOnlyList<PickerRow> visible,
-        float height,
-        Func<GameCatalogItem, bool> hasContextMenu,
-        Action<GameCatalogItem> drawContextMenu)
-    {
-        var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY |
-                    ImGuiTableFlags.SizingStretchProp;
-        if (!ImGui.BeginTable("RQCatalogPicker", 3, flags, new Vector2(0, height)))
-            return;
-        try
-        {
-            ImGui.TableSetupScrollFreeze(0, 1);
-            ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1f);
-            ImGui.TableSetupColumn("Lv", ImGuiTableColumnFlags.WidthFixed, 44);
-            ImGui.TableSetupColumn("Have", ImGuiTableColumnFlags.WidthFixed, 72);
-            ImGui.TableHeadersRow();
-            var rowHeight = ImGui.GetFrameHeight();
-            DalamudVirtualizedRows.Draw(visible, (row, _) =>
-            {
-                ImGui.TableNextRow(ImGuiTableRowFlags.None, rowHeight);
-                if (row.Item is { } item)
-                    DrawItemRow(visible, item, hasContextMenu, drawContextMenu);
-                else
-                    DrawCategoryRow(row);
-            });
-        }
-        finally
-        {
-            ImGui.EndTable();
-        }
+        VisibleCount = matching.Count;
+        Visible.Set(built, matching.ToArray());
     }
 
     private void DrawCategoryRow(PickerRow row)
     {
         var category = row.Category;
         var ids = row.VisibleIds;
-        var selectedCount = ids.Count(selection.Contains);
+        var selectedCount = CountSelected(ids);
         var all = selectedCount == ids.Length;
         var mixed = selectedCount > 0 && !all;
 
@@ -323,7 +328,7 @@ internal sealed class CatalogPicker
             $"quartermaster.catalog.category.{category.Id}",
             $"Select every visible {category.Name} item",
             true,
-            () => ToggleCategory(category.Id, ids, ids.All(selection.Contains)),
+            () => ToggleCategory(category.Id, ids, CountSelected(ids) == ids.Length),
             all ? "Selected" : mixed ? $"{selectedCount:N0} of {ids.Length:N0} selected" : "Available");
 
         ImGui.SameLine();
@@ -347,43 +352,46 @@ internal sealed class CatalogPicker
         RightAlignedDisabled(selectedCount > 0 ? $"{selectedCount:N0} / {ids.Length:N0}" : $"{ids.Length:N0}");
     }
 
+    private int CountSelected(uint[] ids)
+    {
+        if (selection.Count == 0)
+            return 0;
+        var count = 0;
+        foreach (var id in ids)
+            if (selection.IsSelected(id))
+                count++;
+        return count;
+    }
+
     private void ToggleCategory(uint categoryId, uint[] ids, bool allSelected)
     {
-        if (allSelected)
-            selection.ExceptWith(ids);
-        else
-            selection.UnionWith(ids);
+        foreach (var id in ids)
+            selection.SetSelected(id, !allSelected);
         Expand(categoryId);
     }
 
     private void DrawItemRow(
-        IReadOnlyList<PickerRow> visible,
         GameCatalogItem item,
+        int keyIndex,
         Func<GameCatalogItem, bool> hasContextMenu,
         Action<GameCatalogItem> drawContextMenu)
     {
         ImGui.TableNextColumn();
         ImGui.PushID($"catalog-item:{item.ItemId}");
-        var selected = selection.Contains(item.ItemId);
         var cursor = ImGui.GetCursorPos();
-        if (ImGui.Selectable(
-                "##row",
-                selected,
-                ImGuiSelectableFlags.SpanAllColumns | ImGuiSelectableFlags.AllowItemOverlap,
-                new Vector2(0, ImGui.GetFrameHeight())))
-        {
-            if (ImGui.GetIO().KeyShift && rangeAnchor is { } anchor && anchor != item.ItemId)
-                SelectRange(visible, anchor, item.ItemId);
-            else
-                Toggle(item.ItemId);
-            rangeAnchor = item.ItemId;
-        }
+        DalamudTableSelectionRenderer.DrawRow(
+            selection,
+            displayedIds,
+            keyIndex,
+            "##row",
+            new Vector2(0, ImGui.GetFrameHeight()));
+        var selected = selection.IsSelected(item.ItemId);
         reviewRegistry.RegisterLastSelectable(
-            $"quartermaster.catalog.select.{item.ItemId}",
-            $"Select {item.Name}",
+            $"quartermaster.stock.select.{item.ItemId}",
+            $"Select {item.Name} for stock actions",
             true,
             selected,
-            () => Toggle(item.ItemId),
+            () => selection.SetSelected(item.ItemId, !selection.IsSelected(item.ItemId)),
             selected ? "Selected" : "Available");
         if (hasContextMenu(item) && ImGui.BeginPopupContextItem("##context"))
         {
@@ -399,102 +407,27 @@ internal sealed class CatalogPicker
         ImGui.PopID();
 
         ImGui.TableNextColumn();
+        DrawCellHitTarget(item.ItemId, keyIndex, "lv");
         RightAlignedDisabled(item.ItemLevel.ToString("N0"));
         ImGui.TableNextColumn();
+        DrawCellHitTarget(item.ItemId, keyIndex, "have");
         if (have.TryGetValue(item.ItemId, out var quantity))
             RightAligned(quantity.ToString("N0"));
         else
             RightAlignedDisabled("—");
     }
 
-    private void Toggle(uint itemId)
+    /// <summary>Makes a non-name cell select the row too, matching stock rows' whole-row target.</summary>
+    private void DrawCellHitTarget(uint itemId, int keyIndex, string column)
     {
-        if (!selection.Remove(itemId))
-            selection.Add(itemId);
-    }
-
-    /// <summary>Shift-click: selects every visible item between the last clicked row and this one.</summary>
-    private void SelectRange(IReadOnlyList<PickerRow> visible, uint fromId, uint toId)
-    {
-        int from = -1, to = -1;
-        for (var index = 0; index < visible.Count && (from < 0 || to < 0); index++)
-        {
-            if (visible[index].Item is not { } candidate)
-                continue;
-            if (candidate.ItemId == fromId)
-                from = index;
-            if (candidate.ItemId == toId)
-                to = index;
-        }
-        if (from < 0 || to < 0)
-        {
-            Toggle(toId);
-            return;
-        }
-        for (var index = Math.Min(from, to); index <= Math.Max(from, to); index++)
-            if (visible[index].Item is { } item)
-                selection.Add(item.ItemId);
-    }
-
-    private void DrawFooter(
-        GameCatalogSnapshot? snapshot,
-        string addLabel,
-        bool canAdd,
-        Action<IReadOnlyList<GameCatalogItem>> add)
-    {
-        ImGui.Separator();
-        var count = selection.Count;
-        if (count > 0)
-        {
-            ImGui.AlignTextToFramePadding();
-            ImGui.TextColored(ListingWorkspace.Color(ListingStateTone.Info), $"{count:N0} selected");
-            ImGui.SameLine();
-        }
-        var style = ImGui.GetStyle();
-        var buttonsWidth = ImGui.CalcTextSize("Clear").X + ImGui.CalcTextSize(addLabel).X +
-                           (style.FramePadding.X * 4f) + style.ItemSpacing.X;
-        ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - buttonsWidth));
-
-        ImGui.BeginDisabled(count == 0);
-        if (ImGui.Button("Clear##RQCatalogClear"))
-            selection.Clear();
-        ImGui.EndDisabled();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.catalog.clear",
-            "Clear the catalog selection",
-            count > 0,
-            selection.Clear,
-            $"{count:N0} selected");
-
-        ImGui.SameLine();
-        var enabled = count > 0 && canAdd && snapshot is not null;
-        ImGui.BeginDisabled(!enabled);
-        if (ImGui.Button($"{addLabel}###RQCatalogAdd") && snapshot is not null)
-            AddSelected(snapshot, add);
-        ImGui.EndDisabled();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.catalog.add",
-            "Add the selected catalog items to the open Transfer Plan or Item Group",
-            enabled,
-            () =>
-            {
-                if (catalog.TryGet() is { } current)
-                    AddSelected(current, add);
-            },
-            addLabel);
-    }
-
-    private void AddSelected(GameCatalogSnapshot snapshot, Action<IReadOnlyList<GameCatalogItem>> add)
-    {
-        var items = selection
-            .Select(id => snapshot.Items.GetValueOrDefault(id))
-            .OfType<GameCatalogItem>()
-            .OrderBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        if (items.Length == 0)
-            return;
-        add(items);
-        selection.Clear();
+        var cursor = ImGui.GetCursorPos();
+        DalamudTableSelectionRenderer.DrawRow(
+            selection,
+            displayedIds,
+            keyIndex,
+            $"##row-{column}:{itemId}",
+            new Vector2(0, ImGui.GetFrameHeight()));
+        ImGui.SetCursorPos(cursor);
     }
 
     private static void RightAligned(string text)

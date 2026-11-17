@@ -55,7 +55,11 @@ internal sealed class StockWorkspace
     private IReadOnlyList<StockGroup> focusedStockItems = [];
     private long listingEvaluationRevision = -1;
     private ListingPlanEvaluation? stockListingEvaluation;
-    private long stockSelectionRevision = -1;
+    private readonly VisibleItemIds stockVisible = new();
+    private StockLookup? scopedLookup;
+    private StockLookup? allLookup;
+    private long prunedRevision = -1;
+    private int selectionBarLines = 1;
     private int stockProjectionBuildCount;
     private int visibleStockCount;
     private int renderedStockRowCount;
@@ -93,7 +97,7 @@ internal sealed class StockWorkspace
         this.reviewRegistry = reviewRegistry;
         this.requestStockView = requestStockView;
         this.gameCatalog = gameCatalog;
-        catalogPicker = new CatalogPicker(gameCatalog, reviewRegistry);
+        catalogPicker = new CatalogPicker(gameCatalog, reviewRegistry, stockSelection);
         stockTable = CreateTable();
     }
 
@@ -179,6 +183,7 @@ internal sealed class StockWorkspace
     public void Draw(QuartermasterRuntimeSnapshot runtime)
     {
         var drawStarted = Stopwatch.GetTimestamp();
+        PruneSelection(runtime);
         if (catalogMode)
         {
             DrawCatalog(runtime);
@@ -207,19 +212,17 @@ internal sealed class StockWorkspace
         }
         var visibleItems = focusedStockItems;
         visibleStockCount = visibleItems.Count;
+        if (!stockVisible.IsFor(visibleItems))
+            stockVisible.Set(visibleItems, visibleItems.Select(item => item.ItemId).ToArray());
         if (!result.Filter.IsValid)
             ImGui.TextColored(
                 new Vector4(1f, .65f, .25f, 1f),
                 result.Filter.Diagnostics.FirstOrDefault()?.Message ?? "Invalid filter");
 
-        if (stockSelectionRevision != runtime.Revision)
-        {
-            stockSelection.Retain(availableItems.Select(item => item.ItemId));
-            stockSelectionRevision = runtime.Revision;
-        }
         var selectedPlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
         var sourceRows = ResolveStockWorkbenchProjection(runtime, visibleItems, selectedPlan);
-        DrawStockSelectionBar(runtime, availableItems);
+        DrawSelectionBar(runtime, stockVisible, canSelectVisible: true);
+        DrawSingleStockSelection(runtime);
         DrawTableColumnsToolbar(stockTable, "RQStockColumns", "Visible stock");
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
                      ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
@@ -494,7 +497,6 @@ internal sealed class StockWorkspace
                 {
                     workbench.ScopeKey = scope.Key;
                     workbench.FocusedStockItemId = null;
-                    stockSelection.Clear();
                     LeaveCatalog();
                 }
             }
@@ -515,42 +517,20 @@ internal sealed class StockWorkspace
         if (catalogMode)
             return;
         catalogMode = true;
-        stockSelection.Clear();
         workbench.FocusedStockItemId = null;
     }
 
-    private void LeaveCatalog()
-    {
-        catalogMode = false;
-        catalogPicker.ClearSelection();
-    }
+    private void LeaveCatalog() => catalogMode = false;
 
     private void DrawCatalog(QuartermasterRuntimeSnapshot runtime)
     {
         DrawStockToolbar(runtime, [], workbench.ScopeKey, workbench.ItemFilterState.IsInputActive);
-        var groupTarget = workbench.View == WorkbenchView.ItemGroups;
-        var count = catalogPicker.SelectedCount;
-        var amount = count > 0 ? $" {count:N0}" : string.Empty;
-        var label = groupTarget
-            ? $"Add{amount} to @{itemGroupWorkspace.TargetGroupName(runtime.State)}"
-            : $"Add{amount} to plan";
-        catalogPicker.Draw(
-            runtime,
-            label,
-            groupTarget || runtime.Owner.HasStableIdentity,
-            AddCatalogItems,
+        catalogPicker.DrawFilters(runtime);
+        DrawSelectionBar(runtime, catalogPicker.Visible, catalogPicker.NarrowingActive);
+        catalogPicker.DrawTable(
             item => gameCatalog.TryGet()?.MaterialsFor(item.ItemId) is not null,
             item => DrawMaterialsMenuItem(runtimeSnapshots.Current, item.ItemId));
         visibleStockCount = catalogPicker.VisibleCount;
-    }
-
-    private void AddCatalogItems(IReadOnlyList<GameCatalogItem> items)
-    {
-        var runtime = runtimeSnapshots.Current;
-        if (workbench.View == WorkbenchView.ItemGroups)
-            AddStockItemsToItemGroup(runtime, items.Select(item => new StockGroup(item.ItemId, item.Name, [])).ToArray());
-        else
-            transferPlans.AddItems(runtime, items.Select(item => (item.ItemId, item.Name)));
     }
 
     /// <summary>Offers a craftable item's direct materials to whichever right-hand tab is open.</summary>
@@ -570,145 +550,317 @@ internal sealed class StockWorkspace
         ImGui.EndDisabled();
     }
 
-    private void DrawStockSelectionBar(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> availableItems)
+    /// <summary>
+    /// The shared selection bar for every scope. The selection is keyed by item ID and survives
+    /// scope switches; actions resolve each selected ID through stock first, then the catalog.
+    /// </summary>
+    private void DrawSelectionBar(QuartermasterRuntimeSnapshot runtime, VisibleItemIds visible, bool canSelectVisible)
     {
-        var selected = stockSelection.Count == 0 ? Array.Empty<StockGroup>() : availableItems
-            .Where(item => stockSelection.IsSelected(item.ItemId))
-            .ToArray();
-        if (selected.Length != stockSelection.Count)
+        var count = stockSelection.Count;
+        var hasSelection = count > 0;
+        var info = ListingWorkspace.Color(ListingStateTone.Info);
+        var background = Scale(info, hasSelection ? .16f : .09f, .96f);
+        var border = Scale(info, hasSelection ? .65f : .38f, 1f);
+        var barHeight = (ImGui.GetFrameHeightWithSpacing() * selectionBarLines) + 10f;
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, background);
+        ImGui.PushStyleColor(ImGuiCol.Border, border);
+        ImGui.PushStyleVar(ImGuiStyleVar.ChildRounding, 2f);
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new Vector2(8f, 5f));
+        if (ImGui.BeginChild("RQStockSelectionBar", new Vector2(0f, barHeight), true,
+                ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse))
         {
-            stockSelection.Retain(availableItems.Select(item => item.ItemId));
-            selected = availableItems
-                .Where(item => stockSelection.IsSelected(item.ItemId))
-                .ToArray();
+            var top = ImGui.GetCursorPosY();
+            ImGui.AlignTextToFramePadding();
+            ImGui.TextColored(
+                hasSelection ? info : ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled],
+                hasSelection ? $"{count:N0} item{(count == 1 ? string.Empty : "s")} selected" : "No items selected");
+            if (hasSelection && visible.CountSelected(stockSelection) is var visibleSelected && visibleSelected != count)
+            {
+                var detail = $"{visibleSelected:N0} visible";
+                UiLayout.SameLineIfFits(detail);
+                ImGui.AlignTextToFramePadding();
+                ImGui.TextDisabled(detail);
+            }
+            DrawSelectionActions(runtime, visible, canSelectVisible, hasSelection);
+            var lines = (int)MathF.Round((ImGui.GetCursorPosY() - top) / ImGui.GetFrameHeightWithSpacing());
+            selectionBarLines = Math.Max(1, lines);
         }
+        ImGui.EndChild();
+        ImGui.PopStyleVar(2);
+        ImGui.PopStyleColor(2);
+    }
 
-        var canPlan = selected.Length > 0 && runtime.Owner.HasStableIdentity;
-        if (!canPlan)
-            ImGui.BeginDisabled();
+    private void DrawSelectionActions(
+        QuartermasterRuntimeSnapshot runtime,
+        VisibleItemIds visible,
+        bool canSelectVisible,
+        bool hasSelection)
+    {
+        var selectVisibleEnabled = canSelectVisible && visible.Ids.Length > 0;
+        UiLayout.SameLineIfFits("Select visible");
+        ImGui.BeginDisabled(!selectVisibleEnabled);
+        if (ImGui.Button("Select visible"))
+            SelectVisible();
+        ImGui.EndDisabled();
+        if (!canSelectVisible && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip("Narrow the catalog first");
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.stock.select-visible",
+            "Select every visible item",
+            selectVisibleEnabled,
+            SelectVisible,
+            $"visible={visible.Ids.Length:N0}; selected={stockSelection.Count:N0}");
+
+        var canPlan = hasSelection && runtime.Owner.HasStableIdentity;
+        UiLayout.SameLineIfFits("Add to plan");
+        ImGui.BeginDisabled(!canPlan);
         if (ImGui.Button("Add to plan"))
-        {
-            UpsertSelectedStockRules(runtime, selected, stowCarried: false);
-            stockSelection.Clear();
-        }
-        if (!canPlan)
-            ImGui.EndDisabled();
+            AddSelectionToPlan(runtime);
+        ImGui.EndDisabled();
         reviewRegistry.RegisterLastButton(
             "quartermaster.stock.add-selected-to-plan",
-            "Add selected stock to the current Transfer Plan",
+            "Add selected items to the current Transfer Plan",
             canPlan,
-            () =>
-            {
-                var current = runtimeSnapshots.Current;
-                var currentItems = GetStockItemsWithListingDemand(current, workbench.ScopeKey)
-                    .Where(item => stockSelection.IsSelected(item.ItemId))
-                    .ToArray();
-                UpsertSelectedStockRules(current, currentItems, stowCarried: false);
-                stockSelection.Clear();
-            },
-            $"{selected.Length:N0} selected");
+            () => AddSelectionToPlan(runtimeSnapshots.Current),
+            $"{stockSelection.Count:N0} selected");
 
         UiLayout.SameLineIfFits("Add to item group");
-        if (selected.Length == 0)
-            ImGui.BeginDisabled();
+        ImGui.BeginDisabled(!hasSelection);
         if (ImGui.Button("Add to item group"))
-        {
-            AddStockItemsToItemGroup(runtime, selected);
-            stockSelection.Clear();
-        }
-        if (selected.Length == 0)
-            ImGui.EndDisabled();
+            AddSelectionToItemGroup(runtime);
+        ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.stock.add-selected-to-item-group",
+            "Add selected items to the target Item Group",
+            hasSelection,
+            () => AddSelectionToItemGroup(runtimeSnapshots.Current),
+            $"{stockSelection.Count:N0} selected");
 
-        var carried = selected.Where(item => item.PlayerQuantity > 0).ToArray();
-        var canStow = carried.Length > 0 && runtime.Owner.HasStableIdentity;
+        var canStow = hasSelection && runtime.Owner.HasStableIdentity && SelectionHasCarried(runtime);
         UiLayout.SameLineIfFits("Stow carried");
-        if (!canStow)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Stow carried")) stowRequested = true;
-        if (!canStow)
-            ImGui.EndDisabled();
+        ImGui.BeginDisabled(!canStow);
+        if (ImGui.Button("Stow carried"))
+            stowRequested = true;
+        ImGui.EndDisabled();
         reviewRegistry.RegisterLastButton("quartermaster.stock.stow", "Choose a stow destination", canStow,
             () => stowRequested = true, "Selected carried stock");
-        if (stowRequested) { ImGui.OpenPopup("RQStockStow"); stowRequested = false; }
+        if (stowRequested)
+        {
+            ImGui.OpenPopup("RQStockStow");
+            stowRequested = false;
+        }
         if (ImGui.BeginPopup("RQStockStow"))
         {
-            DrawStowDestinations(runtime, carried);
+            DrawStowDestinations(runtime, ResolveSelection(runtime).Stock.Where(item => item.PlayerQuantity > 0).ToArray());
             ImGui.EndPopup();
         }
 
         UiLayout.SameLineIfFits("Clear");
-        if (selected.Length == 0)
-            ImGui.BeginDisabled();
+        ImGui.BeginDisabled(!hasSelection);
         if (ImGui.Button("Clear"))
-        {
-            stockSelection.Clear();
-            workbench.FocusedStockItemId = null;
-        }
-        if (selected.Length == 0)
-            ImGui.EndDisabled();
-        if (selected.Length > 0)
-        {
-            var count = $"{selected.Length:N0} selected";
-            UiLayout.SameLineIfFits(count);
-            ImGui.AlignTextToFramePadding();
-            ImGui.TextDisabled(count);
-        }
+            ClearStockSelection();
+        ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.stock.clear-selection",
+            "Clear the item selection",
+            hasSelection,
+            ClearStockSelection,
+            $"{stockSelection.Count:N0} selected");
+    }
 
-        if (selected.Length == 1)
+    private void SelectVisible()
+    {
+        if (catalogMode && !catalogPicker.NarrowingActive)
+            return;
+        var visible = catalogMode ? catalogPicker.Visible : stockVisible;
+        foreach (var id in visible.Ids)
+            stockSelection.SetSelected(id, true);
+    }
+
+    private void ClearStockSelection()
+    {
+        stockSelection.Clear();
+        workbench.FocusedStockItemId = null;
+    }
+
+    private void AddSelectionToPlan(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (!runtime.Owner.HasStableIdentity || stockSelection.Count == 0)
+            return;
+        var (stock, catalogOnly) = ResolveSelection(runtime);
+        if (stock.Count > 0)
+            UpsertSelectedStockRules(runtime, stock, stowCarried: false);
+        if (catalogOnly.Count > 0)
+            transferPlans.AddItems(runtime, catalogOnly.Select(item => (item.ItemId, item.ItemName)));
+        stockSelection.Clear();
+    }
+
+    private void AddSelectionToItemGroup(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (stockSelection.Count == 0)
+            return;
+        var (stock, catalogOnly) = ResolveSelection(runtime);
+        var items = stock.Concat(catalogOnly).ToList();
+        items.Sort(CompareByName);
+        AddStockItemsToItemGroup(runtime, items);
+        stockSelection.Clear();
+    }
+
+    /// <summary>
+    /// Splits the selection into stock items (resolved from the current stock scope first, so a
+    /// selection made within one scope adds exactly as that scope shows it, then from All) and
+    /// catalog-only items. IDs found in neither are skipped.
+    /// </summary>
+    private (List<StockGroup> Stock, List<StockGroup> CatalogOnly) ResolveSelection(QuartermasterRuntimeSnapshot runtime)
+    {
+        var stock = new List<StockGroup>();
+        var catalogOnly = new List<StockGroup>();
+        var snapshot = gameCatalog.TryGet();
+        foreach (var id in stockSelection.SelectedKeys)
         {
-            var itemId = selected[0].ItemId;
-            var navigationQualities = (listingSession.Draft?.Assignments.Where(a => a.ItemId == itemId).Select(a => a.Quality) ?? [])
-                .Concat(runtime.Browser.Listings.Where(l => l.ItemId == itemId).Select(ListingRetainerProjection.Quality))
-                .Distinct().OrderBy(q => q).ToArray();
-            void DrawListingsNavigation()
+            if (TryResolveStock(runtime, id, out var item, out _))
+                stock.Add(item);
+            else if (snapshot?.Items.GetValueOrDefault(id) is { } catalogItem)
+                catalogOnly.Add(new StockGroup(catalogItem.ItemId, catalogItem.Name, []));
+        }
+        stock.Sort(CompareByName);
+        catalogOnly.Sort(CompareByName);
+        return (stock, catalogOnly);
+    }
+
+    private static int CompareByName(StockGroup left, StockGroup right)
+    {
+        var byName = StringComparer.OrdinalIgnoreCase.Compare(left.ItemName, right.ItemName);
+        return byName != 0 ? byName : left.ItemId.CompareTo(right.ItemId);
+    }
+
+    private bool SelectionHasCarried(QuartermasterRuntimeSnapshot runtime)
+    {
+        foreach (var id in stockSelection.SelectedKeys)
+            if (TryResolveStock(runtime, id, out _, out var carried) && carried)
+                return true;
+        return false;
+    }
+
+    private bool TryResolveStock(QuartermasterRuntimeSnapshot runtime, uint itemId, out StockGroup item, out bool carried)
+    {
+        var scopeKey = catalogMode ? BrowserScope.AllKey : workbench.ScopeKey;
+        var scoped = ResolveLookup(ref scopedLookup, runtime, scopeKey);
+        if (scoped.ById.TryGetValue(itemId, out item!))
+        {
+            carried = scoped.Carried.Contains(itemId);
+            return true;
+        }
+        if (scopeKey != BrowserScope.AllKey)
+        {
+            var all = ResolveLookup(ref allLookup, runtime, BrowserScope.AllKey);
+            if (all.ById.TryGetValue(itemId, out item!))
             {
-                if (navigationQualities.Length == 0) return;
-                var quality = navigationQualities.Contains(workbench.SelectedStockListingQuality)
-                    ? workbench.SelectedStockListingQuality : navigationQualities[0];
-                if (ImGui.SmallButton("Show in Market")) showInListings(runtime, new(itemId, quality));
+                carried = all.Carried.Contains(itemId);
+                return true;
             }
-            var listingPlan = ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner);
-            var demand = ResolveStockListingEvaluation(runtime).Items
-                .Where(item => item.ItemId == selected[0].ItemId && item.IsPlanned)
-                .ToArray();
-            if (listingPlan is not null && demand.Length > 0)
+        }
+        item = null!;
+        carried = false;
+        return false;
+    }
+
+    private StockLookup ResolveLookup(ref StockLookup? slot, QuartermasterRuntimeSnapshot runtime, string scopeKey)
+    {
+        if (slot is { } cached && cached.Revision == runtime.Revision && cached.ScopeKey == scopeKey)
+            return cached;
+        var items = !catalogMode && scopeKey == workbench.ScopeKey
+            ? GetStockItemsWithListingDemand(runtime, scopeKey)
+            : StockItemsWithListingDemand(runtime, scopeKey);
+        var byId = new Dictionary<uint, StockGroup>(items.Count);
+        var carried = new HashSet<uint>();
+        foreach (var item in items)
+        {
+            byId.TryAdd(item.ItemId, item);
+            if (item.PlayerQuantity > 0)
+                carried.Add(item.ItemId);
+        }
+        return slot = new StockLookup(runtime.Revision, scopeKey, byId, carried);
+    }
+
+    /// <summary>Drops selected IDs that exist neither in stock nor in the game catalog.</summary>
+    private void PruneSelection(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (prunedRevision == runtime.Revision || gameCatalog.TryGet() is not { } snapshot)
+            return;
+        prunedRevision = runtime.Revision;
+        if (stockSelection.Count == 0)
+            return;
+        List<uint>? stale = null;
+        foreach (var id in stockSelection.SelectedKeys)
+            if (!snapshot.Items.ContainsKey(id) && !TryResolveStock(runtime, id, out _, out _))
+                (stale ??= []).Add(id);
+        if (stale is not null)
+            foreach (var id in stale)
+                stockSelection.SetSelected(id, false);
+    }
+
+    private static Vector4 Scale(Vector4 color, float scale, float alpha) =>
+        new(color.X * scale, color.Y * scale, color.Z * scale, alpha);
+
+    private void DrawSingleStockSelection(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (stockSelection.Count != 1 ||
+            !TryResolveStock(runtime, stockSelection.SelectedKeys.First(), out var single, out _))
+            return;
+
+        var itemId = single.ItemId;
+        var navigationQualities = (listingSession.Draft?.Assignments.Where(a => a.ItemId == itemId).Select(a => a.Quality) ?? [])
+            .Concat(runtime.Browser.Listings.Where(l => l.ItemId == itemId).Select(ListingRetainerProjection.Quality))
+            .Distinct().OrderBy(q => q).ToArray();
+        void DrawListingsNavigation()
+        {
+            if (navigationQualities.Length == 0) return;
+            var quality = navigationQualities.Contains(workbench.SelectedStockListingQuality)
+                ? workbench.SelectedStockListingQuality : navigationQualities[0];
+            if (ImGui.SmallButton("Show in Market")) showInListings(runtime, new(itemId, quality));
+        }
+        var listingPlan = ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner);
+        var demand = ResolveStockListingEvaluation(runtime).Items
+            .Where(item => item.ItemId == single.ItemId && item.IsPlanned)
+            .ToArray();
+        if (listingPlan is not null && demand.Length > 0)
+        {
+            ImGui.Separator();
+            ImGui.TextUnformatted(single.ItemName);
+            ImGui.SameLine();
+            if (demand.All(item => item.Quality != workbench.SelectedStockListingQuality))
+                workbench.SelectedStockListingQuality = demand[0].Quality;
+            ImGui.SetNextItemWidth(62);
+            if (ImGui.BeginCombo("##stocklistingquality", QualityLabel(workbench.SelectedStockListingQuality)))
             {
-                ImGui.Separator();
-                ImGui.TextUnformatted(selected[0].ItemName);
-                ImGui.SameLine();
-                if (demand.All(item => item.Quality != workbench.SelectedStockListingQuality))
-                    workbench.SelectedStockListingQuality = demand[0].Quality;
-                ImGui.SetNextItemWidth(62);
-                if (ImGui.BeginCombo("##stocklistingquality", QualityLabel(workbench.SelectedStockListingQuality)))
-                {
-                    foreach (var item in demand)
-                        if (ImGui.Selectable(QualityLabel(item.Quality), item.Quality == workbench.SelectedStockListingQuality))
-                            workbench.SelectedStockListingQuality = item.Quality;
-                    ImGui.EndCombo();
-                }
-                var selectedDemand = demand.Single(item => item.Quality == workbench.SelectedStockListingQuality);
-                ImGui.TextDisabled(StockListingShortfall([selectedDemand]));
-                DrawListingsNavigation();
-                if (navigationQualities.Length > 0) ImGui.SameLine();
-                var transferPlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
-                var linked = transferPlan is not null && runtime.State.TransferPlanListingLinks.Any(link =>
-                    link.StowagePlanId == transferPlan.Id && link.ListingPlanId == listingPlan.Id &&
-                    link.ItemId == selectedDemand.ItemId && link.Quality == selectedDemand.Quality);
-                if (linked)
-                    ImGui.TextDisabled($"Linked to {transferPlan!.Name}");
-                else if (transferPlan?.IsEphemeral is not true)
-                {
-                    var destination = transferPlan?.Name ?? "Transfer plan";
-                    if (ImGui.SmallButton($"Prepare target in {destination}"))
-                        transferPlans.PrepareListingTarget(runtime, selectedDemand);
-                }
+                foreach (var item in demand)
+                    if (ImGui.Selectable(QualityLabel(item.Quality), item.Quality == workbench.SelectedStockListingQuality))
+                        workbench.SelectedStockListingQuality = item.Quality;
+                ImGui.EndCombo();
             }
-            else if (navigationQualities.Length > 0)
+            var selectedDemand = demand.Single(item => item.Quality == workbench.SelectedStockListingQuality);
+            ImGui.TextDisabled(StockListingShortfall([selectedDemand]));
+            DrawListingsNavigation();
+            if (navigationQualities.Length > 0) ImGui.SameLine();
+            var transferPlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
+            var linked = transferPlan is not null && runtime.State.TransferPlanListingLinks.Any(link =>
+                link.StowagePlanId == transferPlan.Id && link.ListingPlanId == listingPlan.Id &&
+                link.ItemId == selectedDemand.ItemId && link.Quality == selectedDemand.Quality);
+            if (linked)
+                ImGui.TextDisabled($"Linked to {transferPlan!.Name}");
+            else if (transferPlan?.IsEphemeral is not true)
             {
-                ImGui.Separator();
-                ImGui.TextUnformatted(selected[0].ItemName);
-                DrawListingsNavigation();
+                var destination = transferPlan?.Name ?? "Transfer plan";
+                if (ImGui.SmallButton($"Prepare target in {destination}"))
+                    transferPlans.PrepareListingTarget(runtime, selectedDemand);
             }
+        }
+        else if (navigationQualities.Length > 0)
+        {
+            ImGui.Separator();
+            ImGui.TextUnformatted(single.ItemName);
+            DrawListingsNavigation();
         }
     }
 
@@ -844,4 +996,48 @@ internal sealed class StockWorkspace
         workbench.SelectedStowagePlanId is { } selectedId
             ? document.StowagePlans.FirstOrDefault(plan => plan.Id == selectedId && plan.Owner.Matches(owner))
             : null;
+}
+
+internal sealed record StockLookup(long Revision, string ScopeKey, Dictionary<uint, StockGroup> ById, HashSet<uint> Carried);
+
+/// <summary>
+/// The item IDs a table currently shows, cached against the source they were built from, with
+/// a lazily built set so counting selected-and-visible stays O(min(selection, visible)).
+/// </summary>
+internal sealed class VisibleItemIds
+{
+    private object? source;
+    private HashSet<uint>? set;
+
+    public uint[] Ids { get; private set; } = [];
+
+    public bool IsFor(object candidate) => ReferenceEquals(source, candidate);
+
+    public void Set(object newSource, uint[] ids)
+    {
+        if (ReferenceEquals(source, newSource))
+            return;
+        source = newSource;
+        Ids = ids;
+        set = null;
+    }
+
+    public int CountSelected(TableSelectionModel<uint> selection)
+    {
+        if (selection.Count == 0 || Ids.Length == 0)
+            return 0;
+        var count = 0;
+        if (selection.Count < Ids.Length)
+        {
+            set ??= [.. Ids];
+            foreach (var id in selection.SelectedKeys)
+                if (set.Contains(id))
+                    count++;
+            return count;
+        }
+        foreach (var id in Ids)
+            if (selection.IsSelected(id))
+                count++;
+        return count;
+    }
 }
