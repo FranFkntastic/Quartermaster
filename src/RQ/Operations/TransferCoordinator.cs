@@ -292,6 +292,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             }
 
             var retainerLegMessage = default(string);
+            var inventoryFull = false;
             foreach (var candidate in candidates)
             {
                 if (!retainerSessionOpen)
@@ -372,13 +373,22 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                                         attempt.Evidence != VerifiedMutationEvidence.Unchanged;
                     if (!result.Success)
                     {
+                        if (result.Code == "InventoryFull" && !result.MovementMayHaveOccurred)
+                        {
+                            inventoryFull = true;
+                            journal.RecordWarning(operationId, result.Code, result.Message);
+                            // The market gather caller reports once across all of its targets.
+                            if (borrowedLease is null)
+                                warning?.Invoke($"Retrieval blocked by inventory space; {remaining.Count(pair => pair.Value > 0)} targets remain unmet.");
+                            break;
+                        }
                         warning?.Invoke($"Retrieval {itemName} at {candidate.Route.RetainerName}: {result.Code}: {result.Message}");
                         journal.RecordWarning(operationId, result.Code, result.Message);
                         if (borrowedLease is not null && !result.MovementMayHaveOccurred)
                         {
                             movementAttempted = false;
                             if (result.Code == "GatherCancelled") throw new OperationCanceledException();
-                            if (result.Code is "InventoryFull" or "SourceSlotChanged")
+                            if (result.Code is "SourceSlotChanged")
                             {
                                 continue;
                             }
@@ -400,7 +410,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                 }
                 await driver.CloseRetainerAsync(token).ConfigureAwait(false);
                 retainerOpen = false;
-                if (remaining.Values.All(quantity => quantity <= 0))
+                if (inventoryFull || remaining.Values.All(quantity => quantity <= 0))
                     break;
             }
             await driver.CloseRetainerListAsync(token).ConfigureAwait(false);
@@ -417,9 +427,11 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             journal.Transition(
                 operationId,
                 missing == 0 ? OperationStatuses.Succeeded : bypassedRetainerLeg ? OperationStatuses.Failed : transferred > 0 ? OperationStatuses.PartiallySucceeded : OperationStatuses.Failed,
-                missing == 0 ? "RetrievalComplete" : bypassedRetainerLeg ? "RetrievalLegUnavailable" : transferred > 0 ? "RetrievalPartial" : "NoLiveStock",
+                missing == 0 ? "RetrievalComplete" : inventoryFull ? "InventoryFull" : bypassedRetainerLeg ? "RetrievalLegUnavailable" : transferred > 0 ? "RetrievalPartial" : "NoLiveStock",
                 missing == 0
                     ? $"Retrieved {transferred:N0} units and satisfied every target."
+                    : inventoryFull
+                        ? $"Retrieved {transferred:N0} units; inventory space blocked the remaining {missing:N0} units."
                     : bypassedRetainerLeg
                         ? $"Retainer retrieval could not start ({retainerLegMessage}); remaining units are left for vendor procurement."
                         : $"Retrieved {transferred:N0} units; {missing:N0} units remain missing.");
