@@ -3,6 +3,7 @@ using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Components;
 using Franthropy.Dalamud.AgentBridge;
+using Franthropy.Dalamud.UI.Windows;
 using Franthropy.Filtering.Compilation;
 using Franthropy.Filtering.Documentation;
 using Franthropy.Filtering.Semantics;
@@ -68,7 +69,11 @@ internal static class SearchReference
             var width = Math.Min(540f, Math.Max(200f, ImGui.GetWindowSize().X));
             ImGui.SetNextWindowPos(new Vector2(Math.Max(windowPos.X, anchor.X - width), anchor.Y));
             ImGui.SetNextWindowSizeConstraints(new Vector2(width, 0), new Vector2(width, float.MaxValue));
-            return ImGui.BeginPopup(id);
+            var owner = DalamudOwnedWindowSurface.Capture();
+            owner.ApplyToNextWindow();
+            if (!ImGui.BeginPopup(id)) return false;
+            owner.KeepCurrentWindowAboveOwner();
+            return true;
         }
 
         public string? DrawStock<T>(FilterContext<T> context)
