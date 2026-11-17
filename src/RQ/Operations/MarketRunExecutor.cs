@@ -26,6 +26,7 @@ public sealed record MarketMutationIntent(string Kind, ulong RetainerId, string 
 /// <summary>All reads are live. Implementations must not retry mutations.</summary>
 public interface IMarketRunDriver
 {
+    void BeginRun(IDisposable lease, Func<bool> hasAuthority) { }
     int GatherInventoryBlockedUnits => 0;
     string ItemName(uint itemId);
     Task RequireRetainerListAsync(CancellationToken token);
@@ -39,7 +40,8 @@ public interface IMarketRunDriver
     Task CloseListAsync(CancellationToken token);
     Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token, Action<MarketMutationReceipt>? receiptChanged = null);
     Task<IReadOnlyList<string>> StowAsync(Guid planId, IReadOnlyList<ListingReserveRule> reserves, IDisposable lease,
-        Action check, Func<bool> hasAuthority, CancellationToken token, Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged);
+        Action check, Func<bool> hasAuthority, CancellationToken token, Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged,
+        IReadOnlyDictionary<(uint ItemId, bool Hq), int> baseline, bool forceReorganize);
 }
 
 public interface IMarketRunDeadline
@@ -71,6 +73,7 @@ public sealed class MarketRunDeadline(TimeSpan timeout) : IMarketRunDeadline
 
 public sealed class MarketRunRecord
 {
+    public bool ForceReorganize { get; set; }
     // Null means the legacy receipt did not record this time, not the import time.
     public DateTime? StartedAtUtc { get; set; }
     public DateTime? FinishedAtUtc { get; set; }
@@ -193,21 +196,21 @@ public sealed class MarketRunExecutor(
     public void Restore(MarketRunRecord? record) => Result = record;
     public void Cancel() => Interlocked.Exchange(ref cancelled, 1);
 
-    public Task RunAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty = false)
+    public Task RunAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty = false, bool forceReorganize = false)
     {
         lock (persistenceGate)
         {
             if (!CanStart) return Task.CompletedTask;
-            return ActiveTask = RunCoreAsync(plan, evaluation, draftDirty);
+            return ActiveTask = RunCoreAsync(plan, evaluation, draftDirty, forceReorganize);
         }
     }
 
-    private async Task RunCoreAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty)
+    private async Task RunCoreAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty, bool forceReorganize)
     {
         var listingWork = evaluation.Retainers.Any(r => r.Assignments.Any(a =>
             a.ShortListings is { IsKnown: true, Value: > 0 } || a.RepriceListings is { IsKnown: true, Value: > 0 }));
         if (draftDirty || !evaluation.IsComplete || evaluation.PlanId != plan.Id || evaluation.PlanRevision != plan.Revision ||
-            (!listingWork && evaluation.StowUnits <= 0)) return;
+            (!listingWork && (!forceReorganize || evaluation.StowUnits + evaluation.MoveUnits <= 0))) return;
         var reserves = plan.Reserves.Select(ListingPlanCatalog.Copy).ToArray();
         if (!automation.TryAcquire("market run", out var lease)) return;
         {
@@ -221,7 +224,7 @@ public sealed class MarketRunExecutor(
             shortByAssignment.Clear();
             freshListings.Clear();
             topUpActive = false;
-            var record = new MarketRunRecord { StartedAtUtc = DateTime.UtcNow, PlanId = plan.Id, PlanRevision = plan.Revision, Owner = plan.Owner with { },
+            var record = new MarketRunRecord { ForceReorganize = forceReorganize, StartedAtUtc = DateTime.UtcNow, PlanId = plan.Id, PlanRevision = plan.Revision, Owner = plan.Owner with { },
                 Assignments = plan.Assignments.Where(a => a.Enabled).Select(ListingPlanCatalog.Copy).ToList() };
             AutoRetainerSuppression.Scope? scope = null;
             var sessionStarted = false;
@@ -244,6 +247,12 @@ public sealed class MarketRunExecutor(
                     if (suppression.IsAvailable) scope = suppression.Acquire();
                 }
                 sessionStarted = true;
+                driver.BeginRun(runLease!, () => HasSessionAuthority(record));
+                // Capture before gather, pull, post or any other mutation, including on forced-only runs.
+                var baselinePlayer = await deadline.RunAsync(driver.PlayerAsync).ConfigureAwait(false);
+                Check(record);
+                var baseline = baselinePlayer.Stacks.GroupBy(s => (s.ItemId, s.IsHighQuality))
+                    .ToDictionary(g => g.Key, g => g.Sum(s => s.Quantity));
                 if (listingWork)
                 {
                     Status = "Gathering stock";
@@ -279,7 +288,7 @@ public sealed class MarketRunExecutor(
                                 record.NeedsCheckNames[receipt.Intent.RetainerId] = receipt.RetainerName;
                             }
                             Persist(record);
-                        }, report => { Add(record, report); Persist(record); }).ConfigureAwait(false);
+                        }, report => { Add(record, report); Persist(record); }, baseline, forceReorganize).ConfigureAwait(false);
                     Check(record);
                     stowageEntered = true;
                 }
@@ -330,6 +339,12 @@ public sealed class MarketRunExecutor(
 
     private void StowSkipped(MarketRunRecord record, IReadOnlyList<ListingReserveRule> reserves, string code, string reason)
     {
+        if (record.ForceReorganize)
+        {
+            var relocation = $"{code.Replace("MarketRunStow", "MarketRunRelocate", StringComparison.Ordinal)}: {reason}; relocation not completed.";
+            Add(record, relocation);
+            warning?.Invoke(relocation);
+        }
         // One line per skip; bags are not scanned, so quantities are unknown here.
         var eligible = reserves.Where(r => r.Enabled && r.ItemId > 0 && (r.Location.AnySpace || r.Location.PreferredRetainerIds.Count > 0))
             .Select(r => r.ItemName).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();

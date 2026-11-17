@@ -469,7 +469,8 @@ public sealed class MarketRunExecutorTests
     {
         public Task<IReadOnlyList<string>> StowAsync(Guid planId, IReadOnlyList<ListingReserveRule> reserves,
             IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token,
-            Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged)
+            Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged,
+            IReadOnlyDictionary<(uint ItemId, bool Hq), int> baseline, bool forceReorganize)
         { check(); return Task.FromResult<IReadOnlyList<string>>([]); }
         public int GatherInventoryBlockedUnits { get; set; }
         public Func<IReadOnlyList<MarketGatherTarget>, IDisposable, Action, Func<bool>, CancellationToken, Task<IReadOnlyList<string>>>? GatherOverride;

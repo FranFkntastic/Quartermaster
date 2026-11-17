@@ -60,6 +60,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
     private readonly SaddlebagRetrievalStep? saddlebag;
     // The borrowing caller's mutation authority (run cancel, plan change), checked before every saddlebag dispatch.
     private readonly Func<bool>? callerAuthority;
+    private readonly Func<ulong, bool>? retrievalSource;
     private readonly AutoRetainerSuppression? autoRetainerSuppression;
     private readonly TimeSpan autoRetainerWait;
     private readonly TimeSpan autoRetainerPoll;
@@ -85,8 +86,10 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
         Func<IReadOnlyDictionary<uint, int>>? cachedSaddlebag = null,
         Action<string>? information = null,
         Func<bool>? callerAuthority = null,
-        Action<SaddlebagAttemptReport>? saddlebagAttempt = null)
+        Action<SaddlebagAttemptReport>? saddlebagAttempt = null,
+        Func<ulong, bool>? retrievalSource = null)
     {
+        this.retrievalSource = retrievalSource;
         this.callerAuthority = callerAuthority;
         this.journal = journal;
         this.warning = warning;
@@ -201,7 +204,9 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                 Enabled = true,
             }).ToArray();
             var baselineInventory = playerInventory();
-            var plan = RestockPlanner.Build(rows, baselineInventory, cache.Snapshot(), owner, utcNow());
+            var sources = cache.Snapshot();
+            if (retrievalSource is not null) sources = sources.Where(p => retrievalSource(p.Key)).ToDictionary(p => p.Key, p => p.Value);
+            var plan = RestockPlanner.Build(rows, baselineInventory, sources, owner, utcNow());
             var remaining = plan.Lines
                 .GroupBy(line => RetrievalKey(line.ItemId, line.Quality))
                 .ToDictionary(group => group.Key, group => group.Sum(line => line.NeededQuantity));

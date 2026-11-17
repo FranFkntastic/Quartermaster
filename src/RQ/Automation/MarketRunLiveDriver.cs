@@ -28,6 +28,9 @@ internal sealed class MarketRunLiveDriver(
     private Func<bool> runAuthority = () => false;
     public int GatherInventoryBlockedUnits { get; private set; }
     private bool OwnsGatherLease() => gatherLease is not null && automation.Owns(gatherLease);
+    private int StackSize(uint id) => Math.Max(1, (maxStackSize ?? throw new InvalidOperationException("Item stack-size authority unavailable."))(id));
+    private int RelocationCapacity(StowageDepositRequest request) =>
+        StowageRouter.Route(request, cache.Snapshot(), owner, StackSize(request.ItemId)).RoutedQuantity;
     private bool HasSessionAuthority() => runAuthority() && OwnsGatherLease() &&
         owner.HasStableIdentity && currentOwner() is { HasStableIdentity: true } current && owner.Matches(current);
     private void RequireSessionAuthority()
@@ -35,6 +38,13 @@ internal sealed class MarketRunLiveDriver(
         if (!HasSessionAuthority()) throw new InvalidOperationException("Market run session authority lost.");
     }
     public string ItemName(uint id) => itemName(id);
+    public void BeginRun(IDisposable lease, Func<bool> hasAuthority)
+    {
+        gatherLease = lease;
+        runAuthority = hasAuthority;
+        owner = currentOwner();
+        RequireSessionAuthority();
+    }
 
     public async Task RequireRetainerListAsync(CancellationToken token)
     {
@@ -57,8 +67,13 @@ internal sealed class MarketRunLiveDriver(
         if (!scan.Success) throw new InvalidOperationException($"{scan.Code}: {scan.Message}");
         cache.ReplaceListings(new(retainerId, retainerName, owner, DateTime.UtcNow, scan.Listings.Select(l => new CachedMarketListing
         {
-            ItemId = l.ItemId, ItemName = itemName(l.ItemId), Quantity = (uint)l.Quantity,
-            IsHq = l.IsHq, UnitPrice = l.UnitPrice, SlotIndex = l.SlotIndex, ContainerKey = InventoryType.RetainerMarket.ToString(),
+            ItemId = l.ItemId,
+            ItemName = itemName(l.ItemId),
+            Quantity = (uint)l.Quantity,
+            IsHq = l.IsHq,
+            UnitPrice = l.UnitPrice,
+            SlotIndex = l.SlotIndex,
+            ContainerKey = InventoryType.RetainerMarket.ToString(),
         }).ToArray()));
         return scan.Listings;
     }
@@ -71,9 +86,16 @@ internal sealed class MarketRunLiveDriver(
         var names = Bags.Select(b => b.ToString()).ToArray();
         playerCache.Observe(owner, new(Bags.Select(b => new InventoryBag
         {
-            BagName = b.ToString(), Items = stacks.Where(s => s.Container == b).Select(s => new InventoryItem
-            { ItemId = s.ItemId, ItemName = itemName(s.ItemId), Quantity = (uint)s.Quantity, IsHq = s.IsHighQuality,
-                ContainerKey = b.ToString(), SlotIndex = s.SlotIndex }).ToList(),
+            BagName = b.ToString(),
+            Items = stacks.Where(s => s.Container == b).Select(s => new InventoryItem
+            {
+                ItemId = s.ItemId,
+                ItemName = itemName(s.ItemId),
+                Quantity = (uint)s.Quantity,
+                IsHq = s.IsHighQuality,
+                ContainerKey = b.ToString(),
+                SlotIndex = s.SlotIndex
+            }).ToList(),
         }).ToArray(), names, names), DateTime.UtcNow, coverageUncertain: !complete);
         return new(stacks, Math.Max(0, 140 - stacks.Select(s => (s.Container, s.SlotIndex)).Distinct().Count()));
     }
@@ -188,7 +210,8 @@ internal sealed class MarketRunLiveDriver(
 
     public async Task<IReadOnlyList<string>> StowAsync(Guid planId, IReadOnlyList<ListingReserveRule> reserves,
         IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token,
-        Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged)
+        Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged,
+        IReadOnlyDictionary<(uint ItemId, bool Hq), int> baseline, bool forceReorganize)
     {
         gatherLease = lease;
         runAuthority = hasAuthority;
@@ -196,7 +219,18 @@ internal sealed class MarketRunLiveDriver(
         check();
         var player = await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
         var requests = MarketRunPlanner.StowRequests(planId, reserves,
-            player.Stacks.Select(s => (s.ItemId, s.IsHighQuality, s.Quantity)));
+            player.Stacks.Select(s => (s.ItemId, s.IsHighQuality, s.Quantity)), forceReorganize ? null : baseline);
+        var reports = (await DepositRequestsAsync(requests, lease, check, token, receiptChanged, reportChanged, false).ConfigureAwait(false)).ToList();
+        if (forceReorganize)
+            reports.AddRange(await RelocateAsync(planId, reserves, lease, check, token, receiptChanged, reportChanged).ConfigureAwait(false));
+        return reports;
+    }
+
+    private async Task<IReadOnlyList<string>> DepositRequestsAsync(IReadOnlyList<StowageDepositRequest> requests,
+        IDisposable lease, Action check, CancellationToken token, Action<MarketMutationReceipt> receiptChanged,
+        Action<string> reportChanged, bool relocation)
+    {
+        var prefix = relocation ? "MarketRunRelocate" : "MarketRunStow";
         var reports = new List<string>();
         foreach (var request in requests)
         {
@@ -208,7 +242,7 @@ internal sealed class MarketRunLiveDriver(
             var batch = StowageRouter.BuildBatch([request], cache.Snapshot(), owner,
                 maxStackSize ?? throw new InvalidOperationException("Item stack-size authority unavailable."), DateTime.UtcNow);
             var route = batch.Routes.Single();
-            var guarded = new StowDriver(transferDriver, this, check, request, receiptChanged);
+            var guarded = new StowDriver(transferDriver, this, check, request, receiptChanged, relocation);
             if (route.RoutedQuantity > 0)
             {
                 var operation = journal.CreateDeposit(owner, batch, OperationKinds.StowageSurplus);
@@ -220,7 +254,7 @@ internal sealed class MarketRunLiveDriver(
                 {
                     guarded.MarkIndeterminate(outcome.Message);
                     throw new MarketGatherIndeterminateException(guarded.CurrentRetainer, guarded.CurrentRetainerName,
-                        $"MarketRunStowIndeterminate: {request.ItemName} × {request.Quantity} to {destinations}: {outcome.Message}");
+                        $"{prefix}Indeterminate: {request.ItemName} × {request.Quantity} to {destinations}: {outcome.Message}");
                 }
                 check();
                 var moved = outcome.Lines.Sum(l => l.TransferredQuantity);
@@ -231,12 +265,12 @@ internal sealed class MarketRunLiveDriver(
                     // (authority, source change, opening the session) must not masquerade as full storage.
                     var noRoom = outcome.Status is OperationStatuses.Succeeded or OperationStatuses.PartiallySucceeded ||
                         outcome.Message.StartsWith("Stowed ", StringComparison.Ordinal);
-                    Report(noRoom ? "MarketRunStowLeftInBagsNoRoom" : "MarketRunStowSkippedExecutionFailed", left, outcome.Message);
+                    Report(noRoom ? prefix + "LeftInBagsNoRoom" : prefix + "SkippedExecutionFailed", left, outcome.Message);
                     if (!noRoom) throw new InvalidOperationException(outcome.Message);
                 }
                 await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
             }
-            else Report("MarketRunStowLeftInBagsNoRoom", request.Quantity, "No observed capacity at the configured destinations.");
+            else Report(prefix + "LeftInBagsNoRoom", request.Quantity, "No observed capacity at the configured destinations.");
 
             void Report(string code, int quantity, string reason)
             {
@@ -249,9 +283,110 @@ internal sealed class MarketRunLiveDriver(
         return reports;
     }
 
-    private sealed class StowDriver(RetainerLiveDriver inner, MarketRunLiveDriver market, Action check,
-        StowageDepositRequest request, Action<MarketMutationReceipt> receiptChanged) : IRetainerTransferDriver
+    private async Task<IReadOnlyList<string>> RelocateAsync(Guid planId, IReadOnlyList<ListingReserveRule> reserves,
+        IDisposable lease, Action check, CancellationToken token, Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged)
     {
+        var reports = new List<string>();
+        foreach (var request in MarketRunPlanner.RelocationRequests(planId, reserves, cache.Snapshot(), owner))
+        {
+            // Finish each batch's deposit before retrieving more; never retry a refused or ambiguous move.
+            var sources = cache.Snapshot().Values.Where(r => r.Owner.Matches(owner) &&
+                r.IsCurrentlyAssigned is not false && r.IsUiAccessible is not false &&
+                !request.Routing.PreferredRetainerIds.Contains(r.RetainerId)).Select(r => r.RetainerId).ToArray();
+            var stopItem = false;
+            foreach (var source in sources)
+            {
+                if (stopItem) break;
+                while (true)
+                {
+                    check();
+                    if (!cache.Snapshot().TryGetValue(source, out var sourceCache) ||
+                        !sourceCache.Bags.Where(b => b.BagName.StartsWith("RetainerPage", StringComparison.Ordinal))
+                            .SelectMany(b => b.Items).Any(i => i.ItemId == request.ItemId && i.IsHq == request.IsHighQuality && i.Quantity > 0)) break;
+                    var player = await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
+                    var stackSize = Math.Max(1, (maxStackSize ?? throw new InvalidOperationException("Item stack-size authority unavailable."))(request.ItemId));
+                    var capacity = StowageRouter.Route(request, cache.Snapshot(), owner, stackSize).RoutedQuantity;
+                    // Empty slots are a conservative bound: do not assume a partial bag stack can merge.
+                    var batchUnits = (int)Math.Min(capacity, Math.Min(int.MaxValue, (long)player.FreeSlots * stackSize));
+                    if (batchUnits <= 0)
+                    {
+                        var message = $"MarketRunRelocateSkippedNoRoom: {request.ItemName}: no observed destination capacity or free bag slots.";
+                        reports.Add(message); reportChanged(message); logWarning?.Invoke(message);
+                        stopItem = true;
+                        break;
+                    }
+                    var held = player.Stacks.Where(s => s.ItemId == request.ItemId && s.IsHighQuality == request.IsHighQuality).Sum(s => s.Quantity);
+                    var target = new MarketGatherTarget(request.ItemId, request.ItemName,
+                        request.IsHighQuality ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly, checked(held + batchUnits), false);
+                    MarketMutationReceipt? lastReceipt = null;
+                    void Receipt(MarketMutationReceipt receipt)
+                    {
+                        lastReceipt = receipt;
+                        receipt.Intent = receipt.Intent with { Kind = "RelocationRetrieval" };
+                        receipt.Code = receipt.Outcome == MarketMutationOutcome.Committed ? "MarketRunRelocateRetrieved" :
+                            receipt.Outcome is null or MarketMutationOutcome.Indeterminate ? "MarketRunRelocateIndeterminate" : "MarketRunRelocateSkippedExecutionFailed";
+                        receiptChanged(receipt);
+                    }
+                    var guarded = new GatherDriver(transferDriver, this, check, target, deadline, routeDeadline, Receipt, request, source);
+                    var operation = journal.CreateManual(owner, [new TargetPlanItem { ItemId = target.ItemId,
+                    ItemName = target.ItemName, Quality = target.Quality, TargetQuantity = target.Units }]);
+                    var coordinator = new TransferCoordinator(journal, guarded, cache, currentOwner,
+                        () => new Dictionary<uint, int> { [request.ItemId] = held }, automation, warning: logWarning,
+                        retrievalSource: id => id == source);
+                    await coordinator.ExecuteRetrievalUnderLeaseAsync(operation.OperationId, lease, token).ConfigureAwait(false);
+                    var outcome = journal.Get(operation.OperationId)!;
+                    if (outcome.Status == OperationStatuses.Indeterminate)
+                        throw Indeterminate(outcome.Message);
+                    check();
+                    var moved = outcome.Lines.Sum(l => l.TransferredQuantity);
+                    if (moved <= 0)
+                    {
+                        if (outcome.Status != OperationStatuses.Succeeded)
+                        {
+                            var message = $"MarketRunRelocateSkippedExecutionFailed: {request.ItemName}: {outcome.Message}";
+                            reports.Add(message); reportChanged(message); logWarning?.Invoke(message);
+                        }
+                        break;
+                    }
+                    var after = await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
+                    var arrived = Math.Max(0, after.Stacks.Where(s => s.ItemId == request.ItemId && s.IsHighQuality == request.IsHighQuality).Sum(s => s.Quantity) - held);
+                    if (arrived != moved)
+                        throw Indeterminate("Retrieved stock does not match live bag arrival.");
+                    reports.AddRange(await DepositRequestsAsync([request with { Quantity = moved }], lease, check, token,
+                        receiptChanged, report => { reportChanged(report); }, true).ConfigureAwait(false));
+                    var final = await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
+                    if (final.Stacks.Where(s => s.ItemId == request.ItemId && s.IsHighQuality == request.IsHighQuality).Sum(s => s.Quantity) > held)
+                    {
+                        stopItem = true;
+                        break; // Settled no-room: leave the reported remainder, never retrieve another batch of this item.
+                    }
+                    // A bag-limited batch ends PartiallySucceeded; its verified deposit freed the bags, so take the next batch.
+                    // Each pass moved and stowed > 0 units, so this terminates with the source.
+                    if (outcome.Status is not (OperationStatuses.Succeeded or OperationStatuses.PartiallySucceeded)) break;
+
+                    MarketGatherIndeterminateException Indeterminate(string reason)
+                    {
+                        var receipt = lastReceipt ?? new MarketMutationReceipt
+                        {
+                            Intent = new("RelocationRetrieval", guarded.CurrentRetainer, request.ItemName, null, null, batchUnits, 0),
+                            RetainerName = guarded.CurrentRetainerName,
+                        };
+                        receipt.Outcome = MarketMutationOutcome.Indeterminate;
+                        receipt.Code = "MarketRunRelocateIndeterminate"; receipt.Message = reason;
+                        receiptChanged(receipt);
+                        logWarning?.Invoke($"{receipt.Code}: {request.ItemName}: {reason}");
+                        return new(guarded.CurrentRetainer, guarded.CurrentRetainerName, $"{receipt.Code}: {request.ItemName}: {reason}");
+                    }
+                }
+            }
+        }
+        return reports;
+    }
+
+    private sealed class StowDriver(RetainerLiveDriver inner, MarketRunLiveDriver market, Action check,
+        StowageDepositRequest request, Action<MarketMutationReceipt> receiptChanged, bool relocation = false) : IRetainerTransferDriver
+    {
+        private string Prefix => relocation ? "MarketRunRelocate" : "MarketRunStow";
         public ulong CurrentRetainer { get; private set; }
         public string CurrentRetainerName { get; private set; } = string.Empty;
         private MarketMutationReceipt? lastReceipt;
@@ -301,7 +436,7 @@ internal sealed class MarketRunLiveDriver(
             if (!live.Stacks.Contains(stack)) throw new InvalidOperationException("Stowage source stack changed before dispatch.");
             var receipt = new MarketMutationReceipt
             {
-                Intent = new("Stowage", CurrentRetainer, request.ItemName, null, stack, quantity, 0),
+                Intent = new(relocation ? "RelocationDeposit" : "Stowage", CurrentRetainer, request.ItemName, null, stack, quantity, 0),
                 RetainerName = CurrentRetainerName,
             };
             receiptChanged(receipt); // Persist intent before dispatch; never resend an uncertain move.
@@ -312,15 +447,15 @@ internal sealed class MarketRunLiveDriver(
                 var result = await market.deadline.RunAsync(t => inner.DepositAsync(stack, quantity, t)).ConfigureAwait(false);
                 receipt.Outcome = result.Success && result.Transferred > 0 ? MarketMutationOutcome.Committed :
                     result.Code == "NoCapacity" ? MarketMutationOutcome.Unchanged : MarketMutationOutcome.Indeterminate;
-                receipt.Code = receipt.Outcome == MarketMutationOutcome.Committed ? "MarketRunStowed" :
-                    receipt.Outcome == MarketMutationOutcome.Unchanged ? "MarketRunStowLeftInBagsNoRoom" : "MarketRunStowIndeterminate";
+                receipt.Code = receipt.Outcome == MarketMutationOutcome.Committed ? (relocation ? "MarketRunRelocated" : "MarketRunStowed") :
+                    receipt.Outcome == MarketMutationOutcome.Unchanged ? Prefix + "LeftInBagsNoRoom" : Prefix + "Indeterminate";
                 receipt.Message = $"{result.Transferred} units stowed at {CurrentRetainerName}; {result.Code}: {result.Message}";
                 return result;
             }
             catch (Exception e)
             {
                 receipt.Outcome = MarketMutationOutcome.Indeterminate;
-                receipt.Code = "MarketRunStowIndeterminate"; receipt.Message = e.Message;
+                receipt.Code = Prefix + "Indeterminate"; receipt.Message = e.Message;
                 throw;
             }
             finally
@@ -334,11 +469,11 @@ internal sealed class MarketRunLiveDriver(
         {
             var receipt = lastReceipt ?? new MarketMutationReceipt
             {
-                Intent = new("Stowage", CurrentRetainer, request.ItemName, null, null, request.Quantity, 0),
+                Intent = new(relocation ? "RelocationDeposit" : "Stowage", CurrentRetainer, request.ItemName, null, null, request.Quantity, 0),
                 RetainerName = CurrentRetainerName,
             };
             receipt.Outcome = MarketMutationOutcome.Indeterminate;
-            receipt.Code = "MarketRunStowIndeterminate"; receipt.Message = reason;
+            receipt.Code = Prefix + "Indeterminate"; receipt.Message = reason;
             receiptChanged(receipt);
             market.logWarning?.Invoke($"{receipt.Code}: {request.ItemName} × {receipt.Intent.Quantity} to {CurrentRetainerName}: {reason}");
         }
@@ -379,7 +514,7 @@ internal sealed class MarketRunLiveDriver(
 
     private sealed class GatherDriver(RetainerLiveDriver inner, MarketRunLiveDriver market, Action check,
         MarketGatherTarget target, IMarketRunDeadline deadline, IMarketRunDeadline routeDeadline,
-        Action<MarketMutationReceipt>? receiptChanged) : IRetainerTransferDriver
+        Action<MarketMutationReceipt>? receiptChanged, StowageDepositRequest? relocation = null, ulong? sourceId = null) : IRetainerTransferDriver
     {
         public bool BlockedByInventory { get; private set; }
         public int InventoryBlockedUnits { get; private set; }
@@ -396,6 +531,8 @@ internal sealed class MarketRunLiveDriver(
         public async Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken token)
         {
             check();
+            if (relocation is not null && (candidate.RetainerId != sourceId || relocation.Routing.PreferredRetainerIds.Contains(candidate.RetainerId)))
+                throw new InvalidOperationException("Relocation source is not authorized.");
             await Step(t => inner.OpenRetainerAsync(candidate, t)).ConfigureAwait(false);
             currentRetainer = candidate.RetainerId;
             CurrentRetainerName = candidate.RetainerName;
@@ -426,6 +563,15 @@ internal sealed class MarketRunLiveDriver(
                 var player = await deadline.RunAsync(market.PlayerAsync).ConfigureAwait(false);
                 var held = player.Stacks.Where(s => s.ItemId == target.ItemId && s.IsHighQuality == stack.IsHighQuality).Sum(s => s.Quantity);
                 quantity = Math.Min(quantity, Math.Max(0, target.Units - held));
+                if (relocation is not null)
+                {
+                    if (stack.ItemId != relocation.ItemId || stack.IsHighQuality != relocation.IsHighQuality ||
+                        !stack.Container.ToString().StartsWith("RetainerPage", StringComparison.Ordinal))
+                        return new(false, 0, "SourceNotAuthorized", "Relocation requires the configured variant in retainer inventory.");
+                    var size = market.StackSize(stack.ItemId);
+                    quantity = (int)Math.Min(quantity, Math.Min((long)player.FreeSlots * size,
+                        market.RelocationCapacity(relocation)));
+                }
                 if (quantity == 0) return new(true, 0, "Satisfied", "Live player stock already satisfies gather.");
                 // Conservatively reserve an empty slot; an item-only scan does not prove merge capacity.
                 if (player.FreeSlots == 0)

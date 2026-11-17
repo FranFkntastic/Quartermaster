@@ -43,6 +43,7 @@ internal static class MarketRunPresentation
         }
         return $"Refill {run.Retainers.Sum(r => (long)r.RefillListings.Value):N0} · Short {run.Retainers.Sum(r => (long)r.UnfilledListings.Value):N0} · Craft {run.Items.Sum(i => (long)i.CraftUnits.Value):N0}" +
             (run.StowUnits > 0 ? $" · Stow {run.StowUnits:N0}" : string.Empty) +
+            (run.MoveUnits > 0 ? $" · Move {run.MoveUnits:N0}" : string.Empty) +
             Capacity(Evidence.Known(run.Retainers.Sum(r => r.PullListings.Value)),
                 Evidence.Known(run.Retainers.Sum(r => r.BlockedBySlotsListings.Value)));
     }
