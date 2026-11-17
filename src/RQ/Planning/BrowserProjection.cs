@@ -384,16 +384,21 @@ public sealed class BrowserQueryController
     public int ListingCompilationCount => listings.CompilationCount;
     public int ListingEvaluationCount => listings.EvaluationCount;
 
-    public ItemQueryResult QueryItems(BrowserProjection projection, string? expression, string? scopeKey = null, bool isEditing = false, long revision = 0)
+    public FilterContext<StockGroup> EnsureItemContext(IReadOnlyList<StockGroup> source, OwnerScope owner, string? scopeKey = null, bool isEditing = false, long revision = 0)
     {
-        var source = projection.GetItems(scopeKey);
+        var scopeIdentity = ScopeIdentity(owner, scopeKey);
+        var identity = $"{revision.ToString(CultureInfo.InvariantCulture)}:{scopeIdentity}";
+        return items.EnsureContext(identity, scopeIdentity, isEditing, () => CreateItemContext(source, owner));
+    }
+
+    // A caller with an already-scoped source must still supply its actual scope key
+    // so both the query and autocomplete cache invalidate on scope changes.
+    public ItemQueryResult QueryItems(BrowserProjection projection, string? expression, string? scopeKey = null, bool isEditing = false, long revision = 0, IReadOnlyList<StockGroup>? sourceItems = null)
+    {
+        var source = sourceItems ?? projection.GetItems(scopeKey);
         var scopeIdentity = ScopeIdentity(projection, scopeKey);
         var identity = $"{revision.ToString(CultureInfo.InvariantCulture)}:{scopeIdentity}";
-        var context = items.EnsureContext(
-            identity,
-            scopeIdentity,
-            isEditing,
-            () => CreateItemContext(source, projection.Owner));
+        var context = EnsureItemContext(source, projection.Owner, scopeKey, isEditing, revision);
         var result = items.Query(
             source,
             identity,
@@ -423,7 +428,10 @@ public sealed class BrowserQueryController
     }
 
     private static string ScopeIdentity(BrowserProjection projection, string? scopeKey) =>
-        $"{projection.Owner.LocalContentId}:{projection.Owner.HomeWorldId}:{scopeKey ?? BrowserScope.AllKey}";
+        ScopeIdentity(projection.Owner, scopeKey);
+
+    private static string ScopeIdentity(OwnerScope owner, string? scopeKey) =>
+        $"{owner.LocalContentId}:{owner.HomeWorldId}:{scopeKey ?? BrowserScope.AllKey}";
 
     public static FilterContext<StockGroup> CreateItemContext(IReadOnlyList<StockGroup> source, OwnerScope owner)
     {
