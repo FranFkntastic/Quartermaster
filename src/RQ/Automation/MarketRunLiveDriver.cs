@@ -162,8 +162,9 @@ internal sealed class MarketRunLiveDriver(
         if (!owner.HasStableIdentity) throw new InvalidOperationException("Stable character identity required.");
         // Exact-quality operations are separate because the transfer planner's player
         // count delegate is item keyed. Each delegate below counts only that variant.
-        foreach (var target in targets)
+        for (var targetIndex = 0; targetIndex < targets.Count; targetIndex++)
         {
+            var target = targets[targetIndex];
             check();
             var player = await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
             var held = player.Stacks.Where(s => s.ItemId == target.ItemId && s.IsHighQuality == (target.Quality == ItemQualityPolicy.HqOnly)).Sum(s => s.Quantity);
@@ -199,6 +200,13 @@ internal sealed class MarketRunLiveDriver(
             {
                 GatherInventoryBlockedUnits += guarded.InventoryBlockedUnits;
                 reports.Add($"{target.ItemName}: gather blocked by inventory space; {guarded.InventoryBlockedUnits} units not gathered");
+                var remainingPlayer = await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
+                var unattempted = targets.Skip(targetIndex + 1).ToArray();
+                GatherInventoryBlockedUnits += unattempted.Sum(next => Math.Max(0, next.Units - remainingPlayer.Stacks
+                    .Where(stack => stack.ItemId == next.ItemId && stack.IsHighQuality == (next.Quality == ItemQualityPolicy.HqOnly))
+                    .Sum(stack => stack.Quantity)));
+                logWarning?.Invoke($"Gather blocked by inventory space; {unattempted.Length} targets left unattempted, {GatherInventoryBlockedUnits} units not gathered.");
+                break;
             }
             else if (guarded.SourceChanged) reports.Add($"{target.ItemName}: source changed; {Math.Max(0, target.Units - held - (outcome?.Lines.Sum(l => l.TransferredQuantity) ?? 0))} units not gathered");
             else if (outcome?.Status != OperationStatuses.Succeeded) reports.Add($"{target.ItemName}: gather {outcome?.Message}");
@@ -591,6 +599,11 @@ internal sealed class MarketRunLiveDriver(
                 try
                 {
                     var result = await deadline.RunAsync(t => inner.RetrieveAsync(stack, quantity, before, t)).ConfigureAwait(false);
+                    if (result.Code == "InventoryFull" && !result.MovementMayHaveOccurred)
+                    {
+                        BlockedByInventory = true;
+                        InventoryBlockedUnits = Math.Max(0, target.Units - held);
+                    }
                     receipt.Outcome = result.Success && result.Transferred > 0 ? MarketMutationOutcome.Committed :
                         result.MovementMayHaveOccurred ? MarketMutationOutcome.Indeterminate : MarketMutationOutcome.FailedBeforeSend;
                     receipt.Code = result.Code; receipt.Message = result.Message;
@@ -604,7 +617,7 @@ internal sealed class MarketRunLiveDriver(
                 }
                 finally
                 {
-                    if (receipt.Outcome != MarketMutationOutcome.Committed)
+                    if (receipt.Outcome != MarketMutationOutcome.Committed && !BlockedByInventory)
                         market.logWarning?.Invoke($"Retrieval {target.ItemName} at {CurrentRetainerName}: {receipt.Code}: {receipt.Message}");
                     receiptChanged?.Invoke(receipt);
                 }
