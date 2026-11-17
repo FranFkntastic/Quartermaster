@@ -467,6 +467,10 @@ public sealed class MarketRunExecutorTests
     }
     private sealed class Driver : IMarketRunDriver
     {
+        public Task<IReadOnlyList<string>> StowAsync(Guid planId, IReadOnlyList<ListingReserveRule> reserves,
+            IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token,
+            Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged)
+        { check(); return Task.FromResult<IReadOnlyList<string>>([]); }
         public int GatherInventoryBlockedUnits { get; set; }
         public Func<IReadOnlyList<MarketGatherTarget>, IDisposable, Action, Func<bool>, CancellationToken, Task<IReadOnlyList<string>>>? GatherOverride;
         public Dictionary<ulong, List<RetainerMarketListingTarget>> Live = new() { [10] = [], [11] = [] };

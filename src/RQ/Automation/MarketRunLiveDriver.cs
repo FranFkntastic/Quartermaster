@@ -3,6 +3,7 @@ using Franthropy.Dalamud.Automation.Retainers;
 using RQ.Domain;
 using RQ.Inventory;
 using RQ.Operations;
+using RQ.Planning;
 using InventoryType = FFXIVClientStructs.FFXIV.Client.Game.InventoryType;
 
 namespace RQ.Automation;
@@ -13,7 +14,8 @@ internal sealed class MarketRunLiveDriver(
     OperationJournal journal, RetainerCacheRepository cache, PlayerInventoryCacheRepository playerCache,
     AutomationLease automation, Func<OwnerScope> currentOwner, Func<uint, string> itemName,
     Action<string>? warning = null, ISaddlebagRetrievalDriver? saddlebag = null,
-    Func<IReadOnlyDictionary<uint, int>>? cachedSaddlebag = null, Action<string>? information = null) : IMarketRunDriver
+    Func<IReadOnlyDictionary<uint, int>>? cachedSaddlebag = null, Action<string>? information = null,
+    Func<uint, int>? maxStackSize = null) : IMarketRunDriver
 {
     private readonly Action<string>? logWarning = warning;
     private static readonly InventoryType[] Bags = [InventoryType.Inventory1, InventoryType.Inventory2, InventoryType.Inventory3, InventoryType.Inventory4];
@@ -184,6 +186,170 @@ internal sealed class MarketRunLiveDriver(
     }
     internal const string SaddlebagKind = "SaddlebagRetrieval";
 
+    public async Task<IReadOnlyList<string>> StowAsync(Guid planId, IReadOnlyList<ListingReserveRule> reserves,
+        IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token,
+        Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged)
+    {
+        gatherLease = lease;
+        runAuthority = hasAuthority;
+        owner = currentOwner();
+        check();
+        var player = await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
+        var requests = MarketRunPlanner.StowRequests(planId, reserves,
+            player.Stacks.Select(s => (s.ItemId, s.IsHighQuality, s.Quantity)));
+        var reports = new List<string>();
+        foreach (var request in requests)
+        {
+            check();
+            var destinations = string.Join(", ", request.Routing.PreferredRetainerIds.Select(id =>
+                cache.Snapshot().GetValueOrDefault(id)?.RetainerName ?? $"Retainer {id}"));
+            if (request.Routing.AnySpace) destinations += (destinations.Length > 0 ? ", " : "") + "Any space";
+            // Plan one variant at a time so the preceding deposit's observations feed capacity math.
+            var batch = StowageRouter.BuildBatch([request], cache.Snapshot(), owner,
+                maxStackSize ?? throw new InvalidOperationException("Item stack-size authority unavailable."), DateTime.UtcNow);
+            var route = batch.Routes.Single();
+            var guarded = new StowDriver(transferDriver, this, check, request, receiptChanged);
+            if (route.RoutedQuantity > 0)
+            {
+                var operation = journal.CreateDeposit(owner, batch, OperationKinds.StowageSurplus);
+                var coordinator = new TransferCoordinator(journal, guarded, cache, currentOwner,
+                    () => new Dictionary<uint, int>(), automation, warning: logWarning);
+                await coordinator.ExecuteDepositUnderLeaseAsync(operation.OperationId, lease, token).ConfigureAwait(false);
+                var outcome = journal.Get(operation.OperationId)!;
+                if (outcome.Status == OperationStatuses.Indeterminate)
+                {
+                    guarded.MarkIndeterminate(outcome.Message);
+                    throw new MarketGatherIndeterminateException(guarded.CurrentRetainer, guarded.CurrentRetainerName,
+                        $"MarketRunStowIndeterminate: {request.ItemName} × {request.Quantity} to {destinations}: {outcome.Message}");
+                }
+                check();
+                var moved = outcome.Lines.Sum(l => l.TransferredQuantity);
+                var left = request.Quantity - moved;
+                if (left > 0)
+                {
+                    // Only a capacity refusal or a normally settled route proves no room. Other failures
+                    // (authority, source change, opening the session) must not masquerade as full storage.
+                    var noRoom = outcome.Status is OperationStatuses.Succeeded or OperationStatuses.PartiallySucceeded ||
+                        outcome.Message.StartsWith("Stowed ", StringComparison.Ordinal);
+                    Report(noRoom ? "MarketRunStowLeftInBagsNoRoom" : "MarketRunStowSkippedExecutionFailed", left, outcome.Message);
+                    if (!noRoom) throw new InvalidOperationException(outcome.Message);
+                }
+                await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
+            }
+            else Report("MarketRunStowLeftInBagsNoRoom", request.Quantity, "No observed capacity at the configured destinations.");
+
+            void Report(string code, int quantity, string reason)
+            {
+                var message = $"{code}: {request.ItemName} × {quantity} to {destinations}: {reason}";
+                reports.Add(message);
+                reportChanged(message);
+                logWarning?.Invoke(message);
+            }
+        }
+        return reports;
+    }
+
+    private sealed class StowDriver(RetainerLiveDriver inner, MarketRunLiveDriver market, Action check,
+        StowageDepositRequest request, Action<MarketMutationReceipt> receiptChanged) : IRetainerTransferDriver
+    {
+        public ulong CurrentRetainer { get; private set; }
+        public string CurrentRetainerName { get; private set; } = string.Empty;
+        private MarketMutationReceipt? lastReceipt;
+        private void Guard() { check(); market.RequireSessionAuthority(); }
+        private Task Step(Func<CancellationToken, Task> action)
+        {
+            Guard();
+            return market.deadline.RunAsync(async t => { await action(t).ConfigureAwait(false); return true; });
+        }
+        public Task RequireRetainerListAsync(CancellationToken token)
+        {
+            Guard();
+            return market.routeDeadline.RunAsync(async t => { await inner.RequireRetainerListAsync(t).ConfigureAwait(false); return true; });
+        }
+        public async Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken token)
+        {
+            Guard();
+            if (!request.Routing.AnySpace && !request.Routing.PreferredRetainerIds.Contains(candidate.RetainerId))
+                throw new InvalidOperationException("Stowage destination is not authorized by the reserve.");
+            CurrentRetainer = candidate.RetainerId;
+            CurrentRetainerName = candidate.RetainerName;
+            await Step(t => inner.OpenRetainerAsync(candidate, t)).ConfigureAwait(false);
+        }
+        public Task OpenInventoryAsync(CancellationToken token) => Step(inner.OpenInventoryAsync);
+        public async Task<IReadOnlyList<DalamudInventoryStack>> ScanRetainerAsync(IReadOnlySet<uint> ids, CancellationToken token)
+        {
+            market.RequireSessionAuthority();
+            var stacks = await market.deadline.RunAsync(t => inner.ScanRetainerAsync(ids, t)).ConfigureAwait(false);
+            market.RequireSessionAuthority();
+            market.ObserveStow(CurrentRetainer, request, stacks);
+            return stacks;
+        }
+        public async Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerInventoryAsync(IReadOnlySet<uint> ids, CancellationToken token)
+        {
+            Guard();
+            return (await market.deadline.RunAsync(market.PlayerAsync).ConfigureAwait(false)).Stacks.Where(s => ids.Contains(s.ItemId)).ToArray();
+        }
+        public Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerCrystalsAsync(IReadOnlySet<uint> ids, CancellationToken token) =>
+            Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([]);
+        public async Task<RetainerDepositResult> DepositAsync(DalamudInventoryStack stack, int quantity, CancellationToken token)
+        {
+            Guard();
+            if (stack.ItemId != request.ItemId || stack.IsHighQuality != request.IsHighQuality)
+                throw new InvalidOperationException("Stowage source variant is not authorized.");
+            var live = await market.deadline.RunAsync(market.PlayerAsync).ConfigureAwait(false);
+            Guard();
+            if (!live.Stacks.Contains(stack)) throw new InvalidOperationException("Stowage source stack changed before dispatch.");
+            var receipt = new MarketMutationReceipt
+            {
+                Intent = new("Stowage", CurrentRetainer, request.ItemName, null, stack, quantity, 0),
+                RetainerName = CurrentRetainerName,
+            };
+            receiptChanged(receipt); // Persist intent before dispatch; never resend an uncertain move.
+            lastReceipt = receipt;
+            try
+            {
+                Guard();
+                var result = await market.deadline.RunAsync(t => inner.DepositAsync(stack, quantity, t)).ConfigureAwait(false);
+                receipt.Outcome = result.Success && result.Transferred > 0 ? MarketMutationOutcome.Committed :
+                    result.Code == "NoCapacity" ? MarketMutationOutcome.Unchanged : MarketMutationOutcome.Indeterminate;
+                receipt.Code = receipt.Outcome == MarketMutationOutcome.Committed ? "MarketRunStowed" :
+                    receipt.Outcome == MarketMutationOutcome.Unchanged ? "MarketRunStowLeftInBagsNoRoom" : "MarketRunStowIndeterminate";
+                receipt.Message = $"{result.Transferred} units stowed at {CurrentRetainerName}; {result.Code}: {result.Message}";
+                return result;
+            }
+            catch (Exception e)
+            {
+                receipt.Outcome = MarketMutationOutcome.Indeterminate;
+                receipt.Code = "MarketRunStowIndeterminate"; receipt.Message = e.Message;
+                throw;
+            }
+            finally
+            {
+                if (receipt.Outcome != MarketMutationOutcome.Committed)
+                    market.logWarning?.Invoke($"{receipt.Code}: {request.ItemName} × {quantity} to {CurrentRetainerName}: {receipt.Message}");
+                receiptChanged(receipt);
+            }
+        }
+        public void MarkIndeterminate(string reason)
+        {
+            var receipt = lastReceipt ?? new MarketMutationReceipt
+            {
+                Intent = new("Stowage", CurrentRetainer, request.ItemName, null, null, request.Quantity, 0),
+                RetainerName = CurrentRetainerName,
+            };
+            receipt.Outcome = MarketMutationOutcome.Indeterminate;
+            receipt.Code = "MarketRunStowIndeterminate"; receipt.Message = reason;
+            receiptChanged(receipt);
+            market.logWarning?.Invoke($"{receipt.Code}: {request.ItemName} × {receipt.Intent.Quantity} to {CurrentRetainerName}: {reason}");
+        }
+        public Task CloseRetainerAsync(CancellationToken token) => market.HasSessionAuthority() && !MarketRunDeadline.HasUnsettled
+            ? market.deadline.RunAsync(async t => { await inner.CloseRetainerAsync(t).ConfigureAwait(false); return true; }) : Task.CompletedTask;
+        public Task CloseRetainerListAsync(CancellationToken token) => Task.CompletedTask;
+        public Task<RetrievalResult> RetrieveAsync(DalamudInventoryStack stack, int quantity, CancellationToken token) => throw new NotSupportedException();
+        public Task<RetainerCrystalTransferResult> DepositCrystalAsync(DalamudInventoryStack stack, int quantity, CancellationToken token) => throw new NotSupportedException();
+        public void CancelActive() { }
+    }
+
     /// <summary>
     /// One terminal saddlebag attempt as a run receipt, so the run's no-repeat rules see it.
     /// A move that may have happened without a proven arrival is Indeterminate.
@@ -206,6 +372,10 @@ internal sealed class MarketRunLiveDriver(
     private void ObserveGather(ulong id, MarketGatherTarget target, IReadOnlyList<DalamudInventoryStack> stacks) =>
         cache.ReplaceObservedVariant(new(id, target.ItemId, target.ItemName, target.Quality == ItemQualityPolicy.HqOnly,
             DateTime.UtcNow, stacks.Where(s => s.ItemId == target.ItemId && s.IsHighQuality == (target.Quality == ItemQualityPolicy.HqOnly)).ToArray()));
+
+    private void ObserveStow(ulong id, StowageDepositRequest request, IReadOnlyList<DalamudInventoryStack> stacks) =>
+        cache.ReplaceObservedVariant(new(id, request.ItemId, request.ItemName, request.IsHighQuality,
+            DateTime.UtcNow, stacks.Where(s => s.ItemId == request.ItemId && s.IsHighQuality == request.IsHighQuality).ToArray()));
 
     private sealed class GatherDriver(RetainerLiveDriver inner, MarketRunLiveDriver market, Action check,
         MarketGatherTarget target, IMarketRunDeadline deadline, IMarketRunDeadline routeDeadline,

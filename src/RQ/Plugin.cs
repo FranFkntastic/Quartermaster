@@ -226,7 +226,9 @@ public sealed class Plugin : IDalamudPlugin
         var marketRunStore = new MarketRunStore(Path.Combine(configDirectory, "market-run.json"));
         marketRuns = new(new MarketRunLiveDriver(retainerSession, driver, journal, cache, playerInventory,
                 automation, CurrentOwner, id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.Name.ToString() ?? $"Item {id}", message => log.Warning(message),
-                saddlebagDriver, CountCachedSaddlebagItems, message => log.Information(message)),
+                saddlebagDriver, CountCachedSaddlebagItems, message => log.Information(message),
+                id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.StackSize is > 0 and var size
+                    ? checked((int)size) : throw new InvalidOperationException($"Stack size unavailable for item {id}.")),
             automation, () => state.Read(s => ListingPlanCatalog.OwnerPlan(s, CurrentOwner())), marketRunStore.Save, autoRetainerSuppression, clear: marketRunStore.Clear, warning: message => log.Warning(message),
             information: message => log.Information(message));
         marketRuns.Restore(marketRunStore.Load());

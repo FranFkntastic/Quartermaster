@@ -482,9 +482,18 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             () => ExecuteDepositCoreAsync(operationId, cancellationToken),
             cancellationToken);
 
-    private async Task<TransferExecutionResult> ExecuteDepositCoreAsync(string operationId, CancellationToken cancellationToken)
+    internal Task<TransferExecutionResult> ExecuteDepositUnderLeaseAsync(
+        string operationId, IDisposable lease, CancellationToken cancellationToken)
     {
-        if (!automation.TryAcquire("retainer transfer", out var lease))
+        if (!automation.Owns(lease))
+            throw new InvalidOperationException("The caller does not own the automation lease.");
+        return ExecuteDepositCoreAsync(operationId, cancellationToken, lease);
+    }
+
+    private async Task<TransferExecutionResult> ExecuteDepositCoreAsync(string operationId, CancellationToken cancellationToken, IDisposable? borrowedLease = null)
+    {
+        IDisposable? lease = null;
+        if (borrowedLease is null && !automation.TryAcquire("retainer transfer", out lease))
             return new(false, automation.AcquisitionBlockReason ?? "Automation is unavailable.");
         using (lease)
         {

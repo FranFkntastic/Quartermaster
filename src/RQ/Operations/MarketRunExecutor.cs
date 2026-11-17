@@ -38,6 +38,8 @@ public interface IMarketRunDriver
     Task ReturnAsync(CancellationToken token);
     Task CloseListAsync(CancellationToken token);
     Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token, Action<MarketMutationReceipt>? receiptChanged = null);
+    Task<IReadOnlyList<string>> StowAsync(Guid planId, IReadOnlyList<ListingReserveRule> reserves, IDisposable lease,
+        Action check, Func<bool> hasAuthority, CancellationToken token, Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged);
 }
 
 public interface IMarketRunDeadline
@@ -202,8 +204,11 @@ public sealed class MarketRunExecutor(
 
     private async Task RunCoreAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty)
     {
+        var listingWork = evaluation.Retainers.Any(r => r.Assignments.Any(a =>
+            a.ShortListings is { IsKnown: true, Value: > 0 } || a.RepriceListings is { IsKnown: true, Value: > 0 }));
         if (draftDirty || !evaluation.IsComplete || evaluation.PlanId != plan.Id || evaluation.PlanRevision != plan.Revision ||
-            !evaluation.Retainers.Any(r => r.Assignments.Any(a => a.ShortListings.Value > 0 || a.RepriceListings.Value > 0))) return;
+            (!listingWork && evaluation.StowUnits <= 0)) return;
+        var reserves = plan.Reserves.Select(ListingPlanCatalog.Copy).ToArray();
         if (!automation.TryAcquire("market run", out var lease)) return;
         {
             if (Interlocked.CompareExchange(ref running, 1, 0) != 0) { lease!.Dispose(); return; }
@@ -221,6 +226,7 @@ public sealed class MarketRunExecutor(
             AutoRetainerSuppression.Scope? scope = null;
             var sessionStarted = false;
             var scannedRetainers = new HashSet<ulong>();
+            var stowageEntered = false;
             try
             {
                 Persist(record);
@@ -237,22 +243,48 @@ public sealed class MarketRunExecutor(
                     }
                     if (suppression.IsAvailable) scope = suppression.Acquire();
                 }
-                Status = "Gathering stock";
                 sessionStarted = true;
-                var targets = evaluation.Items.Where(i => i.RefillUnits.Value > 0)
-                    .Select(i => new MarketGatherTarget(i.ItemId, i.ItemName, i.Quality, i.RefillUnits.Value)).ToArray();
-                // Gather owns per-call deadlines, not a single deadline for a multi-retainer route.
-                await GatherAsync(record, targets).ConfigureAwait(false);
-                Check(record);
-                await routeDeadline.RunAsync(async t => { await driver.RequireRetainerListAsync(t).ConfigureAwait(false); return true; }).ConfigureAwait(false);
-                var visits = record.Assignments.GroupBy(a => a.RetainerId)
-                    .Select(g => new RetainerVisit(g.Key, g.Select(a => a.RetainerName).FirstOrDefault(n => !string.IsNullOrWhiteSpace(n)) ?? $"Retainer {g.Key}", g.ToArray()))
-                    .OrderBy(g => g.Name, StringComparer.OrdinalIgnoreCase).ThenBy(g => g.Id).ToArray();
-                foreach (var visit in visits)
-                    await VisitRetainerAsync(record, visit, scannedRetainers, reprice: true).ConfigureAwait(false);
-                await TopUpAsync(record, visits, scannedRetainers).ConfigureAwait(false);
+                if (listingWork)
+                {
+                    Status = "Gathering stock";
+                    var targets = evaluation.Items.Where(i => i.RefillUnits.Value > 0)
+                        .Select(i => new MarketGatherTarget(i.ItemId, i.ItemName, i.Quality, i.RefillUnits.Value)).ToArray();
+                    // Gather owns per-call deadlines, not a single deadline for a multi-retainer route.
+                    await GatherAsync(record, targets).ConfigureAwait(false);
+                    Check(record);
+                    await routeDeadline.RunAsync(async t => { await driver.RequireRetainerListAsync(t).ConfigureAwait(false); return true; }).ConfigureAwait(false);
+                    var visits = record.Assignments.GroupBy(a => a.RetainerId)
+                        .Select(g => new RetainerVisit(g.Key, g.Select(a => a.RetainerName).FirstOrDefault(n => !string.IsNullOrWhiteSpace(n)) ?? $"Retainer {g.Key}", g.ToArray()))
+                        .OrderBy(g => g.Name, StringComparer.OrdinalIgnoreCase).ThenBy(g => g.Id).ToArray();
+                    foreach (var visit in visits)
+                        await VisitRetainerAsync(record, visit, scannedRetainers, reprice: true).ConfigureAwait(false);
+                    await TopUpAsync(record, visits, scannedRetainers).ConfigureAwait(false);
+                }
+                if (record.NeedsCheck.Count > 0 || record.Mutations.Any(m => m.Outcome is null or MarketMutationOutcome.Indeterminate))
+                {
+                    StowSkipped(record, reserves, "MarketRunStowSkippedNeedsCheck", "A mutation outcome is unknown.");
+                    stowageEntered = true;
+                }
+                else
+                {
+                    Check(record);
+                    Status = "Stowing spare stock";
+                    await driver.StowAsync(record.PlanId, reserves, runLease!, () => Check(record),
+                        () => HasSessionAuthority(record), CancellationToken.None, receipt =>
+                        {
+                            if (!record.Mutations.Contains(receipt)) record.Mutations.Add(receipt);
+                            if (receipt.Outcome == MarketMutationOutcome.Indeterminate && !record.NeedsCheck.Contains(receipt.Intent.RetainerId))
+                            {
+                                record.NeedsCheck.Add(receipt.Intent.RetainerId);
+                                record.NeedsCheckNames[receipt.Intent.RetainerId] = receipt.RetainerName;
+                            }
+                            Persist(record);
+                        }, report => { Add(record, report); Persist(record); }).ConfigureAwait(false);
+                    Check(record);
+                    stowageEntered = true;
+                }
                 record.State = record.NeedsCheck.Count > 0 ? "Stopped" : "Completed";
-                if (record.NeedsCheck.Count > 0) record.Reason = "Needs a check: reprice outcome unknown.";
+                if (record.NeedsCheck.Count > 0) record.Reason = "Needs a check: mutation outcome unknown.";
             }
             catch (OperationCanceledException) when (Volatile.Read(ref cancelled) != 0)
             { record.State = "Cancelled"; record.Reason = "Cancelled between steps."; }
@@ -263,6 +295,9 @@ public sealed class MarketRunExecutor(
             {
                 try
                 {
+                    if (!stowageEntered)
+                        StowSkipped(record, reserves, record.State == "Cancelled" ? "MarketRunStowSkippedCancelled" :
+                            record.NeedsCheck.Count > 0 ? "MarketRunStowSkippedNeedsCheck" : "MarketRunStowSkippedStopped", record.Reason);
                     // Never overlap an abandoned call, touch a new character, or use an unloaded session.
                     if (sessionStarted && CanCleanUp(record))
                     {
@@ -292,6 +327,21 @@ public sealed class MarketRunExecutor(
     }
 
     private sealed record RetainerVisit(ulong Id, string Name, ListingPlanAssignment[] Assignments);
+
+    private void StowSkipped(MarketRunRecord record, IReadOnlyList<ListingReserveRule> reserves, string code, string reason)
+    {
+        // One line per skip; bags are not scanned, so quantities are unknown here.
+        var eligible = reserves.Where(r => r.Enabled && r.ItemId > 0 && (r.Location.AnySpace || r.Location.PreferredRetainerIds.Count > 0))
+            .Select(r => r.ItemName).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        if (eligible.Length == 0)
+        {
+            Add(record, $"{code}: {reason}; no reserves with destinations.");
+            return;
+        }
+        var message = $"{code}: {reason}; stowage not attempted for {eligible.Length} reserve item(s): {string.Join(", ", eligible)}.";
+        Add(record, message);
+        warning?.Invoke(message);
+    }
 
     private async Task GatherAsync(MarketRunRecord record, IReadOnlyList<MarketGatherTarget> targets)
     {
