@@ -360,7 +360,9 @@ internal sealed class MarketRunLiveDriver(
                         stopItem = true;
                         break; // Settled no-room: leave the reported remainder, never retrieve another batch of this item.
                     }
-                    if (outcome.Status != OperationStatuses.Succeeded) break;
+                    // A bag-limited batch ends PartiallySucceeded; its verified deposit freed the bags, so take the next batch.
+                    // Each pass moved and stowed > 0 units, so this terminates with the source.
+                    if (outcome.Status is not (OperationStatuses.Succeeded or OperationStatuses.PartiallySucceeded)) break;
 
                     MarketGatherIndeterminateException Indeterminate(string reason)
                     {
