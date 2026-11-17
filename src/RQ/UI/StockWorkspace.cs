@@ -439,7 +439,7 @@ internal sealed class StockWorkspace
 
     private void DrawScopeCombo(BrowserProjection projection)
     {
-        ImGui.SetNextItemWidth(150);
+        ImGui.SetNextItemWidth(Math.Max(150, ImGui.CalcTextSize(CatalogPicker.ScopeLabel).X + ImGui.GetFrameHeight() + (ImGui.GetStyle().FramePadding.X * 2f)));
         var selectedScope = projection.Scopes.First(scope => scope.Key == workbench.ScopeKey);
         if (ImGui.BeginCombo("##RQStockScope", catalogMode ? CatalogPicker.ScopeLabel : selectedScope.Label))
         {
