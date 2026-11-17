@@ -59,6 +59,7 @@ internal sealed class StockWorkspace
     private StockLookup? scopedLookup;
     private StockLookup? allLookup;
     private long prunedRevision = -1;
+    private OwnerScope? selectionOwner;
     private int selectionBarLines = 1;
     private int stockProjectionBuildCount;
     private int visibleStockCount;
@@ -183,6 +184,7 @@ internal sealed class StockWorkspace
     public void Draw(QuartermasterRuntimeSnapshot runtime)
     {
         var drawStarted = Stopwatch.GetTimestamp();
+        ClearSelectionOnOwnerChange(runtime.Owner);
         PruneSelection(runtime);
         if (catalogMode)
         {
@@ -781,6 +783,19 @@ internal sealed class StockWorkspace
                 carried.Add(item.ItemId);
         }
         return slot = new StockLookup(runtime.Revision, scopeKey, byId, carried);
+    }
+
+    /// <summary>
+    /// Clears the selection when a different character logs in. An owner without identity (logged
+    /// out or between areas) is ignored, so a blip back to the same character keeps the selection.
+    /// </summary>
+    private void ClearSelectionOnOwnerChange(OwnerScope owner)
+    {
+        if (!owner.HasStableIdentity && string.IsNullOrWhiteSpace(owner.CharacterName))
+            return;
+        if (selectionOwner is not null && !selectionOwner.Matches(owner))
+            ClearStockSelection();
+        selectionOwner = owner;
     }
 
     /// <summary>Drops selected IDs that exist neither in stock nor in the game catalog.</summary>
