@@ -27,6 +27,7 @@ internal sealed record StockWorkspaceSnapshot(
 /// </summary>
 internal sealed class StockWorkspace
 {
+    private readonly SearchReference.Button searchHelp = new("quartermaster.stock.searchHelp", "Stock search syntax");
     private readonly StateRepository state;
     private readonly QuartermasterRuntimeSnapshotSource runtimeSnapshots;
     private readonly RetainerRefreshCoordinator retainerRefresh;
@@ -370,10 +371,10 @@ internal sealed class StockWorkspace
         var filterBeforeDraw = workbench.ItemFilterState.Expression;
         DalamudFilterAutocompleteRenderer.Draw(
             "RQStockWorkbench",
-            "Search accessible stock by item name",
+            "Search stock — try ilvl>=690 job:WHM slot:body",
             context,
             workbench.ItemFilterState,
-            Math.Max(100, ImGui.GetContentRegionAvail().X - trailingWidth));
+            Math.Max(100, ImGui.GetContentRegionAvail().X - trailingWidth - SearchReference.ButtonWidth - ImGui.GetStyle().ItemSpacing.X));
         if (!string.Equals(filterBeforeDraw, workbench.ItemFilterState.Expression, StringComparison.Ordinal))
             workbench.FocusedStockItemId = null;
         reviewRegistry.RegisterLastAction(
@@ -396,6 +397,14 @@ internal sealed class StockWorkspace
                 return AgentBridgeUiActionResult.Ok("Stock search updated.");
             });
 
+        ImGui.SameLine();
+        searchHelp.Draw(reviewRegistry);
+        if (searchHelp.DrawStock(context) is { } example)
+        {
+            workbench.ItemFilterState.SetExpression(example, example.Length);
+            workbench.ItemFilterState.RequestFocus();
+            workbench.FocusedStockItemId = null;
+        }
         ImGui.SameLine();
         DrawScopeCombo(projection);
 
