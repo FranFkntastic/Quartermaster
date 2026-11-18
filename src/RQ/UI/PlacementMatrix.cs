@@ -17,7 +17,8 @@ internal sealed record PlacementMatrixRow<TKey>(
     string Label,
     string Quantity,
     StowageRoutingPolicy Routing,
-    IReadOnlyDictionary<ulong, int> Holdings);
+    IReadOnlyDictionary<ulong, int> Holdings,
+    string? Gathering = null);
 
 /// <summary>An owner retainer column; FreeSlots is null while its inventory is unobserved.</summary>
 internal sealed record PlacementMatrixColumn(ulong RetainerId, string Name, int? FreeSlots);
@@ -96,6 +97,7 @@ internal sealed class PlacementMatrix<TKey>
     private static readonly Vector4 HoverCellColor = new(.14f, .19f, .23f, 1f);
     private static readonly Vector4 AnySeparatorColor = new(.23f, .23f, .23f, 1f);
 
+    private readonly bool allowConsolidation;
     private readonly string surfaceId;
     private readonly string quantityHeader;
     private readonly AgentBridgeUiReviewRegistry registry;
@@ -105,8 +107,9 @@ internal sealed class PlacementMatrix<TKey>
     private ulong target = PlacementEdits.AnySpace;
     private int selectionBarLines = 1;
 
-    public PlacementMatrix(string surfaceId, string quantityHeader, AgentBridgeUiReviewRegistry registry)
+    public PlacementMatrix(string surfaceId, string quantityHeader, AgentBridgeUiReviewRegistry registry, bool allowConsolidation = false)
     {
+        this.allowConsolidation = allowConsolidation;
         this.surfaceId = surfaceId;
         this.quantityHeader = quantityHeader;
         this.registry = registry;
@@ -216,7 +219,19 @@ internal sealed class PlacementMatrix<TKey>
         Action("remove", "Remove", primary: false, hasSelection, allRows, apply,
             $"Remove {targetName} from the selected rows",
             routing => PlacementEdits.Remove(routing, target));
-        ActionPerRow("where-it-lives", "Where it lives", hasSelection, allRows, apply,
+        if (allowConsolidation)
+        {
+            var turnOff = allRows.Where(row => selected.Contains(row.Key))
+                .All(row => row.Routing.Consolidate && PlacementEdits.Rank(row.Routing, target) == 1);
+            Action("consolidate", "Consolidate", primary: false, hasSelection && target != PlacementEdits.AnySpace,
+                allRows, apply, $"Toggle consolidation into {targetName}", routing =>
+                {
+                    var next = turnOff ? routing.Copy() : PlacementEdits.MakeFirst(routing, target);
+                    next.Consolidate = !turnOff;
+                    return next;
+                });
+        }
+        ActionPerRow("where-it-lives", "Use current holders", hasSelection, allRows, apply,
             "Put the retainers holding each selected item first, most units first",
             row => PlacementEdits.WhereItLives(row.Routing, row.Holdings));
         Action("clear-destinations", "Clear destinations", primary: false, hasSelection, allRows, apply,
@@ -586,6 +601,9 @@ internal sealed class PlacementMatrix<TKey>
             var badgeMin = new Vector2(x, centerY - (badgeDiameter / 2f));
             var badgeMax = new Vector2(x + badgeWidth, centerY + (badgeDiameter / 2f));
             drawList.AddRectFilled(badgeMin, badgeMax, ImGui.GetColorU32(rank == 1 ? FirstRankColor : RankColor), badgeDiameter / 2f);
+            if (allowConsolidation && row.Routing.Consolidate && rank == 1 && column is not null)
+                drawList.AddCircle((badgeMin + badgeMax) / 2f, badgeDiameter / 2f,
+                    ImGui.GetColorU32(new Vector4(.95f, .76f, .25f, 1f)), 0, 1.5f * ImGuiHelpers.GlobalScale);
             var textSize = ImGui.CalcTextSize(badgeText) * smallScale;
             drawList.AddText(font, fontSize,
                 new Vector2(x + ((badgeWidth - textSize.X) / 2f), centerY - (textSize.Y / 2f)),
@@ -599,7 +617,8 @@ internal sealed class PlacementMatrix<TKey>
         }
 
         if (hovered)
-            ImGui.SetTooltip(Tooltip(row, retainerId, column, rank, held));
+            ImGui.SetTooltip(Tooltip(row, retainerId, column, rank, held) +
+                (allowConsolidation && rank == 1 && column is not null && row.Routing.Consolidate ? $" · {row.Gathering}" : ""));
         if (clicked)
             apply([(row.Key, PlacementEdits.Toggle(row.Routing, retainerId))]);
     }
