@@ -550,9 +550,11 @@ internal sealed class TransferPlanWorkspace
             : "Buy from vendor###RQTransferVendorBuy";
         var lines = projection?.Rules.Count ?? 0;
         var placed = projection?.Rules.Count(rule => rule.Routing.AnySpace || rule.Routing.PreferredRetainerIds.Count > 0) ?? 0;
-        var placementLabel = placed > 0
-            ? $"Placement · {placed:N0} of {lines:N0} line{(lines == 1 ? string.Empty : "s")}###RQTransferPlacement"
-            : "Placement###RQTransferPlacement";
+        var placementLabel = showPlacement
+            ? "Back to plan###RQTransferPlacement"
+            : placed > 0
+                ? $"Placement · {placed:N0} of {lines:N0} line{(lines == 1 ? string.Empty : "s")}###RQTransferPlacement"
+                : "Placement###RQTransferPlacement";
         const string menuLabel = "…##RQTransferPlanMenu";
         var trailing = ButtonWidth(menuLabel) + ButtonWidth(placementLabel) + ButtonWidth(executeLabel) + ButtonWidth(buyLabel) +
                        (style.ItemSpacing.X * 4f);
