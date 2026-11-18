@@ -56,6 +56,9 @@ public sealed class QuartermasterWindow : Window
     private TransferReviewDialogState? capturePreviousTransferReviewState;
     private VendorProcurementReviewDialogState? capturePreviousVendorReviewState;
 
+    internal void SetMarketCompetition(Interop.ComplicatedMarketBoardCompetitionClient client, PluginConfiguration config, System.Action save) =>
+        listingWorkspace.Market = new(client, config, save, listingSession);
+
     internal void SetMarketRunExecutor(MarketRunExecutor executor, MarketRunHistoryWindow history,
         RQ.Interop.ComplicatedMarketBoardItemClient itemClient)
     {

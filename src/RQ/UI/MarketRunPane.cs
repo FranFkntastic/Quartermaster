@@ -40,6 +40,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
     internal MarketRunExecutor? Executor { get; set; }
     internal MarketRunHistoryWindow? History { get; set; }
     /// <summary>Opens the Market Placement view, filtered to the named item when given.</summary>
+    internal Action<uint>? OpenItem { get; set; }
     internal Action<string?>? OpenPlacement { get; set; }
     internal AgentBridgeUiReviewRegistry? Registry { get; set; }
 
@@ -409,6 +410,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
             var label = Label(item.ItemName, item.Quality);
             ImGui.AlignTextToFramePadding();
             var open = ImGui.TreeNodeEx(label + "###item", ImGuiTreeNodeFlags.NoTreePushOnOpen | ImGuiTreeNodeFlags.SpanAvailWidth);
+            if (ImGui.IsItemClicked(ImGuiMouseButton.Right)) OpenItem?.Invoke(item.ItemId);
             if (ImGui.IsItemHovered() && ImGui.CalcTextSize(label).X + ImGui.GetTreeNodeToLabelSpacing() > ImGui.GetItemRectSize().X)
                 ImGui.SetTooltip(label);
             if (showListed) { ImGui.TableNextColumn(); DrawListed(item, listedBar); }

@@ -42,6 +42,7 @@ internal sealed class ListingWorkspace
     private string? duplicateRowsWarned;
     private readonly DalamudTableProjection<ListingRetainerRow> retainerTable;
     private readonly DalamudTableProjection<ListingSlotView> slotTable;
+    private readonly DalamudTableProjection<ListingSlotView> slotsWithoutMarket;
     internal RQ.Interop.ComplicatedMarketBoardItemClient? ItemClient { get; set; }
     private string? itemOpenStatus;
     private (long Planning, int Draft) projectionKey = (-1, -1);
@@ -63,10 +64,8 @@ internal sealed class ListingWorkspace
     private readonly DalamudSuggestionInputState bulkItemInput = new();
     private string? bulkUnits;
     private string? bulkPrice;
-    // The popup's target lives until the popup closes; the open request is one frame only.
-    // Several retainers can be expanded, so the target is bound to the retainer whose popup owns it.
-    private (ulong RetainerId, uint ItemId, string Name)? slotMenuItem;
-    private (uint ItemId, string Name)? slotMenuRequest;
+    internal ListingMarketView? Market { get; set; }
+    private void OpenItem(uint id) => itemOpenStatus = ItemClient?.Open(id);
 
     public ListingWorkspace(WorkbenchState workbench, ListingNavigationCoordinator navigation,
         AgentBridgeUiReviewRegistry registry, ListingPlanDraftSession session,
@@ -77,6 +76,7 @@ internal sealed class ListingWorkspace
         this.workbench = workbench; this.navigation = navigation; this.registry = registry; this.session = session;
         this.searchItems = searchItems; this.listability = listability; this.refresh = refresh; this.runPane = runPane;
         placement = new("quartermaster.listings.placement", "Spare", registry);
+        runPane.OpenItem = OpenItem;
         runPane.OpenPlacement = OpenPlacement;
         runPane.Registry = registry;
         retainerTable = new(
@@ -91,10 +91,12 @@ internal sealed class ListingWorkspace
             new("State", StateColumnWidth, r => r.State.Text, r => r.State.Rank,
                 Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoHide,
                 Draw: DrawRetainerState, Id: "state"),
+            new("Market", 145, r => Market?.Summary(r)?.Text ?? "", r => Market?.Summary(r)?.Sort ?? (4, 0, 0m),
+                Draw: r => Market?.DrawSummary(r, () => workbench.ExpandListing(r.RetainerId)), Id: "market"),
         ], DalamudTableSelection<ListingRetainerRow>.Single(
             r => r.RetainerId == workbench.SelectedListingRetainerId,
             r => workbench.ToggleListing(r.RetainerId)));
-        slotTable = new(
+        DalamudTableColumn<ListingSlotView>[] slotColumns =
         [
             new("##select", 22, _ => string.Empty, Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoHeaderLabel,
                 Draw: DrawSlotCheck, Id: "select"),
@@ -110,8 +112,12 @@ internal sealed class ListingWorkspace
                 Id: "price", SelectionTargetFraction: 1),
             new("Listed", 110, s => s.Listed.ToString(), Draw: s => SlotCell(s, () => DrawSlotListed(s)),
                 Id: "listed", SelectionTargetFraction: 1),
-        ], DalamudTableSelection<ListingSlotView>.Single(
-            s => slotRetainerId == drawingRetainerId && slotSelection.IsSelected(s.Key), ClickSlot));
+            new("Market", 145, s => Market?.Slot(s)?.Text ?? "", Draw: s => Market?.DrawSlot(s), Id: "market"),
+        ];
+        var selection = DalamudTableSelection<ListingSlotView>.Single(
+            s => slotRetainerId == drawingRetainerId && slotSelection.IsSelected(s.Key), ClickSlot);
+        slotTable = new(slotColumns, selection);
+        slotsWithoutMarket = new(slotColumns[..^1], selection);
     }
 
     internal static Vector4 Color(ListingStateTone tone) => tone switch
@@ -196,6 +202,7 @@ internal sealed class ListingWorkspace
             return;
         }
         retainerTable.DrawColumnMenuButton("RQMarketRetainerColumns");
+        Market?.DrawToolbar(runtime, all);
         var visible = all.Where(r => string.IsNullOrWhiteSpace(search) ||
             r.PlanRows.Any(a => a.Assignment.ItemName.Contains(search, StringComparison.OrdinalIgnoreCase)) ||
             runtime.Browser.GetListings(BrowserScope.RetainerKey(r.RetainerId)).Any(l => l.ItemName.Contains(search, StringComparison.OrdinalIgnoreCase))).ToArray();
@@ -400,8 +407,9 @@ internal sealed class ListingWorkspace
             var picked = retainer.Slots.Where(s => slotSelection.IsSelected(s.Key)).ToArray();
             if (picked.Length > 0) DrawBulkBar(runtime, retainer, picked);
         }
-        slotMenuRequest = null;
-        if (slotTable.Begin($"RQSlots{retainer.RetainerId}", DalamudTableLayout.FitContent(
+
+        var table = (ImGui.TableGetColumnFlags(3) & ImGuiTableColumnFlags.IsEnabled) != 0 ? slotTable : slotsWithoutMarket;
+        if (table.Begin($"RQSlots{retainer.RetainerId}-{table.ColumnCount}", DalamudTableLayout.FitContent(
             ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.BordersOuterH)))
         {
             try
@@ -411,20 +419,13 @@ internal sealed class ListingWorkspace
                 {
                     var slot = retainer.Slots[index];
                     var highlighted = workbench.HighlightedListingItem is { } key && (Is(slot.Assignment, key) || Is(slot.Listing, key));
-                    slotTable.DrawSaneRow(retainer.Slots, index, $"slot:{SlotId(slot.Key)}",
+                    table.DrawSaneRow(retainer.Slots, index, $"slot:{SlotId(slot.Key)}",
                         highlighted ? new Vector4(.16f, .2f, .13f, 1) : null);
                 }
             }
-            finally { slotTable.End(); }
+            finally { table.End(); }
         }
-        if (slotMenuRequest is { } request) { slotMenuItem = (retainer.RetainerId, request.ItemId, request.Name); ImGui.OpenPopup("RQSlotItemMenu"); }
-        if (ImGui.BeginPopup("RQSlotItemMenu"))
-        {
-            if (ItemClient is not null && slotMenuItem is { } item && item.RetainerId == retainer.RetainerId && ImGui.MenuItem($"Open item search · {item.Name}"))
-                itemOpenStatus = ItemClient.Open(item.ItemId);
-            ImGui.EndPopup();
-        }
-        else if (slotMenuItem?.RetainerId == retainer.RetainerId) slotMenuItem = null;
+
         if (retainer.RetainerId == workbench.SelectedListingRetainerId) workbench.ScrollToListingDetail = null;
     }
 
@@ -507,15 +508,12 @@ internal sealed class ListingWorkspace
 
     private void DrawSlotItem(ListingSlotView slot)
     {
-        // The row target is the last item here; right-click offers item search for this slot's item.
-        if (ItemClient is not null && ImGui.IsItemHovered() && ImGui.IsMouseReleased(ImGuiMouseButton.Right) &&
-            (slot.Assignment?.ItemId ?? slot.Listing?.ItemId) is { } itemId)
-            slotMenuRequest = (itemId, slot.Assignment?.ItemName ?? slot.Listing!.ItemName);
         if (drawingRetainerId == workbench.SelectedListingRetainerId && workbench.ScrollToListingDetail is { } key &&
             (Is(slot.Assignment, key) || Is(slot.Listing, key)))
         { ImGui.SetScrollHereY(.25f); workbench.ScrollToListingDetail = null; }
         if (slot.Assignment is not { } a) { ImGui.TextDisabled("Free"); return; }
         if (Dim(slot)) ImGui.TextDisabled(a.ItemName); else ImGui.TextUnformatted(a.ItemName);
+        if (ImGui.IsItemClicked(ImGuiMouseButton.Right)) OpenItem(a.ItemId);
         ImGui.SameLine(); ImGui.TextDisabled(QualityLabel(a.Quality));
     }
 
@@ -545,6 +543,7 @@ internal sealed class ListingWorkspace
                 break;
             case ListingSlotListed.Other:
                 ImGui.TextDisabled($"{l!.ItemName} · {Price(l)}");
+                if (ImGui.IsItemClicked(ImGuiMouseButton.Right)) OpenItem(l.ItemId);
                 break;
             default:
                 if (slot.Number == 0) ImGui.TextDisabled("Excluded");

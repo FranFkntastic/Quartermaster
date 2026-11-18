@@ -37,6 +37,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly IFramework framework;
     private readonly FrameTimings updateTimings;
     private readonly IPlayerState playerState;
+    private readonly ComplicatedMarketBoardCompetitionClient marketCompetition;
     private readonly PluginConfiguration configuration;
     private readonly string providerInstanceId = Guid.NewGuid().ToString("N");
     private readonly FrameworkWorkQueue workQueue;
@@ -330,7 +331,9 @@ public sealed class Plugin : IDalamudPlugin
             SizeCondition = Dalamud.Bindings.ImGui.ImGuiCond.FirstUseEver,
         };
         windows.AddWindow(marketHistory);
+        marketCompetition = new(pluginInterface);
         window.SetMarketRunExecutor(marketRuns, marketHistory, new ComplicatedMarketBoardItemClient(pluginInterface));
+        window.SetMarketCompetition(marketCompetition, configuration, SaveConfiguration);
         agentBridgeViewportCapture = new(
             configDirectory,
             configuration.PluginInstanceId,
@@ -908,6 +911,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         playerInventory.Flush();
         automaticRetrievals.Dispose();
+        marketCompetition.Dispose();
         listingNavigation.Dispose();
         marketRuns.CancelAndWait(TimeSpan.FromSeconds(2));
         window.CancelAndWaitForActiveTransfer(TimeSpan.FromSeconds(2));
