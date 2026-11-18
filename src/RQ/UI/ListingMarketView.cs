@@ -207,7 +207,12 @@ internal sealed class ListingMarketView
     private void DrawPopup(QuartermasterRuntimeSnapshot runtime)
     {
         if (openPopup) { ImGui.OpenPopup("RQMarketLadder"); openPopup = false; }
-        if (!ImGui.BeginPopup("RQMarketLadder")) return;
+        // The game theme's translucent popup background lets the right pane bleed through the ladder.
+        var bg = ImGui.GetStyle().Colors[(int)ImGuiCol.PopupBg]; bg.W = 1;
+        ImGui.PushStyleColor(ImGuiCol.PopupBg, bg);
+        var open = ImGui.BeginPopup("RQMarketLadder");
+        ImGui.PopStyleColor();
+        if (!open) return;
         try
         {
             if (popup == null || !figures.TryGetValue(popup, out var f)) { ImGui.CloseCurrentPopup(); return; }
