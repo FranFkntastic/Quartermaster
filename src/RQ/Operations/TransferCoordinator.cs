@@ -215,7 +215,7 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
             if (retrievalSource is not null) sources = sources.Where(p => retrievalSource(p.Key)).ToDictionary(p => p.Key, p => p.Value);
             if (placement?.Source is { } sourceId)
                 sources = sources.Where(p => p.Key == sourceId && p.Value is
-                    { Owner.HasStableIdentity: true, IsCurrentlyAssigned: true, IsUiAccessible: true }).ToDictionary();
+                    { Owner.HasStableIdentity: true, IsCurrentlyAssigned: not false, IsUiAccessible: not false }).ToDictionary();
             var plan = RestockPlanner.Build(rows, baselineInventory, sources, owner, utcNow());
             var remaining = plan.Lines
                 .GroupBy(line => RetrievalKey(line.ItemId, line.Quality))

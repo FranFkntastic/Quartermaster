@@ -27,7 +27,7 @@ public static class PlacementMovePlanner
         {
             var r = roster.GetValueOrDefault(id);
             if (id != destination && (r?.IsCurrentlyAssigned == false || r?.IsUiAccessible == false)) continue;
-            if (r is not { Owner.HasStableIdentity: true, IsCurrentlyAssigned: true, IsUiAccessible: true } || !StockCoverage.CoversItem(r, rule.ItemId))
+            if (r is not { Owner.HasStableIdentity: true, IsCurrentlyAssigned: not false, IsUiAccessible: not false } || !StockCoverage.CoversItem(r, rule.ItemId))
             {
                 limits.Add(new("PlacementEvidenceUnavailable", id, rule.ItemId, 0,
                     $"{rule.ItemName} → {Name(destination)}: inventory, assignment or access unverified for {Name(id)}."));

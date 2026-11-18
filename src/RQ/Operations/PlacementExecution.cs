@@ -101,7 +101,7 @@ public sealed partial class TransferCoordinator
             var request = new StowageDepositRequest(plan.Id, rule.Id, rule.ItemId, rule.ItemName, hq, count,
                 rule.Routing, destination, sizeOf(rule.ItemId));
             var stock = Cache();
-            if (transitFloor.HasValue && (stock.GetValueOrDefault(destination) is not { Owner.HasStableIdentity: true, IsCurrentlyAssigned: true, IsUiAccessible: true } target ||
+            if (transitFloor.HasValue && (stock.GetValueOrDefault(destination) is not { Owner.HasStableIdentity: true, IsCurrentlyAssigned: not false, IsUiAccessible: not false } target ||
                 !StockCoverage.CoversItem(target, rule.ItemId)))
                 throw new PlacementStop("PlacementDestinationUnverified", $"{detail}; destination stock or access is no longer verified.");
             var batch = StowageRouter.BuildBatch([request], stock, owner, sizeOf, utcNow());
