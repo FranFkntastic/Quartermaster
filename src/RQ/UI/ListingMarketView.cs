@@ -28,7 +28,8 @@ internal sealed class ListingMarketView
     private MarketPair[] pairs = [];
     private IReadOnlyList<ListingRetainerRow>? projected;
     private ListingRow? popup;
-    private bool openPopup;
+    private bool openPopup, popupVisible;
+    private string homeWorld = "";
     private string input = "";
     private Dictionary<ListingRow, Figure> figures = new(ReferenceEqualityComparer.Instance);
     private sealed record Interest(string? Scope, HashSet<uint> Ids);
@@ -116,6 +117,7 @@ internal sealed class ListingMarketView
             projected = rows;
         }
         if (oldest > 0) { ImGui.SameLine(); ImGui.TextDisabled(Age(oldest) + " ago"); }
+        homeWorld = runtime.Owner.HomeWorldName;
         DrawPopup(runtime);
     }
 
@@ -162,8 +164,8 @@ internal sealed class ListingMarketView
                 var rank = reason != null || item?.Status is null or "pending" ? 3 : below > 0 ? 0 : tied > 0 ? 1 : 2;
                 var label = rank switch { 0 => $"−{delta:N0} · {(item!.Truncated && below == item.Listings.Length ? "≥" : "")}{below} below",
                     1 => $"Tied · {tied}", 2 => "Lowest", _ => reason == null ? "…" : "No data" };
-                var ladder = listings.Take(Math.Min(11, below)).Concat(listings.Skip(below + tied)
-                    .Take(Math.Min(2, Math.Max(0, 11 - below)))).ToArray();
+                var ladder = listings.Take(Math.Min(11, below + tied)).Concat(listings.Skip(below + tied)
+                    .Take(Math.Min(2, Math.Max(0, 11 - below - tied)))).ToArray();
                 var fig = new Figure(label, rank < 2 ? ListingStateTone.Amber : rank == 2 ? ListingStateTone.Green : ListingStateTone.Dim,
                     (rank, -below, -delta), mine, ladder, stamp, reason);
                 figures[mine] = fig;
@@ -199,46 +201,69 @@ internal sealed class ListingMarketView
             expand?.Invoke();
             if (f.Mine.UnitPrice.IsKnown) { popup = f.Mine; input = ""; openPopup = true; }
         }
-        if (f.Reason != null && ImGui.IsItemHovered()) ImGui.SetTooltip(f.Reason);
+        if (ImGui.IsItemHovered())
+        {
+            if (f.Reason != null) ImGui.SetTooltip(f.Reason);
+            else if (!popupVisible && f.Mine.UnitPrice.IsKnown)
+            {
+                ImGui.PushStyleColor(ImGuiCol.PopupBg, OpaquePopupBg());
+                ImGui.BeginTooltip();
+                ImGui.PopStyleColor();
+                DrawLadder(f, f.Mine);
+                ImGui.EndTooltip();
+            }
+        }
         if (f.Timestamp is > 0 && DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - f.Timestamp > 600000)
         { ImGui.SameLine(); ImGui.TextDisabled(Age(f.Timestamp.Value)); }
+    }
+
+    // The game theme's translucent popup background lets the panes behind bleed through the ladder.
+    private static System.Numerics.Vector4 OpaquePopupBg()
+    {
+        var bg = ImGui.GetStyle().Colors[(int)ImGuiCol.PopupBg];
+        bg.W = 1;
+        return bg;
+    }
+
+    // Shared by the hover tooltip and the click popup: every competitor below, ties, yours, then up to two above.
+    private void DrawLadder(Figure f, ListingRow mine)
+    {
+        var pair = Pair(mine);
+        var age = f.Timestamp is > 0 ? " · " + Age(f.Timestamp.Value) + " ago" : "";
+        ImGui.TextDisabled($"{mine.ItemName} {(pair.Hq ? "HQ" : "NQ")} · {snapshot?.Label}{age}");
+        var world = snapshot?.Scopes.FirstOrDefault(s => s.Key == snapshot.Key)?.Kind != "world";
+        if (!ImGui.BeginTable("ladder", world ? 4 : 3)) return;
+        void Row(decimal price, int qty, string where, string who)
+        {
+            ImGui.TableNextRow(); ImGui.TableNextColumn(); ImGui.TextUnformatted($"{price:N0}");
+            ImGui.TableNextColumn(); ImGui.TextUnformatted($"×{qty}");
+            if (world) { ImGui.TableNextColumn(); ImGui.TextUnformatted(where); }
+            ImGui.TableNextColumn(); ImGui.TextUnformatted(who);
+        }
+        var price = mine.UnitPrice.Value;
+        var atOrBelow = f.Competitors.Where(l => l.PricePerUnit <= price).Take(11).ToArray();
+        foreach (var l in atOrBelow) Row(l.PricePerUnit, l.Quantity, l.WorldName, l.RetainerName);
+        ImGui.PushStyleColor(ImGuiCol.Text, ListingWorkspace.Color(ListingStateTone.Info));
+        Row(price, mine.Quantity, homeWorld, "yours");
+        ImGui.PopStyleColor();
+        foreach (var l in f.Competitors.Where(l => l.PricePerUnit > price).Take(Math.Min(2, 11 - atOrBelow.Length)))
+            Row(l.PricePerUnit, l.Quantity, l.WorldName, l.RetainerName);
+        ImGui.EndTable();
     }
 
     private void DrawPopup(QuartermasterRuntimeSnapshot runtime)
     {
         if (openPopup) { ImGui.OpenPopup("RQMarketLadder"); openPopup = false; }
-        // The game theme's translucent popup background lets the right pane bleed through the ladder.
-        var bg = ImGui.GetStyle().Colors[(int)ImGuiCol.PopupBg]; bg.W = 1;
-        ImGui.PushStyleColor(ImGuiCol.PopupBg, bg);
+        ImGui.PushStyleColor(ImGuiCol.PopupBg, OpaquePopupBg());
         var open = ImGui.BeginPopup("RQMarketLadder");
         ImGui.PopStyleColor();
+        popupVisible = open;
         if (!open) return;
         try
         {
             if (popup == null || !figures.TryGetValue(popup, out var f)) { ImGui.CloseCurrentPopup(); return; }
             var pair = Pair(popup);
-            var age = f.Timestamp is > 0 ? " · " + Age(f.Timestamp.Value) + " ago" : "";
-            ImGui.TextDisabled($"{popup.ItemName} {(pair.Hq ? "HQ" : "NQ")} · {snapshot?.Label}{age}");
-            var world = snapshot?.Scopes.FirstOrDefault(s => s.Key == snapshot.Key)?.Kind != "world";
-            if (ImGui.BeginTable("ladder", world ? 4 : 3))
-            {
-                void Row(decimal price, int qty, string where, string who)
-                {
-                    ImGui.TableNextRow(); ImGui.TableNextColumn(); ImGui.TextUnformatted($"{price:N0}");
-                    ImGui.TableNextColumn(); ImGui.TextUnformatted($"×{qty}");
-                    if (world) { ImGui.TableNextColumn(); ImGui.TextUnformatted(where); }
-                    ImGui.TableNextColumn(); ImGui.TextUnformatted(who);
-                }
-                var price = popup.UnitPrice.Value;
-                var below = f.Competitors.Where(l => l.PricePerUnit < price).Take(11).ToArray();
-                foreach (var l in below) Row(l.PricePerUnit, l.Quantity, l.WorldName, l.RetainerName);
-                ImGui.PushStyleColor(ImGuiCol.Text, ListingWorkspace.Color(ListingStateTone.Info));
-                Row(price, popup.Quantity, runtime.Owner.HomeWorldName, "yours");
-                ImGui.PopStyleColor();
-                foreach (var l in f.Competitors.Where(l => l.PricePerUnit > price).Take(Math.Min(2, 11 - below.Length)))
-                    Row(l.PricePerUnit, l.Quantity, l.WorldName, l.RetainerName);
-                ImGui.EndTable();
-            }
+            DrawLadder(f, popup);
             var quality = ListingRetainerProjection.Quality(popup);
             var count = session.Draft!.Assignments.Where(a => a.ItemId == pair.ItemId && a.Quality == quality).Sum(a => a.ListingCount);
             ImGui.Separator(); ImGui.TextDisabled($"All {count} slots"); ImGui.SameLine();
