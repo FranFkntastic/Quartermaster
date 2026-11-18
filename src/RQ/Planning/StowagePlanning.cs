@@ -11,6 +11,7 @@ public enum StowageAction
     None,
     Retrieve,
     Deposit,
+    Move,
 }
 
 public sealed record StowageEvaluationLine(
@@ -25,7 +26,13 @@ public sealed record StowageEvaluationLine(
     int DepositQuantity,
     StowageAction Action,
     StowageRoutingPolicy Routing,
-    int SaddlebagQuantity = 0);
+    int SaddlebagQuantity = 0)
+{
+    public IReadOnlyList<PlacementMove> Moves { get; init; } = [];
+    public int MoveQuantity => Moves.Sum(m => m.Quantity);
+    public IReadOnlyList<PlacementLimit> MoveLimits { get; init; } = [];
+    public string? MissingPlacementEvidence { get; init; }
+}
 
 public sealed record StowageEvaluation(
     Guid PlanId,
@@ -226,7 +233,7 @@ public static class StowageEvaluator
                     .OrderBy(line => line.ItemName, StringComparer.OrdinalIgnoreCase)
                     .ThenBy(line => line.ItemId)
                     .ToArray();
-                return new StowageEvaluation(plan.Id, plan.Name, plan.Revision, lines);
+                return new StowageEvaluation(plan.Id, plan.Name, plan.Revision, Project(lines, stock, owner));
             })
             .ToArray();
     }
@@ -248,7 +255,84 @@ public static class StowageEvaluator
             .OrderBy(line => line.ItemName, StringComparer.OrdinalIgnoreCase)
             .ThenBy(line => line.ItemId)
             .ToArray();
-        return new StowageEvaluation(plan.Id, plan.Name, plan.Revision, lines);
+        return new StowageEvaluation(plan.Id, plan.Name, plan.Revision, Project(lines, stock, owner));
+    }
+
+    private static StowageEvaluationLine[] Project(StowageEvaluationLine[] lines, BrowserProjection stock, OwnerScope owner)
+    {
+        if (!lines.Any(l => l.Routing.Consolidate && l.Routing.PreferredRetainerIds.Count > 0)) return lines;
+        var projected = stock.RetainerStock.Values.Where(r => r.Owner.Matches(owner))
+            .ToDictionary(r => r.RetainerId, StowageRouter.Copy);
+        var groups = stock.Items.ToDictionary(g => g.ItemId);
+        int Size(uint id) => groups.GetValueOrDefault(id)?.Definition?.MaxStackSize is > 0 and var size ? checked((int)size) : 0;
+        foreach (var line in lines.Where(l => l.RetrieveQuantity > l.SaddlebagQuantity))
+        {
+            var rule = new TargetPlanItem { Id = line.RuleId, ItemId = line.ItemId, ItemName = line.ItemName,
+                Routing = line.Routing, Quality = line.Quality, TargetQuantity = line.DesiredPlayerQuantity };
+            var retrieval = RestockPlanner.Build([rule], new Dictionary<uint, int>(), projected, owner, DateTime.UtcNow, stock).Lines.Single();
+            var remaining = line.RetrieveQuantity - line.SaddlebagQuantity;
+            foreach (var candidate in retrieval.Candidates)
+            {
+                if (remaining == 0) break;
+                var count = Math.Min(remaining, candidate.CachedQuantity);
+                Withdraw(projected[candidate.RetainerId], line.ItemId, line.Quality, count);
+                remaining -= count;
+            }
+        }
+        foreach (var line in lines)
+        {
+            var remaining = line.DepositQuantity;
+            if (Size(line.ItemId) == 0) continue;
+            foreach (var hq in new[] { false, true })
+            {
+                if (line.Quality != ItemQualityPolicy.Any && hq != (line.Quality == ItemQualityPolicy.HqOnly)) continue;
+                var available = groups.GetValueOrDefault(line.ItemId)?.Stacks.Where(s => s.ScopeKind == BrowserScopeKind.Player &&
+                    (s.Quality == FfxivItemQuality.HQ) == hq).Sum(s => s.Quantity) ?? 0;
+                var quantity = Math.Min(remaining, available);
+                if (quantity == 0) continue;
+                var request = new StowageDepositRequest(line.PlanId, line.RuleId, line.ItemId, line.ItemName, hq, quantity,
+                    line.Routing);
+                foreach (var allocation in StowageRouter.Route(request, projected, owner, Size(line.ItemId)).Allocations)
+                    StowageRouter.ApplyProjectedDeposit(projected[allocation.RetainerId], request, allocation.Quantity, Size(line.ItemId));
+                remaining -= quantity;
+            }
+        }
+        return lines.Select(line =>
+        {
+            if (!line.Routing.Consolidate || line.Routing.PreferredRetainerIds.Count == 0) return line;
+            var rule = new TargetPlanItem { Id = line.RuleId, ItemId = line.ItemId, ItemName = line.ItemName,
+                Quality = line.Quality, Routing = line.Routing };
+            var size = Size(rule.ItemId);
+            // No stock group means no observed units to move; stack size cannot affect that plan.
+            if (size == 0 && groups.ContainsKey(rule.ItemId))
+                return line with { MoveLimits = [new("PlacementStackSizeUnknown", 0, rule.ItemId, 0, $"Stack size unknown for {rule.ItemName}.")],
+                    Action = line.Action == StowageAction.None ? StowageAction.Move : line.Action };
+            var plan = PlacementMovePlanner.FromCache(rule, projected.Values, Math.Max(1, size));
+            foreach (var move in plan.Moves)
+            {
+                Withdraw(projected[move.SourceRetainerId], rule.ItemId, move.IsHighQuality ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly, move.Quantity);
+                StowageRouter.ApplyProjectedDeposit(projected[move.DestinationRetainerId],
+                    new(line.PlanId, rule.Id, rule.ItemId, rule.ItemName, move.IsHighQuality, move.Quantity, rule.Routing), move.Quantity, size);
+            }
+            var missing = plan.Limits.FirstOrDefault(l => l.Code == "PlacementEvidenceUnavailable")?.Message;
+            var pending = plan.MoveQuantity > 0 || plan.Limits.Count > 0 || missing is not null;
+            return line with { Moves = plan.Moves, MoveLimits = plan.Limits, MissingPlacementEvidence = missing,
+                Action = pending && line.Action == StowageAction.None ? StowageAction.Move : line.Action };
+        }).ToArray();
+    }
+
+    private static void Withdraw(CachedRetainer retainer, uint itemId, ItemQualityPolicy quality, int count)
+    {
+        foreach (var item in retainer.Bags.Where(b => b.BagName.StartsWith("RetainerPage", StringComparison.Ordinal) ||
+                     b.BagName == "RetainerCrystals").SelectMany(b => b.Items)
+                     .Where(i => i.ItemId == itemId && (quality == ItemQualityPolicy.Any || i.IsHq == (quality == ItemQualityPolicy.HqOnly))))
+        {
+            var taken = Math.Min(count, checked((int)item.Quantity));
+            item.Quantity -= (uint)taken;
+            count -= taken;
+            if (count == 0) break;
+        }
+        foreach (var bag in retainer.Bags) bag.Items.RemoveAll(i => i.ItemId == itemId && i.Quantity == 0);
     }
 
     private static StowageEvaluationLine BuildLine(
@@ -336,6 +420,7 @@ public sealed record StowageDepositBatch(
     DateTime BuiltAtUtc,
     IReadOnlyList<StowageRoute> Routes)
 {
+    public bool HasPlacementWork { get; init; }
     public int RequestedQuantity => Routes.Sum(route => route.Request.Quantity);
     public int PlannedQuantity => Routes.Sum(route => route.RoutedQuantity);
     public int RemainingQuantity => Routes.Sum(route => route.RemainingQuantity);
@@ -455,7 +540,12 @@ public static class StowageRouter
         return new(nowUtc, routes);
     }
 
-    private static void ApplyProjectedDeposit(
+    internal static int Held(CachedRetainer retainer, uint itemId, ItemQualityPolicy quality) =>
+        retainer.Bags.Where(b => RetainerPageNames.Contains(b.BagName) || b.BagName == "RetainerCrystals")
+            .SelectMany(b => b.Items).Where(i => i.ItemId == itemId && (quality == ItemQualityPolicy.Any ||
+                i.IsHq == (quality == ItemQualityPolicy.HqOnly))).Sum(i => checked((int)i.Quantity));
+
+    internal static void ApplyProjectedDeposit(
         CachedRetainer retainer,
         StowageDepositRequest request,
         int quantity,
@@ -514,7 +604,7 @@ public static class StowageRouter
         }
     }
 
-    private static CachedRetainer Copy(CachedRetainer source) => new()
+    internal static CachedRetainer Copy(CachedRetainer source) => new()
     {
         RetainerId = source.RetainerId,
         RetainerName = source.RetainerName,

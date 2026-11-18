@@ -19,6 +19,8 @@ public sealed record TransferExecutionResult(bool Started, string Message);
 
 public interface IRetainerTransferDriver
 {
+    Task<MarketPlayerInventory> ReadPlacementBagsAsync(CancellationToken token) =>
+        throw new NotSupportedException("Live player bag evidence is unavailable.");
     Task RequireRetainerListAsync(CancellationToken cancellationToken);
     Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken cancellationToken);
     Task OpenInventoryAsync(CancellationToken cancellationToken);
@@ -46,7 +48,7 @@ public interface IRetainerTransferDriver
     void CancelActive();
 }
 
-public sealed class TransferCoordinator : IRetrievalOperationExecutor
+public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
 {
     private readonly OperationJournal journal;
     private readonly Action<string>? warning;
@@ -161,14 +163,18 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             cancellationToken);
 
     internal Task<TransferExecutionResult> ExecuteRetrievalUnderLeaseAsync(
-        string operationId, IDisposable lease, CancellationToken cancellationToken)
+        string operationId, IDisposable lease, CancellationToken cancellationToken) =>
+        ExecuteRetrievalUnderLeaseAsync(operationId, lease, cancellationToken, null);
+
+    private Task<TransferExecutionResult> ExecuteRetrievalUnderLeaseAsync(
+        string operationId, IDisposable lease, CancellationToken cancellationToken, PlacementLeg? placement)
     {
         if (!automation.Owns(lease))
             throw new InvalidOperationException("The caller does not own the automation lease.");
-        return ExecuteRetrievalCoreAsync(operationId, cancellationToken, lease);
+        return ExecuteRetrievalCoreAsync(operationId, cancellationToken, lease, placement);
     }
 
-    private async Task<TransferExecutionResult> ExecuteRetrievalCoreAsync(string operationId, CancellationToken cancellationToken, IDisposable? borrowedLease = null)
+    private async Task<TransferExecutionResult> ExecuteRetrievalCoreAsync(string operationId, CancellationToken cancellationToken, IDisposable? borrowedLease = null, PlacementLeg? placement = null)
     {
         IDisposable? lease = null;
         if (borrowedLease is null && !automation.TryAcquire("retainer transfer", out lease))
@@ -203,9 +209,13 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                 Quality = line.Quality,
                 Enabled = true,
             }).ToArray();
-            var baselineInventory = playerInventory();
+            var baselineInventory = placement is null ? playerInventory() :
+                new Dictionary<uint, int> { [placement.Rule.ItemId] = placement.Baseline };
             var sources = cache.Snapshot();
             if (retrievalSource is not null) sources = sources.Where(p => retrievalSource(p.Key)).ToDictionary(p => p.Key, p => p.Value);
+            if (placement?.Source is { } sourceId)
+                sources = sources.Where(p => p.Key == sourceId && p.Value is
+                    { Owner.HasStableIdentity: true, IsCurrentlyAssigned: true, IsUiAccessible: true }).ToDictionary();
             var plan = RestockPlanner.Build(rows, baselineInventory, sources, owner, utcNow());
             var remaining = plan.Lines
                 .GroupBy(line => RetrievalKey(line.ItemId, line.Quality))
@@ -218,14 +228,14 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             var transferred = 0;
             // Saddlebag leg first: the retainers cover only what it leaves short. Under a
             // borrowed market-run lease every dispatch also requires that the lease is still held.
-            if (saddlebag is not null && plan.NeededQuantity > 0)
+            if (saddlebag is not null && placement?.Source is null && plan.NeededQuantity > 0)
             {
                 movementAttempted = true;
                 var leg = await saddlebag.ExecuteAsync(
                     operationId,
                     plan,
                     () => !token.IsCancellationRequested && operation.Owner.Matches(currentOwner()) &&
-                        (borrowedLease is null || automation.Owns(borrowedLease)) && (callerAuthority?.Invoke() ?? true),
+                        (borrowedLease is null || automation.Owns(borrowedLease)) && (placement?.Authorized() ?? true) && (callerAuthority?.Invoke() ?? true),
                     token).ConfigureAwait(false);
                 movementAttempted = leg.Dispatched;
                 transferred = leg.VerifiedRetrieved;
@@ -342,6 +352,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         stockMutations,
                         async mutationToken =>
                         {
+                            placement?.Check();
                             if (borrowedLease is not null && !automation.Owns(borrowedLease))
                                 return VerifiedMutationAttempt<RetrievalResult, RetainerVariantObservation>.Unchanged(
                                     new(false, 0, "LeaseLost", "The caller no longer owns the automation lease."));
@@ -388,13 +399,15 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         {
                             movementAttempted = false;
                             if (result.Code == "GatherCancelled") throw new OperationCanceledException();
-                            if (result.Code is "SourceSlotChanged")
+                            if (placement is null && result.Code is "SourceSlotChanged")
                             {
                                 continue;
                             }
                         }
                         throw new InvalidOperationException(result.Message);
                     }
+                    if (placement?.Source is not null && result.Transferred == 0)
+                        throw new InvalidOperationException($"PlacementSourceRefused: {candidate.Route.RetainerName} supplied 0 of {quantity} {itemName}. {result.Message}");
                     remaining[key] -= result.Transferred;
                     liveVariantQuantities[variantKey] -= result.Transferred;
                     transferred += result.Transferred;
@@ -407,6 +420,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         result.Code,
                         result.Message);
                     if (borrowedLease is not null) movementAttempted = false;
+                    if (placement?.Source is not null && result.Transferred < quantity) break;
                 }
                 await driver.CloseRetainerAsync(token).ConfigureAwait(false);
                 retainerOpen = false;
@@ -500,14 +514,18 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
             cancellationToken);
 
     internal Task<TransferExecutionResult> ExecuteDepositUnderLeaseAsync(
-        string operationId, IDisposable lease, CancellationToken cancellationToken)
+        string operationId, IDisposable lease, CancellationToken cancellationToken) =>
+        ExecuteDepositUnderLeaseAsync(operationId, lease, cancellationToken, null);
+
+    private Task<TransferExecutionResult> ExecuteDepositUnderLeaseAsync(
+        string operationId, IDisposable lease, CancellationToken cancellationToken, PlacementLeg? placement)
     {
         if (!automation.Owns(lease))
             throw new InvalidOperationException("The caller does not own the automation lease.");
-        return ExecuteDepositCoreAsync(operationId, cancellationToken, lease);
+        return ExecuteDepositCoreAsync(operationId, cancellationToken, lease, placement);
     }
 
-    private async Task<TransferExecutionResult> ExecuteDepositCoreAsync(string operationId, CancellationToken cancellationToken, IDisposable? borrowedLease = null)
+    private async Task<TransferExecutionResult> ExecuteDepositCoreAsync(string operationId, CancellationToken cancellationToken, IDisposable? borrowedLease = null, PlacementLeg? placement = null)
     {
         IDisposable? lease = null;
         if (borrowedLease is null && !automation.TryAcquire("retainer transfer", out lease))
@@ -608,6 +626,17 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         if (authorized <= 0 || stackRemaining <= 0)
                             continue;
                         var quantity = Math.Min(stackRemaining, authorized);
+                        if (placement is not null)
+                        {
+                            var current = ElementalCurrencyCatalog.IsElementalCurrency(stack.ItemId)
+                                ? await driver.ScanPlayerCrystalsAsync(wanted, token).ConfigureAwait(false)
+                                : await driver.ScanPlayerInventoryAsync(wanted, token).ConfigureAwait(false);
+                            var held = current.Where(s => s.ItemId == stack.ItemId && (placement.TransitBagFloor.HasValue
+                                ? s.IsHighQuality == stack.IsHighQuality : Matches(placement.Rule.Quality, s.IsHighQuality))).Sum(s => s.Quantity);
+                            var floor = placement.TransitBagFloor ?? placement.Rule.TargetQuantity;
+                            quantity = Math.Min(quantity, Math.Max(0, held - floor));
+                            if (quantity == 0) continue;
+                        }
                         // Entrusting an ordinary stack never prompts for a quantity: the game tops up the
                         // retainer's partial stack and places the rest in a new slot. Only crystals clamp.
                         if (!legacyCrystalDeposit &&
@@ -624,6 +653,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                             stockMutations,
                             async mutationToken =>
                             {
+                                placement?.Check();
                                 movementAttempted = true;
                                 (bool Success, int Transferred, string Code, string Message) result;
                                 if (stack.Container == FFXIVClientStructs.FFXIV.Client.Game.InventoryType.Crystals)
@@ -669,6 +699,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                             attempt.Evidence == VerifiedMutationEvidence.Unchanged &&
                             result.Code == "NoCapacity")
                         {
+                            if (placement is not null) candidateCapacity[key] = 0;
                             journal.RecordWarning(
                                 operationId,
                                 "DepositSkippedNoCapacity",
@@ -679,6 +710,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                             throw new InvalidOperationException(result.Message);
                         if (result.Transferred == 0)
                         {
+                            if (placement is not null) candidateCapacity[key] = 0;
                             if (result.Code == "NoCapacity")
                             {
                                 journal.RecordWarning(
@@ -692,6 +724,7 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         candidateCapacity[key] = Math.Max(0, candidateCapacity.GetValueOrDefault(key) - result.Transferred);
                         if (result.Transferred < quantity)
                         {
+                            if (placement is not null) candidateCapacity[key] = 0;
                             journal.RecordWarning(
                                 operationId,
                                 "DepositCapacityClamped",
@@ -840,7 +873,15 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
     public void CancelActive()
     {
         lock (activeGate)
+        {
+            if (placementCancellation is not null)
+            {
+                // The move loop cancels new dispatches but finishes a verified transit deposit.
+                placementCancellation.Cancel();
+                return;
+            }
             activeCancellation?.Cancel();
+        }
         driver.CancelActive();
     }
 

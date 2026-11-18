@@ -32,7 +32,10 @@ public static class PlacementEdits
     {
         var next = routing.Copy();
         if (target == AnySpace)
+        {
             next.AnySpace = true;
+            if (next.PreferredRetainerIds.Count == 0) next.Consolidate = false;
+        }
         else if (!next.PreferredRetainerIds.Contains(target))
             next.PreferredRetainerIds.Add(target);
         return next;
@@ -56,6 +59,7 @@ public static class PlacementEdits
             next.AnySpace = false;
         else
             next.PreferredRetainerIds.Remove(target);
+        if (next.PreferredRetainerIds.Count == 0) next.Consolidate = false;
         return next;
     }
 

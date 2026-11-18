@@ -53,14 +53,18 @@ internal static class TransferPlanEvaluation
                         CopyRouting(line.Routing)));
             }
         }
+        var placementWork = evaluation.Lines.Any(l => l.Moves.Count > 0 || l.MoveLimits.Count > 0);
         if (requests.Count == 0)
-            return new(runtime.CapturedAtUtc, []);
+            return new(runtime.CapturedAtUtc, []) { HasPlacementWork = placementWork };
         return StowageRouter.BuildBatch(
             requests,
             runtime.Retainers,
             runtime.Owner,
             itemId => ResolveMaxStack(runtime.Browser, itemId),
-            runtime.CapturedAtUtc);
+            runtime.CapturedAtUtc) with
+        {
+            HasPlacementWork = placementWork,
+        };
     }
 
     public static int PlayerQuantity(BrowserProjection browser, TargetPlanItem rule) =>

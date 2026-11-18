@@ -71,6 +71,11 @@ public sealed class OperationJournal
                 operation.Revision = checked(operation.Revision + 1);
                 operation.UpdatedAtUtc = utcNow();
                 operation.Message = "Quartermaster reloaded before live transfer completion could be verified; pending mutation evidence was reconciled.";
+                if (operation.Kind == OperationKinds.Placement)
+                {
+                    var last = state.Receipts.LastOrDefault(r => r.OperationId == operation.OperationId);
+                    operation.Message = $"Placement interrupted; no move will be replayed. Last recorded step: {last?.Message}";
+                }
                 AddReceipt(state, operation, "InterruptedByReload", operation.Message);
                 reconciled.Add(Copy(operation));
             }
@@ -104,6 +109,9 @@ public sealed class OperationJournal
             plan.Revision,
             plan.Name);
 
+    internal OperationRecord CreatePlacement(OwnerScope owner, StowagePlan plan, IReadOnlyList<TargetPlanItem> rules) =>
+        CreateManual(owner, rules, OperationKinds.Placement, plan.Id, plan.Revision, plan.Name);
+
     private OperationRecord CreateManual(
         OwnerScope owner,
         IReadOnlyList<TargetPlanItem> plan,
@@ -112,7 +120,7 @@ public sealed class OperationJournal
         long? sourcePlanRevision,
         string? sourcePlanName)
     {
-        if (kind is not (OperationKinds.Retrieval or OperationKinds.Deposit))
+        if (kind is not (OperationKinds.Retrieval or OperationKinds.Deposit or OperationKinds.Placement))
             throw new ArgumentOutOfRangeException(nameof(kind));
         var id = $"rq-{Guid.NewGuid():N}";
         var now = utcNow();
