@@ -219,6 +219,13 @@ internal sealed class ListingPlanDraftSession(
                 ordinal++;
             }
         }
+        // Assignments without slots have no key in the rewrite and must survive untouched.
+        for (var i = own.Length - 1; i >= 0; i--)
+        {
+            if (own[i].ListingCount != 0) continue;
+            var next = own.Skip(i + 1).Select(a => rebuilt.FindIndex(b => b.Id == a.Id)).FirstOrDefault(n => n >= 0, -1);
+            rebuilt.Insert(next < 0 ? rebuilt.Count : next, own[i]);
+        }
         var index = Draft.Assignments.FindIndex(a => a.RetainerId == retainerId);
         Draft.Assignments.RemoveAll(a => a.RetainerId == retainerId);
         Draft.Assignments.InsertRange(index < 0 ? Draft.Assignments.Count : index, rebuilt);

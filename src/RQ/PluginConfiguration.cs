@@ -8,6 +8,7 @@ public sealed class PluginConfiguration : IPluginConfiguration
 {
     public int Version { get; set; } = 1;
     public string PluginInstanceId { get; set; } = Guid.NewGuid().ToString("N");
+    public Dictionary<string, string> MarketScopesByOwner { get; set; } = [];
     public bool EnableAgentBridge { get; set; }
     public bool EnableAgentBridgeAudit { get; set; }
     public string AgentBridgeProtectedAccessToken { get; set; } = string.Empty;
