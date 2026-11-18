@@ -4,7 +4,7 @@ using Franthropy.Dalamud.UI.Filtering;
 
 namespace RQ.UI;
 
-public enum WorkbenchView { Stock, Restock, Stowage, ItemGroups, Listings, Activity }
+public enum WorkbenchView { Stock, Restock, Stowage, ItemGroups, Listings, Activity, Plans }
 
 public sealed class WorkbenchState
 {
