@@ -15,7 +15,7 @@ internal sealed record StockWorkbenchRow(
     IReadOnlyList<ListingPlanItemEvaluation> ListingDemand);
 
 internal sealed record StockWorkbenchProjection(
-    long RuntimeRevision,
+    long PlanningRevision,
     Guid? PlanId,
     IReadOnlyList<StockGroup> QueryItems,
     IReadOnlyList<StockWorkbenchRow> Rows);

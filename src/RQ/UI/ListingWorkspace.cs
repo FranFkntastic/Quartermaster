@@ -44,7 +44,7 @@ internal sealed class ListingWorkspace
     private readonly DalamudTableProjection<ListingSlotView> slotTable;
     internal RQ.Interop.ComplicatedMarketBoardItemClient? ItemClient { get; set; }
     private string? itemOpenStatus;
-    private (long Runtime, int Draft) projectionKey = (-1, -1);
+    private (long Planning, int Draft) projectionKey = (-1, -1);
     private IReadOnlyList<ListingRetainerRow> projection = [];
     private IReadOnlySet<ulong> dirtyRetainers = new HashSet<ulong>();
     private readonly Dictionary<string, IReadOnlyList<ItemChoice>> catalogs = [];
@@ -122,13 +122,13 @@ internal sealed class ListingWorkspace
     private IReadOnlyList<ListingRetainerRow> Resolve(QuartermasterRuntimeSnapshot runtime)
     {
         if (session.Draft is null) return [];
-        if (projectionKey != (runtime.Revision, session.Version))
+        if (projectionKey != (runtime.PlanningRevision, session.Version))
         {
-            projectionKey = (runtime.Revision, session.Version);
             var savedIds = ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner)?.Assignments.Where(a => a.Enabled).Select(a => a.ItemId).ToHashSet() ?? [];
             projection = ListingRetainerProjection.Build(session.Draft, runtime.Browser, session.CurrentRetainerIds(runtime),
                 listability, savedIds);
             dirtyRetainers = session.DirtyRetainerIds();
+            projectionKey = (runtime.PlanningRevision, session.Version);
         }
         return projection;
     }
@@ -155,7 +155,7 @@ internal sealed class ListingWorkspace
         workbench.HighlightedListingItem = null;
     }
 
-    public unsafe void Draw(QuartermasterRuntimeSnapshot runtime)
+    public unsafe void Draw(QuartermasterRuntimeSnapshot runtime, FrameTimings timings)
     {
         workbench.EnsureListingOwner(runtime.Owner);
         if (!runtime.Owner.HasStableIdentity || session.Draft is null) return;
@@ -180,11 +180,14 @@ internal sealed class ListingWorkspace
         ImGui.BeginDisabled(!session.CanReplanAll(runtime.Browser, currentRetainerIds));
         if (ImGui.SmallButton(replanAllLabel)) session.ReplanAll(runtime.Browser, currentRetainerIds);
         ImGui.EndDisabled();
+        timings.Section("listing projection");
         var all = Resolve(runtime);
+        timings.Section("listing table");
         DrawRefresh(all.Count == 0);
         DrawNavigationStatus();
         if (placementView)
         {
+            timings.Section("listing placement");
             DrawPlacement(runtime, search);
             return;
         }
@@ -237,6 +240,7 @@ internal sealed class ListingWorkspace
             ImGui.GetColorU32(ImGuiCol.Separator), 1);
 
         ImGui.SameLine(0, 0);
+        timings.Section("market run pane");
         if (ImGui.BeginChild("RQMarketRun", new Vector2(runWidth, height), false))
             runPane.Draw(runtime, session, all, workbench.SelectedListingRetainerId);
         ImGui.EndChild();

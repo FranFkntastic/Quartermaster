@@ -184,17 +184,19 @@ public sealed class SnapshotPublisher
         Volatile.Write(ref snapshotJson, JsonSerializer.Serialize(snapshot, JsonOptions));
     }
 
-    private IReadOnlyDictionary<string, string> BuildOperationJson(QuartermasterState stateSnapshot, OwnerScope owner) =>
-        stateSnapshot.Operations
+    private IReadOnlyDictionary<string, string> BuildOperationJson(QuartermasterState stateSnapshot, OwnerScope owner)
+    {
+        var receipts = stateSnapshot.Receipts.ToLookup(receipt => receipt.OperationId, StringComparer.Ordinal);
+        return stateSnapshot.Operations
             .Where(operation => operation.Owner.Matches(owner))
             .ToDictionary(
                 operation => operation.OperationId,
                 operation => JsonSerializer.Serialize(OperationEnvelope(
                     operation,
-                    stateSnapshot.Receipts
-                        .Where(receipt => receipt.OperationId == operation.OperationId)
+                    receipts[operation.OperationId]
                         .OrderBy(receipt => receipt.Revision)), JsonOptions),
                 StringComparer.Ordinal);
+    }
 
     public void Refresh(OwnerScope owner, IReadOnlyList<InventoryBag> playerBags) => Refresh(
         owner,

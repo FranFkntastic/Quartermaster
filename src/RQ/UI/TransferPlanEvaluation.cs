@@ -17,7 +17,7 @@ internal static class TransferPlanEvaluation
         var requests = new List<StowageDepositRequest>();
         foreach (var line in evaluation.Lines.Where(line => line.DepositQuantity > 0))
         {
-            var stock = runtime.Browser.Items.FirstOrDefault(item => item.ItemId == line.ItemId);
+            var stock = runtime.Browser.FindItem(line.ItemId);
             var nq = stock?.Stacks.Where(stack =>
                     stack.ScopeKind == BrowserScopeKind.Player && stack.Quality == FfxivItemQuality.NQ)
                 .Sum(stack => stack.Quantity) ?? 0;
@@ -53,6 +53,8 @@ internal static class TransferPlanEvaluation
                         CopyRouting(line.Routing)));
             }
         }
+        if (requests.Count == 0)
+            return new(runtime.CapturedAtUtc, []);
         return StowageRouter.BuildBatch(
             requests,
             runtime.Retainers,
@@ -62,7 +64,7 @@ internal static class TransferPlanEvaluation
     }
 
     public static int PlayerQuantity(BrowserProjection browser, TargetPlanItem rule) =>
-        browser.Items.FirstOrDefault(item => item.ItemId == rule.ItemId)?.Stacks
+        browser.FindItem(rule.ItemId)?.Stacks
             .Where(stack =>
                 stack.ScopeKind == BrowserScopeKind.Player &&
                 (rule.Quality == ItemQualityPolicy.Any ||
@@ -72,7 +74,7 @@ internal static class TransferPlanEvaluation
 
     private static int ResolveMaxStack(BrowserProjection browser, uint itemId) =>
         checked((int)Math.Clamp(
-            browser.Items.FirstOrDefault(item => item.ItemId == itemId)?.Definition?.MaxStackSize ?? 999,
+            browser.FindItem(itemId)?.Definition?.MaxStackSize ?? 999,
             1,
             int.MaxValue));
 

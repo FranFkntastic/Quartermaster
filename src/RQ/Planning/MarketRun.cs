@@ -357,7 +357,7 @@ public static class MarketRunPlanner
         if (!projection.RetainerInventoryCompleteByScope.GetValueOrDefault(BrowserScope.AllKey))
             return Evidence.Unknown<int>("Retainer inventory has not been observed for every retainer.");
         var quality = key.Quality == ItemQualityPolicy.HqOnly ? FfxivItemQuality.HQ : FfxivItemQuality.NQ;
-        var stacks = projection.GetItems(BrowserScope.AllKey).FirstOrDefault(item => item.ItemId == key.ItemId)?.Stacks ?? [];
+        var stacks = projection.FindItem(key.ItemId)?.Stacks ?? [];
         return Evidence.Known(stacks
             .Where(stack => stack.ScopeKind is BrowserScopeKind.Player or BrowserScopeKind.Retainer && stack.Quality == quality)
             .Sum(stack => stack.Quantity));
@@ -385,7 +385,7 @@ public static class MarketRunPlanner
         assignments.Select(assignment => assignment.ItemName)
             .Append(reserve?.ItemName)
             .Append(listingItem?.ItemName)
-            .Append(projection.GetItems(BrowserScope.AllKey).FirstOrDefault(item => item.ItemId == key.ItemId)?.ItemName)
+            .Append(projection.FindItem(key.ItemId)?.ItemName)
             .FirstOrDefault(name => !string.IsNullOrWhiteSpace(name)) ?? $"Item {key.ItemId}";
 
     private static FieldEvidence<int> Sum(IEnumerable<FieldEvidence<int>> values)

@@ -166,13 +166,13 @@ internal sealed class TransferPlanWorkspace
         if (!owner.HasStableIdentity)
             return;
         var selectedId = workbench.SelectedStowagePlanId;
-        var (hasScratch, selectedValid) = state.Read(document => (
+        var (hasScratch, selectedValid) = state.ReadConfiguration(document => (
             document.StowagePlans.Any(plan => plan.IsEphemeral && plan.Owner.Matches(owner)),
             selectedId is { } id && document.StowagePlans.Any(plan => plan.Id == id && plan.Owner.Matches(owner))));
         if (!hasScratch)
             state.Mutate(document => StowagePlanCatalog.EnsureScratch(document, owner));
         if (!selectedValid)
-            workbench.SelectedStowagePlanId = state.Read(document =>
+            workbench.SelectedStowagePlanId = state.ReadConfiguration(document =>
                 document.StowagePlans.First(plan => plan.IsEphemeral && plan.Owner.Matches(owner)).Id);
     }
 
@@ -421,12 +421,14 @@ internal sealed class TransferPlanWorkspace
                 new Vector2(width, ImGui.GetFrameHeight()));
     };
 
-    public void Draw(QuartermasterRuntimeSnapshot runtime)
+    public void Draw(QuartermasterRuntimeSnapshot runtime, FrameTimings timings)
     {
+        timings.Section("transfer projection");
         var owner = runtime.Owner;
         var selected = ResolveSelectedStowagePlan(runtime.State, owner);
         var projection = selected is null ? null : ResolveProjection(runtime, selected);
 
+        timings.Section("transfer controls");
         DrawHeader(runtime, selected, projection);
 
         if (selected is null || projection is null)
@@ -459,6 +461,7 @@ internal sealed class TransferPlanWorkspace
         ImGui.Separator();
         if (showPlacement)
         {
+            timings.Section("transfer placement");
             DrawPlacement(runtime, owner, selected, projection);
             return;
         }
@@ -1865,7 +1868,7 @@ internal sealed class TransferPlanWorkspace
                 var routedDepositQuantity = deposit.Routes
                     .Where(route => route.Request.SourceRuleId == rule.Id)
                     .Sum(route => route.RoutedQuantity);
-                var stock = runtime.Browser.Items.FirstOrDefault(item => item.ItemId == rule.ItemId);
+                var stock = runtime.Browser.FindItem(rule.ItemId);
                 var playerQuantity = StowageEvaluator.PlayerQuantity(rule, stock);
                 var accessibleStorageQuantity = TransferWorkbenchPresentation.AccessibleStorageQuantity(
                     stock,
@@ -1916,7 +1919,7 @@ internal sealed class TransferPlanWorkspace
             deposit,
             movements,
             TransferExecutionPolicy.HasMovement(retrieval.NeededQuantity, deposit),
-            ListingPlanEvaluator.HasUnknownLinkedDemand(runtime.State, runtime.Browser, runtime.Owner, plan.Id),
+            listingContributions.Values.Any(contribution => !contribution.Quantity.IsKnown),
             rows);
         transferProjectionBuildCount++;
         return transferWorkbenchProjection;

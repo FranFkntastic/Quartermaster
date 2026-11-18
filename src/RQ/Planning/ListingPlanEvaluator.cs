@@ -88,16 +88,12 @@ public static class ListingPlanEvaluator
                                  (scopeRetainerId is null || assignment.RetainerId == scopeRetainerId))
             .ToArray() ?? [];
         var scopedListings = projection.GetListings(normalizedScope);
-        var keys = assignments.Select(assignment => (assignment.ItemId, assignment.Quality))
-            .Concat(scopedListings.Select(listing =>
-                (ItemId: listing.ItemId, Quality: listing.Quality == FfxivItemQuality.HQ
-                    ? ItemQualityPolicy.HqOnly
-                    : ItemQualityPolicy.NqOnly)))
-            .Distinct()
-            .ToArray();
+        var byItem = assignments.ToLookup(a => new ListingItemKey(a.ItemId, a.Quality));
+        var listedByItem = scopedListings.ToLookup(l => new ListingItemKey(l.ItemId, ListingQuality(l)));
+        var keys = byItem.Select(g => g.Key).Union(listedByItem.Select(g => g.Key));
         var listingComplete = projection.RetainerListingsCompleteByScope.GetValueOrDefault(normalizedScope);
         var inventoryComplete = projection.RetainerInventoryCompleteByScope.GetValueOrDefault(BrowserScope.AllKey);
-        var items = keys.Select(key => EvaluateItem(key.ItemId, key.Quality, assignments, projection, scopedListings, listingComplete, inventoryComplete))
+        var items = keys.Select(key => EvaluateItem(key.ItemId, key.Quality, byItem[key], projection, listedByItem[key], listingComplete, inventoryComplete))
             .OrderBy(item => item.ItemName, StringComparer.OrdinalIgnoreCase)
             .ThenBy(item => item.Quality)
             .ToArray();
@@ -169,19 +165,17 @@ public static class ListingPlanEvaluator
     private static ListingPlanItemEvaluation EvaluateItem(
         uint itemId,
         ItemQualityPolicy quality,
-        IReadOnlyList<ListingPlanAssignment> allAssignments,
+        IEnumerable<ListingPlanAssignment> itemAssignments,
         BrowserProjection projection,
-        IReadOnlyList<ListingRow> scopedListings,
+        IEnumerable<ListingRow> itemListings,
         bool listingComplete,
         bool inventoryComplete)
     {
-        var assignments = allAssignments
-            .Where(assignment => assignment.ItemId == itemId && assignment.Quality == quality)
+        var assignments = itemAssignments
             .OrderBy(assignment => assignment.RetainerId)
             .ThenBy(assignment => assignment.Id)
             .ToArray();
-        var physical = scopedListings
-            .Where(listing => listing.ItemId == itemId && ListingQuality(listing) == quality)
+        var physical = itemListings
             .OrderBy(listing => listing.RetainerId)
             .ThenBy(listing => listing.SlotIndex)
             .ToArray();
@@ -199,7 +193,7 @@ public static class ListingPlanEvaluator
         // Listing scope determines the assignment/physical comparison, but
         // coverage always searches all accessible stock. A retainer-focused
         // deficit may be ready on the player or retrievable from a sibling.
-        var stock = projection.GetItems(BrowserScope.AllKey).FirstOrDefault(item => item.ItemId == itemId)?.Stacks ?? [];
+        var stock = projection.FindItem(itemId)?.Stacks ?? [];
         var playerUnits = stock.Where(stack => stack.ScopeKind == BrowserScopeKind.Player && stack.Quality == targetQuality)
             .Sum(stack => stack.Quantity);
         var retainerQuantity = stock.Where(stack => stack.ScopeKind == BrowserScopeKind.Retainer && stack.Quality == targetQuality)

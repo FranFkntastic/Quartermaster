@@ -62,7 +62,7 @@ internal static class PlacementMatrixData
         uint itemId,
         ItemQualityPolicy quality)
     {
-        var stock = runtime.Browser.Items.FirstOrDefault(item => item.ItemId == itemId);
+        var stock = runtime.Browser.FindItem(itemId);
         if (stock is null)
             return new Dictionary<ulong, int>();
         return stock.Stacks

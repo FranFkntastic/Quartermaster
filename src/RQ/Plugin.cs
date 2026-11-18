@@ -35,6 +35,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly ICommandManager commands;
     private readonly IFramework framework;
+    private readonly FrameTimings updateTimings;
     private readonly IPlayerState playerState;
     private readonly PluginConfiguration configuration;
     private readonly string providerInstanceId = Guid.NewGuid().ToString("N");
@@ -94,6 +95,7 @@ public sealed class Plugin : IDalamudPlugin
         this.pluginInterface = pluginInterface;
         this.commands = commands;
         this.framework = framework;
+        updateTimings = new(log, "OnFrameworkUpdate", 50);
         this.playerState = playerState;
         configuration = pluginInterface.GetPluginConfig() as PluginConfiguration ?? new PluginConfiguration();
         if (string.IsNullOrWhiteSpace(configuration.PluginInstanceId))
@@ -322,7 +324,7 @@ public sealed class Plugin : IDalamudPlugin
             configDirectory,
             new MarketMafiosoSavedJobClient(pluginInterface),
             log);
-        var marketHistory = new MarketRunHistoryWindow(marketRunStore.History, CurrentOwner)
+        var marketHistory = new MarketRunHistoryWindow(marketRunStore.History, CurrentOwner, window.DrawTimings)
         {
             Size = new System.Numerics.Vector2(780, 650),
             SizeCondition = Dalamud.Bindings.ImGui.ImGuiCond.FirstUseEver,
@@ -393,12 +395,14 @@ public sealed class Plugin : IDalamudPlugin
 
     private void DrawWindows()
     {
+        using var timing = window.DrawTimings.Start("window system");
         try
         {
             windows.Draw();
         }
         finally
         {
+            window.DrawTimings.Section("viewport capture");
             agentBridgeViewportCapture.RenderPendingWindowCapture();
         }
     }
@@ -441,19 +445,29 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnFrameworkUpdate(IFramework _)
     {
+        using var timing = updateTimings.Start("owner and migrations");
         var liveOwner = CurrentOwner();
         StowagePlanMigration.EnsureOwnerPlan(state, liveOwner);
         TransferPlanMigration.EnsureOwnerPlans(state, liveOwner);
         if (RuntimeOwnerTransition.RequiresReconciliation(runtimeSnapshots.Current.Owner, liveOwner))
             reconciliation.Request(RuntimeDomain.All, "owner_transition");
+        updateTimings.Section("work queue");
         workQueue.Drain();
+        updateTimings.Section("player inventory");
         playerInventoryReconciler.ReconcileIfDue(DateTime.UtcNow);
+        updateTimings.Section("automatic retrieval");
         automaticRetrievals.Tick();
+        updateTimings.Section("vendor observer");
         vendorCatalogObserver.Tick();
+        updateTimings.Section("vendor procurement");
         vendorProcurement.Tick();
+        updateTimings.Section("roster");
         retainerRefresh.TickRosterDiscovery(window.StockBrowserVisible);
+        updateTimings.Section("agent bridge");
         agentBridge.Tick();
+        updateTimings.Section("inventory flush");
         FlushPlayerInventoryIfDue();
+        updateTimings.Section("reconciliation queue");
         if (DateTime.UtcNow >= nextSnapshotAt)
             reconciliation.Request(RuntimeDomain.All, "periodic");
 
@@ -467,12 +481,15 @@ public sealed class Plugin : IDalamudPlugin
         var reconciliationBatch = reconciliation.Drain(allowedDomains);
         if (reconciliationBatch.HasWork)
             ReconcileRuntime(reconciliationBatch);
+        updateTimings.Section("transfer execution");
         window.Tick();
     }
 
     private void ReconcileRuntime(RuntimeReconciliationBatch batch)
     {
+        updateTimings.Section("runtime projections");
         var runtime = runtimeSnapshots.Refresh(batch.Domains, batch.PlayerInventoryChange);
+        updateTimings.Section("IPC snapshot");
         if (batch.Domains == RuntimeDomain.Operations)
             snapshots.RefreshOperations(
                 runtime.Owner,
@@ -485,6 +502,7 @@ public sealed class Plugin : IDalamudPlugin
         else
             snapshots.Refresh(runtime);
         nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
+        updateTimings.Section("change notices");
         foreach (var notice in batch.Notices)
         {
             if (RuntimeChangeNotificationPolicy.TryGetPublishedKind(notice, out var kind))

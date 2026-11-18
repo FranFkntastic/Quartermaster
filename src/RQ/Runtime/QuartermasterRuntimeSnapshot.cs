@@ -89,18 +89,21 @@ public sealed class QuartermasterRuntimeSnapshotSource
                 if (playerChange is { IsBaseline: false } change && existing.Owner.Matches(change.Owner))
                 {
                     playerStorage = ApplyPlayerStorageChanges(existing.PlayerStorage, change);
-                    browser = BrowserProjectionBuilder.ApplyPlayerChanges(browser, change, scanner.ResolveItemMetadata);
+                    if ((domains & RuntimeDomain.RetainerStock) == 0)
+                        browser = BrowserProjectionBuilder.ApplyPlayerChanges(browser, change, scanner.ResolveItemMetadata);
                     capturedAtUtc = change.ObservedAtUtc;
                 }
                 else
                 {
                     playerStorage = playerInventory.Snapshot(owner, scanner.RequestedPlayerStorageSources());
-                    browser = BrowserProjectionBuilder.RefreshRetainerStock(
-                        browser,
-                        playerStorage.Bags,
-                        retainers,
-                        owner,
-                        scanner.ResolveItemMetadata);
+                    // A combined batch rebuilds once below from the updated player bags.
+                    if ((domains & RuntimeDomain.RetainerStock) == 0)
+                        browser = BrowserProjectionBuilder.RefreshRetainerStock(
+                            browser,
+                            playerStorage.Bags,
+                            retainers,
+                            owner,
+                            scanner.ResolveItemMetadata);
                 }
             }
 

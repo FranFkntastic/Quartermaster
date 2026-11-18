@@ -3,10 +3,11 @@ using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Windowing;
 using RQ.Domain;
 using RQ.Operations;
+using RQ.Runtime;
 
 namespace RQ.UI;
 
-internal sealed class MarketRunHistoryWindow(MarketRunHistoryStore history, Func<OwnerScope> currentOwner)
+internal sealed class MarketRunHistoryWindow(MarketRunHistoryStore history, Func<OwnerScope> currentOwner, FrameTimings timings)
     : Window("Market run history###RQMarketRunHistory")
 {
     private OwnerScope? owner;
@@ -38,6 +39,7 @@ internal sealed class MarketRunHistoryWindow(MarketRunHistoryStore history, Func
 
     public override void Draw()
     {
+        timings.Section("market history");
         var scope = currentOwner();
         Latest(scope);
         if (!scope.HasStableIdentity) { ImGui.TextDisabled("Character identity unavailable."); return; }
