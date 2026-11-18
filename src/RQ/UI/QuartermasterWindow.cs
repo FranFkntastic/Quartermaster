@@ -37,6 +37,7 @@ public sealed class QuartermasterWindow : Window
     private readonly RestockPlanEditor restockPlanEditor;
     private readonly StockWorkspace stockWorkspace;
     private readonly TransferPlanWorkspace transferPlanWorkspace;
+    private readonly TransferPlanManager transferPlanManager;
     private readonly ListingPlanDraftSession listingSession;
     private readonly Dictionary<uint, bool?> listability = [];
     private (string Query, int Limit, IReadOnlyList<ItemChoice> Choices)? lastItemSearch;
@@ -129,7 +130,14 @@ public sealed class QuartermasterWindow : Window
             vendorCatalogSource,
             (planId, planName) => transferReview?.Request(planId, planName),
             review => vendorReview?.Request(review),
-            RequestDeleteStowagePlan);
+            planId => OpenPlanManager(planId));
+        transferPlanManager = new(
+            state,
+            runtimeSnapshots,
+            workbench,
+            reviewRegistry,
+            transferPlanWorkspace.ResolveProjection,
+            transferPlanWorkspace.OpenPlan);
         stockWorkspace = new(
             state,
             runtimeSnapshots,
@@ -437,13 +445,13 @@ public sealed class QuartermasterWindow : Window
                 ImGui.EndTabItem();
             }
             var stockOpen = ImGui.BeginTabItem("Stock & plans",
-                TabFlags(requestedView is WorkbenchView.Stock or WorkbenchView.Restock or WorkbenchView.Stowage or WorkbenchView.ItemGroups));
+                TabFlags(requestedView is WorkbenchView.Stock or WorkbenchView.Restock or WorkbenchView.Stowage or WorkbenchView.ItemGroups or WorkbenchView.Plans));
             RegisterWorkspaceControl("stock", WorkbenchView.Stock);
             RegisterWorkspaceControl("transfer-plans", WorkbenchView.Stowage);
             if (stockOpen)
             {
-                if (requestedView == WorkbenchView.ItemGroups) workbench.View = WorkbenchView.ItemGroups;
-                else if (requestedView.HasValue || workbench.View != WorkbenchView.ItemGroups) workbench.View = WorkbenchView.Stowage;
+                if (requestedView is WorkbenchView.ItemGroups or WorkbenchView.Plans) workbench.View = requestedView.Value;
+                else if (requestedView.HasValue || workbench.View is not (WorkbenchView.ItemGroups or WorkbenchView.Plans)) workbench.View = WorkbenchView.Stowage;
                 if (ImGui.BeginTable("RQStockTransferWorkbench", 2, ImGuiTableFlags.Resizable | ImGuiTableFlags.BordersInnerV))
                 {
                     ImGui.TableSetupColumn("Stock", ImGuiTableColumnFlags.WidthStretch, 1);
@@ -456,15 +464,20 @@ public sealed class QuartermasterWindow : Window
                     if (ImGui.BeginChild("RQPlanPane", Vector2.Zero, false))
                     {
                         var started = Stopwatch.GetTimestamp();
-                        var transferSelected = workbench.View != WorkbenchView.ItemGroups;
-                        if (ImGui.Selectable("Transfer plan##RQPlannerMode", transferSelected, ImGuiSelectableFlags.None, new Vector2(112, 0))) workbench.View = WorkbenchView.Stowage;
+                        var plansSelected = workbench.View == WorkbenchView.Plans;
+                        var groupsSelected = workbench.View == WorkbenchView.ItemGroups;
+                        if (ImGui.Selectable("Transfer plan##RQPlannerMode", !plansSelected && !groupsSelected, ImGuiSelectableFlags.None, new Vector2(112, 0))) workbench.View = WorkbenchView.Stowage;
                         reviewRegistry.RegisterLastButton("quartermaster.workspace.transfer", "Show Transfer Plan workspace", true, () => workbench.View = WorkbenchView.Stowage, "Available");
                         ImGui.SameLine();
-                        if (ImGui.Selectable("Item groups##RQPlannerMode", !transferSelected, ImGuiSelectableFlags.None, new Vector2(104, 0))) workbench.View = WorkbenchView.ItemGroups;
+                        if (ImGui.Selectable("Plans##RQPlannerMode", plansSelected, ImGuiSelectableFlags.None, new Vector2(56, 0))) OpenPlanManager(null);
+                        reviewRegistry.RegisterLastButton("quartermaster.transfer.plans.mode", "Show the Transfer Plan manager", true, () => OpenPlanManager(null), plansSelected ? "Selected" : "Available");
+                        ImGui.SameLine();
+                        if (ImGui.Selectable("Item groups##RQPlannerMode", groupsSelected, ImGuiSelectableFlags.None, new Vector2(104, 0))) workbench.View = WorkbenchView.ItemGroups;
                         reviewRegistry.RegisterLastButton("quartermaster.workspace.item-groups", "Show Item Groups workspace", true, () => workbench.View = WorkbenchView.ItemGroups, "Available");
                         ImGui.Separator();
-                        DrawTimings.Section(workbench.View == WorkbenchView.ItemGroups ? "item groups" : "transfer plan");
-                        if (workbench.View == WorkbenchView.ItemGroups) itemGroupWorkspace.DrawWorkspace(runtime.State);
+                        DrawTimings.Section(groupsSelected ? "item groups" : plansSelected ? "plan manager" : "transfer plan");
+                        if (groupsSelected) itemGroupWorkspace.DrawWorkspace(runtime.State);
+                        else if (plansSelected) transferPlanManager.Draw(runtime);
                         else transferPlanWorkspace.Draw(runtime, DrawTimings);
                         PlanDrawMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
                     }
@@ -514,6 +527,7 @@ public sealed class QuartermasterWindow : Window
         {
             "listings" => WorkbenchView.Listings,
             "item-groups" or "groups" => WorkbenchView.ItemGroups,
+            "plans" or "plan-manager" => WorkbenchView.Plans,
             "operation" or "activity" => WorkbenchView.Activity,
             _ => WorkbenchView.Stowage,
         };
@@ -561,26 +575,10 @@ public sealed class QuartermasterWindow : Window
         clearAgentReviewWindowOverride = false;
     }
 
-    private void RequestDeleteStowagePlan(StowagePlan plan, OwnerScope owner)
+    private void OpenPlanManager(Guid? planId)
     {
-        if (plan.IsEphemeral) return;
-        var planId = plan.Id;
-        confirmationDialog.Request(
-            $"transfer-plan:{planId}",
-            "Delete Transfer Plan?",
-            $"Delete \"{plan.Name}\" and all of its target rules? This cannot be undone.",
-            "Delete plan",
-            () =>
-            {
-                workbench.SelectedStowagePlanId = state.Mutate(document =>
-                {
-                    document.PlanItems.RemoveAll(rule => rule.StowagePlanId == planId);
-                    document.TransferPlanListingLinks.RemoveAll(link => link.StowagePlanId == planId);
-                    document.StowagePlans.RemoveAll(candidate => candidate.Id == planId && candidate.Owner.Matches(owner));
-                    StowagePlanCatalog.ClearStaleRecovery(document);
-                    return (Guid?)StowagePlanCatalog.EnsureScratch(document, owner).Id;
-                });
-            });
+        transferPlanManager.Select(planId);
+        workbench.View = WorkbenchView.Plans;
     }
 
     private void ClosePlanEditors()

@@ -73,7 +73,7 @@ internal sealed class TransferPlanWorkspace
     private readonly Func<GilVendorCatalog>? vendorCatalogSource;
     private readonly Action<Guid, string> requestTransferReview;
     private readonly Action<TransferVendorProcurementReview> requestVendorReview;
-    private readonly Action<StowagePlan, OwnerScope> requestDeletePlan;
+    private readonly Action<Guid?> managePlans;
     private readonly DalamudTableProjection<TransferWorkbenchRow> transferWorkbenchTable;
     private readonly TableSelectionModel<Guid> selection = new();
     private Guid[]? drawingRowKeys;
@@ -127,7 +127,7 @@ internal sealed class TransferPlanWorkspace
         Func<GilVendorCatalog>? vendorCatalogSource,
         Action<Guid, string> requestTransferReview,
         Action<TransferVendorProcurementReview> requestVendorReview,
-        Action<StowagePlan, OwnerScope> requestDeletePlan)
+        Action<Guid?> managePlans)
     {
         this.state = state;
         this.runtimeSnapshots = runtimeSnapshots;
@@ -143,7 +143,7 @@ internal sealed class TransferPlanWorkspace
         this.vendorCatalogSource = vendorCatalogSource;
         this.requestTransferReview = requestTransferReview;
         this.requestVendorReview = requestVendorReview;
-        this.requestDeletePlan = requestDeletePlan;
+        this.managePlans = managePlans;
         transferWorkbenchTable = CreateTable();
         placement = new PlacementMatrix<Guid>("quartermaster.transfer.placement", "Stow", reviewRegistry, allowConsolidation: true);
     }
@@ -152,6 +152,19 @@ internal sealed class TransferPlanWorkspace
         new(transferProjectionBuildCount, renderedTransferRowCount);
 
     public void ClearVendorStatus() => vendorStatus = string.Empty;
+
+    /// <summary>Makes a plan the open Transfer Plan and shows the plan workspace.</summary>
+    public void OpenPlan(Guid planId)
+    {
+        if (workbench.SelectedStowagePlanId != planId)
+        {
+            selection.Clear();
+            renamingPlanId = null;
+            showPlacement = false;
+        }
+        workbench.SelectedStowagePlanId = planId;
+        workbench.View = WorkbenchView.Stowage;
+    }
 
     private StowagePlan? ResolveSelectedStowagePlan(QuartermasterState document, OwnerScope owner) =>
         workbench.SelectedStowagePlanId is { } selectedId
@@ -755,6 +768,13 @@ internal sealed class TransferPlanWorkspace
             stable,
             () => NewPlan(runtimeSnapshots.Current.Owner),
             stable ? "Available" : "Owner identity unavailable");
+        var managedPlanId = selected is { IsEphemeral: false } ? selected.Id : (Guid?)null;
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.transfer.plans.manage",
+            "Open the Transfer Plan manager",
+            true,
+            () => managePlans(managedPlanId),
+            "Available");
         if (selected?.IsEphemeral == true)
         {
             var planId = selected.Id;
@@ -793,13 +813,10 @@ internal sealed class TransferPlanWorkspace
                 itemGroupWorkspace.OpenNewWorkspaceDraft(selectedRules);
                 workbench.View = WorkbenchView.ItemGroups;
             }
-            if (!selected.IsEphemeral)
-            {
-                ImGui.Separator();
-                if (MenuItem("Delete plan"))
-                    requestDeletePlan(selected, owner);
-            }
         }
+        ImGui.Separator();
+        if (MenuItem("Manage plans…"))
+            managePlans(selected is { IsEphemeral: false } ? selected.Id : null);
         ImGui.EndPopup();
     }
 
@@ -1103,7 +1120,7 @@ internal sealed class TransferPlanWorkspace
         }
     }
 
-    private static string TransferTargetText(TransferWorkbenchRow row) =>
+    internal static string TransferTargetText(TransferWorkbenchRow row) =>
         TransferWorkbenchPresentation.Target(
             row.Line?.DesiredPlayerQuantity ?? row.Rule.TargetQuantity,
             row.PlayerQuantity,
