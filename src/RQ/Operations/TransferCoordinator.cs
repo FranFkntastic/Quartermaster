@@ -427,7 +427,7 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                 if (inventoryFull || remaining.Values.All(quantity => quantity <= 0))
                     break;
             }
-            await driver.CloseRetainerListAsync(token).ConfigureAwait(false);
+            if (placement is null) await driver.CloseRetainerListAsync(token).ConfigureAwait(false);
             retainerSessionOpen = false;
             var missing = remaining.Values.Where(quantity => quantity > 0).Sum();
             var bypassedRetainerLeg = retainerLegMessage is not null;
@@ -744,7 +744,7 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                 if (remaining.Values.All(quantity => quantity <= 0))
                     break;
             }
-            await driver.CloseRetainerListAsync(token).ConfigureAwait(false);
+            if (placement is null) await driver.CloseRetainerListAsync(token).ConfigureAwait(false);
             retainerSessionOpen = false;
             var missing = remaining.Values.Where(quantity => quantity > 0).Sum();
             journal.Transition(operationId,

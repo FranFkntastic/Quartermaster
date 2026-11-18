@@ -252,6 +252,12 @@ public sealed partial class TransferCoordinator
                 ex is PlacementStop stop ? stop.Code : ex is PlacementUncertain uncertain ? uncertain.Code : "PlacementIndeterminate", message);
             return new(true, message);
         }
+        finally
+        {
+            // Legs leave the retainer list open so the next one does not race a bell reopen; close it once here.
+            try { await driver.CloseRetainerListAsync(CancellationToken.None).ConfigureAwait(false); }
+            catch (Exception) { }
+        }
     }
 
     private sealed class PlacementUncertain(string code, string message) : Exception(message)
