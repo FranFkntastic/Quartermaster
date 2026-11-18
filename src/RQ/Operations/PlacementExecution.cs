@@ -199,7 +199,7 @@ public sealed partial class TransferCoordinator
                         inTransit = $" Check your bags for up to {count} × {rule.ItemName} ({quality}); arrival is unverified.";
                         var retrieved = await Retrieve(rule, quality, before, count, move.SourceRetainerId).ConfigureAwait(false);
                         var arrived = (await Read(rule, quality, transit: true).ConfigureAwait(false)).Units - before;
-                        if (arrived == 0) inTransit = "";
+                        if (arrived == 0 && retrieved.Status != OperationStatuses.Indeterminate) inTransit = "";
                         if (arrived > 0)
                             inTransit = $" {arrived} × {rule.ItemName} ({quality}) from {now.GetValueOrDefault(move.SourceRetainerId)?.RetainerName} are in your bags.";
                         if (retrieved.Status == OperationStatuses.Indeterminate)
@@ -236,6 +236,13 @@ public sealed partial class TransferCoordinator
             journal.Transition(parent, problems.Count == 0 ? OperationStatuses.Succeeded : verifiedUnits > 0 ? OperationStatuses.PartiallySucceeded : OperationStatuses.Failed,
                 problems.Count == 0 ? "PlacementComplete" : problems.Count == 1 ? problems[0].Code : "PlacementLimited", summary);
             return new(true, summary);
+        }
+        catch (OperationCanceledException) when (inTransit.Length == 0)
+        {
+            Settle(false);
+            var message = $"{phase}: {detail}; cancelled between steps with nothing in transit. {Deliveries()}".TrimEnd();
+            journal.Transition(parent, verifiedUnits > 0 ? OperationStatuses.PartiallySucceeded : OperationStatuses.Failed, "PlacementCancelled", message);
+            return new(true, message);
         }
         catch (Exception ex)
         {

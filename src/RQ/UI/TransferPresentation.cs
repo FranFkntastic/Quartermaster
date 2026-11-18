@@ -20,9 +20,12 @@ internal static class TransferPresentation
             ? $"+{quantity:N0}"
             : quantity.ToString("N0", CultureInfo.CurrentCulture);
 
+    private static string RetainerName(TransferReviewRow row, ulong id) =>
+        row.Runtime.Retainers.GetValueOrDefault(id)?.RetainerName ?? $"Retainer {id}";
+
     public static string ReviewOutcome(TransferReviewRow row) =>
         row.Move is { } move
-            ? $"{row.Runtime.Retainers[move.SourceRetainerId].RetainerName} → {row.Runtime.Retainers[move.DestinationRetainerId].RetainerName} · {move.Quantity:N0} {(move.IsHighQuality ? "HQ" : "NQ")}"
+            ? $"{RetainerName(row, move.SourceRetainerId)} → {RetainerName(row, move.DestinationRetainerId)} · {move.Quantity:N0} {(move.IsHighQuality ? "HQ" : "NQ")}"
             : !row.ListingContribution.IsKnown
             ? "Verify listing demand"
             : row.Line?.Action switch

@@ -133,7 +133,7 @@ internal sealed class TransferReviewDialog
         {
             table.DrawClippedRows(
                 reviewRows,
-                (row, index) => table.DrawRow(row, id: $"transfer-review:{row.Rule.Id}:{index}"));
+                (row, index) => table.DrawRow(row, id: row.Move is null ? $"transfer-review:{row.Rule.Id}" : $"transfer-review:{row.Rule.Id}:move:{index}"));
             table.End();
         }
 
