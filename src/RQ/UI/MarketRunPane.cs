@@ -22,6 +22,8 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
     // Pane widths at which the Listed and Goes to columns join Item | Reserve | Craft.
     private const float ListedColumnWidth = 470;
     private const float GoesToColumnWidth = 620;
+    // Below this the Reserve cell drops its bar and over-reserve figure so the Item column keeps room.
+    private const float ReserveBarWidth = 360;
     private const string AcknowledgePopup = "Acknowledge market receipt";
     private static readonly TimeSpan StartAfterSaveTimeout = TimeSpan.FromSeconds(10);
 
@@ -383,7 +385,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         var paneClipMax = ImGui.GetWindowDrawList().GetClipRectMax();
         var showGoesTo = width >= GoesToColumnWidth;
         var showListed = width >= ListedColumnWidth;
-        var layout = new RowLayout(showGoesTo ? 80 : 60);
+        var layout = new RowLayout(showGoesTo ? 80 : 60, width < ReserveBarWidth);
         var listedBar = SegmentBar.Width(40);
         var listedWidth = listedBar + 6 + ImGui.CalcTextSize("000/000").X;
         var craftWidth = Math.Max(ImGui.CalcTextSize("Craft").X, ImGui.CalcTextSize("0,000").X);
@@ -523,15 +525,17 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
 
     private sealed class RowLayout
     {
-        public RowLayout(float bar)
+        public RowLayout(float bar, bool compact)
         {
+            Compact = compact;
             Bar = SegmentBar.Width(bar);
             Number = ImGui.CalcTextSize("0,000").X;
             Of = ImGui.CalcTextSize("of").X;
             Input = ImGui.CalcTextSize("00,000").X + (ImGui.GetStyle().FramePadding.X * 2);
             Over = ImGui.CalcTextSize("+0,000").X;
-            Width = Bar + 7 + Number + 4 + Of + 4 + Input + 5 + Over;
+            Width = compact ? Number + 4 + Of + 4 + Input : Bar + 7 + Number + 4 + Of + 4 + Input + 5 + Over;
         }
+        public bool Compact { get; }
         public float Bar { get; }
         public float Number { get; }
         public float Of { get; }
@@ -548,10 +552,13 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         var stays = known ? Math.Max(0, item.ReserveAfterRun.Value) : 0;
         var listing = known ? item.RefillUnits.Value : 0;
         var total = units > 0 ? units : stays + listing;
-        SegmentBar.Draw(layout.Bar, known ? total : 0,
-            (Math.Min(stays, total), ListingWorkspace.Color(ListingStateTone.Green)),
-            (Math.Min(listing, Math.Max(0, total - stays)), ListingWorkspace.Color(ListingStateTone.Run)));
-        ImGui.SameLine(0, 7);
+        if (!layout.Compact)
+        {
+            SegmentBar.Draw(layout.Bar, known ? total : 0,
+                (Math.Min(stays, total), ListingWorkspace.Color(ListingStateTone.Green)),
+                (Math.Min(listing, Math.Max(0, total - stays)), ListingWorkspace.Color(ListingStateTone.Run)));
+            ImGui.SameLine(0, 7);
+        }
         var number = known ? stays.ToString("N0") : "—";
         ImGui.SetCursorPosX(ImGui.GetCursorPosX() + Math.Max(0, layout.Number - ImGui.CalcTextSize(number).X));
         ImGui.AlignTextToFramePadding();
@@ -566,7 +573,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
             reserve ??= session.AddReserve(item.ItemId, item.ItemName, item.Quality);
             session.SetReserveUnits(reserve.Id, Math.Clamp(units, 0, ListingReserveRule.MaxReserveUnits).ToString());
         }
-        if (known && stays > units)
+        if (!layout.Compact && known && stays > units)
         {
             ImGui.SameLine(0, 5);
             ImGui.TextColored(ListingWorkspace.Color(ListingStateTone.Green), $"+{stays - units:N0}");
