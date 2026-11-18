@@ -119,6 +119,10 @@ internal sealed class TransferReviewDialog
                 row.Difference,
                 row.ListingContribution,
                 runtime))
+            .SelectMany(row => row.Line is { Moves.Count: > 0 } line
+                ? (line.Action == RQ.Planning.StowageAction.Move ? Enumerable.Empty<TransferReviewRow>() : [row])
+                    .Concat(line.Moves.Select(move => row with { Move = move }))
+                : [row])
             .ToArray();
         if (table.Begin(
                 "RQTransferReviewRows",
@@ -129,7 +133,7 @@ internal sealed class TransferReviewDialog
         {
             table.DrawClippedRows(
                 reviewRows,
-                (row, _) => table.DrawRow(row, id: $"transfer-review:{row.Rule.Id}"));
+                (row, index) => table.DrawRow(row, id: row.Move is null ? $"transfer-review:{row.Rule.Id}" : $"transfer-review:{row.Rule.Id}:move:{index}"));
             table.End();
         }
 

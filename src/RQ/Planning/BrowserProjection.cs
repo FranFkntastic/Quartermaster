@@ -61,6 +61,7 @@ public sealed record ListingRow(
 
 public sealed class BrowserProjection
 {
+    internal IReadOnlyDictionary<ulong, CachedRetainer> RetainerStock { get; init; } = new Dictionary<ulong, CachedRetainer>();
     private Dictionary<uint, StockGroup>? itemsById;
 
     // Published projections do not mutate. Index on first use; readers only see a complete map.
@@ -133,6 +134,7 @@ public static class BrowserProjectionBuilder
             Items = rebuilt.Items,
             Listings = current.Listings,
             Owner = rebuilt.Owner,
+            RetainerStock = cache,
             RetainerInventoryCompleteByScope = rebuilt.RetainerInventoryCompleteByScope,
             RetainerListingsCompleteByScope = current.RetainerListingsCompleteByScope,
         };
@@ -213,6 +215,7 @@ public static class BrowserProjectionBuilder
                 .ThenBy(listing => listing.RetainerName, StringComparer.OrdinalIgnoreCase)
                 .ToArray(),
             Owner = owner,
+            RetainerStock = current.RetainerStock,
             RetainerInventoryCompleteByScope = inventoryCompleteness,
             RetainerListingsCompleteByScope = listingCompleteness,
         };
@@ -287,6 +290,7 @@ public static class BrowserProjectionBuilder
                 .ToArray(),
             Listings = current.Listings,
             Owner = current.Owner,
+            RetainerStock = current.RetainerStock,
             RetainerInventoryCompleteByScope = current.RetainerInventoryCompleteByScope,
             RetainerListingsCompleteByScope = current.RetainerListingsCompleteByScope,
         };
@@ -363,6 +367,7 @@ public static class BrowserProjectionBuilder
             Items = items,
             Listings = sortedListings,
             Owner = owner,
+            RetainerStock = cache,
             RetainerInventoryCompleteByScope = retainerInventoryCompleteByScope,
             RetainerListingsCompleteByScope = retainerListingsCompleteByScope,
         };

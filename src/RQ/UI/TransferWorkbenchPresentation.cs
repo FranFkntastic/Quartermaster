@@ -11,6 +11,7 @@ internal enum TransferLineKind
     Retrieve,
     Stow,
     Balanced,
+    Move,
 }
 
 internal readonly record struct TransferLineProjection(
@@ -104,6 +105,8 @@ internal static class TransferWorkbenchPresentation
         var requested = Math.Max(0, requestedQuantity);
         switch (action)
         {
+            case StowageAction.Move:
+                return new(TransferLineKind.Move);
             case StowageAction.Retrieve:
             {
                 var fromSaddlebag = Math.Min(requested, Math.Max(0, saddlebagQuantity));

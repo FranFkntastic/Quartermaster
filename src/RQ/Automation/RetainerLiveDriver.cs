@@ -51,6 +51,12 @@ public sealed class RetainerLiveDriver : IRetainerTransferDriver
         this.bellRoute = bellRoute;
     }
 
+    public async Task<MarketPlayerInventory> ReadPlacementBagsAsync(CancellationToken token)
+    {
+        var stacks = await session.ScanPlayerInventoryAsync(null, token).ConfigureAwait(false);
+        return new(stacks, Math.Max(0, 140 - stacks.Select(s => (s.Container, s.SlotIndex)).Distinct().Count()));
+    }
+
     public async Task RequireRetainerListAsync(CancellationToken cancellationToken)
     {
         var result = await session.EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);

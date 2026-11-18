@@ -50,6 +50,9 @@ public sealed class QuartermasterRuntimeSnapshotSource
         this.currentOwner = currentOwner;
     }
 
+    internal int? MaxStackSize(uint itemId) => scanner.ResolveItemMetadata(itemId).MaxStackSize is > 0 and var size
+        ? checked((int)size) : null;
+
     public QuartermasterRuntimeSnapshot Current => Volatile.Read(ref current)
         ?? throw new InvalidOperationException("Quartermaster runtime snapshot has not been initialized.");
 

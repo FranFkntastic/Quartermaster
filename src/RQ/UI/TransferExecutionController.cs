@@ -66,10 +66,19 @@ internal sealed class TransferExecutionController
             return;
         }
         rules = ListingPlanEvaluator.ComposeRules(current.State, current.Browser, current.Owner, plan.Id).ToArray();
+        var enabled = rules.Where(r => r.Enabled).OrderBy(r => r.ItemName, StringComparer.OrdinalIgnoreCase).ThenBy(r => r.ItemId).ToArray();
+        var placement = enabled.Any(r => r.Routing.Consolidate && r.Routing.PreferredRetainerIds.Count > 0);
+        if (placement && enabled.GroupBy(r => r.ItemId).FirstOrDefault(g => g.Count() > 1 &&
+            (g.Any(r => r.Quality == ItemQualityPolicy.Any) || g.Select(r => r.Quality).Distinct().Count() != g.Count())) is { } overlap)
+        {
+            ReportInlineError($"PlacementOverlappingRules: more than one enabled line authorizes {overlap.First().ItemName} with the same quality.");
+            return;
+        }
         var currentStowage = StowageEvaluator.BuildPlan(current.State, current.Browser, current.Owner, plan.Id);
+        var missing = currentStowage?.Lines.Select(l => l.MissingPlacementEvidence).FirstOrDefault(reason => reason is not null);
         var currentRetrieval = BuildRetrievalEvaluation(current, rules);
         var currentBatch = TransferPlanEvaluation.BuildSurplusBatch(current, currentStowage);
-        if (allowCapacityRecovery && TransferExecutionPolicy.RequiresCapacityRecovery(currentBatch))
+        if (allowCapacityRecovery && (missing is not null || TransferExecutionPolicy.RequiresCapacityRecovery(currentBatch)))
         {
             if (retainerRefresh.StartForPlan(out var refreshRunId))
             {
@@ -83,7 +92,29 @@ internal sealed class TransferExecutionController
         }
         if (!allowCapacityRecovery && currentBatch.RequestedQuantity > 0 && currentBatch.PlannedQuantity == 0)
         {
-            ReportInlineError("No owner retainer has capacity for the items to stow.");
+            ReportInlineError(placement
+                ? "PlacementStowUnavailable: " + string.Join("; ", currentBatch.Routes.Select(route =>
+                    $"{route.Request.ItemName} × {route.RemainingQuantity}: no capacity at configured destinations")) + ". Moves cancelled."
+                : "No owner retainer has capacity for the items to stow.");
+            return;
+        }
+        if (placement)
+        {
+            if (missing is not null)
+            {
+                ReportInlineError($"PlacementEvidenceUnavailable: inventory unverified for {missing} after refresh.");
+                return;
+            }
+            var sizes = enabled.Select(r => r.ItemId).Distinct().ToDictionary(id => id, runtimeSnapshots.MaxStackSize);
+            var unknown = enabled.FirstOrDefault(r => sizes[r.ItemId] is null);
+            if (unknown is not null)
+            {
+                ReportInlineError($"PlacementStackSizeUnknown: cannot bound a batch for {unknown.ItemName}.");
+                return;
+            }
+            Start(transfers.ExecutePlacementAsync(current.Owner, plan, enabled,
+                () => state.ReadConfiguration(s => s.StowagePlans.Any(p => p.Id == plan.Id && p.Revision == plan.Revision && p.Owner.Matches(current.Owner))),
+                id => sizes[id]!.Value));
             return;
         }
         var retrievalOperationId = currentRetrieval.NeededQuantity > 0

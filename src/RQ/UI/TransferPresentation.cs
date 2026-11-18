@@ -20,11 +20,19 @@ internal static class TransferPresentation
             ? $"+{quantity:N0}"
             : quantity.ToString("N0", CultureInfo.CurrentCulture);
 
+    private static string RetainerName(TransferReviewRow row, ulong id) =>
+        row.Runtime.Retainers.GetValueOrDefault(id)?.RetainerName ?? $"Retainer {id}";
+
     public static string ReviewOutcome(TransferReviewRow row) =>
-        !row.ListingContribution.IsKnown
+        row.Move is { } move
+            ? $"{RetainerName(row, move.SourceRetainerId)} → {RetainerName(row, move.DestinationRetainerId)} · {move.Quantity:N0} {(move.IsHighQuality ? "HQ" : "NQ")}"
+            : !row.ListingContribution.IsKnown
             ? "Verify listing demand"
             : row.Line?.Action switch
             {
+                StowageAction.Move when row.Line.MissingPlacementEvidence is not null => "Verify retainer stock",
+                StowageAction.Move when row.Line.MoveQuantity == 0 => string.Join("; ", row.Line.MoveLimits.Select(l => l.Message)),
+                StowageAction.Move => $"Move {row.Line.MoveQuantity:N0}",
                 StowageAction.Retrieve => Math.Min(row.Line.RetrieveQuantity, row.Line.SaddlebagQuantity) is > 0 and var fromSaddlebag
                     ? $"Retrieve {row.Line.RetrieveQuantity:N0} · {fromSaddlebag:N0} saddlebag"
                     : $"Retrieve {row.Line.RetrieveQuantity:N0}",

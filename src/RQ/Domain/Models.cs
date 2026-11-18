@@ -162,6 +162,8 @@ public sealed class StowageRoutingPolicy : IJsonOnDeserialized
 
     public List<ulong> PreferredRetainerIds { get; set; } = [];
 
+    public bool Consolidate { get; set; }
+
     public bool AnySpace
     {
         get => anySpace;
@@ -217,10 +219,11 @@ public sealed class StowageRoutingPolicy : IJsonOnDeserialized
     {
         PreferredRetainerIds = PreferredRetainerIds.Distinct().ToList(),
         AnySpace = AnySpace,
+        Consolidate = Consolidate,
     };
 
     public bool SameAs(StowageRoutingPolicy? other) =>
-        other is not null && AnySpace == other.AnySpace && PreferredRetainerIds.SequenceEqual(other.PreferredRetainerIds);
+        other is not null && Consolidate == other.Consolidate && AnySpace == other.AnySpace && PreferredRetainerIds.SequenceEqual(other.PreferredRetainerIds);
 
     public static StowageRoutingPolicy CopyOf(StowageRoutingPolicy? source) => source?.Copy() ?? new();
 }
@@ -362,6 +365,7 @@ public static class OperationStatuses
 
 public static class OperationKinds
 {
+    public const string Placement = "PlacementMove";
     public const string Retrieval = "retrieval";
     public const string Deposit = "deposit";
     public const string QuickDeposit = "quick_deposit";

@@ -86,7 +86,7 @@ internal sealed class TransferPlanWorkspace
     private TransferWorkbenchProjection? transferWorkbenchProjection;
     private int transferProjectionBuildCount;
     private int renderedTransferRowCount;
-    private object? dismissedVendorRun;
+    private string? dismissedVendorRunId;
     private string vendorStatus = string.Empty;
 
     private Guid? renamingPlanId;
@@ -145,7 +145,7 @@ internal sealed class TransferPlanWorkspace
         this.requestVendorReview = requestVendorReview;
         this.requestDeletePlan = requestDeletePlan;
         transferWorkbenchTable = CreateTable();
-        placement = new PlacementMatrix<Guid>("quartermaster.transfer.placement", "Stow", reviewRegistry);
+        placement = new PlacementMatrix<Guid>("quartermaster.transfer.placement", "Stow", reviewRegistry, allowConsolidation: true);
     }
 
     public TransferPlanWorkspaceSnapshot Snapshot() =>
@@ -498,10 +498,6 @@ internal sealed class TransferPlanWorkspace
         StowagePlan plan,
         TransferWorkbenchProjection projection)
     {
-        if (ImGui.Button("Return to plan##RQTransferPlacementReturn"))
-            showPlacement = false;
-        reviewRegistry.RegisterLastButton("quartermaster.transfer.placement.return", "Return to the plan lines", true,
-            () => showPlacement = false, "Ready");
         var rows = projection.Rows
             .Select(row => new PlacementMatrixRow<Guid>(
                 row.Rule.Id,
@@ -509,7 +505,8 @@ internal sealed class TransferPlanWorkspace
                 row.Rule.Quality == ItemQualityPolicy.Any ? row.Rule.ItemName : $"{row.Rule.ItemName} {QualityLabel(row.Rule.Quality)}",
                 (row.Line?.DepositQuantity ?? 0).ToString("N0"),
                 row.Rule.Routing,
-                PlacementMatrixData.Holdings(runtime, row.Rule.ItemId, row.Rule.Quality)))
+                PlacementMatrixData.Holdings(runtime, row.Rule.ItemId, row.Rule.Quality),
+                row.Rule.Routing.Consolidate ? GatherSummary(row.Line) : null))
             .ToArray();
         var columns = PlacementMatrixData.Columns(runtime, rows.Select(row => row.Routing));
         placement.Draw(rows, rows, columns, changes =>
@@ -518,6 +515,16 @@ internal sealed class TransferPlanWorkspace
             return MutateRules(owner, plan.Id, routing.Keys.ToArray(),
                 rule => rule.Routing = routing[rule.Id].Copy());
         });
+    }
+
+    private static string GatherSummary(StowageEvaluationLine? line)
+    {
+        if (line is null) return "line paused";
+        var parts = new List<string>();
+        if (line.Moves.Count > 0)
+            parts.Add($"gathers {line.MoveQuantity:N0} from {line.Moves.Select(m => m.SourceRetainerId).Distinct().Count():N0} retainers");
+        parts.AddRange(line.MoveLimits.Select(l => l.Message));
+        return parts.Count == 0 ? "nothing is elsewhere" : string.Join(" · ", parts);
     }
 
     // ---- Header -------------------------------------------------------------------------
@@ -559,14 +566,24 @@ internal sealed class TransferPlanWorkspace
         ImGui.SameLine();
         DrawPlanMenu(runtime, selected, projection, menuLabel);
 
-        var canPlace = selected is not null && projection is not null && !showPlacement;
+        var canPlace = selected is not null && projection is not null;
         UiLayout.SameLineIfFits(placementLabel);
         ImGui.BeginDisabled(!canPlace);
+        var wasOpen = showPlacement;
+        if (wasOpen) ImGui.PushStyleColor(ImGuiCol.Button, style.Colors[(int)ImGuiCol.ButtonActive]);
         if (ImGui.Button(placementLabel))
-            OpenPlacement(null);
+        {
+            if (wasOpen) showPlacement = false;
+            else OpenPlacement(null);
+        }
+        if (wasOpen) ImGui.PopStyleColor();
         ImGui.EndDisabled();
         reviewRegistry.RegisterLastButton("quartermaster.transfer.placement.open", "Edit placement for this plan's lines", canPlace,
             () => OpenPlacement(null), $"lines={lines:N0} placed={placed:N0}");
+
+        if (wasOpen)
+            reviewRegistry.RegisterLastButton("quartermaster.transfer.placement.return", "Return to the plan lines", true,
+                () => showPlacement = false, "Ready");
 
         var availability = TransferExecutionPolicy.ForExplicitRun(
             projection is not null && (projection.HasMovement || projection.HasUnknownListingDemand),
@@ -1156,8 +1173,9 @@ internal sealed class TransferPlanWorkspace
     private static string OutcomeText(TransferWorkbenchRow row)
     {
         var projection = row.Projection;
-        return projection.Kind switch
+        var primary = projection.Kind switch
         {
+            TransferLineKind.Move => string.Empty,
             TransferLineKind.Paused => "Paused",
             TransferLineKind.VerifyListing => "Verify listing shortfall",
             TransferLineKind.Balanced => "Balanced",
@@ -1175,7 +1193,13 @@ internal sealed class TransferPlanWorkspace
                 projection.Short > 0 ? $"{projection.Short:N0} short" : null,
             }.Where(part => part is not null)),
         };
+        var moves = MoveOutcome(row.Line);
+        return moves.Length == 0 ? primary : primary.Length == 0 ? moves : $"{primary} · {moves}";
     }
+
+    private static string MoveOutcome(StowageEvaluationLine? line) => line is null || (line.Moves.Count == 0 && line.MoveLimits.Count == 0) ? string.Empty :
+        string.Join(" · ", (line.MoveQuantity > 0 ? new[] { $"Move {line.MoveQuantity:N0}" } : Array.Empty<string>())
+            .Concat(line.MoveLimits.Select(l => l.Message)));
 
     private void DrawOutcome(TransferWorkbenchRow row)
     {
@@ -1195,8 +1219,12 @@ internal sealed class TransferPlanWorkspace
         }
 
         var retrieveColor = TransferPresentation.ActionColor(StowageAction.Retrieve);
+        if (MoveOutcome(row.Line) is { Length: > 0 } moves)
+            Part(moves, retrieveColor);
         switch (projection.Kind)
         {
+            case TransferLineKind.Move:
+                return;
             case TransferLineKind.Paused:
                 ImGui.TextDisabled("Paused");
                 return;
@@ -1672,14 +1700,14 @@ internal sealed class TransferPlanWorkspace
     private void DrawVendorRunStatus()
     {
         var run = vendorProcurement.ActiveRun;
-        if (run is null || ReferenceEquals(run, dismissedVendorRun))
+        if (run is null || run.RunId == dismissedVendorRunId)
             return;
 
         ImGui.TextUnformatted($"Vendor buy · {run.Phase}");
         if (!vendorProcurement.IsRunning && run.Phase != GilVendorBuyPhase.Paused)
         {
             ImGui.SameLine();
-            if (ImGui.SmallButton("Dismiss##vendor-result")) dismissedVendorRun = run;
+            if (ImGui.SmallButton("Dismiss##vendor-result")) dismissedVendorRunId = run.RunId;
         }
         if (run.Receipts.Count > 0)
         {
@@ -1888,7 +1916,8 @@ internal sealed class TransferPlanWorkspace
             })
             .ToArray();
         // Count lines that will actually move something, from the same projection the rows show.
-        var movements = rows.Count(row => row.Projection.Retrieve > 0 || row.Projection.Stow > 0);
+        var movements = rows.Count(row => row.Projection.Retrieve > 0 || row.Projection.Stow > 0) +
+                        rows.Sum(row => row.Line?.Moves.Count ?? 0);
         transferWorkbenchProjection = new(
             runtime.Revision,
             plan.Id,

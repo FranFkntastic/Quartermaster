@@ -64,7 +64,8 @@ internal sealed record TransferReviewRow(
     int PlayerQuantity,
     int Difference,
     FieldEvidence<int> ListingContribution,
-    QuartermasterRuntimeSnapshot Runtime);
+    QuartermasterRuntimeSnapshot Runtime,
+    PlacementMove? Move = null);
 
 internal sealed record TransferReviewRequest(Guid PlanId, string PlanName);
 
