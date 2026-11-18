@@ -608,7 +608,10 @@ public sealed class TransferCoordinator : IRetrievalOperationExecutor
                         if (authorized <= 0 || stackRemaining <= 0)
                             continue;
                         var quantity = Math.Min(stackRemaining, authorized);
-                        if (!legacyCrystalDeposit)
+                        // Entrusting an ordinary stack never prompts for a quantity: the game tops up the
+                        // retainer's partial stack and places the rest in a new slot. Only crystals clamp.
+                        if (!legacyCrystalDeposit &&
+                            stack.Container == FFXIVClientStructs.FFXIV.Client.Game.InventoryType.Crystals)
                         {
                             var partialCapacity = LivePartialStackCapacity(source, operationLine, owner);
                             if (partialCapacity > 0)
