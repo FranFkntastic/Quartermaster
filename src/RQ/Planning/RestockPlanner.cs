@@ -51,7 +51,8 @@ public static class RestockPlanner
         IReadOnlyDictionary<ulong, CachedRetainer> cache,
         OwnerScope owner,
         DateTime nowUtc,
-        BrowserProjection? stock = null)
+        BrowserProjection? stock = null,
+        IReadOnlyDictionary<(uint, ItemQualityPolicy), int>? placementBaselines = null)
     {
         ArgumentNullException.ThrowIfNull(rows);
         ArgumentNullException.ThrowIfNull(playerInventory);
@@ -60,7 +61,8 @@ public static class RestockPlanner
 
         var lines = rows
             .Where(row => row.Enabled && row.ItemId > 0 && row.TargetQuantity > 0)
-            .Select(row => BuildLine(row, playerInventory, cache, owner, nowUtc, stock))
+            .Select(row => BuildLine(row, placementBaselines is null ? playerInventory.GetValueOrDefault(row.ItemId)
+                : placementBaselines[(row.ItemId, row.Quality)], cache, owner, nowUtc, stock))
             .OrderByDescending(line => line.NeededQuantity > 0)
             .ThenByDescending(line => line.MissingQuantity > 0)
             .ThenBy(line => line.ItemName, StringComparer.OrdinalIgnoreCase)
@@ -71,7 +73,7 @@ public static class RestockPlanner
 
     private static PlanLine BuildLine(
         TargetPlanItem row,
-        IReadOnlyDictionary<uint, int> playerInventory,
+        int baselineQuantity,
         IReadOnlyDictionary<ulong, CachedRetainer> cache,
         OwnerScope owner,
         DateTime nowUtc,
@@ -81,7 +83,7 @@ public static class RestockPlanner
             .Where(stack => QualityMatches(row.Quality, stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ))
             .ToArray();
         var player = stacks?.Where(stack => stack.ScopeKind == BrowserScopeKind.Player).Sum(stack => stack.Quantity)
-            ?? playerInventory.GetValueOrDefault(row.ItemId);
+            ?? baselineQuantity;
         var saddlebag = stacks?.Where(stack => stack.ScopeKind == BrowserScopeKind.Saddlebag).Sum(stack => stack.Quantity) ?? 0;
         var needed = Math.Max(0, row.TargetQuantity - player);
         var candidates = needed == 0

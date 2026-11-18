@@ -7,8 +7,9 @@ namespace RQ.Operations;
 public sealed partial class TransferCoordinator
 {
     private CancellationTokenSource? placementCancellation;
-    private sealed record PlacementLeg(TargetPlanItem Rule, Func<bool> Authorized, int Baseline = 0, ulong? Source = null,
-        int? TransitBagFloor = null)
+    private sealed record PlacementLeg(Func<bool> Authorized,
+        IReadOnlyDictionary<(uint, ItemQualityPolicy), int>? RetrievalBaselines = null, ulong? Source = null,
+        IReadOnlyDictionary<(uint, bool), (ItemQualityPolicy Quality, int Quantity)>? DepositFloors = null)
     {
         public void Check()
         {
@@ -79,14 +80,11 @@ public sealed partial class TransferCoordinator
                 ? await driver.ScanPlayerCrystalsAsync(new HashSet<uint> { rule.ItemId }, readToken).ConfigureAwait(false) : bags.Stacks;
             return (stacks.Where(s => s.ItemId == rule.ItemId && Matches(quality, s.IsHighQuality)).Sum(s => s.Quantity), bags.FreeSlots);
         }
-        async Task<OperationRecord> Retrieve(TargetPlanItem rule, ItemQualityPolicy quality, int baseline, int count, ulong? source)
+        async Task<OperationRecord> Retrieve(IReadOnlyList<(TargetPlanItem Rule, int Held)> needs, ulong? source)
         {
-            var leg = new PlacementLeg(rule, authorized, baseline, source);
+            var leg = new PlacementLeg(authorized, needs.ToDictionary(n => (n.Rule.ItemId, n.Rule.Quality), n => n.Held), source);
             leg.Check();
-            var row = StowagePlanCatalog.CopyRule(rule, plan.Id, newIdentity: false);
-            row.Quality = quality;
-            row.TargetQuantity = checked(baseline + count);
-            var id = journal.CreateTransferRetrieval(owner, plan, [row]).OperationId;
+            var id = journal.CreateTransferRetrieval(owner, plan, needs.Select(n => n.Rule).ToArray()).OperationId;
             Note("PlacementRetrievalLeg", $"{detail}; retrieval {id}");
             var result = await ExecuteRetrievalUnderLeaseAsync(id, lease, source.HasValue ? CancellationToken.None : token, leg).ConfigureAwait(false);
             if (!result.Started) throw new InvalidOperationException(result.Message);
@@ -94,18 +92,23 @@ public sealed partial class TransferCoordinator
             verifiedUnits += record.Lines.Sum(l => l.TransferredQuantity);
             return record;
         }
-        async Task<OperationRecord> Deposit(TargetPlanItem rule, bool hq, int count, ulong destination, int? transitFloor = null)
+        async Task<OperationRecord> Deposit(IReadOnlyList<(TargetPlanItem Rule, StowageDepositRequest Request)> lines, ulong destination, int? transitFloor = null)
         {
-            var leg = new PlacementLeg(rule, transitFloor.HasValue ? TransitAuthorized : authorized, TransitBagFloor: transitFloor);
+            var leg = new PlacementLeg(transitFloor.HasValue ? TransitAuthorized : authorized,
+                DepositFloors: lines.ToDictionary(l => (l.Rule.ItemId, l.Request.IsHighQuality),
+                    l => (transitFloor.HasValue ? (l.Request.IsHighQuality ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly) : l.Rule.Quality,
+                        transitFloor ?? l.Rule.TargetQuantity)));
             leg.Check();
-            var request = new StowageDepositRequest(plan.Id, rule.Id, rule.ItemId, rule.ItemName, hq, count,
-                rule.Routing, destination, sizeOf(rule.ItemId));
             var stock = Cache();
             if (transitFloor.HasValue && (stock.GetValueOrDefault(destination) is not { Owner.HasStableIdentity: true, IsCurrentlyAssigned: not false, IsUiAccessible: not false } target ||
-                !StockCoverage.CoversItem(target, rule.ItemId)))
+                !StockCoverage.CoversItem(target, lines[0].Rule.ItemId)))
                 throw new PlacementStop("PlacementDestinationUnverified", $"{detail}; destination stock or access is no longer verified.");
-            var batch = StowageRouter.BuildBatch([request], stock, owner, sizeOf, utcNow());
-            if (batch.PlannedQuantity == 0) throw new PlacementStop("DestinationFull", $"{detail}; no observed room at {destination} for {count}.");
+            var batch = StowageRouter.BuildBatch(lines.Select(l => l.Request), stock, owner, sizeOf, utcNow());
+            if (batch.PlannedQuantity == 0)
+            {
+                if (!transitFloor.HasValue) throw StowShort(lines[0].Request, detail, 0);
+                throw new PlacementStop("DestinationFull", $"{detail}; no observed room at {destination} for {batch.RequestedQuantity}.");
+            }
             var id = journal.CreateTransferDeposit(owner, plan, batch).OperationId;
             Note("PlacementDepositLeg", $"{detail}; deposit {id}");
             var result = await ExecuteDepositUnderLeaseAsync(id, lease, transitFloor.HasValue ? CancellationToken.None : token, leg).ConfigureAwait(false);
@@ -121,19 +124,38 @@ public sealed partial class TransferCoordinator
         }
         try
         {
+            var needs = new List<(TargetPlanItem Rule, int Held)>();
             foreach (var rule in rules)
             {
                 detail = rule.ItemName;
                 var (held, _) = await Read(rule, rule.Quality).ConfigureAwait(false);
                 var need = rule.TargetQuantity - held;
                 if (need <= 0) continue;
-                detail = $"{rule.ItemName} × {need} to player";
-                var retrievedToPlayer = await Retrieve(rule, rule.Quality, held, need, null).ConfigureAwait(false);
+                needs.Add((rule, held));
+            }
+            if (needs.Count > 0)
+            {
+                detail = "retrieving player shortfalls";
+                var retrievedToPlayer = await Retrieve(needs, null).ConfigureAwait(false);
                 if (retrievedToPlayer.Status == OperationStatuses.Indeterminate) throw new InvalidOperationException(retrievedToPlayer.Message);
                 if (retrievedToPlayer.Status != OperationStatuses.Succeeded)
-                    Limit("PlayerRetrievalIncomplete", $"{detail}; {retrievedToPlayer.Message}");
+                {
+                    var incomplete = false;
+                    foreach (var line in retrievedToPlayer.Lines)
+                    {
+                        var held = needs.First(n => n.Rule.ItemId == line.ItemId && n.Rule.Quality == line.Quality).Held;
+                        if (line.TransferredQuantity < line.TargetQuantity - held)
+                        {
+                            incomplete = true;
+                            Limit("PlayerRetrievalIncomplete", $"{line.ItemName} × {line.TargetQuantity - held} to player; {retrievedToPlayer.Message}");
+                        }
+                    }
+                    if (!incomplete) Limit("PlayerRetrievalIncomplete", retrievedToPlayer.Message);
+                }
             }
             phase = "stow";
+            var projected = Cache().ToDictionary(p => p.Key, p => StowageRouter.Copy(p.Value));
+            var deposits = new List<(TargetPlanItem Rule, StowageDepositRequest Request, StowageAllocation Destination)>();
             foreach (var rule in rules)
             {
                 detail = rule.ItemName;
@@ -146,27 +168,37 @@ public sealed partial class TransferCoordinator
                     var amount = Math.Min(surplus, (await Read(rule, quality).ConfigureAwait(false)).Units);
                     var request = new StowageDepositRequest(plan.Id, rule.Id, rule.ItemId, rule.ItemName, hq, amount,
                         rule.Routing);
-                    var route = StowageRouter.Route(request, Cache(), owner, sizeOf(rule.ItemId));
+                    var size = sizeOf(rule.ItemId);
+                    var route = StowageRouter.Route(request, projected, owner, size);
                     foreach (var a in route.Allocations)
                     {
-                        detail = $"{rule.ItemName} × {a.Quantity} to {a.RetainerName}";
-                        var left = a.Quantity;
-                        while (left > 0)
-                        {
-                            var capacity = StowageRouter.Capacity(Cache()[a.RetainerId], rule.ItemId, hq, sizeOf(rule.ItemId));
-                            var count = Math.Min(left, capacity.PartialStackCapacity > 0 ? capacity.PartialStackCapacity : capacity.TotalCapacity);
-                            if (count <= 0) throw new PlacementStop("PlayerStowFull", $"{detail}; {left} units have no room.");
-                            var deposit = await Deposit(rule, hq, count, a.RetainerId).ConfigureAwait(false);
-                            CheckOutcome(deposit, "PlayerStowIncomplete");
-                            var moved = deposit.Lines.Sum(l => l.TransferredQuantity);
-                            if (moved != count) throw new PlacementStop("PlayerStowShort", $"{detail}; accepted {moved} of {count}.");
-                            left -= moved;
-                        }
+                        deposits.Add((rule, request with { Quantity = a.Quantity, DestinationOverride = a.RetainerId }, a));
+                        StowageRouter.ApplyProjectedDeposit(projected[a.RetainerId], request, a.Quantity, size);
                     }
                     surplus -= amount - route.RemainingQuantity;
                     if (route.RemainingQuantity > 0 && (rule.Routing.PreferredRetainerIds.Count > 0 || rule.Routing.AnySpace))
                         Limit("PlayerStowCapacityLimited", $"{rule.ItemName} × {route.RemainingQuantity} remain in bags.");
                 }
+            }
+            // One visit per destination. Receipts and bag floors are keyed by item + NQ/HQ, so two rules
+            // landing in the same variant (e.g. an Any rule and an NQ-only rule for one item) take
+            // separate visits rather than sharing a batch.
+            var batches = deposits.GroupBy(d => d.Destination.RetainerId).SelectMany(group => group
+                .GroupBy(d => (d.Rule.ItemId, d.Request.IsHighQuality))
+                .SelectMany(variant => variant.Select((d, index) => (Index: index, Deposit: d)))
+                .GroupBy(entry => entry.Index, entry => entry.Deposit));
+            foreach (var group in batches)
+            {
+                var retainerId = group.First().Destination.RetainerId;
+                detail = group.First().Destination.RetainerName;
+                var deposit = await Deposit(group.Select(d => (d.Rule, d.Request)).ToArray(), retainerId).ConfigureAwait(false);
+                if (deposit.Status == OperationStatuses.Indeterminate) throw new InvalidOperationException(deposit.Message);
+                foreach (var (_, request, _) in group)
+                {
+                    var moved = deposit.Lines.SingleOrDefault(l => l.ItemId == request.ItemId && l.IsHighQuality == request.IsHighQuality)?.TransferredQuantity ?? 0;
+                    if (moved != request.Quantity) throw StowShort(request, detail, moved, deposit.Message);
+                }
+                CheckOutcome(deposit, "PlayerStowIncomplete");
             }
             phase = "moves";
             foreach (var rule in rules.Where(r => r.Routing.Consolidate && r.Routing.PreferredRetainerIds.Count > 0))
@@ -197,7 +229,10 @@ public sealed partial class TransferCoordinator
                         Arm(move.SourceRetainerId);
                         Arm(move.DestinationRetainerId);
                         inTransit = $" Check your bags for up to {count} × {rule.ItemName} ({quality}); arrival is unverified.";
-                        var retrieved = await Retrieve(rule, quality, before, count, move.SourceRetainerId).ConfigureAwait(false);
+                        var row = StowagePlanCatalog.CopyRule(rule, plan.Id, newIdentity: false);
+                        row.Quality = quality;
+                        row.TargetQuantity = checked(before + count);
+                        var retrieved = await Retrieve([(row, before)], move.SourceRetainerId).ConfigureAwait(false);
                         var arrived = (await Read(rule, quality, transit: true).ConfigureAwait(false)).Units - before;
                         if (arrived == 0 && retrieved.Status != OperationStatuses.Indeterminate) inTransit = "";
                         if (arrived > 0)
@@ -208,7 +243,9 @@ public sealed partial class TransferCoordinator
                             throw new PlacementUncertain("PlacementArrivalMismatch", $"{detail}; arrived {arrived}, receipt {retrieved.Lines.Sum(l => l.TransferredQuantity)}.");
                         if (arrived > 0)
                         {
-                            var deposited = await Deposit(rule, move.IsHighQuality, arrived, move.DestinationRetainerId, before).ConfigureAwait(false);
+                            var request = new StowageDepositRequest(plan.Id, rule.Id, rule.ItemId, rule.ItemName,
+                                move.IsHighQuality, arrived, rule.Routing, move.DestinationRetainerId, size);
+                            var deposited = await Deposit([(rule, request)], move.DestinationRetainerId, before).ConfigureAwait(false);
                             inTransit = $" Check your bags for up to {arrived} × {rule.ItemName} ({quality}); delivery is unverified.";
                             var left = (await Read(rule, quality, transit: true).ConfigureAwait(false)).Units - before;
                             if (left == 0) inTransit = "";
@@ -259,6 +296,9 @@ public sealed partial class TransferCoordinator
             catch (Exception) { }
         }
     }
+
+    private static PlacementStop StowShort(StowageDepositRequest request, string destination, int moved, string reason = "") =>
+        new("PlayerStowShort", $"{request.ItemName} ({(request.IsHighQuality ? "HQ" : "NQ")}) to {destination}; accepted {moved} of {request.Quantity}. {reason}".TrimEnd());
 
     private sealed class PlacementUncertain(string code, string message) : Exception(message)
     {

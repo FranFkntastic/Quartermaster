@@ -209,14 +209,13 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                 Quality = line.Quality,
                 Enabled = true,
             }).ToArray();
-            var baselineInventory = placement is null ? playerInventory() :
-                new Dictionary<uint, int> { [placement.Rule.ItemId] = placement.Baseline };
+            var baselineInventory = placement is null ? playerInventory() : new Dictionary<uint, int>();
             var sources = cache.Snapshot();
             if (retrievalSource is not null) sources = sources.Where(p => retrievalSource(p.Key)).ToDictionary(p => p.Key, p => p.Value);
             if (placement?.Source is { } sourceId)
                 sources = sources.Where(p => p.Key == sourceId && p.Value is
                     { Owner.HasStableIdentity: true, IsCurrentlyAssigned: not false, IsUiAccessible: not false }).ToDictionary();
-            var plan = RestockPlanner.Build(rows, baselineInventory, sources, owner, utcNow());
+            var plan = RestockPlanner.Build(rows, baselineInventory, sources, owner, utcNow(), placementBaselines: placement?.RetrievalBaselines);
             var remaining = plan.Lines
                 .GroupBy(line => RetrievalKey(line.ItemId, line.Quality))
                 .ToDictionary(group => group.Key, group => group.Sum(line => line.NeededQuantity));
@@ -631,14 +630,13 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                             var current = ElementalCurrencyCatalog.IsElementalCurrency(stack.ItemId)
                                 ? await driver.ScanPlayerCrystalsAsync(wanted, token).ConfigureAwait(false)
                                 : await driver.ScanPlayerInventoryAsync(wanted, token).ConfigureAwait(false);
-                            var held = current.Where(s => s.ItemId == stack.ItemId && (placement.TransitBagFloor.HasValue
-                                ? s.IsHighQuality == stack.IsHighQuality : Matches(placement.Rule.Quality, s.IsHighQuality))).Sum(s => s.Quantity);
-                            var floor = placement.TransitBagFloor ?? placement.Rule.TargetQuantity;
-                            quantity = Math.Min(quantity, Math.Max(0, held - floor));
+                            var floor = placement.DepositFloors![(stack.ItemId, stack.IsHighQuality)];
+                            var held = current.Where(s => s.ItemId == stack.ItemId && Matches(floor.Quality, s.IsHighQuality)).Sum(s => s.Quantity);
+                            quantity = Math.Min(quantity, Math.Max(0, held - floor.Quantity));
                             if (quantity == 0) continue;
                         }
-                        // Entrusting an ordinary stack never prompts for a quantity: the game tops up the
-                        // retainer's partial stack and places the rest in a new slot. Only crystals clamp.
+                        // Ordinary partial deposits use Entrust Quantity: the exact amount can top up a
+                        // partial stack and spill into new slots. Only crystals need the additional clamp.
                         if (!legacyCrystalDeposit &&
                             stack.Container == FFXIVClientStructs.FFXIV.Client.Game.InventoryType.Crystals)
                         {
