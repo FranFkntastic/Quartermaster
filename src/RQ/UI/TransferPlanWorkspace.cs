@@ -4,6 +4,7 @@ using Dalamud.Bindings.ImGui;
 using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.Automation.Vendors;
 using Franthropy.Dalamud.Automation.Vendors.Coordination;
+using Franthropy.Dalamud.UI.Feedback;
 using Franthropy.Dalamud.UI.Inputs;
 using Franthropy.Dalamud.UI.Tables;
 using Franthropy.Filtering.Evaluation;
@@ -968,16 +969,15 @@ internal sealed class TransferPlanWorkspace
     {
         if (lastRemoved is not { } removed || removed.PlanId != plan.Id)
             return;
-        ImGui.AlignTextToFramePadding();
-        ImGui.TextDisabled(removed.Label);
-        ImGui.SameLine(0, 0);
-        ImGui.TextDisabled(" · ");
-        ImGui.SameLine(0, 0);
-        if (ImGui.SmallButton("Undo##RQTransferUndo"))
-            UndoRemoval(owner, removed);
-        ImGui.SameLine();
-        if (ImGui.SmallButton("x##RQTransferUndoDismiss"))
-            lastRemoved = null;
+        switch (DalamudUndoStrip.Draw("RQTransferUndo", removed.Label))
+        {
+            case DalamudUndoStripResult.Undo:
+                UndoRemoval(owner, removed);
+                break;
+            case DalamudUndoStripResult.Dismiss:
+                lastRemoved = null;
+                break;
+        }
     }
 
     // ---- Table ----------------------------------------------------------------------------
@@ -1368,33 +1368,13 @@ internal sealed class TransferPlanWorkspace
     private void DrawHoverRemove(TransferWorkbenchRow row)
     {
         // The line menu button was just drawn in this row; its rect is the row's vertical extent.
-        var padding = ImGui.GetStyle().CellPadding.Y;
-        var rowTop = ImGui.GetItemRectMin().Y - padding;
-        var rowBottom = ImGui.GetItemRectMax().Y + padding;
+        var rowHovered = DalamudRowRemoveButton.IsLastItemRowHovered();
         ImGui.SameLine();
-        var mouseY = ImGui.GetMousePos().Y;
-        // Pressing the button makes it the active item, which a plain IsWindowHovered treats as
-        // "not hovered"; the button would vanish mid-click and the release would never land.
-        var rowHovered = ImGui.IsWindowHovered(ImGuiHoveredFlags.AllowWhenBlockedByActiveItem) &&
-                         mouseY >= rowTop && mouseY < rowBottom;
         var ruleId = row.Rule.Id;
         var owner = row.Owner;
         var planId = row.PlanId;
-        if (rowHovered)
-        {
-            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-            ImGui.PushStyleColor(ImGuiCol.Button, Vector4.Zero);
-            var clicked = ImGui.SmallButton("×##remove-line");
-            ImGui.PopStyleColor(2);
-            if (clicked)
-                RemoveRules(owner, planId, [ruleId]);
-        }
-        else
-        {
-            ImGui.Dummy(new Vector2(
-                ImGui.CalcTextSize("×").X + (ImGui.GetStyle().FramePadding.X * 2f),
-                ImGui.GetTextLineHeight()));
-        }
+        if (DalamudRowRemoveButton.Draw("remove-line", rowHovered))
+            RemoveRules(owner, planId, [ruleId]);
         reviewRegistry.RegisterLastButton(
             $"quartermaster.transfer.line.remove.{ruleId:N}",
             $"Remove {row.Rule.ItemName} from the plan",
