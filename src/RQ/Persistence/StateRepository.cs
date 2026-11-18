@@ -45,6 +45,12 @@ public sealed class StateRepository
             return Combine(Clone(state), operationStore.Snapshot());
     }
 
+    internal T ReadConfiguration<T>(Func<QuartermasterState, T> read)
+    {
+        lock (gate)
+            return read(state);
+    }
+
     public T Read<T>(Func<QuartermasterState, T> read)
     {
         lock (gate)

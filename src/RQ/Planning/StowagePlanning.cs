@@ -45,7 +45,7 @@ public static class StowagePlanMigration
     {
         if (!owner.HasStableIdentity)
             return false;
-        if (!repository.Read(state => NeedsMigration(state, owner)))
+        if (!repository.ReadConfiguration(state => NeedsMigration(state, owner)))
             return false;
 
         repository.Mutate(state =>
@@ -123,7 +123,7 @@ public static class TransferPlanMigration
 
     public static bool EnsureOwnerPlans(StateRepository repository, OwnerScope owner, Func<DateTime>? utcNow = null)
     {
-        if (!owner.HasStableIdentity || !repository.Read(state => NeedsMigration(state, owner)))
+        if (!owner.HasStableIdentity || !repository.ReadConfiguration(state => NeedsMigration(state, owner)))
             return false;
 
         repository.Mutate(state =>

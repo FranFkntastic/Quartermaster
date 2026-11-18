@@ -25,6 +25,7 @@ public sealed class QuartermasterWindow : Window
     private const string MainWindowName = "Quartermaster###RQMain";
 
     private readonly StateRepository state;
+    internal FrameTimings DrawTimings { get; }
     private readonly QuartermasterRuntimeSnapshotSource runtimeSnapshots;
     private readonly IDataManager dataManager;
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
@@ -38,6 +39,7 @@ public sealed class QuartermasterWindow : Window
     private readonly TransferPlanWorkspace transferPlanWorkspace;
     private readonly ListingPlanDraftSession listingSession;
     private readonly Dictionary<uint, bool?> listability = [];
+    private (string Query, int Limit, IReadOnlyList<ItemChoice> Choices)? lastItemSearch;
     private readonly ListingWorkspace listingWorkspace;
     private readonly MarketRunPane marketRunPane;
     private readonly TransferReviewDialog transferReviewDialog;
@@ -81,6 +83,7 @@ public sealed class QuartermasterWindow : Window
         : base(MainWindowName, ImGuiWindowFlags.NoScrollbar)
     {
         this.state = state;
+        DrawTimings = new(log, "Draw", 100);
         this.runtimeSnapshots = runtimeSnapshots;
         this.dataManager = dataManager;
         this.reviewRegistry = reviewRegistry;
@@ -243,6 +246,7 @@ public sealed class QuartermasterWindow : Window
 
     public override void Draw()
     {
+        DrawTimings.Section("window setup");
         var drawStarted = Stopwatch.GetTimestamp();
         ClearAgentReviewWindowOverride();
         reviewRegistry.BeginFrame();
@@ -268,18 +272,22 @@ public sealed class QuartermasterWindow : Window
         finally
         {
             var reviewStarted = Stopwatch.GetTimestamp();
+            DrawTimings.Section("review finalize");
             var frame = reviewRegistry.EndFrame();
             if (ActiveCapturePresentationTarget() is { } target)
                 captureTransactions.MarkRendered(target, frame.FrameId);
             ReviewFinalizeMilliseconds = Stopwatch.GetElapsedTime(reviewStarted).TotalMilliseconds;
             WindowDrawMilliseconds = Stopwatch.GetElapsedTime(drawStarted).TotalMilliseconds;
+            DrawTimings.Section("window system");
         }
     }
 
     public override void PreDraw()
     {
+        DrawTimings.Section("PreDraw");
         ReleaseRestoredCaptureCollapseOverride();
         ApplyViewportReopenGuard();
+        DrawTimings.Section("window begin");
     }
 
     private void ApplyViewportReopenGuard()
@@ -391,13 +399,16 @@ public sealed class QuartermasterWindow : Window
 
     private void DrawContent()
     {
+        DrawTimings.Section("scope and draft");
         requestedView ??= deferredView;
         deferredView = null;
         var runtime = runtimeSnapshots.Current;
         workbench.EnsureScope(runtime.Browser);
         workbench.EnsureListingOwner(runtime.Owner);
         listingSession.Ensure(runtime);
+        DrawTimings.Section("plan selection");
         transferPlanWorkspace.EnsureSelection(runtime);
+        DrawTimings.Section("toolbar");
         if (requestedView == WorkbenchView.Activity)
         { historyDialog.RequestOpen(); requestedView = null; }
         ImGui.TextUnformatted(runtime.Owner.HasStableIdentity
@@ -406,7 +417,9 @@ public sealed class QuartermasterWindow : Window
         if (ImGui.SmallButton("History")) historyDialog.RequestOpen();
         reviewRegistry.RegisterLastButton("quartermaster.history.open", "Open transfer history", true,
             historyDialog.RequestOpen, "Recent Quartermaster operations");
+        DrawTimings.Section("history dialog");
         historyDialog.Draw(runtime.Owner);
+        DrawTimings.Section("tab bar");
         ImGui.SameLine();
         if (ImGui.SmallButton("Market run history")) marketRunPane.History?.Open();
 
@@ -418,7 +431,9 @@ public sealed class QuartermasterWindow : Window
             if (marketOpen)
             {
                 workbench.View = WorkbenchView.Listings;
+                DrawTimings.Section("market");
                 DrawMarketTab(runtime);
+                DrawTimings.Section("tab bar");
                 ImGui.EndTabItem();
             }
             var stockOpen = ImGui.BeginTabItem("Stock & plans",
@@ -434,7 +449,8 @@ public sealed class QuartermasterWindow : Window
                     ImGui.TableSetupColumn("Stock", ImGuiTableColumnFlags.WidthStretch, 1);
                     ImGui.TableSetupColumn("Transfer plan", ImGuiTableColumnFlags.WidthStretch, 1.2f);
                     ImGui.TableNextRow(); ImGui.TableNextColumn();
-                    if (ImGui.BeginChild("RQSourcePane", Vector2.Zero, false)) stockWorkspace.Draw(runtime);
+                    DrawTimings.Section("stock");
+                    if (ImGui.BeginChild("RQSourcePane", Vector2.Zero, false)) stockWorkspace.Draw(runtime, DrawTimings);
                     ImGui.EndChild();
                     ImGui.TableNextColumn();
                     if (ImGui.BeginChild("RQPlanPane", Vector2.Zero, false))
@@ -447,8 +463,9 @@ public sealed class QuartermasterWindow : Window
                         if (ImGui.Selectable("Item groups##RQPlannerMode", !transferSelected, ImGuiSelectableFlags.None, new Vector2(104, 0))) workbench.View = WorkbenchView.ItemGroups;
                         reviewRegistry.RegisterLastButton("quartermaster.workspace.item-groups", "Show Item Groups workspace", true, () => workbench.View = WorkbenchView.ItemGroups, "Available");
                         ImGui.Separator();
+                        DrawTimings.Section(workbench.View == WorkbenchView.ItemGroups ? "item groups" : "transfer plan");
                         if (workbench.View == WorkbenchView.ItemGroups) itemGroupWorkspace.DrawWorkspace(runtime.State);
-                        else transferPlanWorkspace.Draw(runtime);
+                        else transferPlanWorkspace.Draw(runtime, DrawTimings);
                         PlanDrawMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
                     }
                     ImGui.EndChild();
@@ -459,8 +476,11 @@ public sealed class QuartermasterWindow : Window
             ImGui.EndTabBar();
             requestedView = null;
         }
+        DrawTimings.Section("transfer review");
         transferReviewDialog.Draw();
+        DrawTimings.Section("vendor review");
         vendorReviewDialog.Draw();
+        DrawTimings.Section("confirmation");
         confirmationDialog.Draw();
     }
 
@@ -473,8 +493,9 @@ public sealed class QuartermasterWindow : Window
             listingSession.MergedElsewhere || listingSession.Error is not null);
         var stripHeight = showSave ? ImGui.GetFrameHeightWithSpacing() + ImGui.GetStyle().ItemSpacing.Y : 0;
         if (ImGui.BeginChild("RQMarketBody", new Vector2(0, -stripHeight), false))
-            listingWorkspace.Draw(runtime);
+            listingWorkspace.Draw(runtime, DrawTimings);
         ImGui.EndChild();
+        DrawTimings.Section("listing save strip");
         if (showSave) DrawListingSaveStrip(runtime);
     }
 
@@ -612,7 +633,7 @@ public sealed class QuartermasterWindow : Window
 
     private int ResolveListingMaxStack(BrowserProjection browser, uint itemId)
     {
-        var observed = browser.Items.FirstOrDefault(item => item.ItemId == itemId)?.Definition?.MaxStackSize;
+        var observed = browser.FindItem(itemId)?.Definition?.MaxStackSize;
         if (observed is > 0) return checked((int)Math.Min(observed.Value, int.MaxValue));
         var item = dataManager.GetExcelSheet<Item>().GetRowOrDefault(itemId);
         return item is { } value && value.StackSize > 0 ? checked((int)value.StackSize) : 1;
@@ -642,6 +663,8 @@ public sealed class QuartermasterWindow : Window
     private IReadOnlyList<ItemChoice> SearchItems(string search, int limit)
     {
         var needle = search.Trim();
+        if (lastItemSearch is { } previous && previous.Query == needle && previous.Limit == limit)
+            return previous.Choices;
         var matches = dataManager.GetExcelSheet<Item>()
             .Select(row => new { row.RowId, Name = row.Name.ExtractText() })
             .Where(item => !string.IsNullOrWhiteSpace(item.Name) && item.Name.Contains(needle, StringComparison.OrdinalIgnoreCase))
@@ -650,7 +673,7 @@ public sealed class QuartermasterWindow : Window
             .ThenBy(item => item.RowId)
             .Take(limit * 2)
             .ToArray();
-        return matches
+        var choices = matches
             .GroupBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
             .SelectMany(group => group.Select((item, index) => new ItemChoice(
                 item.RowId,
@@ -658,6 +681,8 @@ public sealed class QuartermasterWindow : Window
                 group.Count() > 1 ? $"{item.Name} ({index + 1})" : item.Name)))
             .Take(limit)
             .ToArray();
+        lastItemSearch = (needle, limit, choices);
+        return choices;
     }
 
     private StowagePlan? ResolveSelectedStowagePlan(QuartermasterState document, OwnerScope owner) =>

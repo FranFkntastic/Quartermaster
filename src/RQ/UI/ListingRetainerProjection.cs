@@ -245,7 +245,7 @@ internal static class ListingRetainerProjection
         if (remaining > 0)
         {
             var quality = a.Quality == ItemQualityPolicy.HqOnly ? FfxivItemQuality.HQ : FfxivItemQuality.NQ;
-            var held = browser.Items.FirstOrDefault(i => i.ItemId == a.ItemId)?.Stacks
+            var held = browser.FindItem(a.ItemId)?.Stacks
                 .Where(s => s.RetainerId == a.RetainerId && s.Quality == quality).Sum(s => s.Quantity) ?? 0;
             if (item.Coverage == ListingCoverageState.ReadyOnAssignedRetainer)
                 return held >= slotUnits ? new(AmountText(5, remaining), ListingStateTone.Amber, 5, Amount: remaining) : new("Shape differs", ListingStateTone.Info, 7);

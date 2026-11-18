@@ -305,8 +305,8 @@ internal sealed class ItemGroupWorkspace
         ImGui.SetNextItemWidth(120);
         DrawQualityCombo("##item-group-add-quality");
 
-        var matches = searchItems(itemSearch, 6);
-        if (!string.IsNullOrWhiteSpace(itemSearch) && matches.Count > 0)
+        var matches = string.IsNullOrWhiteSpace(itemSearch) ? [] : searchItems(itemSearch, 6);
+        if (matches.Count > 0)
         {
             if (ImGui.BeginChild(
                     "RQItemGroupSearchResults",
@@ -351,9 +351,8 @@ internal sealed class ItemGroupWorkspace
         else
             ImGui.TextDisabled("Select stock on the left to add several items at once.");
 
-        var snapshot = state.Snapshot();
-        var canApply = ItemGroupCatalog.CanApply(snapshot, currentDraft);
-        var hasChanges = ItemGroupCatalog.HasChanges(snapshot, currentDraft);
+        var (canApply, hasChanges) = state.ReadConfiguration(document =>
+            (ItemGroupCatalog.CanApply(document, currentDraft), ItemGroupCatalog.HasChanges(document, currentDraft)));
         ImGui.SameLine();
         if (!hasChanges)
             ImGui.BeginDisabled();

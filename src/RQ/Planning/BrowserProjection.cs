@@ -61,6 +61,20 @@ public sealed record ListingRow(
 
 public sealed class BrowserProjection
 {
+    private Dictionary<uint, StockGroup>? itemsById;
+
+    // Published projections do not mutate. Index on first use; readers only see a complete map.
+    internal StockGroup? FindItem(uint itemId)
+    {
+        var index = Volatile.Read(ref itemsById);
+        if (index is null)
+        {
+            var built = Items.ToDictionary(item => item.ItemId);
+            index = Interlocked.CompareExchange(ref itemsById, built, null) ?? built;
+        }
+        return index.GetValueOrDefault(itemId);
+    }
+
     public required IReadOnlyList<BrowserScope> Scopes { get; init; }
     public required IReadOnlyList<StockGroup> Items { get; init; }
     public required IReadOnlyList<ListingRow> Listings { get; init; }
