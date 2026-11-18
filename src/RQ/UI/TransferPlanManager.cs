@@ -112,7 +112,7 @@ internal sealed class TransferPlanManager
                 "RQTransferPlanManager",
                 2,
                 flags,
-                new Vector2(0, Math.Max(260, ImGui.GetContentRegionAvail().Y))))
+                new Vector2(0, Math.Max(260, ImGui.GetContentRegionAvail().Y - ImGui.GetStyle().ItemSpacing.Y))))
             return;
 
         ImGui.TableSetupColumn("Plans", ImGuiTableColumnFlags.WidthFixed, 210);
@@ -243,16 +243,17 @@ internal sealed class TransferPlanManager
                          ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp;
         if (ImGui.BeginTable(
                 "RQTransferPlanManagerLines",
-                2,
+                3,
                 tableFlags,
                 new Vector2(0, Math.Max(120, ImGui.GetContentRegionAvail().Y - footerHeight))))
         {
             ImGui.TableSetupScrollFreeze(0, 1);
             ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1f);
-            ImGui.TableSetupColumn("Target", ImGuiTableColumnFlags.WidthFixed, 96);
+            ImGui.TableSetupColumn("Keep", ImGuiTableColumnFlags.WidthFixed, 56);
+            ImGui.TableSetupColumn("Stow to", ImGuiTableColumnFlags.WidthStretch, .8f);
             ImGui.TableHeadersRow();
             foreach (var row in resolveProjection(runtime, plan).Rows)
-                DrawLine(row);
+                DrawLine(runtime, row);
             ImGui.EndTable();
         }
 
@@ -300,7 +301,7 @@ internal sealed class TransferPlanManager
             CommitRename(owner, plan.Id);
     }
 
-    private void DrawLine(TransferWorkbenchRow row)
+    private static void DrawLine(QuartermasterRuntimeSnapshot runtime, TransferWorkbenchRow row)
     {
         var rule = row.Rule;
         ImGui.TableNextRow();
@@ -318,7 +319,23 @@ internal sealed class TransferPlanManager
         if (display.Length != full.Length && ImGui.IsItemHovered())
             ImGui.SetTooltip(full);
         ImGui.TableNextColumn();
-        ImGui.TextUnformatted(TransferPlanWorkspace.TransferTargetText(row));
+        ImGui.TextUnformatted(rule.TargetQuantity.ToString("N0"));
+        ImGui.TableNextColumn();
+        var destination = StowTo(runtime, rule.Routing);
+        var shown = Fit(destination, ImGui.GetContentRegionAvail().X);
+        ImGui.TextUnformatted(shown);
+        if (shown.Length != destination.Length && ImGui.IsItemHovered())
+            ImGui.SetTooltip(destination);
+    }
+
+    private static string StowTo(QuartermasterRuntimeSnapshot runtime, StowageRoutingPolicy routing)
+    {
+        if (routing.PreferredRetainerIds.Count == 0)
+            return routing.AnySpace ? "Any space" : "—";
+        var first = runtime.Retainers.GetValueOrDefault(routing.PreferredRetainerIds[0])?.RetainerName
+                    ?? $"Retainer {routing.PreferredRetainerIds[0]}";
+        var more = routing.PreferredRetainerIds.Count - 1;
+        return more > 0 ? $"{first} +{more}" : first;
     }
 
     private void DrawActions(OwnerScope owner, StowagePlan plan, bool stable)

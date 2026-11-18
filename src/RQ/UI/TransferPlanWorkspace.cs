@@ -1120,7 +1120,7 @@ internal sealed class TransferPlanWorkspace
         }
     }
 
-    internal static string TransferTargetText(TransferWorkbenchRow row) =>
+    private static string TransferTargetText(TransferWorkbenchRow row) =>
         TransferWorkbenchPresentation.Target(
             row.Line?.DesiredPlayerQuantity ?? row.Rule.TargetQuantity,
             row.PlayerQuantity,
