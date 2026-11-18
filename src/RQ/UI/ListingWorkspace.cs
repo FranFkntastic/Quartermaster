@@ -56,6 +56,7 @@ internal sealed class ListingWorkspace
     private ListingPlanDraft? previousDraft;
     private bool refreshStartedHere;
     private float? runPaneWidth;
+    private Dictionary<ulong, int> toList = [];
     // Slot selection belongs to one expanded retainer at a time and is keyed by stable slot identity.
     private readonly TableSelectionModel<ListingSlotKey> slotSelection = new();
     private ulong? slotRetainerId;
@@ -116,7 +117,7 @@ internal sealed class ListingWorkspace
     internal static Vector4 Color(ListingStateTone tone) => tone switch
     {
         ListingStateTone.Amber => new(1, .7f, .3f, 1), ListingStateTone.Green => new(.45f, .78f, .58f, 1),
-        ListingStateTone.Info => new(.56f, .70f, .85f, 1), _ => ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled],
+        ListingStateTone.Info => new(.56f, .70f, .85f, 1), ListingStateTone.Run => new(.29f, .62f, .85f, 1), _ => ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled],
     };
 
     private IReadOnlyList<ListingRetainerRow> Resolve(QuartermasterRuntimeSnapshot runtime)
@@ -182,6 +183,9 @@ internal sealed class ListingWorkspace
         ImGui.EndDisabled();
         timings.Section("listing projection");
         var all = Resolve(runtime);
+        // Listings this run will post per retainer, drawn in the run pane's blue on the slot bar and State.
+        toList = all.ToDictionary(r => r.RetainerId, r =>
+            runPane.Retainer(runtime, session, r.RetainerId)?.RefillListings is { IsKnown: true, Value: > 0 } refill ? refill.Value : 0);
         timings.Section("listing table");
         DrawRefresh(all.Count == 0);
         DrawNavigationStatus();
@@ -301,11 +305,13 @@ internal sealed class ListingWorkspace
         if (!string.IsNullOrWhiteSpace(refresh.Status)) { ImGui.SameLine(); ImGui.TextDisabled(refresh.Status); }
     }
 
-    private static void DrawSlots(ListingRetainerRow row)
+    private void DrawSlots(ListingRetainerRow row)
     {
+        var listing = toList.GetValueOrDefault(row.RetainerId);
         foreach (var slot in row.Slots.Where(s => s.Number > 0))
         {
-            var (color, label) = slot.Listed switch
+            var unlisted = slot.Assignment is not null && slot.Listed is ListingSlotListed.NotListed or ListingSlotListed.None;
+            var (color, label) = unlisted && listing-- > 0 ? (Color(ListingStateTone.Run), "to list") : slot.Listed switch
             {
                 ListingSlotListed.Match => (Color(ListingStateTone.Green), "listed"),
                 ListingSlotListed.UnknownPrice or ListingSlotListed.PriceDiffers or ListingSlotListed.ShapeDiffers => (Color(ListingStateTone.Info), "differs"),
@@ -333,7 +339,12 @@ internal sealed class ListingWorkspace
     {
         var start = ImGui.GetCursorPosX();
         var right = start + ImGui.GetContentRegionAvail().X;
-        DrawState(row.State);
+        if (toList.GetValueOrDefault(row.RetainerId) is var listing and > 0)
+        {
+            ImGui.TextColored(Color(ListingStateTone.Run), $"{listing:N0} to list");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(row.State.Text);
+        }
+        else DrawState(row.State);
         if (ImGui.IsItemClicked()) workbench.ToggleListing(row.RetainerId);
         if (!row.Available) return;
         var size = ImGui.GetTextLineHeight();
