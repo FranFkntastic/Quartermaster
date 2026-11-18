@@ -17,7 +17,7 @@ internal enum ListingSlotListed { None, Match, UnknownPrice, PriceDiffers, Shape
 /// <summary>One retainer market slot. Number is 1-based for capacity rows and 0 for excluded plan rows.</summary>
 internal sealed record ListingSlotView(ListingSlotKey Key, int Number, ListingPlanAssignment? Assignment,
     ListingRow? Listing, ListingSlotListed Listed, bool Continuation, bool GroupStart);
-internal enum ListingStateTone { Dim, Amber, Green, Info }
+internal enum ListingStateTone { Dim, Amber, Green, Info, Run }
 internal enum ListingStateAction { None, FocusStock }
 internal sealed record ListingStateView(string Text, ListingStateTone Tone, int Rank,
     ListingStateAction Action = ListingStateAction.None, int Amount = 0);

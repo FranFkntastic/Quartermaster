@@ -22,35 +22,18 @@ internal static class MarketRunPresentation
     };
 
     internal static string Number(FieldEvidence<int> value) => value.IsKnown ? value.Value.ToString("N0") : "—";
-    // Units already listed where the plan wants them; listings on other retainers do not count.
-    internal static string InPlace(MarketRunEvaluation run, MarketRunItem item)
+    // Units already listed where the plan wants them; listings on other retainers do not count. Null when unobserved.
+    internal static int? InPlaceUnits(MarketRunEvaluation run, MarketRunItem item)
     {
         long units = 0;
         foreach (var row in run.Retainers.SelectMany(r => r.Assignments)
                      .Where(a => a.Assignment.ItemId == item.ItemId && a.Assignment.Quality == item.Quality))
         {
-            if (!row.ShortListings.IsKnown) return "—";
+            if (!row.ShortListings.IsKnown) return null;
             units += (long)(row.PlannedListings - row.ShortListings.Value) * Math.Max(0, row.Assignment.QuantityPerListing);
         }
-        return units.ToString("N0");
+        return (int)Math.Min(units, int.MaxValue);
     }
-    internal static string Header(MarketRunEvaluation run)
-    {
-        if (!run.IsComplete)
-        {
-            var missing = run.Retainers.Count(r => !r.ListingsComplete);
-            return missing > 0 ? $"{missing} retainers not yet observed" : "Retainer stock not yet observed";
-        }
-        return $"Refill {run.Retainers.Sum(r => (long)r.RefillListings.Value):N0} · Short {run.Retainers.Sum(r => (long)r.UnfilledListings.Value):N0} · Craft {run.Items.Sum(i => (long)i.CraftUnits.Value):N0}" +
-            (run.StowUnits > 0 ? $" · Stow {run.StowUnits:N0}" : string.Empty) +
-            (run.MoveUnits > 0 ? $" · Move {run.MoveUnits:N0}" : string.Empty) +
-            Capacity(Evidence.Known(run.Retainers.Sum(r => r.PullListings.Value)),
-                Evidence.Known(run.Retainers.Sum(r => r.BlockedBySlotsListings.Value)));
-    }
-
-    internal static string Capacity(FieldEvidence<int> pulls, FieldEvidence<int> blocked) =>
-        (!pulls.IsKnown ? " · Pull —" : pulls.Value > 0 ? $" · Pull {pulls.Value:N0}" : string.Empty) +
-        (!blocked.IsKnown ? " · No slot —" : blocked.Value > 0 ? $" · No slot {blocked.Value:N0}" : string.Empty);
 
     internal static string PullLabel(MarketRunPullListing pull) =>
         $"Pull · {pull.Listing.ItemName} {(pull.Listing.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ ? "HQ" : "NQ")}";

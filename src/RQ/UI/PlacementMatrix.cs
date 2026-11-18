@@ -266,14 +266,10 @@ internal sealed class PlacementMatrix<TKey>
         UiLayout.SameLineIfFits(label);
         ImGui.BeginDisabled(!hasSelection);
         if (primary)
-        {
-            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(.48f, .13f, .13f, 1f));
-            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(.57f, .16f, .16f, 1f));
-            ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(.64f, .19f, .19f, 1f));
-        }
+            UiLayout.PushPrimary();
         var clicked = ImGui.Button($"{label}##{surfaceId}");
         if (primary)
-            ImGui.PopStyleColor(3);
+            UiLayout.PopPrimary();
         ImGui.EndDisabled();
         if (clicked)
             ApplyToSelection(allRows, apply, edit);

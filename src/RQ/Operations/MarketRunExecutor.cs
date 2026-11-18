@@ -41,7 +41,7 @@ public interface IMarketRunDriver
     Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token, Action<MarketMutationReceipt>? receiptChanged = null);
     Task<IReadOnlyList<string>> StowAsync(Guid planId, IReadOnlyList<ListingReserveRule> reserves, IDisposable lease,
         Action check, Func<bool> hasAuthority, CancellationToken token, Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged,
-        IReadOnlyDictionary<(uint ItemId, bool Hq), int> baseline, bool forceReorganize);
+        bool reorganizeRetainers);
 }
 
 public interface IMarketRunDeadline
@@ -73,6 +73,7 @@ public sealed class MarketRunDeadline(TimeSpan timeout) : IMarketRunDeadline
 
 public sealed class MarketRunRecord
 {
+    /// <summary>Reorganize retainers was on (persisted name kept for older records).</summary>
     public bool ForceReorganize { get; set; }
     // Null means the legacy receipt did not record this time, not the import time.
     public DateTime? StartedAtUtc { get; set; }
@@ -196,21 +197,33 @@ public sealed class MarketRunExecutor(
     public void Restore(MarketRunRecord? record) => Result = record;
     public void Cancel() => Interlocked.Exchange(ref cancelled, 1);
 
-    public Task RunAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty = false, bool forceReorganize = false)
+    /// <summary>Listings committed by the active (or last) run.</summary>
+    public int PostedListings => Volatile.Read(ref posted);
+    /// <summary>Short listings the active run set out to refill, from its evaluation.</summary>
+    public int ListingTarget { get; private set; }
+    private int posted;
+
+    /// <summary>True when the evaluation has listing work or anything to stow or relocate.</summary>
+    public static bool HasWork(MarketRunEvaluation evaluation, bool reorganizeRetainers) =>
+        HasListingWork(evaluation) || evaluation.StowUnits > 0 || reorganizeRetainers && evaluation.MoveUnits > 0;
+
+    private static bool HasListingWork(MarketRunEvaluation evaluation) => evaluation.Retainers.Any(r => r.Assignments.Any(a =>
+        a.ShortListings is { IsKnown: true, Value: > 0 } || a.RepriceListings is { IsKnown: true, Value: > 0 }));
+
+    public Task RunAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty = false, bool reorganizeRetainers = false)
     {
         lock (persistenceGate)
         {
             if (!CanStart) return Task.CompletedTask;
-            return ActiveTask = RunCoreAsync(plan, evaluation, draftDirty, forceReorganize);
+            return ActiveTask = RunCoreAsync(plan, evaluation, draftDirty, reorganizeRetainers);
         }
     }
 
-    private async Task RunCoreAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty, bool forceReorganize)
+    private async Task RunCoreAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty, bool reorganizeRetainers)
     {
-        var listingWork = evaluation.Retainers.Any(r => r.Assignments.Any(a =>
-            a.ShortListings is { IsKnown: true, Value: > 0 } || a.RepriceListings is { IsKnown: true, Value: > 0 }));
+        var listingWork = HasListingWork(evaluation);
         if (draftDirty || !evaluation.IsComplete || evaluation.PlanId != plan.Id || evaluation.PlanRevision != plan.Revision ||
-            (!listingWork && (!forceReorganize || evaluation.StowUnits + evaluation.MoveUnits <= 0))) return;
+            !HasWork(evaluation, reorganizeRetainers)) return;
         var reserves = plan.Reserves.Select(ListingPlanCatalog.Copy).ToArray();
         if (!automation.TryAcquire("market run", out var lease)) return;
         {
@@ -224,7 +237,9 @@ public sealed class MarketRunExecutor(
             shortByAssignment.Clear();
             freshListings.Clear();
             topUpActive = false;
-            var record = new MarketRunRecord { ForceReorganize = forceReorganize, StartedAtUtc = DateTime.UtcNow, PlanId = plan.Id, PlanRevision = plan.Revision, Owner = plan.Owner with { },
+            Volatile.Write(ref posted, 0);
+            ListingTarget = evaluation.Retainers.Sum(r => r.RefillListings.IsKnown ? r.RefillListings.Value : 0);
+            var record = new MarketRunRecord { ForceReorganize = reorganizeRetainers, StartedAtUtc = DateTime.UtcNow, PlanId = plan.Id, PlanRevision = plan.Revision, Owner = plan.Owner with { },
                 Assignments = plan.Assignments.Where(a => a.Enabled).Select(ListingPlanCatalog.Copy).ToList() };
             AutoRetainerSuppression.Scope? scope = null;
             var sessionStarted = false;
@@ -248,11 +263,6 @@ public sealed class MarketRunExecutor(
                 }
                 sessionStarted = true;
                 driver.BeginRun(runLease!, () => HasSessionAuthority(record));
-                // Capture before gather, pull, post or any other mutation, including on forced-only runs.
-                var baselinePlayer = await deadline.RunAsync(driver.PlayerAsync).ConfigureAwait(false);
-                Check(record);
-                var baseline = baselinePlayer.Stacks.GroupBy(s => (s.ItemId, s.IsHighQuality))
-                    .ToDictionary(g => g.Key, g => g.Sum(s => s.Quantity));
                 if (listingWork)
                 {
                     Status = "Gathering stock";
@@ -288,7 +298,7 @@ public sealed class MarketRunExecutor(
                                 record.NeedsCheckNames[receipt.Intent.RetainerId] = receipt.RetainerName;
                             }
                             Persist(record);
-                        }, report => { Add(record, report); Persist(record); }, baseline, forceReorganize).ConfigureAwait(false);
+                        }, report => { Add(record, report); Persist(record); }, reorganizeRetainers).ConfigureAwait(false);
                     Check(record);
                     stowageEntered = true;
                 }
@@ -795,6 +805,7 @@ public sealed class MarketRunExecutor(
             receipt.Code = "MutationFaulted"; receipt.Message = e.Message;
         }
         if (receipt.Outcome != MarketMutationOutcome.Committed) Warn();
+        else if (intent.Kind == "Post") Interlocked.Increment(ref posted);
         // A failed reprice has no three-way primitive outcome; verify the exact
         // expected after-state before classifying it, without ever sending again.
         if (intent.Kind != "Reprice" && receipt.Outcome == MarketMutationOutcome.Indeterminate && !record.NeedsCheck.Contains(intent.RetainerId))

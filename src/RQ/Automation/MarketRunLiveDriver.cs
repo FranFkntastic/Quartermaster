@@ -219,7 +219,7 @@ internal sealed class MarketRunLiveDriver(
     public async Task<IReadOnlyList<string>> StowAsync(Guid planId, IReadOnlyList<ListingReserveRule> reserves,
         IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token,
         Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged,
-        IReadOnlyDictionary<(uint ItemId, bool Hq), int> baseline, bool forceReorganize)
+        bool reorganizeRetainers)
     {
         gatherLease = lease;
         runAuthority = hasAuthority;
@@ -227,9 +227,9 @@ internal sealed class MarketRunLiveDriver(
         check();
         var player = await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
         var requests = MarketRunPlanner.StowRequests(planId, reserves,
-            player.Stacks.Select(s => (s.ItemId, s.IsHighQuality, s.Quantity)), forceReorganize ? null : baseline);
+            player.Stacks.Select(s => (s.ItemId, s.IsHighQuality, s.Quantity)));
         var reports = (await DepositRequestsAsync(requests, lease, check, token, receiptChanged, reportChanged, false).ConfigureAwait(false)).ToList();
-        if (forceReorganize)
+        if (reorganizeRetainers)
             reports.AddRange(await RelocateAsync(planId, reserves, lease, check, token, receiptChanged, reportChanged).ConfigureAwait(false));
         return reports;
     }

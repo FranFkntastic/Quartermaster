@@ -60,7 +60,9 @@ public sealed record MarketRunEvaluation(
     IReadOnlyList<MarketRunItem> Items,
     IReadOnlyList<MarketRunCraftLine> CraftQueue)
 {
+    /// <summary>Bag units the stow step is projected to route to a destination; set by the caller that has capacity data.</summary>
     public int StowUnits { get; init; }
+    /// <summary>Retainer units Reorganize retainers would relocate; set by the caller that has capacity data.</summary>
     public int MoveUnits { get; init; }
     /// <summary>False when any listing or stock number the run depends on is unknown.</summary>
     public bool IsComplete =>
@@ -78,14 +80,11 @@ public sealed record MarketRunEvaluation(
 /// </summary>
 public static class MarketRunPlanner
 {
+    /// <summary>Every bag unit of a reserve item that has destinations.</summary>
     public static IReadOnlyList<StowageDepositRequest> StowRequests(Guid planId,
-        IEnumerable<ListingReserveRule> reserves, IEnumerable<(uint ItemId, bool Hq, int Quantity)> stacks,
-        IReadOnlyDictionary<(uint ItemId, bool Hq), int>? baseline = null)
+        IEnumerable<ListingReserveRule> reserves, IEnumerable<(uint ItemId, bool Hq, int Quantity)> stacks)
     {
         var remaining = stacks.GroupBy(s => (s.ItemId, s.Hq)).ToDictionary(g => g.Key, g => g.Sum(s => s.Quantity));
-        if (baseline is not null)
-            foreach (var key in remaining.Keys.ToArray())
-                remaining[key] = Math.Clamp(remaining[key] - baseline.GetValueOrDefault(key), 0, remaining[key]);
         var requests = new List<StowageDepositRequest>();
         foreach (var reserve in reserves.Where(r => r.Enabled && r.ItemId > 0 &&
                      (r.Location.AnySpace || r.Location.PreferredRetainerIds.Count > 0)))
@@ -100,6 +99,29 @@ public static class MarketRunPlanner
             remaining[key] = 0; // Overlapping policies must not authorize the same units twice.
         }
         return requests;
+    }
+
+    /// <summary>
+    /// What the run's stow step will find in the bags once listing is done: today's bag stock, less the
+    /// units listing posts (gather only tops the bags up to the refill, so posts consume bag stock first),
+    /// plus pulled listings. Null when a refill amount is unknown.
+    /// </summary>
+    public static IReadOnlyList<StowageDepositRequest>? ProjectedStowRequests(Guid planId,
+        IEnumerable<ListingReserveRule> reserves, MarketRunEvaluation run, IEnumerable<(uint ItemId, bool Hq, int Quantity)> bagStacks)
+    {
+        var bags = bagStacks.GroupBy(s => (s.ItemId, s.Hq)).ToDictionary(g => g.Key, g => g.Sum(s => s.Quantity));
+        foreach (var item in run.Items)
+        {
+            if (!item.RefillUnits.IsKnown) return null;
+            var key = (item.ItemId, item.Quality == ItemQualityPolicy.HqOnly);
+            if (bags.TryGetValue(key, out var held)) bags[key] = Math.Max(0, held - item.RefillUnits.Value);
+        }
+        foreach (var pull in run.Retainers.SelectMany(r => r.ListingsToPull))
+        {
+            var key = (pull.Listing.ItemId, pull.Listing.Quality == FfxivItemQuality.HQ);
+            bags[key] = bags.GetValueOrDefault(key) + pull.Listing.Quantity;
+        }
+        return StowRequests(planId, reserves, bags.Select(b => (b.Key.ItemId, b.Key.Hq, b.Value)));
     }
 
     public static IReadOnlyList<StowageDepositRequest> RelocationRequests(Guid planId,
@@ -326,12 +348,7 @@ public static class MarketRunPlanner
             .Where(item => item.CraftUnits is { IsKnown: true, Value: > 0 })
             .Select(item => new MarketRunCraftLine(item.ItemId, item.ItemName, item.Quality, item.CraftUnits.Value))
             .ToArray();
-        return new(plan.Id, plan.Revision, retainers, orderedItems, craftQueue)
-        {
-            StowUnits = StowRequests(plan.Id, plan.Reserves, projection.Items.SelectMany(i => i.Stacks)
-                .Where(s => s.ScopeKind == BrowserScopeKind.Player)
-                .Select(s => (s.ItemId, s.Quality == FfxivItemQuality.HQ, s.Quantity))).Sum(r => r.Quantity),
-        };
+        return new(plan.Id, plan.Revision, retainers, orderedItems, craftQueue);
     }
 
     private static (FieldEvidence<int> Exact, FieldEvidence<int> Reprice, FieldEvidence<int> Short) Count(
