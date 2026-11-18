@@ -40,9 +40,11 @@ internal sealed class RootConfirmationDialog
         var popupId = $"{request.Title}##RQConfirm:{request.Id}";
         if (openRequested)
         {
-            var viewport = ImGui.GetMainViewport();
+            // Centre on the host window, in its viewport: the main window can live in its own
+            // OS viewport, and a modal placed on the game's viewport would open behind it.
+            ImGui.SetNextWindowViewport(ImGui.GetWindowViewport().ID);
             ImGui.SetNextWindowPos(
-                viewport.WorkPos + (viewport.WorkSize * 0.5f),
+                ImGui.GetWindowPos() + (ImGui.GetWindowSize() * 0.5f),
                 ImGuiCond.Appearing,
                 new Vector2(0.5f, 0.5f));
             ImGui.OpenPopup(popupId);
