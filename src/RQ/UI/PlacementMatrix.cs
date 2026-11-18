@@ -621,6 +621,14 @@ internal sealed class PlacementMatrix<TKey>
                 (allowConsolidation && rank == 1 && column is not null && row.Routing.Consolidate ? $" · {row.Gathering}" : ""));
         if (clicked)
             apply([(row.Key, PlacementEdits.Toggle(row.Routing, retainerId))]);
+        else if (allowConsolidation && column is not null && hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
+        {
+            // Right-click marks this retainer as the row's consolidation target; again on the ringed chit clears it.
+            var ringed = row.Routing.Consolidate && rank == 1;
+            var next = ringed ? row.Routing.Copy() : PlacementEdits.MakeFirst(row.Routing, retainerId);
+            next.Consolidate = !ringed;
+            apply([(row.Key, next)]);
+        }
     }
 
     private static string Tooltip(PlacementMatrixRow<TKey> row, ulong retainerId, PlacementMatrixColumn? column, int rank, int held)
