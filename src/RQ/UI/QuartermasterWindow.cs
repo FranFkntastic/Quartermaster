@@ -88,7 +88,7 @@ public sealed class QuartermasterWindow : Window
         this.runtimeSnapshots = runtimeSnapshots;
         this.dataManager = dataManager;
         this.reviewRegistry = reviewRegistry;
-        marketRunPane = new(resolveWorkshopProject, configDirectory, marketImporter);
+        marketRunPane = new(resolveWorkshopProject, configDirectory, marketImporter, runtimeSnapshots.GetFresh);
         var gameCatalog = new GameItemCatalog(dataManager, log);
         historyDialog = new(journal);
         RestockPlanEditor? restockEditor = null;
@@ -616,16 +616,16 @@ public sealed class QuartermasterWindow : Window
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(message);
         }
         ImGui.SameLine(buttonX);
-        if (ImGui.SmallButton("Discard")) listingSession.Discard(runtime);
+        if (ImGui.SmallButton("Discard")) listingSession.Discard(runtimeSnapshots.GetFresh());
         reviewRegistry.RegisterLastButton("quartermaster.listings.discard", "Discard the Listing Plan draft", true,
-            () => listingSession.Discard(runtimeSnapshots.Current), "Discard unsaved changes");
+            () => listingSession.Discard(runtimeSnapshots.GetFresh()), "Discard unsaved changes");
         ImGui.SameLine();
         var canSave = listingSession.Issues(runtime).Count == 0;
         ImGui.BeginDisabled(!canSave);
-        if (ImGui.SmallButton("Save Listing Plan")) listingSession.Save(runtime);
+        if (ImGui.SmallButton("Save Listing Plan")) listingSession.Save(runtimeSnapshots.GetFresh());
         ImGui.EndDisabled();
         reviewRegistry.RegisterLastButton("quartermaster.listings.save", "Save the Listing Plan draft", canSave,
-            () => listingSession.Save(runtimeSnapshots.Current), canSave ? "Ready" : listingSession.SaveBlockedTooltip(runtime));
+            () => listingSession.Save(runtimeSnapshots.GetFresh()), canSave ? "Ready" : listingSession.SaveBlockedTooltip(runtime));
         if (!canSave && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) ImGui.SetTooltip(listingSession.SaveBlockedTooltip(runtime));
     }
 

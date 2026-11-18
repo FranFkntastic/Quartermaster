@@ -29,6 +29,7 @@ public sealed class QuartermasterRuntimeSnapshotSource
     private readonly RetainerCacheRepository cache;
     private readonly StateRepository state;
     private readonly Func<OwnerScope> currentOwner;
+    private readonly Action flushPending;
     private QuartermasterRuntimeSnapshot? current;
     private long revision;
     private long stockRevision;
@@ -41,13 +42,15 @@ public sealed class QuartermasterRuntimeSnapshotSource
         PlayerInventoryCacheRepository playerInventory,
         RetainerCacheRepository cache,
         StateRepository state,
-        Func<OwnerScope> currentOwner)
+        Func<OwnerScope> currentOwner,
+        Action flushPending)
     {
         this.scanner = scanner;
         this.playerInventory = playerInventory;
         this.cache = cache;
         this.state = state;
         this.currentOwner = currentOwner;
+        this.flushPending = flushPending ?? throw new ArgumentNullException(nameof(flushPending));
     }
 
     internal int? MaxStackSize(uint itemId) => scanner.ResolveItemMetadata(itemId).MaxStackSize is > 0 and var size
@@ -55,6 +58,13 @@ public sealed class QuartermasterRuntimeSnapshotSource
 
     public QuartermasterRuntimeSnapshot Current => Volatile.Read(ref current)
         ?? throw new InvalidOperationException("Quartermaster runtime snapshot has not been initialized.");
+
+    // Decision readers use this checkpoint; passive rendering may use Current.
+    public QuartermasterRuntimeSnapshot GetFresh()
+    {
+        flushPending();
+        return Current;
+    }
 
     public QuartermasterRuntimeSnapshot Refresh() => Refresh(RuntimeDomain.All);
 

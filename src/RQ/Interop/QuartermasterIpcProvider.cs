@@ -21,20 +21,32 @@ public sealed class QuartermasterIpcProvider : IDisposable
         IIpcRegistrar registrar,
         SnapshotPublisher snapshots,
         ShortageSubmissionService submissions,
-        ElementalDepositSubmissionService deposits)
+        ElementalDepositSubmissionService deposits,
+        Action flushSnapshot,
+        Action flushOperations)
     {
         this.registrar = registrar;
         this.snapshots = snapshots;
         this.submissions = submissions;
         this.deposits = deposits;
+        ArgumentNullException.ThrowIfNull(flushSnapshot);
+        ArgumentNullException.ThrowIfNull(flushOperations);
         registrar.Register(IpcChannels.GetCapabilities, snapshots.GetCapabilities);
-        registrar.Register(IpcChannels.GetSnapshot, snapshots.GetSnapshot);
+        registrar.Register(IpcChannels.GetSnapshot, () =>
+        {
+            flushSnapshot();
+            return snapshots.GetSnapshot();
+        });
         registrar.Register(IpcChannels.SubmitShortages, submissions.Submit);
         registrar.Register(IpcChannels.SubmitElementalDeposit, deposits.Submit);
         registrar.Register(IpcChannels.GetOperation, operationId =>
+        {
+            flushOperations();
+            return
             submissions.GetPendingOperation(operationId) ??
             deposits.GetPendingOperation(operationId) ??
-            snapshots.GetOperation(operationId));
+            snapshots.GetOperation(operationId);
+        });
         registrar.RegisterNotification(IpcChannels.Changed);
     }
 

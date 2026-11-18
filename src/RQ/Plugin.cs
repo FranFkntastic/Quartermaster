@@ -36,6 +36,8 @@ public sealed class Plugin : IDalamudPlugin
     private readonly ICommandManager commands;
     private readonly IFramework framework;
     private readonly FrameTimings updateTimings;
+    private readonly IPluginLog log;
+    private int interactiveDepth;
     private readonly IPlayerState playerState;
     private readonly PluginConfiguration configuration;
     private readonly string providerInstanceId = Guid.NewGuid().ToString("N");
@@ -96,6 +98,7 @@ public sealed class Plugin : IDalamudPlugin
         this.commands = commands;
         this.framework = framework;
         updateTimings = new(log, "OnFrameworkUpdate", 50);
+        this.log = log;
         this.playerState = playerState;
         configuration = pluginInterface.GetPluginConfig() as PluginConfiguration ?? new PluginConfiguration();
         if (string.IsNullOrWhiteSpace(configuration.PluginInstanceId))
@@ -236,7 +239,7 @@ public sealed class Plugin : IDalamudPlugin
         marketRuns.Restore(marketRunStore.Load());
         activeMarketRuns = marketRuns;
         automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerSuppression);
-        runtimeSnapshots = new(scanner, playerInventory, cache, state, CurrentOwner);
+        runtimeSnapshots = new(scanner, playerInventory, cache, state, CurrentOwner, FlushPendingReconciliation);
         var vendorAccess = new DalamudGilVendorAccessReader(
             clientState,
             playerState,
@@ -306,7 +309,8 @@ public sealed class Plugin : IDalamudPlugin
         nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
         submissions = new ShortageSubmissionService(providerInstanceId, state, workQueue, CurrentOwner);
         deposits = new ElementalDepositSubmissionService(providerInstanceId, state, workQueue, journal, cache.Snapshot, CurrentOwner);
-        ipc = new(new DalamudIpcRegistrar(pluginInterface), snapshots, submissions, deposits);
+        ipc = new(new DalamudIpcRegistrar(pluginInterface), snapshots, submissions, deposits,
+            FlushPendingReconciliation, () => FlushPendingReconciliation(RuntimeDomain.Operations));
         window = new(
             state,
             runtimeSnapshots,
@@ -398,10 +402,12 @@ public sealed class Plugin : IDalamudPlugin
         using var timing = window.DrawTimings.Start("window system");
         try
         {
+            interactiveDepth++;
             windows.Draw();
         }
         finally
         {
+            interactiveDepth--;
             window.DrawTimings.Section("viewport capture");
             agentBridgeViewportCapture.RenderPendingWindowCapture();
         }
@@ -478,7 +484,7 @@ public sealed class Plugin : IDalamudPlugin
         var allowedDomains = transfers.IsRunning
             ? RuntimeDomain.Listings | RuntimeDomain.Operations
             : RuntimeDomain.All;
-        var reconciliationBatch = reconciliation.Drain(allowedDomains);
+        var reconciliationBatch = reconciliation.Drain(allowedDomains, force: false);
         if (reconciliationBatch.HasWork)
             ReconcileRuntime(reconciliationBatch);
         updateTimings.Section("transfer execution");
@@ -487,27 +493,62 @@ public sealed class Plugin : IDalamudPlugin
 
     private void ReconcileRuntime(RuntimeReconciliationBatch batch)
     {
-        updateTimings.Section("runtime projections");
-        var runtime = runtimeSnapshots.Refresh(batch.Domains, batch.PlayerInventoryChange);
-        updateTimings.Section("IPC snapshot");
-        if (batch.Domains == RuntimeDomain.Operations)
-            snapshots.RefreshOperations(
-                runtime.Owner,
-                batch.Notices
-                    .Select(notice => notice.OperationId)
-                    .Where(operationId => !string.IsNullOrWhiteSpace(operationId))
-                    .Select(operationId => operationId!)
-                    .Distinct(StringComparer.Ordinal)
-                    .ToArray());
-        else
-            snapshots.Refresh(runtime);
-        nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
-        updateTimings.Section("change notices");
-        foreach (var notice in batch.Notices)
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
         {
-            if (RuntimeChangeNotificationPolicy.TryGetPublishedKind(notice, out var kind))
-                ipc.PublishChanged(snapshots.CreateChanged(kind, notice.OperationId, CurrentOwner()));
+            updateTimings.Section("runtime projections");
+            var runtime = runtimeSnapshots.Refresh(batch.Domains, batch.PlayerInventoryChange);
+            updateTimings.Section("IPC snapshot");
+            if (batch.Domains == RuntimeDomain.Operations)
+                snapshots.RefreshOperations(
+                    runtime.Owner,
+                    batch.Notices
+                        .Select(notice => notice.OperationId)
+                        .Where(operationId => !string.IsNullOrWhiteSpace(operationId))
+                        .Select(operationId => operationId!)
+                        .Distinct(StringComparer.Ordinal)
+                        .ToArray());
+            else
+                snapshots.Refresh(runtime);
+            nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
+            updateTimings.Section("change notices");
+            var published = new HashSet<(string Kind, string? OperationId)>();
+            foreach (var notice in batch.Notices)
+            {
+                if (RuntimeChangeNotificationPolicy.TryGetPublishedKind(notice, out var kind) && published.Add((kind, notice.OperationId)))
+                {
+                    try { ipc.PublishChanged(snapshots.CreateChanged(kind, notice.OperationId, CurrentOwner())); }
+                    catch (Exception exception) { log.Warning(exception, "Quartermaster change subscriber failed for {Kind}", kind); }
+                }
+            }
         }
+        finally
+        {
+            log.Debug("Runtime reconciliation: {Domains}, {Requests} requests, waited {WaitMs:F1} ms, refresh {RefreshMs:F1} ms",
+                batch.Domains, batch.RequestCount, batch.Waited.TotalMilliseconds,
+                System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+        }
+    }
+
+    private void FlushPendingReconciliation() => FlushPendingReconciliation(RuntimeDomain.All);
+
+    private void FlushPendingReconciliation(RuntimeDomain requested)
+    {
+        if (!framework.IsInFrameworkUpdateThread)
+        {
+            framework.RunOnFrameworkThread(() => FlushPendingReconciliation(requested)).GetAwaiter().GetResult();
+            return;
+        }
+        // Changed subscribers may synchronously request freshness for other
+        // domains. The drained batch has already refreshed both projections.
+        if (RuntimeOwnerTransition.RequiresReconciliation(runtimeSnapshots.Current.Owner, CurrentOwner()))
+            reconciliation.Request(RuntimeDomain.All, "owner_transition");
+        // While a transfer owns inventory, stock/planning stay held exactly as the
+        // framework loop holds them; readers get the held projection, not an error.
+        var allowed = transfers.IsRunning ? RuntimeDomain.Listings | RuntimeDomain.Operations : RuntimeDomain.All;
+        var batch = reconciliation.Drain(requested & allowed);
+        if (batch.HasWork)
+            ReconcileRuntime(batch);
     }
 
     private static void LogCacheWriteFailure(IPluginLog log, string cacheName, CacheWriteFailure failure)
@@ -537,7 +578,7 @@ public sealed class Plugin : IDalamudPlugin
             StateChangeKind.Recovery => RuntimeDomain.None,
             _ => RuntimeDomain.Plans,
         };
-        reconciliation.Request(domain, "state");
+        reconciliation.Request(domain, "state", interactive: interactiveDepth > 0 && framework.IsInFrameworkUpdateThread);
     }
 
     private void OnCacheChanged(RetainerCacheChangeKind changeKind)
@@ -606,6 +647,7 @@ public sealed class Plugin : IDalamudPlugin
             }
             try
             {
+                interactiveDepth++;
                 action();
                 completion.SetResult();
             }
@@ -613,13 +655,17 @@ public sealed class Plugin : IDalamudPlugin
             {
                 completion.SetException(exception);
             }
+            finally
+            {
+                interactiveDepth--;
+            }
         });
         return completion.Task.WaitAsync(cancellationToken);
     }
 
     private QuartermasterBridgeTruth CreateAgentBridgeTruth()
     {
-        var runtime = runtimeSnapshots.Current;
+        var runtime = runtimeSnapshots.GetFresh();
         var ui = window.CreateUiSnapshot();
         var retainers = runtime.Retainers.Values
             .Where(retainer => runtime.Owner.Matches(retainer.Owner) && retainer.IsCurrentlyAssigned is not false)
