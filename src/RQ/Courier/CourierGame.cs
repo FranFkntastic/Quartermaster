@@ -142,7 +142,8 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
             warn($"{code}: {bell?.Label} on world {p.World}: {detail}");
             return Result<bool>.Fail(code,detail);
         }
-        try { return await Poll<bool>(d, () =>
+        bool wardOwned=false, arrived=false;
+        try { var outcome=await Poll<bool>(d, () =>
         {
             if(allowed?.Invoke()==false)return new(CourierOutcome.Cancelled,"RouteStopped",d.Name);
             if (Position() is not {} here) return null;
@@ -170,7 +171,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                     wardMarker.Save!();
                     try { gate.InvokeAction(("",checked((int)p.World),city,ward,0,bell.Subdivision?31:1,1,false,false,"")); }
                     catch(Exception e){return WardFailure("WardTravelSubmissionFailed",e.Message);}
-                    wardSubmitted=true;wardIdle=new();return null;
+                    wardSubmitted=wardOwned=true;wardIdle=new();return null;
                 }
             }
             if (here.Territory != p.Territory)
@@ -202,8 +203,18 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
             var path=nav.TryMoveCloseTo(target,1.5f);
             ownsPath=moving=path.Submitted;
             return moving || path.Retryable ? null : Result<bool>.Fail(path.Code,path.Message);
-        }); }
-        finally { if (moving && !unload.IsCancellationRequested) await dispatch(()=>{if(ownsPath)nav.TryStop();ownsPath=false;},unload.Token); }
+        }); arrived=outcome.Outcome==CourierOutcome.Succeeded; return outcome; }
+        finally
+        {
+            // A stopped, failed or timed-out approach must not leave Lifestream walking the character on its own.
+            if ((moving || wardOwned && !arrived) && !unload.IsCancellationRequested) await dispatch(()=>
+            {
+                if(ownsPath)nav.TryStop();ownsPath=false;
+                if(!wardOwned || arrived)return;
+                try { if(Busy("Lifestream.IsBusy"))pi.GetIpcSubscriber<object>("Lifestream.Abort").InvokeAction(); }
+                catch(Exception e){warn("WardTravelAbort: "+e.Message);}
+            },unload.Token);
+        }
     }
     public Task<Result<string>> SwitchRefusalAsync(Deadline deadline)=>Poll<string>(deadline,()=>
         Result<string>.Ok(CharacterSwitchPolicy.GetRefusal(CharacterSwitchGameState.Observe(client,objects,conditions,false,null))??""));
