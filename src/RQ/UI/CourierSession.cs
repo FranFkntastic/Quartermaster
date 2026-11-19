@@ -417,12 +417,15 @@ public sealed class CourierSession
             foreach (var line in completed.Lines)
             {
                 var rule = draft.Rules.Find(r => r.Id == line.Line && r.Courier is not null);
-                if (rule is null || line.Moved <= 0)
+                // A line re-routed during the run is a new instruction; what was delivered does not count against it.
+                if (rule is null || line.Moved <= 0 || line.Route is not { } sent || rule.Courier!.RetainerId != sent.To ||
+                    rule.Courier.SourceRetainerId != sent.From || !CourierPlanner.Exact(rule.Courier.Character, sent.Destination) ||
+                    !CourierPlanner.Exact(rule.Courier.SourceCharacter ?? scratch.Owner, sent.Source))
                     continue;
-                if (line.Remaining == 0)
+                if (rule.TargetQuantity <= line.Moved)
                     draft.Rules.Remove(rule);
-                else if (line.Remaining > 0)
-                    rule.TargetQuantity = line.Remaining;
+                else
+                    rule.TargetQuantity -= line.Moved;
             }
             StowagePlanCatalog.Apply(document, scratch.Owner, draft);
             scratch.LastAppliedCourierRun = completed.Run;

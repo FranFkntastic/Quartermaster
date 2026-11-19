@@ -37,7 +37,7 @@ public sealed class CourierJournal
     public InventoryView? ResumeCarrier { get; set; }
     public string? ClearAcknowledgement { get; set; }
 }
-public sealed record LineProgress(Guid Line, string Name, int Moved, int Remaining);
+public sealed record LineProgress(Guid Line, string Name, int Moved, int Remaining, Shipment? Route = null);
 public sealed record CourierSnapshot(Guid Run, string State, string OwnerPhase, string CarrierPhase, int Trip, int Trips,
     string Code, string Detail, ImmutableArray<LineProgress> Lines, ImmutableArray<Refusal> Refusals,bool CanResume,bool CanClear,ImmutableArray<CustodyRow> Custody,
     CourierUnverified? Unverified=null, Guid PlanId=default);
@@ -126,7 +126,7 @@ public sealed class CourierConductor
         return new(r.Run, r.State, step?.Phase.ToString() ?? r.State, r.State=="Running"?peerPhase:"Idle", r.Plan.Trips.IsEmpty ? 0 :
             step is null || step.Phase >= CourierPhase.ReturnOwner ? r.Plan.Trips.Length : step.Trip + 1, r.Plan.Trips.Length, r.Code, r.Detail,
             [..r.Plan.Trips.SelectMany(t=>t.Manifest).GroupBy(s=>s.Line).Select(g=>new LineProgress(g.Key,g.First().Name,
-                r.Delivered.GetValueOrDefault(g.Key),g.Sum(s=>s.Units)-r.Delivered.GetValueOrDefault(g.Key)))], r.Plan.Refusals,
+                r.Delivered.GetValueOrDefault(g.Key),g.Sum(s=>s.Units)-r.Delivered.GetValueOrDefault(g.Key),g.First()))], r.Plan.Refusals,
             connected && attempt && r.State is "Failed" or "Interrupted" or "Indeterminate",
             (connected || r.Custody.IsEmpty) && r.Pending==null && r.State is "Completed" or "Failed" or "Interrupted" or "Indeterminate" or "Refused",Rows(r.Custody,r.Settings.Carrier),
             Unverified(r),r.Plan.PlanId);
