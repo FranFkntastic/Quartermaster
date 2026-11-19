@@ -76,12 +76,18 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
 j.Task.IsFaulted?Result<CourierReceipt>.Fail("CarrierStepFault",j.Task.Exception!.GetBaseException().Message):null,acknowledgements.GetValueOrDefault(key))
                 :new PeerResult.Refused("UnknownStep","No active step handle.");
         if(w.Kind!="start" || w.Command is not {} m || w.Limit is not {} d || m.Step!=w.Step || m.Run!=w.Run ||
-            d.Expires<=DateTimeOffset.UtcNow || d.Expires>DateTimeOffset.UtcNow.AddSeconds(Deadline.PeerSeconds(m.Bell)))
+            d.Expires<=DateTimeOffset.UtcNow || d.Expires>DateTimeOffset.UtcNow.AddSeconds(Deadline.PeerSeconds(m.Bell, m.Command)))
             return new PeerResult.Refused("InvalidEnvelope","Invalid or expired courier step.");
         var p=presences.FirstOrDefault(p=>p.InstanceId==sender);
         if(p==null) return new PeerResult.Refused("UnknownOwnerEndpoint","No matching peer presence.");
         var who=p.Identity.Deserialize<CourierPeer>()?.Character ?? new OwnerScope();
         var hash=JsonSerializer.Serialize(m);
+        // A resumed step reuses its id. A finished attempt that did not succeed must not answer for the new one;
+        // the follower's ledger decides whether the step may run again.
+        if(jobs.TryGetValue(key,out var done) && done.Fingerprint==hash && done.Task.IsCompleted &&
+            !(done.Task.IsCompletedSuccessfully && done.Task.Result.Outcome==CourierOutcome.Succeeded) &&
+            jobs.TryRemove(new KeyValuePair<(Guid,Guid),Job>(key,done)))
+            acknowledgements.TryRemove(key,out _);
         var job=jobs.GetOrAdd(key,unused=>new(m,hash,Task.Run(async ()=>{
             var result=await follower.HandleAsync(who,m,d,sender,p=>acknowledgements[key]=p);
             if(m.Command==CourierCommand.Begin && result.Outcome==CourierOutcome.Succeeded){owners[m.Run]=sender;Connect(await endpoint,p);}
