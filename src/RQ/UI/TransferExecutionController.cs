@@ -53,7 +53,7 @@ internal sealed class TransferExecutionController
             .ToArray();
         // Courier lines are not ordinary movements (the composed rules below exclude them); they
         // run as a courier run once this plan's ordinary part has succeeded.
-        var courierPlanId = rules.Any(r => r.Enabled && r.Courier is not null) ? planId : (Guid?)null;
+        (Guid Id, long Revision)? courierPlanId = rules.Any(r => r.Enabled && r.Courier is not null) ? (planId, plan.Revision) : null;
         courierFollowUp = null;
         if (ListingPlanEvaluator.HasUnknownLinkedDemand(current.State, current.Browser, current.Owner, plan.Id))
         {
@@ -149,19 +149,19 @@ internal sealed class TransferExecutionController
     /// Starts the plan's courier run (on the framework thread, from <see cref="Tick"/>) once the
     /// ordinary transfer finishes and its journal shows every operation succeeded.
     /// </summary>
-    internal Action<Guid>? StartCourier { get; set; }
+    internal Action<Guid, long>? StartCourier { get; set; }
 
-    private (Task<TransferExecutionResult> Transfer, Guid PlanId, Func<bool> Succeeded)? courierFollowUp;
-    // A boxed plan id, swapped atomically: the transfer's observer sets it, Tick takes it.
+    private (Task<TransferExecutionResult> Transfer, (Guid Id, long Revision) Plan, Func<bool> Succeeded)? courierFollowUp;
+    // A boxed plan id and reviewed revision, swapped atomically: the transfer's observer sets it, Tick takes it.
     private object? courierReady;
 
-    private void FollowWithCourier(Task<TransferExecutionResult> transfer, Guid? courierPlanId, Func<bool> succeeded) =>
+    private void FollowWithCourier(Task<TransferExecutionResult> transfer, (Guid Id, long Revision)? courierPlanId, Func<bool> succeeded) =>
         courierFollowUp = courierPlanId is { } id ? (transfer, id, succeeded) : null;
 
     public void Tick()
     {
-        if (Interlocked.Exchange(ref courierReady, null) is Guid ready)
-            StartCourier?.Invoke(ready);
+        if (Interlocked.Exchange(ref courierReady, null) is ValueTuple<Guid, long> ready)
+            StartCourier?.Invoke(ready.Item1, ready.Item2);
         if (pendingRecovery is not { } pending ||
             !string.Equals(retainerRefresh.LastCompletedRunId, pending.RefreshRunId, StringComparison.Ordinal))
             return;
@@ -305,7 +305,7 @@ internal sealed class TransferExecutionController
             var result = await transfer;
             Status = result.Message;
             if (followUp is { } next && result.Started && next.Succeeded())
-                Volatile.Write(ref courierReady, next.PlanId);
+                Volatile.Write(ref courierReady, next.Plan);
         }
         catch (Exception exception)
         {

@@ -122,10 +122,11 @@ public sealed class QuartermasterWindow : Window
         listingSession = new(state, ResolveListingMaxStack, id => dataManager.GetExcelSheet<Item>().GetRowOrDefault(id)?.CanBeHq == true);
         transferExecution = new(state, runtimeSnapshots, journal, transfers, retainerRefresh)
         {
-            StartCourier = planId =>
+            StartCourier = (planId, revision) =>
             {
                 var current = runtimeSnapshots.Current;
-                if (current.State.StowagePlans.FirstOrDefault(plan => plan.Id == planId && plan.Owner.Matches(current.Owner)) is { } plan)
+                // Only the revision the user reviewed may start; an edit made meanwhile needs its own Execute.
+                if (current.State.StowagePlans.FirstOrDefault(plan => plan.Id == planId && plan.Revision == revision && plan.Owner.Matches(current.Owner)) is { } plan)
                     courier.Start(current, plan);
             },
         };
