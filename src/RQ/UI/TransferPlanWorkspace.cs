@@ -1835,7 +1835,7 @@ internal sealed class TransferPlanWorkspace
                 foreach (var rule in draft.Rules.Where(rule => ruleIds.Contains(rule.Id)))
                     update(rule);
                 var duplicate = draft.Rules
-                    .GroupBy(rule => (rule.ItemId, rule.Quality))
+                    .GroupBy(StowagePlanCatalog.LineKey)
                     .FirstOrDefault(group => group.Count() > 1);
                 if (duplicate is not null)
                     throw new InvalidOperationException(
