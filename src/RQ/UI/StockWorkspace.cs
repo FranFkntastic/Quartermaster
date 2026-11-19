@@ -1001,7 +1001,8 @@ internal sealed class StockWorkspace
             ImGui.TextDisabled(StockListingShortfall([selectedDemand]));
             DrawListingsNavigation();
             if (navigationQualities.Length > 0) ImGui.SameLine();
-            var transferPlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
+            // Listing targets live in Transfer plans; with a Courier plan open they go to the unsaved Transfer plan.
+            var transferPlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner) is { Kind: StowagePlanKind.Transfer } open ? open : null;
             var linked = transferPlan is not null && runtime.State.TransferPlanListingLinks.Any(link =>
                 link.StowagePlanId == transferPlan.Id && link.ListingPlanId == listingPlan.Id &&
                 link.ItemId == selectedDemand.ItemId && link.Quality == selectedDemand.Quality);

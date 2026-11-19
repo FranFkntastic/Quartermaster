@@ -193,6 +193,17 @@ public sealed class CourierSession
         return projection;
     }
 
+    /// <summary>Free slots in a character's observed bags; null while its bags have not been observed.</summary>
+    internal int? FreeBagSlots(OwnerScope character)
+    {
+        var capture = cachedBags(character);
+        if (!PlayerBagNames.All(name => capture.ObservedSources.Contains(name, StringComparer.Ordinal)))
+            return null;
+        var used = capture.Bags.Where(bag => PlayerBagNames.Contains(bag.BagName, StringComparer.Ordinal))
+            .SelectMany(bag => bag.Items).Count(item => item.ItemId > 0 && item.Quantity > 0);
+        return Math.Max(0, PlayerBagSlots - used);
+    }
+
     internal static bool IsCarrier(QuartermasterRuntimeSnapshot runtime, OwnerScope owner) =>
         runtime.State.Courier.Carrier is { } carrier && carrier.Matches(owner);
 
@@ -405,14 +416,23 @@ public sealed class CourierSession
         catch (Exception exception) { Fail("Carrier state unreadable", exception.ToString()); }
     }
 
+    /// <summary>
+    /// The unsaved plan a completed run's delivered lines clear from: the run's own plan, or, for a
+    /// run started from an unsaved Transfer plan before courier lines moved to their own unsaved
+    /// Courier plan, that owner's unsaved Courier plan. Saved plans keep their lines.
+    /// </summary>
+    private static StowagePlan? CompletedScratch(QuartermasterState document, CourierSnapshot completed) =>
+        document.StowagePlans.SingleOrDefault(p => p.Id == completed.PlanId && p.IsEphemeral) is { } scratch
+            ? scratch.Kind == StowagePlanKind.Courier ? scratch : StowagePlanCatalog.FindScratch(document, scratch.Owner, StowagePlanKind.Courier)
+            : null;
+
     private void ApplyCompleted(CourierSnapshot completed)
     {
-        if (!state.ReadConfiguration(document => document.StowagePlans.Any(p =>
-                p.Id == completed.PlanId && p.IsEphemeral && p.LastAppliedCourierRun != completed.Run)))
+        if (!state.ReadConfiguration(document => CompletedScratch(document, completed) is { } p && p.LastAppliedCourierRun != completed.Run))
             return;
         state.Mutate(document =>
         {
-            var scratch = document.StowagePlans.SingleOrDefault(p => p.Id == completed.PlanId && p.IsEphemeral);
+            var scratch = CompletedScratch(document, completed);
             if (scratch is null || scratch.LastAppliedCourierRun == completed.Run)
                 return;
             var draft = StowagePlanCatalog.Draft(document, scratch.Owner, scratch.Id);

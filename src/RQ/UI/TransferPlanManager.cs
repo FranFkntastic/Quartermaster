@@ -85,11 +85,7 @@ internal sealed class TransferPlanManager
         lastDrawFrame = frame;
 
         var owner = runtime.Owner;
-        var plans = runtime.State.StowagePlans
-            .Where(plan => !plan.IsEphemeral && plan.Owner.Matches(owner))
-            .OrderBy(plan => plan.Name, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(plan => plan.Id)
-            .ToArray();
+        var plans = Ordered(runtime.State.StowagePlans.Where(plan => !plan.IsEphemeral && plan.Owner.Matches(owner))).ToArray();
         var lineCounts = runtime.State.PlanItems
             .GroupBy(rule => rule.StowagePlanId)
             .ToDictionary(group => group.Key, group => group.Count());
@@ -139,17 +135,25 @@ internal sealed class TransferPlanManager
         ImGui.InputTextWithHint("##transferplanfilter", "Filter plans", ref filter, 80);
         ImGui.Separator();
 
-        var footerHeight = ImGui.GetFrameHeightWithSpacing() + ImGui.GetStyle().ItemSpacing.Y + 2;
+        var footerHeight = (ImGui.GetFrameHeightWithSpacing() * 2f) + ImGui.GetStyle().ItemSpacing.Y + 2;
         if (ImGui.BeginChild("RQTransferPlanManagerRows", new Vector2(0, -footerHeight), false))
         {
             if (lastDeleted is { } deleted && stable)
                 DrawUndoRow(deleted);
 
             var needle = filter.Trim();
+            StowagePlanKind? section = null;
             foreach (var plan in plans)
             {
                 if (needle.Length > 0 && !plan.Name.Contains(needle, StringComparison.OrdinalIgnoreCase))
                     continue;
+                if (section != plan.Kind)
+                {
+                    if (section is not null)
+                        ImGui.Spacing();
+                    section = plan.Kind;
+                    ImGui.TextColored(PlanKindPresentation.Color(plan.Kind), PlanKindPresentation.Plural(plan.Kind));
+                }
                 DrawPlanRow(plan, lineCounts.GetValueOrDefault(plan.Id));
             }
         }
@@ -158,15 +162,30 @@ internal sealed class TransferPlanManager
         ImGui.Separator();
         if (!stable)
             return;
-        if (ImGui.Button("New plan##transferplanmanager", new Vector2(-1, 0)))
-            NewPlan(owner);
+        if (ImGui.Button("+ New transfer plan##transferplanmanager", new Vector2(-1, 0)))
+            NewPlan(owner, StowagePlanKind.Transfer);
         reviewRegistry.RegisterLastButton(
             "quartermaster.transfer.plans.new",
             "Create a new Transfer Plan in the plan manager",
             true,
-            () => NewPlan(runtimeSnapshots.Current.Owner),
+            () => NewPlan(runtimeSnapshots.Current.Owner, StowagePlanKind.Transfer),
+            "Available");
+        if (ImGui.Button("+ New courier plan##transferplanmanager", new Vector2(-1, 0)))
+            NewPlan(owner, StowagePlanKind.Courier);
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.transfer.plans.new-courier",
+            "Create a new Courier Plan in the plan manager",
+            true,
+            () => NewPlan(runtimeSnapshots.Current.Owner, StowagePlanKind.Courier),
             "Available");
     }
+
+    /// <summary>The manager's order: Transfer plans then Courier plans, each by name.</summary>
+    private static IEnumerable<StowagePlan> Ordered(IEnumerable<StowagePlan> plans) =>
+        plans
+            .OrderBy(plan => plan.Kind)
+            .ThenBy(plan => plan.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(plan => plan.Id);
 
     private void DrawPlanRow(StowagePlan plan, int lineCount)
     {
@@ -189,16 +208,18 @@ internal sealed class TransferPlanManager
         var planId = plan.Id;
         reviewRegistry.RegisterLastButton(
             $"quartermaster.transfer.plans.select.{plan.Id:N}",
-            $"Select Transfer Plan {plan.Name} in the plan manager",
+            $"Select {PlanKindPresentation.Label(plan.Kind)} Plan {plan.Name} in the plan manager",
             true,
             () => SelectPlan(planId),
-            selected ? "Selected" : $"{lineCount:N0} lines");
+            selected ? "Selected" : $"{PlanKindPresentation.Label(plan.Kind)} · {lineCount:N0} lines");
         if (ImGui.IsItemVisible())
         {
             var cursor = ImGui.GetCursorPos();
             ImGui.SetCursorPosY(cursor.Y - ImGui.GetTextLineHeightWithSpacing());
             ImGui.Indent();
-            ImGui.TextDisabled($"{lineCount:N0} line{(lineCount == 1 ? string.Empty : "s")}");
+            ImGui.TextColored(PlanKindPresentation.Color(plan.Kind), PlanKindPresentation.Label(plan.Kind));
+            ImGui.SameLine(0, 0);
+            ImGui.TextDisabled($" · {lineCount:N0} line{(lineCount == 1 ? string.Empty : "s")}");
             ImGui.Unindent();
         }
     }
@@ -232,8 +253,22 @@ internal sealed class TransferPlanManager
     {
         var owner = runtime.Owner;
         var stable = owner.HasStableIdentity;
+        var courier = plan.Kind == StowagePlanKind.Courier;
+        PlanKindPresentation.Badge(plan.Kind);
+        ImGui.SameLine();
         DrawName(owner, plan, stable);
 
+        var rows = resolveProjection(runtime, plan).Rows;
+        if (courier)
+        {
+            var destinations = rows
+                .Where(row => row.Rule.Courier is not null)
+                .GroupBy(row => (row.Rule.Courier!.Character.LocalContentId, row.Rule.Courier.Character.HomeWorldId))
+                .Select(group => $"{CourierSession.CharacterLabel(group.First().Rule.Courier!.Character)} {group.Count():N0}")
+                .ToArray();
+            if (destinations.Length > 0)
+                ImGui.TextDisabled($"To {string.Join(" · ", destinations)}");
+        }
         if (!string.IsNullOrWhiteSpace(error))
             ImGui.TextColored(ErrorColor, error);
         ImGui.Separator();
@@ -242,17 +277,17 @@ internal sealed class TransferPlanManager
         var tableFlags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
                          ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp;
         if (ImGui.BeginTable(
-                "RQTransferPlanManagerLines",
+                courier ? "RQCourierPlanManagerLines" : "RQTransferPlanManagerLines",
                 3,
                 tableFlags,
                 new Vector2(0, Math.Max(120, ImGui.GetContentRegionAvail().Y - footerHeight))))
         {
             ImGui.TableSetupScrollFreeze(0, 1);
             ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1f);
-            ImGui.TableSetupColumn("Quantity", ImGuiTableColumnFlags.WidthFixed, ImGui.CalcTextSize("Keep 999,999").X);
-            ImGui.TableSetupColumn("Stow to", ImGuiTableColumnFlags.WidthStretch, .8f);
+            ImGui.TableSetupColumn(courier ? "Send" : "Keep", ImGuiTableColumnFlags.WidthFixed, ImGui.CalcTextSize("999,999").X);
+            ImGui.TableSetupColumn(courier ? "Route" : "Stowage", ImGuiTableColumnFlags.WidthStretch, courier ? 1.4f : .8f);
             ImGui.TableHeadersRow();
-            foreach (var row in resolveProjection(runtime, plan).Rows)
+            foreach (var row in rows)
                 DrawLine(runtime, row);
             ImGui.EndTable();
         }
@@ -319,9 +354,11 @@ internal sealed class TransferPlanManager
         if (display.Length != full.Length && ImGui.IsItemHovered())
             ImGui.SetTooltip(full);
         ImGui.TableNextColumn();
-        ImGui.TextUnformatted($"{(rule.Courier is null ? "Keep" : "Send")} {rule.TargetQuantity:N0}");
+        ImGui.TextUnformatted(rule.TargetQuantity.ToString("N0"));
         ImGui.TableNextColumn();
-        var destination = rule.Courier is { } route ? CourierSession.RouteLabel(runtime, route) : StowTo(runtime, rule.Routing);
+        var destination = rule.Courier is { } route
+            ? $"{CourierSession.Side(runtime, route.SourceCharacter ?? row.Owner, route.SourceRetainerId, includeOwner: true)} → {CourierSession.Side(runtime, route.Character, route.RetainerId, includeOwner: true)}"
+            : StowTo(runtime, rule.Routing);
         var shown = Fit(destination, ImGui.GetContentRegionAvail().X);
         ImGui.TextUnformatted(shown);
         if (shown.Length != destination.Length && ImGui.IsItemHovered())
@@ -345,7 +382,7 @@ internal sealed class TransferPlanManager
             Open(planId);
         reviewRegistry.RegisterLastButton(
             "quartermaster.transfer.plans.open",
-            $"Open Transfer Plan {plan.Name}",
+            $"Open {PlanKindPresentation.Label(plan.Kind)} Plan {plan.Name}",
             true,
             () => Open(planId),
             "Available");
@@ -405,13 +442,13 @@ internal sealed class TransferPlanManager
         openPlan(planId);
     }
 
-    private void NewPlan(OwnerScope owner)
+    private void NewPlan(OwnerScope owner, StowagePlanKind kind)
     {
         if (!owner.HasStableIdentity)
             return;
         try
         {
-            var id = state.Mutate(document => StowagePlanCatalog.Create(document, owner).Id);
+            var id = state.Mutate(document => StowagePlanCatalog.Create(document, owner, kind: kind).Id);
             SelectWithRename(id);
         }
         catch (Exception exception)
@@ -506,7 +543,7 @@ internal sealed class TransferPlanManager
                 document.TransferPlanListingLinks.RemoveAll(link => link.StowagePlanId == planId);
                 document.StowagePlans.RemoveAt(index);
                 StowagePlanCatalog.ClearStaleRecovery(document);
-                var scratch = StowagePlanCatalog.EnsureScratch(document, owner);
+                var scratch = StowagePlanCatalog.EnsureScratch(document, owner, plan.Kind);
                 var next = openPlanId == planId ? scratch.Id : openPlanId;
                 return (new DeletedPlan(owner with { }, plan, index, rules, links, DateTime.UtcNow), next);
             });
@@ -525,17 +562,21 @@ internal sealed class TransferPlanManager
 
     private Guid? NeighbourAfterDelete(OwnerScope owner, StowagePlan removed)
     {
-        var remaining = state.ReadConfiguration(document => document.StowagePlans
-            .Where(plan => !plan.IsEphemeral && plan.Owner.Matches(owner))
-            .Select(plan => (plan.Id, plan.Name))
-            .OrderBy(plan => plan.Name, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(plan => plan.Id)
-            .ToArray());
+        var remaining = state.ReadConfiguration(document =>
+            Ordered(document.StowagePlans.Where(plan => !plan.IsEphemeral && plan.Owner.Matches(owner)))
+                .Select(plan => (plan.Id, plan.Name, plan.Kind))
+                .ToArray());
         if (remaining.Length == 0)
             return null;
-        var after = remaining.FirstOrDefault(plan =>
-            StringComparer.OrdinalIgnoreCase.Compare(plan.Name, removed.Name) > 0 ||
-            (StringComparer.OrdinalIgnoreCase.Compare(plan.Name, removed.Name) == 0 && plan.Id.CompareTo(removed.Id) > 0));
+        // The plan listed after the removed one, in the manager's order.
+        int Compare((Guid Id, string Name, StowagePlanKind Kind) plan)
+        {
+            var byKind = plan.Kind.CompareTo(removed.Kind);
+            if (byKind != 0) return byKind;
+            var byName = StringComparer.OrdinalIgnoreCase.Compare(plan.Name, removed.Name);
+            return byName != 0 ? byName : plan.Id.CompareTo(removed.Id);
+        }
+        var after = remaining.FirstOrDefault(plan => Compare(plan) > 0);
         return after.Id != Guid.Empty ? after.Id : remaining[^1].Id;
     }
 

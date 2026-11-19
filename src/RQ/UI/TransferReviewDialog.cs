@@ -104,21 +104,16 @@ internal sealed class TransferReviewDialog
         }
 
         var projection = resolveProjection(runtime, plan);
-        // A mixed plan runs its ordinary lines, then the courier run: one review lists both.
-        var mixedCourier = projection.Courier is { } plannedCourier &&
-            projection.Rows.Any(row => row.Rule.Enabled && row.Rule.Courier is null)
-                ? plannedCourier
-                : null;
-        if (projection.Courier is { } courierPlan && mixedCourier is null)
+        // A Courier plan's review is the courier run's; a Transfer plan never holds courier lines.
+        if (plan.Kind == StowagePlanKind.Courier)
         {
-            DrawCourier(runtime, plan, projection, courierPlan);
+            DrawCourier(runtime, plan, projection, projection.Courier);
             ImGui.EndPopup();
             if (!open)
                 Clear();
             return;
         }
         var movementSummary = projection.MovementSummary;
-        var courierRows = mixedCourier is null ? [] : CourierRows(projection);
 
         ImGui.TextUnformatted(movementSummary);
         ImGui.SameLine();
@@ -129,15 +124,10 @@ internal sealed class TransferReviewDialog
         ImGui.TextColored(
             new Vector4(.53f, .83f, .64f, 1f),
             projection.HasUnknownListingDemand ? "Stow —" : $"Stow {projection.Deposit.RequestedQuantity:N0}");
-        if (mixedCourier is not null)
-        {
-            ImGui.SameLine();
-            ImGui.TextColored(TransferPresentation.SendColor, $"Send {courierRows.Sum(row => row.Projection.Send):N0}");
-        }
         ImGui.Separator();
 
         var reviewRows = projection.Rows
-            .Where(row => mixedCourier is null || row.Rule.Courier is null)
+            .Where(row => row.Rule.Courier is null)
             .Select(row => new TransferReviewRow(
                 row.Rule,
                 row.Line,
@@ -154,7 +144,7 @@ internal sealed class TransferReviewDialog
         if (table.Begin(
                 "RQTransferReviewRows",
                 new DalamudTableLayout(
-                    new Vector2(0, mixedCourier is null ? tableHeight : tableHeight * .55f),
+                    new Vector2(0, tableHeight),
                     ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
                     ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp)))
         {
@@ -163,8 +153,6 @@ internal sealed class TransferReviewDialog
                 (row, index) => table.DrawRow(row, id: row.Move is null ? $"transfer-review:{row.Rule.Id}" : $"transfer-review:{row.Rule.Id}:move:{index}"));
             table.End();
         }
-        if (mixedCourier is not null)
-            DrawCourierRows(mixedCourier, courierRows);
 
         if (ImGui.Button("Back"))
         {
@@ -182,23 +170,11 @@ internal sealed class TransferReviewDialog
             runtime.Owner.HasStableIdentity,
             transfersCanStart(),
             retainerRefreshBusy());
-        var courierGate = mixedCourier is null ? (CourierStartGate?)null : courier.StartGate(runtime, mixedCourier);
-        if (courierGate is { CanStart: false } blocked)
-            availability = new(false, blocked.Status ?? availability.BlockReason);
         ImGui.SameLine();
         ImGui.TextDisabled(
             projection.HasUnknownListingDemand
                 ? "Listing demand will be verified before any movement."
-                : availability.BlockReason ??
-                  (mixedCourier is null ? "Balanced items remain in the plan but require no movement." : string.Empty));
-        // An active or unsettled courier run is handled on the run pane; Execute is not offered meanwhile.
-        if (courierGate is { Offer: false })
-        {
-            ImGui.EndPopup();
-            if (!open)
-                Clear();
-            return;
-        }
+                : availability.BlockReason ?? "Balanced items remain in the plan but require no movement.");
         var canExecute = availability.CanExecute;
         ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - 110));
         if (!canExecute)
@@ -227,16 +203,17 @@ internal sealed class TransferReviewDialog
             Clear();
     }
 
-    /// <summary>A plan with courier lines runs as a courier run: its review lists what goes where.</summary>
+    /// <summary>A Courier plan runs as a courier run: its review lists the trips and what goes where.</summary>
     private void DrawCourier(
         QuartermasterRuntimeSnapshot runtime,
         StowagePlan plan,
         TransferWorkbenchProjection projection,
-        CourierPlan courierPlan)
+        CourierPlan? courierPlan)
     {
         var rows = CourierRows(projection);
         var units = rows.Sum(row => row.Projection.Send);
-        ImGui.TextUnformatted($"{courierPlan.Trips.Length:N0} trip{(courierPlan.Trips.Length == 1 ? string.Empty : "s")}");
+        var trips = courierPlan?.Trips.Length ?? 0;
+        ImGui.TextUnformatted($"{trips:N0} trip{(trips == 1 ? string.Empty : "s")}");
         ImGui.SameLine();
         ImGui.TextDisabled("·");
         ImGui.SameLine();
@@ -252,7 +229,7 @@ internal sealed class TransferReviewDialog
         }
         reviewRegistry.RegisterLastButton(
             "quartermaster.transfer.review.back",
-            "Return to the Transfer Plan without executing",
+            "Return to the Courier Plan without executing",
             true,
             Clear,
             "No inventory movement");
@@ -267,9 +244,11 @@ internal sealed class TransferReviewDialog
         // An active or unsettled run is handled on the run pane; Start is not offered meanwhile.
         if (!gate.Offer)
             return;
-        ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - 110));
+        const string executeLabel = "Execute courier run";
+        ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(),
+            ImGui.GetContentRegionMax().X - ImGui.CalcTextSize(executeLabel).X - (ImGui.GetStyle().FramePadding.X * 2f)));
         ImGui.BeginDisabled(!canStart);
-        if (ImGui.Button("Execute plan"))
+        if (ImGui.Button(executeLabel))
         {
             courier.Start(runtime, plan);
             Clear();
@@ -285,15 +264,15 @@ internal sealed class TransferReviewDialog
                 courier.Start(runtimeSnapshot(), plan);
                 Clear();
             },
-            block ?? (canStart ? $"{courierPlan.Trips.Length:N0} courier trips" : "Lines refused"));
+            block ?? (canStart ? $"{trips:N0} courier trips" : "Lines refused"));
     }
 
     private static TransferWorkbenchRow[] CourierRows(TransferWorkbenchProjection projection) =>
         projection.Rows.Where(row => row.Rule.Courier is not null && row.Rule.Enabled).ToArray();
 
-    private void DrawCourierRows(CourierPlan plan, IReadOnlyList<TransferWorkbenchRow> rows)
+    private void DrawCourierRows(CourierPlan? plan, IReadOnlyList<TransferWorkbenchRow> rows)
     {
-        if (!plan.Trips.IsEmpty)
+        if (plan is { Trips.IsEmpty: false })
         {
             var lineHeight = ImGui.GetTextLineHeightWithSpacing();
             var height = Math.Min(plan.Trips.Length * lineHeight + ImGui.GetStyle().ScrollbarSize,
@@ -340,7 +319,7 @@ internal sealed class TransferReviewDialog
             row => CourierSession.Side(row.Runtime, row.Rule.Courier!.Character, row.Rule.Courier.RetainerId, includeOwner: true),
             Flags: ImGuiTableColumnFlags.WidthStretch),
         new(
-            "Units",
+            "Send",
             72,
             row => row.Rule.TargetQuantity.ToString("N0"),
             row => row.Rule.TargetQuantity),

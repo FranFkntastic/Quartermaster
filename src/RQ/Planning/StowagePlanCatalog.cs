@@ -7,6 +7,7 @@ public sealed class StowagePlanDraft
     public Guid PlanId { get; init; }
     public long SourceRevision { get; init; }
     public bool IsNew { get; init; }
+    public StowagePlanKind Kind { get; init; } = StowagePlanKind.Transfer;
     public string Name { get; set; } = "General";
     public bool Enabled { get; set; } = true;
     public List<TargetPlanItem> Rules { get; set; } = [];
@@ -14,15 +15,28 @@ public sealed class StowagePlanDraft
 
 public static class StowagePlanCatalog
 {
+    /// <summary>The name an owner's unsaved plan of a kind always carries.</summary>
+    public static string ScratchName(StowagePlanKind kind) =>
+        kind == StowagePlanKind.Courier ? "Unsaved courier plan" : "Unsaved plan";
+
+    /// <summary>The default name of a new saved plan of a kind.</summary>
+    public static string DefaultName(StowagePlanKind kind) =>
+        kind == StowagePlanKind.Courier ? "Courier plan" : "Transfer plan";
+
+    /// <summary>The owner's unsaved plan of a kind, or null before one was created.</summary>
+    public static StowagePlan? FindScratch(QuartermasterState state, OwnerScope owner, StowagePlanKind kind = StowagePlanKind.Transfer) =>
+        state.StowagePlans.SingleOrDefault(p => p.IsEphemeral && p.Kind == kind && p.Owner.Matches(owner));
+
     // Additive v5 migration: absent IsEphemeral fields deserialize as false. Create
     // lazily under the repository mutation lock, after the legacy plan migrations.
-    public static StowagePlan EnsureScratch(QuartermasterState state, OwnerScope owner)
+    // Each owner keeps one unsaved plan per kind: a Transfer scratchpad and a Courier one.
+    public static StowagePlan EnsureScratch(QuartermasterState state, OwnerScope owner, StowagePlanKind kind = StowagePlanKind.Transfer)
     {
         if (!owner.HasStableIdentity)
             throw new InvalidOperationException("Transfer plans require stable owner identity.");
-        var existing = state.StowagePlans.SingleOrDefault(p => p.IsEphemeral && p.Owner.Matches(owner));
+        var existing = FindScratch(state, owner, kind);
         if (existing is not null) return existing;
-        var plan = new StowagePlan { Owner = owner with { }, Name = "Unsaved plan", IsEphemeral = true, Enabled = false };
+        var plan = new StowagePlan { Owner = owner with { }, Name = ScratchName(kind), IsEphemeral = true, Enabled = false, Kind = kind };
         state.StowagePlans.Add(plan);
         return plan;
     }
@@ -34,7 +48,7 @@ public static class StowagePlanCatalog
         plan.Name = UniqueName(state, owner, name, id);
         plan.IsEphemeral = false;
         plan.Revision = checked(plan.Revision + 1);
-        EnsureScratch(state, owner);
+        EnsureScratch(state, owner, plan.Kind);
         ClearStaleRecovery(state);
         return plan;
     }
@@ -86,29 +100,35 @@ public static class StowagePlanCatalog
         return rule;
     }
 
-    public static IReadOnlyList<StowagePlan> OwnerPlans(QuartermasterState state, OwnerScope owner) =>
+    public static IReadOnlyList<StowagePlan> OwnerPlans(QuartermasterState state, OwnerScope owner, StowagePlanKind? kind = null) =>
         state.StowagePlans
-            .Where(plan => !plan.IsEphemeral && plan.Owner.Matches(owner))
+            .Where(plan => !plan.IsEphemeral && plan.Owner.Matches(owner) && (kind is null || plan.Kind == kind))
             .OrderByDescending(plan => plan.Enabled)
             .ThenBy(plan => plan.Priority)
             .ThenBy(plan => plan.Name, StringComparer.OrdinalIgnoreCase)
             .ThenBy(plan => plan.Id)
             .ToArray();
 
+    /// <summary>
+    /// Creates a saved plan. Only Transfer plans take part in the owner's single enabled plan;
+    /// a Courier plan is never enabled.
+    /// </summary>
     public static StowagePlan Create(
         QuartermasterState state,
         OwnerScope owner,
-        string requestedName = "Transfer plan")
+        string? requestedName = null,
+        StowagePlanKind kind = StowagePlanKind.Transfer)
     {
         if (!owner.HasStableIdentity)
             throw new InvalidOperationException("Transfer plans require stable owner identity.");
-        var hasEnabledPlan = OwnerPlans(state, owner).Any(plan => plan.Enabled);
+        var hasEnabledPlan = OwnerPlans(state, owner, StowagePlanKind.Transfer).Any(plan => plan.Enabled);
         var plan = new StowagePlan
         {
             Owner = owner with { },
-            Name = UniqueName(state, owner, requestedName),
-            Enabled = !hasEnabledPlan,
+            Name = UniqueName(state, owner, requestedName ?? DefaultName(kind)),
+            Enabled = kind == StowagePlanKind.Transfer && !hasEnabledPlan,
             Priority = OwnerPlans(state, owner).Count,
+            Kind = kind,
         };
         state.StowagePlans.Add(plan);
         state.Schema = "gooseworks-quartermaster-state/v5";
@@ -122,7 +142,7 @@ public static class StowagePlanCatalog
     {
         var source = state.StowagePlans.Single(plan =>
             plan.Id == sourcePlanId && plan.Owner.Matches(owner));
-        var copy = Create(state, owner, $"{source.Name} copy");
+        var copy = Create(state, owner, $"{source.Name} copy", source.Kind);
         copy.Enabled = false;
         foreach (var sourceRule in state.PlanItems.Where(rule => rule.StowagePlanId == source.Id))
             state.PlanItems.Add(CopyRule(sourceRule, copy.Id, newIdentity: true));
@@ -139,6 +159,7 @@ public static class StowagePlanCatalog
         return new StowagePlanDraft
         {
             PlanId = plan.Id,
+            Kind = plan.Kind,
             SourceRevision = plan.Revision,
             Name = plan.Name,
             Enabled = plan.Enabled,
@@ -152,7 +173,8 @@ public static class StowagePlanCatalog
     public static StowagePlanDraft NewDraft(
         QuartermasterState state,
         OwnerScope owner,
-        string requestedName = "Transfer plan")
+        string? requestedName = null,
+        StowagePlanKind kind = StowagePlanKind.Transfer)
     {
         if (!owner.HasStableIdentity)
             throw new InvalidOperationException("Transfer plans require stable owner identity.");
@@ -160,8 +182,9 @@ public static class StowagePlanCatalog
         {
             PlanId = Guid.NewGuid(),
             IsNew = true,
-            Name = UniqueName(state, owner, requestedName),
-            Enabled = !OwnerPlans(state, owner).Any(plan => plan.Enabled),
+            Kind = kind,
+            Name = UniqueName(state, owner, requestedName ?? DefaultName(kind)),
+            Enabled = kind == StowagePlanKind.Transfer && !OwnerPlans(state, owner, StowagePlanKind.Transfer).Any(plan => plan.Enabled),
         };
     }
 
@@ -176,6 +199,7 @@ public static class StowagePlanCatalog
         {
             PlanId = Guid.NewGuid(),
             IsNew = true,
+            Kind = source.Kind,
             Name = UniqueName(state, owner, $"{source.Name} copy"),
             Enabled = false,
             Rules = state.PlanItems
@@ -239,8 +263,8 @@ public static class StowagePlanCatalog
                 Owner = owner with { },
                 Revision = 1,
                 Priority = OwnerPlans(state, owner).Count,
+                Kind = draft.Kind,
             };
-            state.StowagePlans.Add(plan);
         }
         else
         {
@@ -248,15 +272,24 @@ public static class StowagePlanCatalog
                 candidate.Id == draft.PlanId && candidate.Owner.Matches(owner));
             if (plan.Revision != draft.SourceRevision)
                 throw new InvalidOperationException("This Transfer Plan changed after the editor opened. Reopen it to continue.");
-            plan.Revision = checked(plan.Revision + 1);
         }
+        // A plan never mixes kinds: Transfer plans hold same-character lines, Courier plans hold courier lines.
+        if (draft.Rules.FirstOrDefault(rule => rule.ItemId > 0 && !Holds(plan.Kind, rule)) is { } foreign)
+            throw new InvalidOperationException(plan.Kind == StowagePlanKind.Courier
+                ? $"{foreign.ItemName} is not a courier line; a Courier Plan only sends items to other characters."
+                : $"{foreign.ItemName} is a courier line; send items to other characters from a Courier Plan.");
+        if (draft.IsNew)
+            state.StowagePlans.Add(plan);
+        else
+            plan.Revision = checked(plan.Revision + 1);
 
-        plan.Name = plan.IsEphemeral ? "Unsaved plan" : UniqueName(state, owner, draft.Name, plan.Id);
-        plan.Enabled = !plan.IsEphemeral && draft.Enabled;
+        plan.Name = plan.IsEphemeral ? ScratchName(plan.Kind) : UniqueName(state, owner, draft.Name, plan.Id);
+        plan.Enabled = !plan.IsEphemeral && plan.Kind == StowagePlanKind.Transfer && draft.Enabled;
         if (plan.Enabled)
         {
             foreach (var other in state.StowagePlans.Where(candidate =>
-                         !candidate.IsEphemeral && candidate.Id != plan.Id && candidate.Owner.Matches(owner) && candidate.Enabled))
+                         !candidate.IsEphemeral && candidate.Kind == StowagePlanKind.Transfer &&
+                         candidate.Id != plan.Id && candidate.Owner.Matches(owner) && candidate.Enabled))
             {
                 other.Enabled = false;
                 other.Revision = checked(other.Revision + 1);
@@ -276,6 +309,10 @@ public static class StowagePlanCatalog
         state.Schema = "gooseworks-quartermaster-state/v5";
         return plan;
     }
+
+    /// <summary>Whether a line belongs in a plan of the kind: courier lines only in Courier plans.</summary>
+    public static bool Holds(StowagePlanKind kind, TargetPlanItem rule) =>
+        (rule.Courier is not null) == (kind == StowagePlanKind.Courier);
 
     /// <summary>
     /// A plan holds one ordinary line per item and quality, plus one courier line per distinct route
@@ -352,6 +389,7 @@ public static class StowagePlanCatalog
             pair.First.PreferredVendorNpcId == pair.Second.PreferredVendorNpcId &&
             pair.First.Notes == pair.Second.Notes &&
             pair.First.Enabled == pair.Second.Enabled &&
+            Equals(pair.First.Courier, pair.Second.Courier) &&
             pair.First.Routing.SameAs(pair.Second.Routing));
     }
 }

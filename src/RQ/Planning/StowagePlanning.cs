@@ -59,7 +59,8 @@ public static class StowagePlanMigration
         {
             if (!NeedsMigration(state, owner))
                 return;
-            var plan = state.StowagePlans.FirstOrDefault(candidate => !candidate.IsEphemeral && candidate.Owner.Matches(owner));
+            var plan = state.StowagePlans.FirstOrDefault(candidate =>
+                !candidate.IsEphemeral && candidate.Kind == StowagePlanKind.Transfer && candidate.Owner.Matches(owner));
             if (plan is null)
             {
                 plan = new StowagePlan
@@ -98,14 +99,14 @@ public static class StowagePlanMigration
 
     public static bool NeedsMigration(QuartermasterState state, OwnerScope owner) =>
         owner.HasStableIdentity &&
-        (state.StowagePlans.All(plan => plan.IsEphemeral || !plan.Owner.Matches(owner)) ||
+        (state.StowagePlans.All(plan => plan.IsEphemeral || plan.Kind != StowagePlanKind.Transfer || !plan.Owner.Matches(owner)) ||
          state.PlanItems.Any(rule => rule.StowagePlanId == Guid.Empty) ||
          state.StowageMigrations.All(record =>
              record.MigrationId != MigrationId || !record.Owner.Matches(owner)));
 
     public static StowagePlan? OwnerPlan(QuartermasterState state, OwnerScope owner) =>
         state.StowagePlans
-            .Where(plan => !plan.IsEphemeral && plan.Owner.Matches(owner))
+            .Where(plan => !plan.IsEphemeral && plan.Kind == StowagePlanKind.Transfer && plan.Owner.Matches(owner))
             .OrderBy(plan => plan.Priority)
             .ThenBy(plan => plan.Name, StringComparer.OrdinalIgnoreCase)
             .ThenBy(plan => plan.Id)
@@ -117,10 +118,87 @@ public static class StowagePlanMigration
         bool enabledPlansOnly = true)
     {
         var planIds = state.StowagePlans
-            .Where(plan => !plan.IsEphemeral && plan.Owner.Matches(owner) && (!enabledPlansOnly || plan.Enabled))
+            .Where(plan => !plan.IsEphemeral && plan.Kind == StowagePlanKind.Transfer && plan.Owner.Matches(owner) && (!enabledPlansOnly || plan.Enabled))
             .Select(plan => plan.Id)
             .ToHashSet();
         return state.PlanItems.Where(rule => planIds.Contains(rule.StowagePlanId)).ToArray();
+    }
+
+    /// <summary>
+    /// Separates courier lines from Transfer plans written before plans had a kind, losslessly:
+    /// an unsaved plan's courier lines move to its owner's unsaved Courier plan; a saved plan holding
+    /// only courier lines becomes a Courier plan; a saved plan holding both keeps its ordinary lines
+    /// and its courier lines move to a new saved sibling "{Name} (Courier)". Line identities, routes,
+    /// quantities and states are kept. Returns whether anything changed; running it again changes nothing.
+    /// </summary>
+    public static bool SeparateCourierLines(QuartermasterState state)
+    {
+        var changed = false;
+        foreach (var plan in state.StowagePlans.Where(plan => plan.Kind == StowagePlanKind.Transfer).ToArray())
+        {
+            var courierLines = state.PlanItems.Where(rule => rule.StowagePlanId == plan.Id && rule.Courier is not null).ToArray();
+            if (courierLines.Length == 0)
+                continue;
+            var hasOrdinaryLines = state.PlanItems.Any(rule => rule.StowagePlanId == plan.Id && rule.Courier is null);
+            StowagePlan target;
+            if (plan.IsEphemeral)
+            {
+                target = StowagePlanCatalog.FindScratch(state, plan.Owner, StowagePlanKind.Courier) ?? new StowagePlan
+                {
+                    Owner = plan.Owner with { },
+                    Name = StowagePlanCatalog.ScratchName(StowagePlanKind.Courier),
+                    IsEphemeral = true,
+                    Enabled = false,
+                    Kind = StowagePlanKind.Courier,
+                    LastAppliedCourierRun = plan.LastAppliedCourierRun,
+                };
+                if (!state.StowagePlans.Contains(target))
+                    state.StowagePlans.Add(target);
+            }
+            else if (!hasOrdinaryLines)
+            {
+                // Courier lines never took part in the enabled plan's targets; a Courier plan is never enabled.
+                plan.Kind = StowagePlanKind.Courier;
+                plan.Enabled = false;
+                plan.Revision = checked(plan.Revision + 1);
+                state.TransferPlanListingLinks.RemoveAll(link => link.StowagePlanId == plan.Id);
+                changed = true;
+                continue;
+            }
+            else
+            {
+                target = new StowagePlan
+                {
+                    Owner = plan.Owner with { },
+                    Name = StowagePlanCatalog.UniqueName(state, plan.Owner, $"{plan.Name} (Courier)"),
+                    Enabled = false,
+                    Priority = plan.Priority,
+                    Kind = StowagePlanKind.Courier,
+                    LastAppliedCourierRun = plan.LastAppliedCourierRun,
+                };
+                state.StowagePlans.Add(target);
+            }
+            foreach (var line in courierLines)
+            {
+                // Two identical routes would be one line in the target: keep both quantities on the first.
+                var same = state.PlanItems.FirstOrDefault(rule => rule.StowagePlanId == target.Id &&
+                    StowagePlanCatalog.LineKey(rule) == StowagePlanCatalog.LineKey(line));
+                if (same is null)
+                {
+                    line.StowagePlanId = target.Id;
+                    continue;
+                }
+                same.TargetQuantity = (int)Math.Min(int.MaxValue, (long)same.TargetQuantity + Math.Max(0, line.TargetQuantity));
+                same.Enabled |= line.Enabled;
+                state.PlanItems.Remove(line);
+            }
+            plan.Revision = checked(plan.Revision + 1);
+            target.Revision = checked(target.Revision + 1);
+            changed = true;
+        }
+        if (changed)
+            StowagePlanCatalog.ClearStaleRecovery(state);
+        return changed;
     }
 }
 
@@ -145,7 +223,7 @@ public static class TransferPlanMigration
                 .ThenBy(plan => plan.Id)
                 .ToArray();
             var emptyPlaceholder = state.StowagePlans.FirstOrDefault(plan =>
-                !plan.IsEphemeral && plan.Owner.Matches(owner) &&
+                !plan.IsEphemeral && plan.Kind == StowagePlanKind.Transfer && plan.Owner.Matches(owner) &&
                 plan.Enabled &&
                 state.PlanItems.All(rule => rule.StowagePlanId != plan.Id));
             if (sources.Any(source => source.Enabled) && emptyPlaceholder is not null)
