@@ -460,6 +460,7 @@ public sealed class CourierConductor
                 CourierGame.Step.Value = intent.Id;
                 CourierGame.CanContinue.Value=()=>!stop && !unloaded;
                 information?.Invoke($"{r.Run}/{intent.Id} owner {s.Phase} trip {s.Trip + 1}");
+                CourierReceipt? finished = null;
                 switch (s.Phase)
                 {
                     case CourierPhase.EnsureSource:
@@ -496,7 +497,9 @@ public sealed class CourierConductor
                     case CourierPhase.ReturnCarrier: await Send(r, CourierCommand.ReturnHome, r.Start, [],id:intent.Id); break;
                     case CourierPhase.Finish:
                         if (!r.Custody.IsEmpty) throw Fault("CustodyRemaining", "Carrier still holds stock");
-                        await Send(r, CourierCommand.Finish, r.Start, []); r.PeerClaimed = false; break;
+                        // Finish closes the carrier's run, so its receipt is the terminal checkpoint;
+                        // a later Status could no longer be authorized against this run.
+                        finished = await Send(r, CourierCommand.Finish, r.Start, []); r.PeerClaimed = false; break;
                 }
                 if (s.Phase is CourierPhase.HandOut or CourierPhase.HandIn)
                 {
@@ -506,7 +509,8 @@ public sealed class CourierConductor
                 else
                 {
                     r.OwnerCheckpoint = await Observe();
-                    r.CarrierCheckpoint = (await Send(r, CourierCommand.Status, r.Start, [])).Bags;
+                    r.CarrierCheckpoint = finished?.Bags ?? (s.Phase == CourierPhase.Finish ? r.CarrierCheckpoint :
+                        (await Send(r, CourierCommand.Status, r.Start, [])).Bags);
                 }
                 if(s.Phase==CourierPhase.Deposit){var unit=s.Batch.Single();r.Delivered[unit.Line]=checked(r.Delivered.GetValueOrDefault(unit.Line)+unit.Units);}
                 r.Pending = null; r.Cursor++; store.Save(r);
