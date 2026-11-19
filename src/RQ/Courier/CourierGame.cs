@@ -11,6 +11,7 @@ using Franthropy.Dalamud.Travel;
 using Franthropy.Dalamud.Worlds;
 using World = Lumina.Excel.Sheets.World;
 using TerritoryType = Lumina.Excel.Sheets.TerritoryType;
+using Aetheryte = Lumina.Excel.Sheets.Aetheryte;
 using RQ.Domain;
 using RQ.Inventory;
 using RQ.UI;
@@ -73,6 +74,22 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     {
         339 => 8, 340 => 2, 341 => 9, 641 => 111, 979 => 70, _ => null
     };
+    private float DestinationDistanceSquared(uint nodeId, Vector3 target)
+    {
+        if (data.GetExcelSheet<Aetheryte>().GetRowOrDefault(nodeId) is { } node)
+        {
+            foreach (var reference in node.Level)
+            {
+                if (reference.RowId == 0 || reference.ValueNullable is not { } level)
+                    continue;
+                var position = new Vector3(level.X, level.Y, level.Z);
+                var distance = Vector3.DistanceSquared(position, target);
+                if (position != Vector3.Zero && float.IsFinite(distance))
+                    return distance;
+            }
+        }
+        return float.MaxValue;
+    }
     private static unsafe (int Number,bool Subdivision)? CurrentWard()
     {
         var housing=HousingManager.Instance();
@@ -329,7 +346,8 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
             {
                 if(WardCity(p.Territory)!=null)return WardFailure("WardUnknown","The destination is in a housing ward whose number was not recorded.");
                 route??=DalamudGilVendorCatalogBuilder.ResolveTravelRoutesForTerritory(data,p.Territory)
-                    .FirstOrDefault(r=>attuned.Any(a=>a.AetheryteId==r.AetheryteId));
+                    .Where(r => attuned.Any(a => a.AetheryteId == r.AetheryteId))
+                    .MinBy(r => DestinationDistanceSquared(r.AethernetId ?? r.AetheryteId, target));
                 if(route==null)return Result<bool>.Fail("NoAttunedAetheryte",p.Territory.ToString());
                 if(hopped)return null;
                 if(route.AethernetId is {} shard && here.Territory==route.AetheryteTerritoryId &&

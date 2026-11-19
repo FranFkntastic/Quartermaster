@@ -117,10 +117,10 @@ internal sealed class TransferReviewDialog
                 Clear();
             return;
         }
-        var movements = projection.Movements;
+        var movementSummary = projection.MovementSummary;
         var courierRows = mixedCourier is null ? [] : CourierRows(projection);
 
-        ImGui.TextUnformatted($"{movements:N0} movements");
+        ImGui.TextUnformatted(movementSummary);
         ImGui.SameLine();
         ImGui.TextDisabled("·");
         ImGui.SameLine();
@@ -220,7 +220,7 @@ internal sealed class TransferReviewDialog
                 executePlan(plan.Id);
                 Clear();
             },
-            canExecute ? $"{movements:N0} movements" : availability.BlockReason);
+            canExecute ? movementSummary : availability.BlockReason);
 
         ImGui.EndPopup();
         if (!open)
