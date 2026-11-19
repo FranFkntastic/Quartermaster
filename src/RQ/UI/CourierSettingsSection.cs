@@ -132,6 +132,8 @@ internal sealed class CourierSettingsSection
         ImGui.TableHeadersRow();
         foreach (var character in characters)
         {
+            if (settings.Carrier is { } carrier && CourierPlanner.Exact(carrier, character))
+                continue;
             var id = character.LocalContentId!.Value;
             var current = character.Matches(runtime.Owner);
             ImGui.TableNextRow();
@@ -143,7 +145,7 @@ internal sealed class CourierSettingsSection
             if (settings.Bells.GetValueOrDefault(id) is { } bell)
                 ImGui.TextUnformatted(bell.Label);
             else
-                ImGui.TextDisabled("—");
+                ImGui.TextDisabled(current && courier.Link.BellBlock is { } block ? block : "—");
             ImGui.TableNextColumn();
             if (current && capturable is { } here)
             {

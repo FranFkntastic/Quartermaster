@@ -28,6 +28,9 @@ public interface ICourierLink
     /// </summary>
     MeetingBell? StandingAt { get; }
 
+    /// <summary>Why the logged-in character's current place cannot hold a meeting bell; null where one could.</summary>
+    string? BellBlock { get; }
+
     /// <summary>
     /// Characters logged in on the other linked clients: carrier candidates on the owner client,
     /// owner candidates on the carrier client. Return a new list instance whenever an entry or
@@ -40,6 +43,7 @@ public sealed class NullCourierLink : ICourierLink
 {
     public static readonly NullCourierLink Instance = new();
     public MeetingBell? StandingAt => null;
+    public string? BellBlock => null;
     public IReadOnlyList<CourierPeer> Peers { get; } = [];
 }
 

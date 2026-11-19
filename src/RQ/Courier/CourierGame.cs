@@ -63,6 +63,10 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     private CourierPosition? Position() => objects.LocalPlayer is {} p && player.IsLoaded && client.IsLoggedIn
         ? new(player.CurrentWorld.RowId,client.TerritoryType,p.Position.X,p.Position.Y,p.Position.Z) : null;
     public Task<Result<CourierPosition>> PositionAsync(Deadline d) => Poll<CourierPosition>(d, () => Position() is {} p ? Result<CourierPosition>.Ok(p) : null);
+    /// <summary>Why this place cannot hold a meeting bell at all; null where one could be captured.</summary>
+    internal string? BellBlock() => Position() is not {} p ? null :
+        p.World != player.HomeWorld.RowId ? "Not on home world" :
+        data.GetExcelSheet<TerritoryType>().GetRowOrDefault(p.Territory)?.TerritoryIntendedUse.RowId is not (0 or 1) ? "Not in a town or field zone" : null;
     internal MeetingBell? StandingAt()
     {
         if (Position() is not {} p || p.World != player.HomeWorld.RowId ||
