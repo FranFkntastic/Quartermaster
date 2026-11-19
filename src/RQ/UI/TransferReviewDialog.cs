@@ -2,6 +2,7 @@ using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.UI.Tables;
+using RQ.Courier;
 using RQ.Domain;
 using RQ.Runtime;
 
@@ -162,7 +163,7 @@ internal sealed class TransferReviewDialog
             table.End();
         }
         if (mixedCourier is not null)
-            DrawCourierRows(courierRows, 120);
+            DrawCourierRows(mixedCourier, courierRows);
 
         if (ImGui.Button("Back"))
         {
@@ -230,7 +231,7 @@ internal sealed class TransferReviewDialog
         QuartermasterRuntimeSnapshot runtime,
         StowagePlan plan,
         TransferWorkbenchProjection projection,
-        RQ.Courier.CourierPlan courierPlan)
+        CourierPlan courierPlan)
     {
         var rows = CourierRows(projection);
         var units = rows.Sum(row => row.Projection.Send);
@@ -241,7 +242,7 @@ internal sealed class TransferReviewDialog
         ImGui.TextColored(TransferPresentation.SendColor, $"Send {units:N0}");
         ImGui.Separator();
 
-        DrawCourierRows(rows, 260);
+        DrawCourierRows(courierPlan, rows);
 
         if (ImGui.Button("Back"))
         {
@@ -289,12 +290,29 @@ internal sealed class TransferReviewDialog
     private static TransferWorkbenchRow[] CourierRows(TransferWorkbenchProjection projection) =>
         projection.Rows.Where(row => row.Rule.Courier is not null && row.Rule.Enabled).ToArray();
 
-    private void DrawCourierRows(IReadOnlyList<TransferWorkbenchRow> rows, float minimumHeight)
+    private void DrawCourierRows(CourierPlan plan, IReadOnlyList<TransferWorkbenchRow> rows)
     {
+        if (!plan.Trips.IsEmpty)
+        {
+            var lineHeight = ImGui.GetTextLineHeightWithSpacing();
+            var height = Math.Min(plan.Trips.Length * lineHeight + ImGui.GetStyle().ScrollbarSize,
+                Math.Max(lineHeight, (ImGui.GetContentRegionAvail().Y - 48) * .4f));
+            if (ImGui.BeginChild("RQCourierReviewTrips", new Vector2(0, height), false, ImGuiWindowFlags.HorizontalScrollbar))
+            {
+                for (var i = 0; i < plan.Trips.Length; i++)
+                {
+                    var trip = plan.Trips[i];
+                    var count = trip.Manifest.Length;
+                    ImGui.TextDisabled($"Trip {i + 1} · {CourierSession.CharacterLabel(trip.Source)} at {trip.Pickup.Label} → " +
+                        $"{CourierSession.CharacterLabel(trip.Destination)} at {trip.Dropoff.Label} · {count:N0} shipment{(count == 1 ? string.Empty : "s")}");
+                }
+            }
+            ImGui.EndChild();
+        }
         if (!courierTable.Begin(
                 "RQCourierReviewRows",
                 new DalamudTableLayout(
-                    new Vector2(0, Math.Max(minimumHeight, ImGui.GetContentRegionAvail().Y - 48)),
+                    new Vector2(0, Math.Max(ImGui.GetFrameHeight(), ImGui.GetContentRegionAvail().Y - 48)),
                     ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
                     ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp)))
             return;
@@ -313,12 +331,12 @@ internal sealed class TransferReviewDialog
         new(
             "From",
             1f,
-            row => CourierSession.Side(row.Runtime, row.Rule.Courier!.SourceCharacter, row.Rule.Courier.SourceRetainerId),
+            row => CourierSession.Side(row.Runtime, row.Rule.Courier!.SourceCharacter, row.Rule.Courier.SourceRetainerId, includeOwner: true),
             Flags: ImGuiTableColumnFlags.WidthStretch),
         new(
             "To",
             1f,
-            row => CourierSession.Side(row.Runtime, row.Rule.Courier!.Character, row.Rule.Courier.RetainerId),
+            row => CourierSession.Side(row.Runtime, row.Rule.Courier!.Character, row.Rule.Courier.RetainerId, includeOwner: true),
             Flags: ImGuiTableColumnFlags.WidthStretch),
         new(
             "Units",

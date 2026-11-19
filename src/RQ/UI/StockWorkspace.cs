@@ -211,7 +211,10 @@ internal sealed class StockWorkspace
         // snapshot for both cache lookups so a focus transition cannot rebuild twice.
         var isEditing = workbench.ItemFilterState.IsInputActive;
         var scopeKey = viewed is null ? workbench.ScopeKey : BrowserScope.AllKey;
+        var characterBeforeToolbar = viewedCharacter;
         DrawStockToolbar(runtime, availableItems, scopeKey, isEditing);
+        if (characterBeforeToolbar != viewedCharacter)
+            return; // The stock projection belongs to the previous character.
         var result = queries.QueryItems(
             projection,
             workbench.ItemFilterState.Expression,
@@ -305,13 +308,21 @@ internal sealed class StockWorkspace
         if (!character.Matches(runtime.Owner) && !CourierSession.IsCarrier(runtime, character) &&
             courier.Stock(runtime, character) is { } stock)
             return stock;
-        viewedCharacter = null;
+        SetViewedCharacter(null);
         return null;
+    }
+
+    private void SetViewedCharacter(OwnerScope? character)
+    {
+        if (character is null ? viewedCharacter is null : viewedCharacter?.Matches(character) == true)
+            return;
+        ClearStockSelection();
+        viewedCharacter = character;
     }
 
     private void ViewCharacter(OwnerScope character)
     {
-        viewedCharacter = character with { };
+        SetViewedCharacter(character);
         workbench.FocusedStockItemId = null;
         LeaveCatalog();
     }
@@ -569,7 +580,7 @@ internal sealed class StockWorkspace
                 {
                     workbench.ScopeKey = scope.Key;
                     workbench.FocusedStockItemId = null;
-                    viewedCharacter = null;
+                    SetViewedCharacter(null);
                     LeaveCatalog();
                 }
             }
@@ -604,7 +615,7 @@ internal sealed class StockWorkspace
         if (catalogMode)
             return;
         catalogMode = true;
-        viewedCharacter = null;
+        SetViewedCharacter(null);
         workbench.FocusedStockItemId = null;
     }
 
@@ -613,6 +624,8 @@ internal sealed class StockWorkspace
     private void DrawCatalog(QuartermasterRuntimeSnapshot runtime)
     {
         DrawStockToolbar(runtime, [], workbench.ScopeKey, workbench.ItemFilterState.IsInputActive);
+        if (viewedCharacter is not null)
+            return;
         catalogPicker.DrawFilters(runtime);
         DrawSelectionBar(runtime, catalogPicker.Visible, catalogPicker.NarrowingActive);
         catalogPicker.DrawTable(
@@ -640,7 +653,7 @@ internal sealed class StockWorkspace
 
     /// <summary>
     /// The shared selection bar for every scope. The selection is keyed by item ID and survives
-    /// scope switches; actions resolve each selected ID through stock first, then the catalog.
+    /// scope switches within a character; actions resolve each selected ID through stock first, then the catalog.
     /// </summary>
     private void DrawSelectionBar(QuartermasterRuntimeSnapshot runtime, VisibleItemIds visible, bool canSelectVisible)
     {
@@ -1152,7 +1165,7 @@ internal sealed class StockWorkspace
     public void FocusFromListings(QuartermasterRuntimeSnapshot runtime, ListingItemKey group)
     {
         LeaveCatalog();
-        viewedCharacter = null;
+        SetViewedCharacter(null);
         stockSelection.Clear();
         stockSelection.SetSelected(group.ItemId, true);
         workbench.SelectedStockListingQuality = group.Quality;
