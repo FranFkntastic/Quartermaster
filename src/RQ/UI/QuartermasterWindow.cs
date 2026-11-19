@@ -43,6 +43,8 @@ public sealed class QuartermasterWindow : Window
     private (string Query, int Limit, IReadOnlyList<ItemChoice> Choices)? lastItemSearch;
     private readonly ListingWorkspace listingWorkspace;
     private readonly MarketRunPane marketRunPane;
+    private readonly CourierSession courier;
+    private readonly CourierRunPane courierRunPane;
     private readonly TransferReviewDialog transferReviewDialog;
     private readonly TransferExecutionController transferExecution;
     private readonly VendorProcurementReviewDialog vendorReviewDialog;
@@ -83,10 +85,13 @@ public sealed class QuartermasterWindow : Window
         Func<uint, uint?> resolveWorkshopProject,
         string configDirectory,
         RQ.Interop.MarketMafiosoSavedJobClient marketImporter,
-        Dalamud.Plugin.Services.IPluginLog log)
+        Dalamud.Plugin.Services.IPluginLog log,
+        CourierSession courier)
         : base(MainWindowName, ImGuiWindowFlags.NoScrollbar)
     {
         this.state = state;
+        this.courier = courier;
+        courierRunPane = new(courier, reviewRegistry);
         DrawTimings = new(log, "Draw", 100);
         this.runtimeSnapshots = runtimeSnapshots;
         this.dataManager = dataManager;
@@ -133,7 +138,8 @@ public sealed class QuartermasterWindow : Window
             vendorCatalogSource,
             (planId, planName) => transferReview?.Request(planId, planName),
             review => vendorReview?.Request(review),
-            planId => OpenPlanManager(planId));
+            planId => OpenPlanManager(planId),
+            courier);
         transferPlanManager = new(
             state,
             runtimeSnapshots,
@@ -155,7 +161,8 @@ public sealed class QuartermasterWindow : Window
             (runtime, key) => { listingWorkspace!.Focus(runtime, key); deferredView = WorkbenchView.Listings; },
             reviewRegistry,
             () => deferredView = WorkbenchView.Stock,
-            gameCatalog);
+            gameCatalog,
+            courier);
         listingWorkspace = new(
             workbench,
             listingNavigation,
@@ -172,7 +179,8 @@ public sealed class QuartermasterWindow : Window
             () => transfers.CanStart,
             () => retainerRefresh.IsRefreshing || retainerRefresh.IsQueued,
             planId => transferExecution.ExecutePlan(planId),
-            reviewRegistry);
+            reviewRegistry,
+            courier);
         vendorReviewDialog = vendorReview = new(vendorProcurement, reviewRegistry, transferPlanWorkspace.ClearVendorStatus);
         captureTransactions = new(
             () => IsOpen,
@@ -467,6 +475,7 @@ public sealed class QuartermasterWindow : Window
                     if (ImGui.BeginChild("RQPlanPane", Vector2.Zero, false))
                     {
                         var started = Stopwatch.GetTimestamp();
+                        courierRunPane.Draw(runtime);
                         var plansSelected = workbench.View == WorkbenchView.Plans;
                         var groupsSelected = workbench.View == WorkbenchView.ItemGroups;
                         if (ImGui.Selectable("Transfer plan##RQPlannerMode", !plansSelected && !groupsSelected, ImGuiSelectableFlags.None, new Vector2(112, 0))) workbench.View = WorkbenchView.Stowage;

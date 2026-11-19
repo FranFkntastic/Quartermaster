@@ -9,6 +9,7 @@ using Franthropy.Dalamud.UI.Inputs;
 using Franthropy.Dalamud.UI.Tables;
 using Franthropy.Filtering.Evaluation;
 using RQ.Automation;
+using RQ.Courier;
 using RQ.Domain;
 using RQ.Inventory;
 using RQ.Operations;
@@ -74,6 +75,7 @@ internal sealed class TransferPlanWorkspace
     private readonly Action<Guid, string> requestTransferReview;
     private readonly Action<TransferVendorProcurementReview> requestVendorReview;
     private readonly Action<Guid?> managePlans;
+    private readonly CourierSession courier;
     private readonly DalamudTableProjection<TransferWorkbenchRow> transferWorkbenchTable;
     private readonly TableSelectionModel<Guid> selection = new();
     private Guid[]? drawingRowKeys;
@@ -84,6 +86,7 @@ internal sealed class TransferPlanWorkspace
     private int retainedSelectionCount = -1;
     private readonly Dictionary<Guid, string> lineErrors = [];
     private TransferWorkbenchProjection? transferWorkbenchProjection;
+    private object? projectedPeers;
     private int transferProjectionBuildCount;
     private int renderedTransferRowCount;
     private string? dismissedVendorRunId;
@@ -127,8 +130,10 @@ internal sealed class TransferPlanWorkspace
         Func<GilVendorCatalog>? vendorCatalogSource,
         Action<Guid, string> requestTransferReview,
         Action<TransferVendorProcurementReview> requestVendorReview,
-        Action<Guid?> managePlans)
+        Action<Guid?> managePlans,
+        CourierSession courier)
     {
+        this.courier = courier;
         this.state = state;
         this.runtimeSnapshots = runtimeSnapshots;
         this.transfers = transfers;
@@ -206,6 +211,73 @@ internal sealed class TransferPlanWorkspace
         });
     }
 
+    /// <summary>
+    /// Adds courier lines that send the logged-in character's units of each item (one line per
+    /// container holding it) to another character's retainer or bags. Re-sending from the same
+    /// container to the same place replaces that line's quantity.
+    /// </summary>
+    public void AddCourier(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, OwnerScope destination, ulong? retainerId)
+    {
+        if (!runtime.Owner.HasStableIdentity || items.Count == 0)
+            return;
+        EnsureSelection(runtime);
+        var planId = workbench.SelectedStowagePlanId!.Value;
+        var target = destination with { };
+        var sources = items
+            .SelectMany(item => item.Stacks
+                .Where(stack => stack.Quantity > 0 && stack.ScopeKind switch
+                {
+                    BrowserScopeKind.Player => CourierSession.PlayerBags.Contains(stack.Storage, StringComparer.Ordinal),
+                    BrowserScopeKind.Retainer => stack.RetainerId is { } id && runtime.Retainers.GetValueOrDefault(id)?.Owner.Matches(runtime.Owner) == true,
+                    _ => false,
+                })
+                .GroupBy(stack => stack.ScopeKind == BrowserScopeKind.Player ? null : stack.RetainerId)
+                .Select(group => (item.ItemId, item.ItemName, Source: group.Key, Units: group.Sum(stack => stack.Quantity))))
+            .ToArray();
+        if (sources.Length == 0)
+            return;
+        try
+        {
+            var affected = state.Mutate(document =>
+            {
+                var draft = StowagePlanCatalog.Draft(document, runtime.Owner, planId);
+                var ids = new List<Guid>();
+                foreach (var (itemId, name, source, units) in sources)
+                {
+                    var rule = draft.Rules.FirstOrDefault(candidate => candidate.ItemId == itemId && candidate.Courier is { } route &&
+                        route.SourceCharacter is null && route.SourceRetainerId == source &&
+                        route.Character.Matches(target) && route.RetainerId == retainerId);
+                    if (rule is null)
+                    {
+                        rule = new TargetPlanItem
+                        {
+                            StowagePlanId = planId,
+                            ItemId = itemId,
+                            ItemName = name,
+                            Courier = new CourierRoute(target, retainerId, source),
+                        };
+                        draft.Rules.Add(rule);
+                    }
+                    rule.TargetQuantity = units;
+                    rule.Enabled = true;
+                    ids.Add(rule.Id);
+                }
+                StowagePlanCatalog.Apply(document, runtime.Owner, draft);
+                return ids;
+            });
+            workbench.SelectedStowagePlanId = planId;
+            showPlacement = false;
+            selection.Clear();
+            pendingSelection = affected.Count > 1 ? affected.ToArray() : null;
+            pendingSelectionFrames = 0;
+            transferExecution.ClearInlineError();
+        }
+        catch (Exception exception)
+        {
+            transferExecution.ReportInlineError(exception.Message);
+        }
+    }
+
     /// <summary>Adds balanced lines for items not already in the selected plan and selects every affected line.</summary>
     public void AddItems(QuartermasterRuntimeSnapshot runtime, IEnumerable<(uint ItemId, string Name)> items) =>
         AddToSelectedPlan(runtime, items.Select(item => new PlanAddEntry(item.ItemId, item.Name, ItemQualityPolicy.Any)).ToArray());
@@ -255,9 +327,9 @@ internal sealed class TransferPlanWorkspace
                 foreach (var entry in entries)
                 {
                     // An Any-quality add treats any line for the item as already present.
-                    var existing = draft.Rules.FirstOrDefault(rule => rule.ItemId == entry.ItemId && rule.Quality == entry.Quality) ??
+                    var existing = draft.Rules.FirstOrDefault(rule => rule.Courier is null && rule.ItemId == entry.ItemId && rule.Quality == entry.Quality) ??
                                    (entry.Quality == ItemQualityPolicy.Any
-                                       ? draft.Rules.FirstOrDefault(rule => rule.ItemId == entry.ItemId)
+                                       ? draft.Rules.FirstOrDefault(rule => rule.Courier is null && rule.ItemId == entry.ItemId)
                                        : null);
                     if (existing is null)
                     {
@@ -337,9 +409,9 @@ internal sealed class TransferPlanWorkspace
                         link.StowagePlanId == planId && link.ItemId == demand.ItemId && link.Quality == demand.Quality))
                     throw new InvalidOperationException("This item already uses a live listing-demand link in this plan.");
                 var draft = StowagePlanCatalog.Draft(document, runtime.Owner, planId);
-                if (draft.Rules.Any(rule => rule.ItemId == demand.ItemId && rule.Quality == ItemQualityPolicy.Any))
+                if (draft.Rules.Any(rule => rule.Courier is null && rule.ItemId == demand.ItemId && rule.Quality == ItemQualityPolicy.Any))
                     throw new InvalidOperationException("This item has an Any-quality target. Choose NQ or HQ on its line before preparing exact-quality listings.");
-                var rule = draft.Rules.FirstOrDefault(candidate => candidate.ItemId == demand.ItemId && candidate.Quality == demand.Quality);
+                var rule = draft.Rules.FirstOrDefault(candidate => candidate.Courier is null && candidate.ItemId == demand.ItemId && candidate.Quality == demand.Quality);
                 if (rule is null)
                 {
                     rule = new TargetPlanItem
@@ -491,6 +563,8 @@ internal sealed class TransferPlanWorkspace
             DrawBulkBar(owner, selected, projection);
         else
             DrawSummary(projection);
+        if (projection.Courier is not null && courier.Error is { Length: > 0 } courierError)
+            DrawWrappedStatus(courierError, ErrorColor);
         DrawUndoStrip(owner, selected);
         DrawTable(runtime, selected, projection);
     }
@@ -512,6 +586,7 @@ internal sealed class TransferPlanWorkspace
         TransferWorkbenchProjection projection)
     {
         var rows = projection.Rows
+            .Where(row => row.Rule.Courier is null)
             .Select(row => new PlacementMatrixRow<Guid>(
                 row.Rule.Id,
                 row.Rule.Id.ToString("N"),
@@ -561,8 +636,8 @@ internal sealed class TransferPlanWorkspace
         var buyLabel = maximumGil > 0
             ? $"Buy from vendor · {maximumGil:N0} gil###RQTransferVendorBuy"
             : "Buy from vendor###RQTransferVendorBuy";
-        var lines = projection?.Rules.Count ?? 0;
-        var placed = projection?.Rules.Count(rule => rule.Routing.AnySpace || rule.Routing.PreferredRetainerIds.Count > 0) ?? 0;
+        var lines = projection?.Rules.Count(rule => rule.Courier is null) ?? 0;
+        var placed = projection?.Rules.Count(rule => rule.Courier is null && (rule.Routing.AnySpace || rule.Routing.PreferredRetainerIds.Count > 0)) ?? 0;
         var placementLabel = showPlacement
             ? "Back to plan###RQTransferPlacement"
             : placed > 0
@@ -581,7 +656,7 @@ internal sealed class TransferPlanWorkspace
         ImGui.SameLine();
         DrawPlanMenu(runtime, selected, projection, menuLabel);
 
-        var canPlace = selected is not null && projection is not null;
+        var canPlace = selected is not null && projection is not null && (lines > 0 || projection.Rules.Count == 0);
         UiLayout.SameLineIfFits(placementLabel);
         ImGui.BeginDisabled(!canPlace);
         var wasOpen = showPlacement;
@@ -600,11 +675,14 @@ internal sealed class TransferPlanWorkspace
             reviewRegistry.RegisterLastButton("quartermaster.transfer.placement.return", "Return to the plan lines", true,
                 () => showPlacement = false, "Ready");
 
-        var availability = TransferExecutionPolicy.ForExplicitRun(
-            projection is not null && (projection.HasMovement || projection.HasUnknownListingDemand),
-            owner.HasStableIdentity,
-            transfers.CanStart,
-            retainerRefresh.IsRefreshing || retainerRefresh.IsQueued);
+        var courierBlock = projection?.Courier is { } plannedCourier ? courier.StartBlock(runtime, plannedCourier) : null;
+        var availability = projection?.Courier is not null
+            ? new TransferExecutionAvailability(courierBlock is null, courierBlock)
+            : TransferExecutionPolicy.ForExplicitRun(
+                projection is not null && (projection.HasMovement || projection.HasUnknownListingDemand),
+                owner.HasStableIdentity,
+                transfers.CanStart,
+                retainerRefresh.IsRefreshing || retainerRefresh.IsQueued);
         var canExecute = selected is not null && availability.CanExecute;
         UiLayout.SameLineIfFits(executeLabel);
         ImGui.BeginDisabled(!canExecute);
@@ -626,7 +704,8 @@ internal sealed class TransferPlanWorkspace
                     requestTransferReview(currentPlan.Id, currentPlan.Name);
             },
             canExecute
-                ? projection!.HasUnknownListingDemand ? "Listing demand will be verified first" : $"{movements:N0} movements"
+                ? projection!.Courier is { } plannedRun ? $"{plannedRun.Trips.Length:N0} courier trips"
+                : projection.HasUnknownListingDemand ? "Listing demand will be verified first" : $"{movements:N0} movements"
                 : availability.BlockReason);
 
         var canReviewVendor = vendor is not null &&
@@ -919,6 +998,15 @@ internal sealed class TransferPlanWorkspace
             Clause($"Retrieve {totals.Retrieve:N0}", TransferPresentation.ActionColor(StowageAction.Retrieve));
         if (totals.Stow > 0)
             Clause($"Stow {totals.Stow:N0}", TransferPresentation.ActionColor(StowageAction.Deposit));
+        if (totals.Send > 0)
+            Clause($"Send {totals.Send:N0}", TransferPresentation.SendColor);
+        if (projection.Courier is { } courierPlan)
+        {
+            if (courierPlan.Trips.Length > 1)
+                Clause($"{courierPlan.Trips.Length:N0} trips", TransferPresentation.SendColor);
+            if (courierPlan.Refusals.FirstOrDefault(refusal => CourierSession.IsPlanWide(refusal.Code)) is { } wide)
+                Clause(CourierSession.RefusalLabel(wide.Code), AmberColor);
+        }
         if (totals.Vendor > 0)
             Clause($"Vendor {totals.Vendor:N0}", VendorColor);
         if (totals.Short > 0)
@@ -1095,8 +1183,9 @@ internal sealed class TransferPlanWorkspace
         ImGui.TextUnformatted(rule.ItemName);
         if (rule.Quality != ItemQualityPolicy.Any)
             Tag(QualityLabel(rule.Quality));
-        var routeSummary = TransferPresentation.RouteSummary(rule.Routing, row.Runtime.Retainers, row.Owner);
-        if (routeSummary.Length > 0)
+        if (rule.Courier is { } courierRoute)
+            Tag(CourierSession.RouteLabel(row.Runtime, courierRoute));
+        else if (TransferPresentation.RouteSummary(rule.Routing, row.Runtime.Retainers, row.Owner) is { Length: > 0 } routeSummary)
             Tag($"→ {routeSummary}");
         if (!string.IsNullOrWhiteSpace(rule.Notes))
         {
@@ -1121,6 +1210,7 @@ internal sealed class TransferPlanWorkspace
     }
 
     private static string TransferTargetText(TransferWorkbenchRow row) =>
+        row.Rule.Courier is not null ? row.Rule.TargetQuantity.ToString("N0") :
         TransferWorkbenchPresentation.Target(
             row.Line?.DesiredPlayerQuantity ?? row.Rule.TargetQuantity,
             row.PlayerQuantity,
@@ -1128,6 +1218,11 @@ internal sealed class TransferPlanWorkspace
 
     private void DrawTransferTarget(TransferWorkbenchRow row)
     {
+        if (row.Rule.Courier is not null)
+        {
+            DrawCourierQuantity(row);
+            return;
+        }
         var listingShortfall = row.ListingContribution.IsKnown ? row.ListingContribution.Value : 0;
         var target = row.ListingContribution.IsKnown
             ? row.Rule.TargetQuantity + listingShortfall
@@ -1158,6 +1253,25 @@ internal sealed class TransferPlanWorkspace
                 : $"Independent target {row.Rule.TargetQuantity:N0}; Listing Plan demand is not yet known.");
         if (row.ListingLink is not null)
             DrawTransferSource(row);
+    }
+
+    /// <summary>A courier line's quantity is the number of units to send; it never drops below one.</summary>
+    private void DrawCourierQuantity(TransferWorkbenchRow row)
+    {
+        var units = row.Rule.TargetQuantity;
+        ImGui.SetNextItemWidth(Math.Min(66, Math.Max(32, ImGui.GetContentRegionAvail().X * .55f)));
+        if (focusTargetRuleId == row.Rule.Id)
+        {
+            ImGui.SetScrollHereY(.5f);
+            ImGui.SetKeyboardFocusHere();
+            focusTargetRuleId = null;
+        }
+        if (DalamudGroupedIntegerInput.InputGroupedInt("##target", ref units, 0, 0))
+        {
+            var clamped = Math.Max(1, units);
+            if (clamped != row.Rule.TargetQuantity)
+                MutateRules(row.Owner, row.PlanId, [row.Rule.Id], draftRule => draftRule.TargetQuantity = clamped);
+        }
     }
 
     private void DrawTransferSource(TransferWorkbenchRow row)
@@ -1198,6 +1312,7 @@ internal sealed class TransferPlanWorkspace
             TransferLineKind.Paused => "Paused",
             TransferLineKind.VerifyListing => "Verify listing shortfall",
             TransferLineKind.Balanced => "Balanced",
+            TransferLineKind.Courier => CourierOutcome(row),
             TransferLineKind.Stow => string.Join(" · ", new[]
             {
                 projection.Stow > 0 ? $"Stow {projection.Stow:N0}" : null,
@@ -1252,6 +1367,12 @@ internal sealed class TransferPlanWorkspace
                 return;
             case TransferLineKind.Balanced:
                 ImGui.TextColored(TransferPresentation.ActionColor(null), "Balanced");
+                return;
+            case TransferLineKind.Courier:
+                if (row.CourierRefusal is { } refusal && !CourierSession.IsPlanWide(refusal.Code))
+                    ImGui.TextColored(ErrorColor, CourierSession.RefusalLabel(refusal.Code));
+                else if (row.Projection.Send > 0)
+                    ImGui.TextColored(TransferPresentation.SendColor, $"Send {row.Projection.Send:N0}");
                 return;
             case TransferLineKind.Stow:
                 if (projection.Stow > 0)
@@ -1337,7 +1458,6 @@ internal sealed class TransferPlanWorkspace
             return;
         Guid[] ids = [rule.Id];
         ImGui.Dummy(new Vector2(280, 0));
-
         ImGui.TextDisabled("Quality");
         var firstQuality = true;
         foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
@@ -1350,6 +1470,40 @@ internal sealed class TransferPlanWorkspace
         }
 
         ImGui.Separator();
+        if (rule.Courier is { } lineRoute)
+            DrawCourierRoute(row, lineRoute);
+        else
+            DrawStorageSourcing(row);
+
+        ImGui.Separator();
+        ImGui.TextDisabled("Note");
+        if (noteRuleId != rule.Id)
+        {
+            noteRuleId = rule.Id;
+            noteBuffer = rule.Notes;
+        }
+        ImGui.SetNextItemWidth(-1);
+        ImGui.InputText("##note", ref noteBuffer, 160);
+        if (ImGui.IsItemDeactivatedAfterEdit() && !string.Equals(noteBuffer.Trim(), rule.Notes, StringComparison.Ordinal))
+        {
+            var note = noteBuffer.Trim();
+            MutateRules(row.Owner, row.PlanId, ids, draftRule => draftRule.Notes = note);
+        }
+
+        ImGui.Separator();
+        var enabled = rule.Enabled;
+        if (ImGui.Selectable(enabled ? "Pause line" : "Resume line"))
+            MutateRules(row.Owner, row.PlanId, ids, draftRule => draftRule.Enabled = !enabled);
+        if (ImGui.Selectable("Remove"))
+            RemoveRules(row.Owner, row.PlanId, ids);
+        ImGui.EndPopup();
+    }
+
+    /// <summary>Vendor sourcing and retainer placement: the same-character line's sections.</summary>
+    private void DrawStorageSourcing(TransferWorkbenchRow row)
+    {
+        var rule = row.Rule;
+        Guid[] ids = [rule.Id];
         ImGui.TextDisabled("Vendor");
         var vendorSupported = rule.Quality == ItemQualityPolicy.Any;
         ImGui.BeginDisabled(!vendorSupported);
@@ -1387,30 +1541,82 @@ internal sealed class TransferPlanWorkspace
         var summary = TransferPresentation.RouteSummary(rule.Routing, row.Runtime.Retainers, row.Owner);
         if (ImGui.Selectable(summary.Length == 0 ? "Placement" : $"Placement · {summary}"))
             OpenPlacement(rule.Id);
-
-        ImGui.Separator();
-        ImGui.TextDisabled("Note");
-        if (noteRuleId != rule.Id)
-        {
-            noteRuleId = rule.Id;
-            noteBuffer = rule.Notes;
-        }
-        ImGui.SetNextItemWidth(-1);
-        ImGui.InputText("##note", ref noteBuffer, 160);
-        if (ImGui.IsItemDeactivatedAfterEdit() && !string.Equals(noteBuffer.Trim(), rule.Notes, StringComparison.Ordinal))
-        {
-            var note = noteBuffer.Trim();
-            MutateRules(row.Owner, row.PlanId, ids, draftRule => draftRule.Notes = note);
-        }
-
-        ImGui.Separator();
-        var enabled = rule.Enabled;
-        if (ImGui.Selectable(enabled ? "Pause line" : "Resume line"))
-            MutateRules(row.Owner, row.PlanId, ids, draftRule => draftRule.Enabled = !enabled);
-        if (ImGui.Selectable("Remove"))
-            RemoveRules(row.Owner, row.PlanId, ids);
-        ImGui.EndPopup();
     }
+
+    /// <summary>A courier line's source and destination choosers.</summary>
+    private void DrawCourierRoute(TransferWorkbenchRow row, CourierRoute route)
+    {
+        Guid[] ids = [row.Rule.Id];
+        var runtime = row.Runtime;
+        var source = route.SourceCharacter ?? row.Owner;
+        if (ImGui.BeginMenu($"From · {CourierSession.Side(runtime, route.SourceCharacter, route.SourceRetainerId)}###from"))
+        {
+            void From(ulong? container)
+            {
+                if (container != route.SourceRetainerId)
+                    MutateRules(row.Owner, row.PlanId, ids, draftRule => draftRule.Courier = route with { SourceRetainerId = container });
+            }
+            if (ImGui.MenuItem("Bags##from", string.Empty, route.SourceRetainerId is null))
+                From(null);
+            foreach (var retainer in CourierSession.Retainers(runtime, source))
+                if (ImGui.MenuItem($"{retainer.RetainerName}##from:{retainer.RetainerId}", string.Empty, route.SourceRetainerId == retainer.RetainerId))
+                    From(retainer.RetainerId);
+            ImGui.EndMenu();
+        }
+        if (ImGui.BeginMenu($"To · {CourierSession.Side(runtime, route.Character, route.RetainerId)}###to"))
+        {
+            DrawCourierDestinations(runtime, (character, container) =>
+            {
+                if (!character.Matches(route.Character) || container != route.RetainerId)
+                    MutateRules(row.Owner, row.PlanId, ids, draftRule => draftRule.Courier = route with { Character = character with { }, RetainerId = container });
+            }, route.Character, route.RetainerId);
+            ImGui.EndMenu();
+        }
+    }
+
+    /// <summary>
+    /// The courier destination chooser: one menu per other known character, holding its bags and
+    /// retainers. Shared by the stock browser and the line menu.
+    /// </summary>
+    internal void DrawCourierDestinations(
+        QuartermasterRuntimeSnapshot runtime,
+        Action<OwnerScope, ulong?> choose,
+        OwnerScope? current = null,
+        ulong? currentRetainer = null,
+        string? controlPrefix = null)
+    {
+        foreach (var character in courier.Destinations(runtime))
+        {
+            var key = character.LocalContentId!.Value;
+            var here = current?.Matches(character) == true;
+            var target = character;
+            var open = ImGui.BeginMenu($"{CourierSession.CharacterLabel(character)}##courier:{key}");
+            if (controlPrefix is not null)
+                reviewRegistry.RegisterLastButton($"{controlPrefix}.{key}.bags", $"Send to {character.CharacterName} · Bags", true,
+                    () => choose(target, null), "Available");
+            if (!open)
+                continue;
+            if (ImGui.MenuItem($"Bags##courier:{key}:bags", string.Empty, here && currentRetainer is null))
+                choose(character, null);
+            foreach (var retainer in CourierSession.Retainers(runtime, character))
+            {
+                if (ImGui.MenuItem($"{retainer.RetainerName}##courier:{key}:{retainer.RetainerId}", string.Empty, here && currentRetainer == retainer.RetainerId))
+                    choose(character, retainer.RetainerId);
+                var retainerId = retainer.RetainerId;
+                if (controlPrefix is not null)
+                    reviewRegistry.RegisterLastButton($"{controlPrefix}.{key}.{retainerId}", $"Send to {character.CharacterName} · {retainer.RetainerName}", true,
+                        () => choose(target, retainerId), "Available");
+            }
+            ImGui.EndMenu();
+        }
+    }
+
+    internal bool HasCourierDestinations(QuartermasterRuntimeSnapshot runtime) => courier.Destinations(runtime).Any();
+
+    private static string CourierOutcome(TransferWorkbenchRow row) =>
+        row.CourierRefusal is { } refusal && !CourierSession.IsPlanWide(refusal.Code)
+            ? CourierSession.RefusalLabel(refusal.Code)
+            : row.Projection.Send > 0 ? $"Send {row.Projection.Send:N0}" : string.Empty;
 
     private void DrawHoverRemove(TransferWorkbenchRow row)
     {
@@ -1848,10 +2054,19 @@ internal sealed class TransferPlanWorkspace
         QuartermasterRuntimeSnapshot runtime,
         StowagePlan plan)
     {
+        var peers = courier.Link.Peers;
         if (transferWorkbenchProjection is { } cached &&
             cached.RuntimeRevision == runtime.Revision &&
-            cached.PlanId == plan.Id)
+            cached.PlanId == plan.Id &&
+            ReferenceEquals(projectedPeers, peers))
             return cached;
+        projectedPeers = peers;
+        var courierPlan = courier.Plan(runtime, plan);
+        var courierUnits = courierPlan?.Trips.SelectMany(trip => trip.Manifest)
+            .GroupBy(shipment => shipment.Line)
+            .ToDictionary(group => group.Key, group => group.Sum(shipment => shipment.Units)) ?? [];
+        var courierRefusals = courierPlan?.Refusals.GroupBy(refusal => refusal.Line)
+            .ToDictionary(group => group.Key, group => group.First()) ?? [];
 
         var rules = runtime.State.PlanItems
             .Where(rule => rule.StowagePlanId == plan.Id)
@@ -1905,7 +2120,11 @@ internal sealed class TransferPlanWorkspace
                 listingContributions.TryGetValue((rule.ItemId, rule.Quality), out var listingContribution);
                 var listingQuantity = listingContribution?.Quantity ?? Evidence.Known(0);
                 var difference = (line?.DesiredPlayerQuantity ?? rule.TargetQuantity) - playerQuantity;
-                var lineProjection = TransferWorkbenchPresentation.Project(
+                var lineProjection = rule.Courier is not null
+                    ? rule.Enabled
+                        ? new TransferLineProjection(TransferLineKind.Courier, Send: courierUnits.GetValueOrDefault(rule.Id))
+                        : new TransferLineProjection(TransferLineKind.Paused)
+                    : TransferWorkbenchPresentation.Project(
                     rule.Enabled,
                     listingQuantity.IsKnown,
                     line?.Action ?? StowageAction.None,
@@ -1931,11 +2150,12 @@ internal sealed class TransferPlanWorkspace
                     plan.Id,
                     runtime,
                     lineProjection,
-                    vendorPreviewLine);
+                    vendorPreviewLine,
+                    courierRefusals.GetValueOrDefault(rule.Id));
             })
             .ToArray();
         // Count lines that will actually move something, from the same projection the rows show.
-        var movements = rows.Count(row => row.Projection.Retrieve > 0 || row.Projection.Stow > 0) +
+        var movements = rows.Count(row => row.Projection.Retrieve > 0 || row.Projection.Stow > 0 || row.Projection.Send > 0) +
                         rows.Sum(row => row.Line?.Moves.Count ?? 0);
         transferWorkbenchProjection = new(
             runtime.Revision,
@@ -1946,9 +2166,10 @@ internal sealed class TransferPlanWorkspace
             vendor,
             deposit,
             movements,
-            TransferExecutionPolicy.HasMovement(retrieval.NeededQuantity, deposit),
+            TransferExecutionPolicy.HasMovement(retrieval.NeededQuantity, deposit) || courierPlan?.Trips.IsEmpty == false,
             listingContributions.Values.Any(contribution => !contribution.Quantity.IsKnown),
-            rows);
+            rows,
+            courierPlan);
         transferProjectionBuildCount++;
         return transferWorkbenchProjection;
     }

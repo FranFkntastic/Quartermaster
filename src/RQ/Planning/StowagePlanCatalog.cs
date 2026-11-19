@@ -41,7 +41,7 @@ public static class StowagePlanCatalog
 
     public static void SetStockRule(StowagePlanDraft draft, uint itemId, string name, int retrieveTarget, bool stow, ulong? retainerId = null)
     {
-        var rule = draft.Rules.FirstOrDefault(r => r.ItemId == itemId && r.Quality == ItemQualityPolicy.Any);
+        var rule = draft.Rules.FirstOrDefault(r => r.Courier is null && r.ItemId == itemId && r.Quality == ItemQualityPolicy.Any);
         if (rule is null)
         {
             rule = new TargetPlanItem { StowagePlanId = draft.PlanId, ItemId = itemId, ItemName = name, TargetQuantity = Math.Max(0, retrieveTarget) };
@@ -71,7 +71,7 @@ public static class StowagePlanCatalog
         ItemQualityPolicy quality,
         int playerQuantity)
     {
-        var rule = draft.Rules.FirstOrDefault(r => r.ItemId == itemId && r.Quality == quality);
+        var rule = draft.Rules.FirstOrDefault(r => r.Courier is null && r.ItemId == itemId && r.Quality == quality);
         if (rule is not null)
             return rule;
         rule = new TargetPlanItem

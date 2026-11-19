@@ -12,6 +12,7 @@ internal enum TransferLineKind
     Stow,
     Balanced,
     Move,
+    Courier,
 }
 
 internal readonly record struct TransferLineProjection(
@@ -23,7 +24,8 @@ internal readonly record struct TransferLineProjection(
     int Missing = 0,
     int Vendor = 0,
     bool StockUnverified = false,
-    int KeptInBags = 0)
+    int KeptInBags = 0,
+    int Send = 0)
 {
     public int Retrieve => FromSaddlebag + FromRetainers;
     public int Short => Math.Max(0, Missing - Vendor);
@@ -36,7 +38,8 @@ internal readonly record struct TransferPlanTotals(
     int Vendor,
     int Short,
     int NoRoom,
-    bool StockUnverified);
+    bool StockUnverified,
+    int Send = 0);
 
 internal static class TransferWorkbenchPresentation
 {
@@ -132,7 +135,7 @@ internal static class TransferWorkbenchPresentation
     public static TransferPlanTotals Totals(IEnumerable<TransferLineProjection> lines)
     {
         var count = 0;
-        int retrieve = 0, stow = 0, vendor = 0, shortQuantity = 0, noRoom = 0;
+        int retrieve = 0, stow = 0, vendor = 0, shortQuantity = 0, noRoom = 0, send = 0;
         var unverified = false;
         foreach (var line in lines)
         {
@@ -142,9 +145,10 @@ internal static class TransferWorkbenchPresentation
             vendor += line.Vendor;
             shortQuantity += line.Short;
             noRoom += line.NoRoom;
+            send += line.Send;
             unverified |= line.StockUnverified;
         }
-        return new(count, retrieve, stow, vendor, shortQuantity, noRoom, unverified);
+        return new(count, retrieve, stow, vendor, shortQuantity, noRoom, unverified, send);
     }
 
     private static string Signed(int quantity) => quantity > 0

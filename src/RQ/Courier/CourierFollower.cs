@@ -8,6 +8,8 @@ using RQ.Persistence;
 namespace RQ.Courier;
 
 public sealed record CarrierStep(string Fingerprint, CourierMessage Command, Result<CourierReceipt>? Result);
+// Read-only projection for the carrier pane: the run held, the units in custody and the command in flight.
+public sealed record CarrierView(Guid? Run, ImmutableArray<Shipment> Custody, bool Paused, bool Unconfirmed, CourierCommand? Active);
 public sealed class CarrierLedger
 {
     public Guid? Run { get; set; }
@@ -30,7 +32,14 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     private readonly SemaphoreSlim gate = new(1);
     private IDisposable? lease, suppress;
     private volatile bool stopped;
+    private volatile CourierMessage? active;
     public event Action<Guid>? StopRequested;
+
+    public CarrierView View()
+    {
+        var ledger = store.Load();
+        return new(ledger.Run, ledger.Units, ledger.Paused, ledger.Unconfirmed != null, active?.Command);
+    }
 
     // peerOwner comes from the authenticated session, never from the message body.
     public async Task<Result<CourierReceipt>> HandleAsync(OwnerScope peerOwner, CourierMessage m, Deadline deadline)
@@ -51,6 +60,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         if (remaining <= TimeSpan.Zero) return Refuse("CommandExpired");
         if (m.Command == CourierCommand.Stop && store.Load().Run == m.Run) await StopLocalAsync(false);
         if (!await gate.WaitAsync(remaining)) return Refuse("CommandQueueDeadline");
+        active = m;
         try
         {
             cfg = settings();
@@ -178,7 +188,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             warning($"{m.Run}/{m.Step} {m.Command}: {e.Message}");
             return new(CourierOutcome.Indeterminate, (e as CourierFault)?.Code ?? "CarrierUnsettled", e.Message);
         }
-        finally { try { if (refused) Release(); } finally { gate.Release(); } }
+        finally { active = null; try { if (refused) Release(); } finally { gate.Release(); } }
     }
     private Task<InventoryView> Observe() => calls.Call("CarrierBags", 15, inventory.ObserveAsync);
     public async Task StopLocalAsync(bool notifyOwner = true)

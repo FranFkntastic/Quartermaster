@@ -42,6 +42,8 @@ public sealed class Plugin : IDalamudPlugin
     private readonly string providerInstanceId = Guid.NewGuid().ToString("N");
     private readonly FrameworkWorkQueue workQueue;
     private readonly InventoryScanner scanner;
+    // Courier wiring (Q2) sets Link, Conductor and Follower on this session.
+    private readonly CourierSession courier;
     private readonly PlayerInventoryCacheRepository playerInventory;
     private readonly PlayerInventoryReconciler playerInventoryReconciler;
     private readonly RetainerCacheRepository cache;
@@ -324,7 +326,12 @@ public sealed class Plugin : IDalamudPlugin
             new ItemMetadataCatalog(dataManager, log).ResolveWorkshopProject,
             configDirectory,
             new MarketMafiosoSavedJobClient(pluginInterface),
-            log);
+            log,
+            courier = new CourierSession(
+                state,
+                owner => playerInventory.Snapshot(owner, CourierSession.PlayerBags),
+                playerInventory.Owners,
+                scanner.ResolveItemMetadata));
         var marketHistory = new MarketRunHistoryWindow(marketRunStore.History, CurrentOwner, window.DrawTimings)
         {
             Size = new System.Numerics.Vector2(780, 650),
@@ -638,7 +645,7 @@ public sealed class Plugin : IDalamudPlugin
         var listingPersistence = cache.LastListingPersistence;
         var vendorRun = vendorProcurement.ActiveRun;
         return new QuartermasterBridgeTruth(
-            14,
+            15,
             configuration.PluginInstanceId,
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
@@ -694,7 +701,8 @@ public sealed class Plugin : IDalamudPlugin
             vendorRun?.Phase.ToString(),
             vendorRun?.Message,
             vendorRun?.Receipts.Sum(receipt => receipt.Quantity) ?? 0,
-            vendorRun?.Receipts.Aggregate(0UL, (sum, receipt) => checked(sum + receipt.SpentGil)) ?? 0);
+            vendorRun?.Receipts.Aggregate(0UL, (sum, receipt) => checked(sum + receipt.SpentGil)) ?? 0,
+            courier.Truth(runtime));
     }
 
     private void ApplyInventoryObservation(SharedObservationDelivery delivery)

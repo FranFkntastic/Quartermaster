@@ -321,7 +321,7 @@ internal sealed class TransferPlanManager
         ImGui.TableNextColumn();
         ImGui.TextUnformatted(rule.TargetQuantity.ToString("N0"));
         ImGui.TableNextColumn();
-        var destination = StowTo(runtime, rule.Routing);
+        var destination = rule.Courier is { } route ? CourierSession.RouteLabel(runtime, route) : StowTo(runtime, rule.Routing);
         var shown = Fit(destination, ImGui.GetContentRegionAvail().X);
         ImGui.TextUnformatted(shown);
         if (shown.Length != destination.Length && ImGui.IsItemHovered())

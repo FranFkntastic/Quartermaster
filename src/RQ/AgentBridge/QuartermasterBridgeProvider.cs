@@ -60,7 +60,32 @@ public sealed record QuartermasterBridgeTruth(
     string? VendorProcurementPhase,
     string? VendorProcurementMessage,
     int VendorPurchasedQuantity,
-    ulong VendorSpentGil);
+    ulong VendorSpentGil,
+    CourierBridgeTruth? Courier = null);
+
+/// <summary>Courier run and carrier state as the UI shows it; names only, no internal ids.</summary>
+public sealed record CourierBridgeTruth(
+    bool Available,
+    string? Carrier,
+    bool CarrierOptIn,
+    string? PairedOwner,
+    IReadOnlyList<string> CharactersWithMeetingBell,
+    bool Starting,
+    string? RunState,
+    string? OwnerPhase,
+    string? CarrierPhase,
+    int Trip,
+    int Trips,
+    string? Code,
+    string? Detail,
+    IReadOnlyList<CourierLineBridgeTruth> Lines,
+    string? CarrierCommand,
+    int CarrierHoldingUnits,
+    bool CarrierPaused,
+    bool CarrierUnconfirmed,
+    string? Error);
+
+public sealed record CourierLineBridgeTruth(string Item, int Moved, int Remaining);
 
 public sealed class QuartermasterBridgeProvider
 {

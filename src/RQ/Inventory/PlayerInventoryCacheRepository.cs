@@ -42,6 +42,13 @@ public sealed class PlayerInventoryCacheRepository : IDisposable
     public event Action<CacheWriteFailure>? PersistenceFailed;
     public long Revision { get; private set; }
 
+    /// <summary>Every character whose player inventory this client has cached.</summary>
+    public IReadOnlyList<OwnerScope> Owners()
+    {
+        lock (gate)
+            return cache.Values.Select(entry => entry.Owner).ToArray();
+    }
+
     public PlayerStorageCapture Snapshot(OwnerScope owner, IReadOnlyList<string> requestedSources)
     {
         lock (gate)
