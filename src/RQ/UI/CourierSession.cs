@@ -73,6 +73,7 @@ public sealed class CourierSession
     private (long Revision, IReadOnlyList<OwnerScope> Characters)? characters;
     private (long Revision, Guid PlanId, object Peers, CourierPlan? Plan)? plan;
     private CourierSnapshot? run;
+    private Guid? settledRun;
     private CarrierView? carried;
     private long polledAt;
     private Task? starting;
@@ -388,10 +389,44 @@ public sealed class CourierSession
         if (!force && now - polledAt < PollTicks)
             return;
         polledAt = now;
-        try { run = Conductor?.Snapshot(); }
+        try
+        {
+            run = Conductor?.Snapshot();
+            if (run is { State: "Completed" } completed && settledRun != completed.Run)
+            {
+                ApplyCompleted(completed);
+                settledRun = completed.Run;
+            }
+        }
         catch (Exception exception) { Fail("Courier run state unreadable", exception.ToString()); }
         try { carried = Follower?.View(); }
         catch (Exception exception) { Fail("Carrier state unreadable", exception.ToString()); }
+    }
+
+    private void ApplyCompleted(CourierSnapshot completed)
+    {
+        if (!state.ReadConfiguration(document => document.StowagePlans.Any(p =>
+                p.Id == completed.PlanId && p.IsEphemeral && p.LastAppliedCourierRun != completed.Run)))
+            return;
+        state.Mutate(document =>
+        {
+            var scratch = document.StowagePlans.SingleOrDefault(p => p.Id == completed.PlanId && p.IsEphemeral);
+            if (scratch is null || scratch.LastAppliedCourierRun == completed.Run)
+                return;
+            var draft = StowagePlanCatalog.Draft(document, scratch.Owner, scratch.Id);
+            foreach (var line in completed.Lines)
+            {
+                var rule = draft.Rules.Find(r => r.Id == line.Line && r.Courier is not null);
+                if (rule is null || line.Moved <= 0)
+                    continue;
+                if (line.Remaining == 0)
+                    draft.Rules.Remove(rule);
+                else if (line.Remaining > 0)
+                    rule.TargetQuantity = line.Remaining;
+            }
+            StowagePlanCatalog.Apply(document, scratch.Owner, draft);
+            scratch.LastAppliedCourierRun = completed.Run;
+        });
     }
 
     /// <summary>
@@ -427,6 +462,10 @@ public sealed class CourierSession
 
     internal void Start(QuartermasterRuntimeSnapshot runtime, StowagePlan stowagePlan)
     {
+        Poll(force: true);
+        if (run is { State: "Completed" } completed && settledRun != completed.Run ||
+            !state.ReadConfiguration(document => document.StowagePlans.Any(p => p.Id == stowagePlan.Id && p.Revision == stowagePlan.Revision)))
+            return;
         plan = null;
         var courierPlan = Plan(runtime, stowagePlan);
         if (Conductor is not { } conductor || !StartGate(runtime, courierPlan).CanStart)
@@ -442,7 +481,7 @@ public sealed class CourierSession
     /// </summary>
     internal void Clear(Guid expectedRun, ImmutableArray<CustodyRow> shown)
     {
-        if (Conductor is not { } conductor || IsActive) return;
+        if (Conductor is not { } conductor || IsActive || run is { State: "Completed" } completed && settledRun != completed.Run) return;
         var acknowledgement = ClearAcknowledgement;
         Launch(async () =>
         {

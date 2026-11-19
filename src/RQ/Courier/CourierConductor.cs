@@ -40,7 +40,7 @@ public sealed class CourierJournal
 public sealed record LineProgress(Guid Line, string Name, int Moved, int Remaining);
 public sealed record CourierSnapshot(Guid Run, string State, string OwnerPhase, string CarrierPhase, int Trip, int Trips,
     string Code, string Detail, ImmutableArray<LineProgress> Lines, ImmutableArray<Refusal> Refusals,bool CanResume,bool CanClear,ImmutableArray<CustodyRow> Custody,
-    CourierUnverified? Unverified=null);
+    CourierUnverified? Unverified=null, Guid PlanId=default);
 public sealed record CustodyRow(string Item,string Quality,int Quantity,string Holder);
 /// <summary>The journaled step whose outcome is not yet proven; Rows hold its batch at the last verified holder (From).</summary>
 public sealed record CourierUnverified(string Step,string From,string To,ImmutableArray<CustodyRow> Rows);
@@ -73,7 +73,7 @@ public sealed class CourierConductor
         if(!drained)warning("OwnerUnloadDrainDeadline: 2s elapsed.");
         try { Volatile.Read(ref releaseOwner)?.Invoke(); } finally { if(drained)gate.Release(); }
     }
-    private string peerPhase = "Idle";
+    private volatile string peerPhase = "Idle";
 
     public CourierConductor(string directory, ICourierPeerPort peer, ICourierTradePort trade, IInventoryObservationPort inventory,
         IWorldVisitPort worlds, ICharacterSwitchPort login, IMeetingBellPort bells, ICourierPlacementPort placement,
@@ -123,13 +123,13 @@ public sealed class CourierConductor
             _=>true
         };
         var step = r.Schedule.Skip(r.Cursor).FirstOrDefault();
-        return new(r.Run, r.State, step?.Phase.ToString() ?? r.State, peerPhase, r.Plan.Trips.IsEmpty ? 0 :
+        return new(r.Run, r.State, step?.Phase.ToString() ?? r.State, r.State=="Running"?peerPhase:"Idle", r.Plan.Trips.IsEmpty ? 0 :
             step is null || step.Phase >= CourierPhase.ReturnOwner ? r.Plan.Trips.Length : step.Trip + 1, r.Plan.Trips.Length, r.Code, r.Detail,
             [..r.Plan.Trips.SelectMany(t=>t.Manifest).GroupBy(s=>s.Line).Select(g=>new LineProgress(g.Key,g.First().Name,
                 r.Delivered.GetValueOrDefault(g.Key),g.Sum(s=>s.Units)-r.Delivered.GetValueOrDefault(g.Key)))], r.Plan.Refusals,
             connected && attempt && r.State is "Failed" or "Interrupted" or "Indeterminate",
             (connected || r.Custody.IsEmpty) && r.Pending==null && r.State is "Completed" or "Failed" or "Interrupted" or "Indeterminate" or "Refused",Rows(r.Custody,r.Settings.Carrier),
-            Unverified(r));
+            Unverified(r),r.Plan.PlanId);
     }
     private static CourierUnverified? Unverified(CourierJournal r)
     {
@@ -251,6 +251,7 @@ public sealed class CourierConductor
             if (!automation.TryAcquire("courier owner", out lease) || lease == null) throw new CourierFault(CourierOutcome.Failed, "AutomationBusy", automation.AcquisitionBlockReason ?? "Busy");
             if(needsSuppression())suppress = suppression.Acquire();
             if (suppression.IsBusy) throw new CourierFault(CourierOutcome.Failed, "AutoRetainerBusy", "AutoRetainer still active");
+            peerPhase = "Idle";
             peer.LinkLost += Lost; peer.Progress += Progress; peer.StopRequested += RemoteStop;
             if (trade is ICourierHoldPort holds)
                 tradeHold = await calls.Call("OwnerTradeHold",10,d=>holds.BeginHold(r.Run,d));
