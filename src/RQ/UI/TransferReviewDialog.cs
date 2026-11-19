@@ -237,7 +237,9 @@ internal sealed class TransferReviewDialog
             true,
             Clear,
             "No inventory movement");
-        var block = courier.StartBlock(runtime, courierPlan);
+        var block = projection.Rows.Any(row=>row.Rule.Enabled && row.Rule.Courier==null)
+            ? "Mixed execution unavailable: ordinary transfers have no completion receipt for the courier."
+            : courier.StartBlock(runtime, courierPlan);
         if (block is not null)
         {
             ImGui.SameLine();

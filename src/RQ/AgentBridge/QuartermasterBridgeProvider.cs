@@ -126,6 +126,7 @@ public sealed class QuartermasterBridgeProvider
     }
 
     public QuartermasterBridgeTruth CreateTruth() => createTruth();
+    internal Action<int?>? SetCourierSlotCap {get;init;}
     public IReadOnlyList<AgentBridgeReviewSurfaceDescriptor> GetReviewSurfaces() => ReviewSurfaces;
     public IReadOnlyList<AgentBridgeCaptureSurfaceDescriptor> GetCaptureSurfaces() => CaptureSurfaces;
     public AgentBridgeUiReviewFrame GetControlSurface() => reviewRegistry.Snapshot();

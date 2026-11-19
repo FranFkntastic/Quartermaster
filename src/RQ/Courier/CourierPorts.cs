@@ -13,13 +13,13 @@ public sealed record Deadline(string Name, DateTimeOffset Expires)
 {
     public static Deadline After(string name, int seconds) => new(name, DateTimeOffset.UtcNow.AddSeconds(seconds));
 }
-public enum CourierCommand { Status, Travel, Receive, Send, Confirm, ReturnHome, Stop, Begin, Finish }
+public enum CourierCommand { Status, Travel, Receive, Send, Confirm, ReturnHome, Stop, Begin, Finish, Settle, Clear }
 public sealed record TradeEvidence(InventoryView Before, InventoryView After);
 public sealed record CourierMessage(int Version, Guid Run, Guid Step, CourierCommand Command, OwnerScope Owner,
     OwnerScope Partner, OwnerScope Carrier, ImmutableArray<Shipment> Manifest, MeetingBell? Bell = null,
-    Guid? ConfirmStep = null, TradeEvidence? OwnerEvidence = null);
+    Guid? ConfirmStep = null, TradeEvidence? OwnerEvidence = null, string? RunKey = null);
 public sealed record CourierReceipt(Guid Run, Guid Step, InventoryView? Bags = null, TradeEvidence? Evidence = null,
-    ImmutableArray<Shipment> Custody = default, Guid? Unconfirmed = null, Guid? LastConfirmed = null);
+    ImmutableArray<Shipment> Custody = default, Guid? Unconfirmed = null, Guid? LastConfirmed = null, Guid? ActiveRun = null);
 public sealed record CourierProgress(Guid Run, Guid Step, string Phase);
 public interface ICourierPeerPort
 {
@@ -35,9 +35,14 @@ public interface ICourierTradePort
     Task<Result<bool>> ReceiveAsync(OwnerScope partner, ImmutableArray<Shipment> manifest, Deadline deadline);
     Task<Result<bool>> CancelPreLockAsync(Deadline deadline);
 }
+// No dispatch: can only advance a durable, fully delivered checkpoint for this exact step.
+internal interface ICourierSettlement
+{
+    Task<Result<bool>> Settle(Guid step,Deadline deadline);
+}
 public interface ICharacterSwitchPort
 {
-    string? MaySwitchNow();
+    Task<Result<string>> SwitchRefusalAsync(Deadline deadline);
     Task<Result<OwnerScope>> SwitchAsync(OwnerScope character, Deadline deadline);
 }
 public interface IWorldVisitPort

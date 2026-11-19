@@ -63,6 +63,13 @@ public sealed class CourierSession
     private CarrierView? carried;
     private long polledAt;
     private Task? starting;
+    internal string? ClearAcknowledgement { get; private set; }
+    private int? testSlotCap;
+    internal void SetTestSlotCap(int? value)
+    {
+        if(value is <1 or >140 || IsActive) throw new InvalidOperationException("Expected an idle run and 1–140 carrier slots.");
+        testSlotCap=value;plan=null;
+    }
 
     public CourierSession(
         StateRepository state,
@@ -154,7 +161,7 @@ public sealed class CourierSession
             var carrier = peers.FirstOrDefault(peer => CourierPlanner.Exact(peer.Character, settings.Carrier))?.Bags;
             try
             {
-                built = CourierPlanner.Build(stowagePlan, rules, Locations(runtime), carrier, settings, metadata);
+                built = CourierPlanner.Build(stowagePlan, rules, Locations(runtime), carrier, settings, metadata,testSlotCap);
             }
             catch (Exception exception)
             {
@@ -254,6 +261,15 @@ public sealed class CourierSession
         if (Conductor is not { } conductor || StartBlock(runtime, courierPlan) is not null)
             return;
         Launch(() => conductor.StartAsync(courierPlan!, runtime.State.Courier));
+    }
+
+    internal void Clear(Guid expectedRun,string? acknowledgement)
+    {
+        if(Conductor is not {} conductor || IsActive) return;
+        Launch(async ()=>{
+            try{var snapshot=await conductor.ClearAsync(expectedRun,acknowledgement);ClearAcknowledgement=null;return snapshot;}
+            catch(CourierConductor.CustodyAcknowledgementRequired e){ClearAcknowledgement=e.Message;throw;}
+        });
     }
 
     /// <summary>Resumes an interrupted run from its journal; the journal owns the plan and settings.</summary>

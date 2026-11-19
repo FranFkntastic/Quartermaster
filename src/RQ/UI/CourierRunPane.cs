@@ -38,10 +38,12 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
         if (courier.IsUnresolved)
         {
             DrawUnresolved(run);
+            DrawClear(run);
             DrawLines(run);
             return true;
         }
         DrawLastOutcome(run);
+        DrawClear(run);
         return true;
     }
 
@@ -80,6 +82,15 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
                     ImGui.GetColorU32(UiLayout.PrimaryActive));
         }
         ImGui.Dummy(new Vector2(width, height));
+    }
+
+    private void DrawClear(CourierSnapshot run)
+    {
+        var held=courier.ClearAcknowledgement;
+        var label=held==null?"Clear":"Acknowledge and clear: "+held;
+        void Clear()=>courier.Clear(run.Run,held);
+        if(ImGui.SmallButton(label+"##RQCourierClear"))Clear();
+        reviewRegistry.RegisterLastButton("quartermaster.courier.run.clear",label,true,Clear,label);
     }
 
     private void DrawUnresolved(CourierSnapshot run)

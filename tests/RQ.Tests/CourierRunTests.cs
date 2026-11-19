@@ -106,6 +106,20 @@ public sealed class CourierRunTests : IDisposable
         Assert.Equal(7, owner.Deposited); Assert.Equal(10, mule.Units);
     }
     [Fact]
+    public async Task VerifiedSenderCheckpointAfterLostConfirmationCreditsOnlyOneCustodyBatch()
+    {
+        // Both bags changed, but the sender lost its completion reply. Restarting it would
+        // send a second stack, while crediting the carrier twice would encumber private stock.
+        owner.LoseSenderReply=true;
+        var interrupted=await engine.StartAsync(Plan(),cfg);
+        Assert.Equal("Indeterminate",interrupted.State);
+        Assert.Equal(13,mule.Units);
+        engine=Conductor();
+        var completed=await engine.StartAsync(Plan(),cfg);
+        Assert.True(completed.State=="Completed",completed.Code+":"+completed.Detail);
+        Assert.Equal(3,owner.Sends);Assert.Equal(7,owner.Deposited);Assert.Equal(10,mule.Units);
+    }
+    [Fact]
     public async Task FollowerRefusesUnpairedDisarmedAndNonCustodyStock()
     {
         var m = new CourierMessage(1, Guid.NewGuid(), Guid.NewGuid(), CourierCommand.Send, source, destination, carrier, Plan().Trips[0].Manifest);
@@ -117,6 +131,23 @@ public sealed class CourierRunTests : IDisposable
         Assert.Equal("CustodyInsufficient", (await Handle(source)).Code); Assert.Equal(0, mule.Sends); Assert.Equal(10, mule.Units);
     }
     public void Dispose() { follower.Dispose(); Directory.Delete(dir, true); }
+
+    [Fact]
+    public async Task LostReplyAndCarrierRestartCannotReceiveTwiceOrRebindToAnotherEndpoint()
+    {
+        var endpoint=Guid.NewGuid();
+        var m=new CourierMessage(1,Guid.NewGuid(),Guid.NewGuid(),CourierCommand.Receive,source,source,carrier,Plan().Trips[0].Manifest);
+        var begin=m with {Step=Guid.NewGuid(),Command=CourierCommand.Begin,Manifest=[]};
+        Assert.Equal(CourierOutcome.Succeeded,(await follower.HandleAsync(source,begin,Deadline.After("begin",10),endpoint)).Outcome);
+        var first=await follower.HandleAsync(source,m,Deadline.After("receive",10),endpoint);
+        Assert.Equal(CourierOutcome.Succeeded,first.Outcome);
+        var credited=mule.Units;
+        follower.Dispose();follower=Follower();
+        var replay=await follower.HandleAsync(destination,m,Deadline.After("reconnect",10),endpoint);
+        Assert.Equal(first.Value!.Step,replay.Value!.Step);
+        Assert.Equal(credited,mule.Units);
+        Assert.Equal("OwnerNotPaired",(await follower.HandleAsync(destination,m,Deadline.After("impostor",10),Guid.NewGuid())).Code);
+    }
     sealed class AR : IAutoRetainerIpc
     {
         public bool IsAvailable => true; public bool IsBusy => false; public bool IsSuppressed { get; private set; }
@@ -142,17 +173,26 @@ public sealed class CourierRunTests : IDisposable
             return result;
         }
     }
-    sealed class Client(OwnerScope initial) : ICourierPlacementPort, ICourierTradePort, ICharacterSwitchPort, IInventoryObservationPort, IWorldVisitPort, IMeetingBellPort
+    sealed class Client(OwnerScope initial) : ICourierPlacementPort, ICourierTradePort, ICourierSettlement, ICharacterSwitchPort, IInventoryObservationPort, IWorldVisitPort, IMeetingBellPort
     {
         OwnerScope who = initial;
         public Dictionary<OwnerScope, int> Quantities = new(); public int Units => Quantities.GetValueOrDefault(who);
         public int Deposited, Sends, ReceiveOffset;
         static Task<Result<T>> OK<T>(T value) => Task.FromResult(Result<T>.Ok(value));
         public bool PauseTrade, UncertainTrade;
+        public bool LoseSenderReply;
+        Guid? recoverable;
+        public Task<Result<bool>> Settle(Guid step,Deadline d)=>recoverable==step ? OK(true) :
+            Task.FromResult(Result<bool>.Fail("NoVerifiedCheckpoint","No matching locked-window proof."));
         public TaskCompletionSource Opened = new(TaskCreationOptions.RunContinuationsAsynchronously);
         readonly TaskCompletionSource<Result<bool>> cancelled = new(TaskCreationOptions.RunContinuationsAsynchronously);
         Task<Result<bool>> Pause() { Opened.TrySetResult(); return cancelled.Task; }
-        public Task<Result<bool>> SendAsync(OwnerScope partner, ImmutableArray<Shipment> m, Deadline d) { if (PauseTrade) return Pause(); Sends++; Quantities[who] = Units - m.Sum(x => x.Units); return OK(true); }
+        public Task<Result<bool>> SendAsync(OwnerScope partner, ImmutableArray<Shipment> m, Deadline d) {
+            if (PauseTrade) return Pause(); Sends++; Quantities[who] = Units - m.Sum(x => x.Units);
+            if(LoseSenderReply){LoseSenderReply=false; recoverable=CourierGame.Step.Value;
+                return Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate,"AwaitingVerification","Reply lost."));}
+            return OK(true);
+        }
         public Task<Result<bool>> ReceiveAsync(OwnerScope partner, ImmutableArray<Shipment> m, Deadline d) { if (PauseTrade) return Pause(); Quantities[who] = Units + m.Sum(x => x.Units) + ReceiveOffset; return UncertainTrade ? Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate, "LockUnknown", "Missing locked partner evidence")) : OK(true); }
         public Task<Result<bool>> CancelPreLockAsync(Deadline d) { cancelled.TrySetResult(new(CourierOutcome.Cancelled, "PreLock", "Trade cancelled")); return OK(true); }
         public Task<Result<bool>> MoveAsync(StowagePlan plan, Shipment s, bool deposit, IDisposable lease, Func<bool> auth, Deadline d)
@@ -161,7 +201,7 @@ public sealed class CourierRunTests : IDisposable
             Quantities[who] = Units + (deposit ? -s.Units : s.Units); if (deposit) Deposited += s.Units; return OK(true);
         }
         public Task<Result<InventoryView>> ObserveAsync(Deadline d) => OK(new InventoryView(who, 4, [new(1, false, Units)]));
-        public string? MaySwitchNow() => null;
+        public Task<Result<string>> SwitchRefusalAsync(Deadline deadline) => OK("");
         public Task<Result<OwnerScope>> SwitchAsync(OwnerScope target, Deadline d) => OK(who = target);
         public Task<Result<bool>> EnsureWorldAsync(uint world, Deadline d) => OK(true);
         public Task<Result<bool>> ReturnHomeAsync(Deadline d) => OK(true);

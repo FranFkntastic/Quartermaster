@@ -85,6 +85,13 @@ public sealed class AgentBridgeHost : IDisposable
 
     private void RegisterCommands()
     {
+        // This host can only start under DEBUG (see Tick); compile its command contract in Release too.
+        router.Register("set-courier-slot-cap",async (request,ct)=>{
+            if(provider.SetCourierSlotCap is not {} set || !int.TryParse(request.Target,out var value) || value is <0 or >140)
+                return AgentBridgeResponse.Fail("Target must be 1–140 slots, or 0 to remove the cap.");
+            await dispatchOnFramework(()=>set(value==0?null:value),ct);
+            return AgentBridgeResponse.Ok("Courier carrier-slot cap updated.");
+        });
         router.Register("get-snapshot", async (_, cancellationToken) =>
             AgentBridgeResponse.Ok("Quartermaster truth captured.", await OnFrameworkAsync(provider.CreateTruth, cancellationToken).ConfigureAwait(false)));
         router.Register("get-control-surface", _ => AgentBridgeResponse.Ok("Control surface captured.", provider.GetControlSurface()));
