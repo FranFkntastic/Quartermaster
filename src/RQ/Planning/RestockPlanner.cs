@@ -60,7 +60,7 @@ public static class RestockPlanner
         ArgumentNullException.ThrowIfNull(owner);
 
         var lines = rows
-            .Where(row => row.Enabled && row.ItemId > 0 && row.TargetQuantity > 0)
+            .Where(row => row.Enabled && row.Courier is null && row.ItemId > 0 && row.TargetQuantity > 0)
             .Select(row => BuildLine(row, placementBaselines is null ? playerInventory.GetValueOrDefault(row.ItemId)
                 : placementBaselines[(row.ItemId, row.Quality)], cache, owner, nowUtc, stock))
             .OrderByDescending(line => line.NeededQuantity > 0)

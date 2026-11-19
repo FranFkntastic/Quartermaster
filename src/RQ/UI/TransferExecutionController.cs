@@ -51,6 +51,11 @@ internal sealed class TransferExecutionController
         var rules = current.State.PlanItems
             .Where(rule => rule.StowagePlanId == plan.Id)
             .ToArray();
+        if (rules.Any(r => r.Enabled && r.Courier is not null))
+        {
+            ReportInlineError("CourierRunRequired: this plan includes a cross-character shipment.");
+            return;
+        }
         if (ListingPlanEvaluator.HasUnknownLinkedDemand(current.State, current.Browser, current.Owner, plan.Id))
         {
             if (allowCapacityRecovery && retainerRefresh.StartForPlan(out var refreshRunId))

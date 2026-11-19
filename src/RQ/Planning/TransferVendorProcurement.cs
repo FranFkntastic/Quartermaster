@@ -130,7 +130,7 @@ public sealed class TransferVendorProcurementPlanner
 
         var retrievalByRule = retrieval.Lines.ToDictionary(line => line.PlanItemId);
         var lines = effectiveRules
-            .Where(rule => rule.Enabled && rule.AllowVendorPurchase)
+            .Where(rule => rule.Enabled && rule.Courier is null && rule.AllowVendorPurchase)
             .Where(rule => retrievalByRule.GetValueOrDefault(rule.Id)?.MissingQuantity > 0)
             .Select(rule => BuildLine(rule, retrievalByRule[rule.Id]))
             .OrderByDescending(line => line.IsReady)
@@ -175,7 +175,7 @@ public sealed class TransferVendorProcurementPlanner
         var canonical = string.Join(
             "|",
             effectiveRules
-                .Where(rule => rule.Enabled && rule.AllowVendorPurchase)
+                .Where(rule => rule.Enabled && rule.Courier is null && rule.AllowVendorPurchase)
                 .OrderBy(rule => rule.Id)
                 .Select(rule => $"{rule.Id:N}:{rule.ItemId}:{rule.Quality}:{rule.TargetQuantity}"));
         var value = $"{owner.LocalContentId}:{owner.HomeWorldId}:{plan.Id:N}:{plan.Revision}:{canonical}";

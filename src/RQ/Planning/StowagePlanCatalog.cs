@@ -320,6 +320,7 @@ public static class StowagePlanCatalog
         TargetQuantity = Math.Max(0, source.TargetQuantity),
         Quality = source.Quality,
         Routing = StowageRoutingPolicy.CopyOf(source.Routing),
+        Courier = source.Courier,
         AllowVendorPurchase = source.AllowVendorPurchase,
         PreferredVendorNpcId = source.PreferredVendorNpcId,
         Notes = source.Notes,
