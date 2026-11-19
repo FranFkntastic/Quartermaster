@@ -389,7 +389,9 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                     }
                 }
                 if(Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.Nav.PathfindInProgress"))return null;
-                var start=Enumerable.Range(0,points.Length).MinBy(i=>Vector3.DistanceSquared(pos,points[i].Position));
+                // A fresh replay walks the trail in order; only a resumed one continues from the nearest point,
+                // since a trail may pass close to its own start again.
+                var start=following ? Enumerable.Range(0,points.Length).MinBy(i=>Vector3.DistanceSquared(pos,points[i].Position)) : 0;
                 pathMarker.Save();
                 try{pi.GetIpcSubscriber<List<Vector3>,bool,object>("vnavmesh.Path.MoveTo").InvokeAction([..points.Skip(start).Select(x=>x.Position)],false);}
                 catch(Exception e){return WardFailure("WardRouteUnavailable",e.Message);}
