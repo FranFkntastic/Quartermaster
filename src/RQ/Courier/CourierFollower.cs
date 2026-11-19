@@ -251,7 +251,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                     var start = ledger.Start ?? throw new InvalidOperationException("CarrierStartUnknown");
                     await calls.Call("CarrierReturnWorld", 180, d => start.World == m.Carrier.HomeWorldId
                         ? worlds.ReturnHomeAsync(d) : worlds.EnsureWorldAsync(start.World, d));
-                    await calls.Call("CarrierReturnPosition", 150, d => bells.ReturnToAsync(start, d)); break;
+                    await calls.Call("CarrierReturnPosition", start.Ward != null ? 300 : 150, d => bells.ReturnToAsync(start, d)); break;
                 case CourierCommand.Clear:
                     if (ledger.Unconfirmed!=null || !Custody.Covers(ledger.Units,m.Manifest) || !Custody.Covers(m.Manifest,ledger.Units))
                         return Refuse("ClearCustodyChanged");
