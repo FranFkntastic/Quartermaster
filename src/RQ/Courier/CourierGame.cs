@@ -63,7 +63,9 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     public Task<Result<InventoryView>> ObserveAsync(Deadline d) => Poll<InventoryView>(d, () => Bags() is {} b ? Result<InventoryView>.Ok(b) : null);
     private CourierPosition? Position() => objects.LocalPlayer is {} p && player.IsLoaded && client.IsLoggedIn
         ? new(player.CurrentWorld.RowId,client.TerritoryType,p.Position.X,p.Position.Y,p.Position.Z) : null;
-    public Task<Result<CourierPosition>> PositionAsync(Deadline d) => Poll<CourierPosition>(d, () => Position() is {} p ? Result<CourierPosition>.Ok(p) : null);
+    public Task<Result<CourierPosition>> PositionAsync(Deadline d) => Poll<CourierPosition>(d, () => Position() is not {} p ? null :
+        // A start inside a housing ward is only reachable again by its ward address.
+        Result<CourierPosition>.Ok(WardCity(p.Territory)!=null && CurrentWard() is {} w ? p with {Ward=w.Number,Subdivision=w.Subdivision} : p));
     /// <summary>Why this place cannot hold a meeting bell at all; null where one could be captured.</summary>
     internal string? BellBlock() => Position() is {} p ? BellLocation(p,out _) : null;
     // Lifestream's address City is the gateway aetheryte, not the district territory id.
@@ -182,13 +184,16 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         var idle=new IdleWindow();
         var target=new Vector3(p.X,p.Y,p.Z);
         var allowed=CanContinue.Value;
-        var wardMarker=bell?.Ward!=null ? Marker("Ward",Step.Value) : default;
+        var wardNumber=bell?.Ward ?? p.Ward;
+        var subdivision=bell?.Subdivision ?? p.Subdivision;
+        var place=bell?.Label ?? $"territory {p.Territory}";
+        var wardMarker=wardNumber!=null ? Marker("Ward",Step.Value) : default;
         var wardSubmitted=wardMarker.Already;
         bool wardWasBusy=false;
         var wardIdle=new IdleWindow();
         Result<bool> WardFailure(string code,string detail)
         {
-            warn($"{code}: {bell?.Label} on world {p.World}: {detail}");
+            warn($"{code}: {place} on world {p.World}: {detail}");
             return Result<bool>.Fail(code,detail);
         }
         bool wardOwned=false, arrived=false;
@@ -198,7 +203,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
             if (Position() is not {} here) return null;
             if ((teleported || hopped || moving) && idle.Ready(this,moving)) teleported=hopped=moving=false;
             if (here.World != p.World) return Result<bool>.Fail("WrongRendezvousWorld",d.Name);
-            if(bell?.Ward is {} ward)
+            if(wardNumber is {} ward)
             {
                 if(WardCity(p.Territory) is not {} city || ward is <1 or >30)
                     return WardFailure("InvalidWardAddress",$"Territory {p.Territory}, ward {ward}");
@@ -210,21 +215,22 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 // Do not race it with our own path, or attest arrival while it owns movement.
                 if(wardSubmitted && busy)wardWasBusy=true;
                 if(busy || !IdleCharacter()){wardIdle=new();return null;}
-                if(current!=(ward,bell.Subdivision))
+                if(current!=(ward,subdivision))
                 {
                     if(wardSubmitted && !wardIdle.Ready(this))return null;
                     if(wardWasBusy && current.HasValue)
-                        return WardFailure("WrongWard",$"Expected ward {ward} (subdivision {bell.Subdivision}); observed {current}");
+                        return WardFailure("WrongWard",$"Expected ward {ward} (subdivision {subdivision}); observed {current}");
                     var gate=pi.GetIpcSubscriber<(string,int,int,int,int,int,int,bool,bool,string),object>("Lifestream.GoToHousingAddress");
                     if(!gate.HasAction)return WardFailure("WardTravelUnavailable","GoToHousingAddress is not registered");
                     wardMarker.Save!();
-                    try { gate.InvokeAction(("",checked((int)p.World),city,ward,0,bell.Subdivision?31:1,1,false,false,"")); }
+                    try { gate.InvokeAction(("",checked((int)p.World),city,ward,0,subdivision?31:1,1,false,false,"")); }
                     catch(Exception e){return WardFailure("WardTravelSubmissionFailed",e.Message);}
                     wardSubmitted=wardOwned=true;wardIdle=new();return null;
                 }
             }
             if (here.Territory != p.Territory)
             {
+                if(WardCity(p.Territory)!=null)return WardFailure("WardUnknown","The destination is in a housing ward whose number was not recorded.");
                 route??=DalamudGilVendorCatalogBuilder.ResolveTravelRoutesForTerritory(data,p.Territory)
                     .FirstOrDefault(r=>attuned.Any(a=>a.AetheryteId==r.AetheryteId));
                 if(route==null)return Result<bool>.Fail("NoAttunedAetheryte",p.Territory.ToString());
