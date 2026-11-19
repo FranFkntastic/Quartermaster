@@ -27,6 +27,12 @@ public sealed class StateRepository
         var databaseName = $"{Path.GetFileNameWithoutExtension(store.Path)}-operations.db";
         operationStore = new OperationStateStore(Path.Combine(directory, databaseName));
         MigrateLegacyOperations();
+        // Plans written before Courier plans existed may mix courier lines into Transfer plans.
+        if (Planning.StowagePlanMigration.SeparateCourierLines(state))
+        {
+            state.Revision = checked(state.Revision + 1);
+            store.Save(state);
+        }
     }
 
     public event Action<StateChangeKind>? Changed;

@@ -26,15 +26,18 @@ internal sealed record PlacementMatrixColumn(ulong RetainerId, string Name, int?
 internal static class PlacementMatrixData
 {
     /// <summary>
-    /// Assigned owner retainers in game order, plus any retainer a row already names so no
-    /// existing destination is hidden.
+    /// The target character's assigned retainers in game order (the logged-in character's by
+    /// default), plus any retainer a row already names so no existing destination is hidden.
     /// </summary>
     public static IReadOnlyList<PlacementMatrixColumn> Columns(
         QuartermasterRuntimeSnapshot runtime,
-        IEnumerable<StowageRoutingPolicy> routings)
+        IEnumerable<StowageRoutingPolicy> routings,
+        OwnerScope? owner = null,
+        IEnumerable<ulong>? referenced = null)
     {
+        var target = owner ?? runtime.Owner;
         var owned = runtime.Retainers.Values
-            .Where(retainer => retainer.Owner.Matches(runtime.Owner) && retainer.IsCurrentlyAssigned is not false)
+            .Where(retainer => retainer.Owner.Matches(target) && retainer.IsCurrentlyAssigned is not false)
             .OrderBy(retainer => retainer.DisplayOrder ?? int.MaxValue)
             .ThenBy(retainer => retainer.RetainerName, StringComparer.OrdinalIgnoreCase)
             .ThenBy(retainer => retainer.RetainerId)
@@ -46,36 +49,91 @@ internal static class PlacementMatrixData
                 StowageRouter.FreeInventorySlots(retainer)))
             .ToList();
         var shown = columns.Select(column => column.RetainerId).ToHashSet();
-        foreach (var id in routings.SelectMany(routing => routing.PreferredRetainerIds).Distinct())
+        foreach (var id in routings.SelectMany(routing => routing.PreferredRetainerIds).Concat(referenced ?? []).Distinct())
         {
             if (id == PlacementEdits.AnySpace || !shown.Add(id))
                 continue;
-            columns.Add(runtime.Retainers.TryGetValue(id, out var retainer) && retainer.Owner.Matches(runtime.Owner)
+            columns.Add(runtime.Retainers.TryGetValue(id, out var retainer) && retainer.Owner.Matches(target)
                 ? new(id, retainer.RetainerName, StowageRouter.FreeInventorySlots(retainer))
                 : new(id, $"Retainer {id}", null));
         }
         return columns;
     }
 
-    /// <summary>Units of the item each retainer holds, restricted to the row's quality.</summary>
+    /// <summary>
+    /// Units of the item each retainer holds, restricted to the row's quality. Another character's
+    /// holdings come from its observed stock (see <c>CourierSession.Stock</c>); none when unobserved.
+    /// </summary>
     public static IReadOnlyDictionary<ulong, int> Holdings(
         QuartermasterRuntimeSnapshot runtime,
         uint itemId,
-        ItemQualityPolicy quality)
+        ItemQualityPolicy quality,
+        OwnerScope? owner = null,
+        BrowserProjection? ownerStock = null)
     {
-        var stock = runtime.Browser.FindItem(itemId);
+        var stock = Stock(runtime, owner, ownerStock)?.FindItem(itemId);
         if (stock is null)
             return new Dictionary<ulong, int>();
         return stock.Stacks
             .Where(stack => stack.ScopeKind == BrowserScopeKind.Retainer && stack.RetainerId is not null)
-            .Where(stack => quality switch
-            {
-                ItemQualityPolicy.NqOnly => stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.NQ,
-                ItemQualityPolicy.HqOnly => stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ,
-                _ => true,
-            })
+            .Where(stack => Matches(quality, stack.Quality))
             .GroupBy(stack => stack.RetainerId!.Value)
             .ToDictionary(group => group.Key, group => group.Sum(stack => stack.Quantity));
+    }
+
+    /// <summary>Units of the item in the target character's bags, restricted to the row's quality.</summary>
+    public static int BagHoldings(
+        QuartermasterRuntimeSnapshot runtime,
+        uint itemId,
+        ItemQualityPolicy quality,
+        OwnerScope? owner = null,
+        BrowserProjection? ownerStock = null) =>
+        Stock(runtime, owner, ownerStock)?.FindItem(itemId)?.Stacks
+            .Where(stack => stack.ScopeKind == BrowserScopeKind.Player &&
+                            CourierSession.PlayerBags.Contains(stack.Storage, StringComparer.Ordinal) &&
+                            Matches(quality, stack.Quality))
+            .Sum(stack => stack.Quantity) ?? 0;
+
+    private static BrowserProjection? Stock(QuartermasterRuntimeSnapshot runtime, OwnerScope? owner, BrowserProjection? ownerStock) =>
+        owner is null || owner.Matches(runtime.Owner) ? runtime.Browser : ownerStock;
+
+    private static bool Matches(ItemQualityPolicy quality, Franthropy.FFXIV.Filtering.FfxivItemQuality stack) => quality switch
+    {
+        ItemQualityPolicy.NqOnly => stack == Franthropy.FFXIV.Filtering.FfxivItemQuality.NQ,
+        ItemQualityPolicy.HqOnly => stack == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ,
+        _ => true,
+    };
+}
+
+/// <summary>Drawing primitives shared by the placement matrices.</summary>
+internal static class PlacementMatrixDrawing
+{
+    internal const float HeaderAngle = 48f * MathF.PI / 180f;
+
+    internal static void RightAligned(string text, Vector4? color)
+    {
+        var width = ImGui.CalcTextSize(text).X;
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + Math.Max(0f, ImGui.GetContentRegionAvail().X - width));
+        if (color is { } value)
+            ImGui.TextColored(value, text);
+        else
+            ImGui.TextUnformatted(text);
+    }
+
+    /// <summary>Draws text with its bottom-left corner at the pivot, rotated about the pivot.</summary>
+    internal static unsafe void AddRotatedText(ImDrawListPtr drawList, Vector2 pivot, float radians, uint color, string text, float lineHeight)
+    {
+        var start = drawList.VtxBuffer.Size;
+        drawList.AddText(new Vector2(pivot.X, pivot.Y - lineHeight), color, text);
+        var end = drawList.VtxBuffer.Size;
+        var cos = MathF.Cos(radians);
+        var sin = MathF.Sin(radians);
+        var vertices = drawList.VtxBuffer.Data;
+        for (var index = start; index < end; index++)
+        {
+            var offset = vertices[index].Pos - pivot;
+            vertices[index].Pos = pivot + new Vector2((offset.X * cos) - (offset.Y * sin), (offset.X * sin) + (offset.Y * cos));
+        }
     }
 }
 
@@ -685,31 +743,10 @@ internal sealed class PlacementMatrix<TKey>
             ImGui.GetColorU32(AnySeparatorColor), 2f * ImGuiHelpers.GlobalScale);
     }
 
-    private static void RightAligned(string text, Vector4? color)
-    {
-        var width = ImGui.CalcTextSize(text).X;
-        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + Math.Max(0f, ImGui.GetContentRegionAvail().X - width));
-        if (color is { } value)
-            ImGui.TextColored(value, text);
-        else
-            ImGui.TextUnformatted(text);
-    }
+    private static void RightAligned(string text, Vector4? color) => PlacementMatrixDrawing.RightAligned(text, color);
 
-    /// <summary>Draws text with its bottom-left corner at the pivot, rotated about the pivot.</summary>
-    private static unsafe void AddRotatedText(ImDrawListPtr drawList, Vector2 pivot, float radians, uint color, string text, float lineHeight)
-    {
-        var start = drawList.VtxBuffer.Size;
-        drawList.AddText(new Vector2(pivot.X, pivot.Y - lineHeight), color, text);
-        var end = drawList.VtxBuffer.Size;
-        var cos = MathF.Cos(radians);
-        var sin = MathF.Sin(radians);
-        var vertices = drawList.VtxBuffer.Data;
-        for (var index = start; index < end; index++)
-        {
-            var offset = vertices[index].Pos - pivot;
-            vertices[index].Pos = pivot + new Vector2((offset.X * cos) - (offset.Y * sin), (offset.X * sin) + (offset.Y * cos));
-        }
-    }
+    private static void AddRotatedText(ImDrawListPtr drawList, Vector2 pivot, float radians, uint color, string text, float lineHeight) =>
+        PlacementMatrixDrawing.AddRotatedText(drawList, pivot, radians, color, text, lineHeight);
 
     private void RegisterAction(
         string id,

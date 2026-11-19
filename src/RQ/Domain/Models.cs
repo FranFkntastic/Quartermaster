@@ -230,9 +230,21 @@ public sealed class StowageRoutingPolicy : IJsonOnDeserialized
     public static StowageRoutingPolicy CopyOf(StowageRoutingPolicy? source) => source?.Copy() ?? new();
 }
 
+/// <summary>
+/// What a plan's lines mean. A Transfer plan sets same-character targets (keep in bags, stow to
+/// retainers); a Courier plan sends explicit quantities between characters. A plan never mixes them.
+/// </summary>
+public enum StowagePlanKind
+{
+    Transfer = 0,
+    Courier = 1,
+}
+
 public sealed class StowagePlan
 {
     public bool IsEphemeral { get; set; }
+    /// <summary>Absent in documents written before courier plans, which deserialize as Transfer.</summary>
+    public StowagePlanKind Kind { get; set; } = StowagePlanKind.Transfer;
     public Guid? LastAppliedCourierRun { get; set; }
     public Guid Id { get; set; } = Guid.NewGuid();
     public long Revision { get; set; } = 1;

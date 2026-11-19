@@ -299,8 +299,9 @@ public sealed class SnapshotPublisher
         return new
         {
             schema,
+            // Courier plans send between characters; they set no target for this character.
             plans = state.StowagePlans
-                .Where(plan => !plan.IsEphemeral && plan.Owner.Matches(owner))
+                .Where(plan => !plan.IsEphemeral && plan.Kind == StowagePlanKind.Transfer && plan.Owner.Matches(owner))
                 .OrderBy(plan => plan.Priority)
                 .ThenBy(plan => plan.Name, StringComparer.OrdinalIgnoreCase)
                 .Select(plan => new
