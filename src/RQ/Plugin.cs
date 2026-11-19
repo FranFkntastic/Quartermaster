@@ -402,9 +402,7 @@ public sealed class Plugin : IDalamudPlugin
             submissions.OperationChanged += OnSubmittedOperationChanged;
             deposits.OperationChanged += OnSubmittedOperationChanged;
             var commandHelp = "Open Quartermaster.";
-#if DEBUG
-            commandHelp += " Use '/rq bridge on|off' to control the local development bridge.";
-#endif
+            commandHelp += " Use '/rq bridge on|off' to control the local agent bridge (off by default).";
             commands.AddHandler(Command, new CommandInfo((_, arguments) => HandleCommand(arguments)) { HelpMessage = commandHelp });
             pluginInterface.UiBuilder.Draw += DrawWindows;
             pluginInterface.UiBuilder.OpenMainUi += OpenMainUi;
@@ -616,7 +614,6 @@ public sealed class Plugin : IDalamudPlugin
 
     private void HandleCommand(string arguments)
     {
-#if DEBUG
         var normalized = arguments.Trim();
         if (normalized.Equals("bridge on", StringComparison.OrdinalIgnoreCase) ||
             normalized.Equals("bridge off", StringComparison.OrdinalIgnoreCase))
@@ -625,7 +622,6 @@ public sealed class Plugin : IDalamudPlugin
             SaveConfiguration();
             return;
         }
-#endif
         reconciliation.Request(RuntimeDomain.All, "opened");
         window.IsOpen = true;
     }

@@ -27,6 +27,7 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     private Task refresh=Task.CompletedTask;
     private string published="", projected="";
     public MeetingBell? StandingAt {get;private set;}
+    public string? BellBlock {get;private set;}
     public IReadOnlyList<CourierPeer> Peers => peers;
     public event Action<CourierProgress>? Progress;
     public event Action? LinkLost;
@@ -44,8 +45,8 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
         if(now<next || !refresh.IsCompleted) return;
         next=now.AddSeconds(2);
         InventoryView? bags=null;
-        try{ StandingAt=game.StandingAt();bags=game.Bags(); }
-        catch(Exception e){ StandingAt=null;warn("CourierPresenceObservation: "+e.Message); }
+        try{ StandingAt=game.StandingAt();BellBlock=game.BellBlock();bags=game.Bags(); }
+        catch(Exception e){ StandingAt=null;BellBlock=null;warn("CourierPresenceObservation: "+e.Message); }
         var identity=JsonSerializer.SerializeToElement(bags==null?null:new CourierPeer(bags.Character,bags,roster()));
         refresh=Refresh(identity);
         foreach(var p in jobs.Where(e=>e.Value.Task.IsCompleted && e.Value.Expires<now)){ jobs.TryRemove(p.Key,out _); acknowledgements.TryRemove(p.Key,out _); }
