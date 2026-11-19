@@ -109,26 +109,19 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     private uint recordingShard;
     internal int PointCount=>trail.Count;
     internal string? RouteError {get;private set;}
-    private unsafe (uint Id,Vector3 Position)? NearestShard(Vector3 from)
+    // The shard table carries no positions; each placed shard's EObj row points at its table row instead.
+    private (uint Id,Vector3 Position)? NearestShard(Vector3 from)
     {
+        var shards=data.GetExcelSheet<Lumina.Excel.Sheets.HousingAethernet>();
+        var eobj=data.GetExcelSheet<Lumina.Excel.Sheets.EObj>();
         (uint,Vector3)? nearest=null;
         var best=float.MaxValue;
-        foreach(var row in data.GetExcelSheet<Lumina.Excel.Sheets.HousingAethernet>())
+        foreach(var o in objects)
         {
-            if(row.TerritoryType.RowId!=client.TerritoryType || row.Level.RowId==0)continue;
-            Vector3 at;
-            if(row.Level.ValueNullable is {} level)at=new(level.X,level.Y,level.Z);
-            else
-            {
-                // Some shard Level IDs identify a placed aetheryte rather than an Excel Level row.
-                var layout=FFXIVClientStructs.FFXIV.Client.LayoutEngine.LayoutWorld.Instance();
-                if(layout==null)continue;
-                var instance=layout->GetLayoutInstance(FFXIVClientStructs.FFXIV.Client.LayoutEngine.InstanceType.Aetheryte,row.Level.RowId);
-                if(instance==null)continue;
-                instance->GetTranslation(&at);
-            }
-            var distance=Vector3.DistanceSquared(at,from);
-            if(distance<best){best=distance;nearest=(row.RowId,at);}
+            if(o.ObjectKind!=ObjectKind.EventObj || !eobj.TryGetRow(o.BaseId,out var e) ||
+                !shards.TryGetRow(e.Data.RowId,out var row) || row.TerritoryType.RowId!=client.TerritoryType)continue;
+            var distance=Vector3.DistanceSquared(o.Position,from);
+            if(distance<best){best=distance;nearest=(row.RowId,o.Position);}
         }
         return nearest;
     }
