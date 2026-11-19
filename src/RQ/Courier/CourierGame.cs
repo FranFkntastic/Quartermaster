@@ -114,8 +114,8 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         bool walking=false, met=false;
         var last="partner not visible";
         var walkedAt=DateTimeOffset.MinValue;
-        // The in-range fallback counts from the first approach, so retries cannot postpone it.
-        var firstWalkAt=DateTimeOffset.MinValue;
+        // Tradeable but outside the meeting margin: proceed after a short grace whether or not an approach could run.
+        DateTimeOffset? edgeSince=null;
         static DateTimeOffset now()=>DateTimeOffset.UtcNow;
         try
         {
@@ -124,8 +124,12 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 var seenNow=Sighting(who);
                 // Meet inside a margin of trade range, so the other client's slightly different view is in range too.
                 var close=seenNow is {Distance:<=MeetRange};
-                if (Partner(who) != null && (close || walking && now()-firstWalkAt>TimeSpan.FromSeconds(6)))
-                    return Result<bool>.Ok(true);
+                if (Partner(who) != null)
+                {
+                    edgeSince??=now();
+                    if (close || now()-edgeSince>TimeSpan.FromSeconds(6)) return Result<bool>.Ok(true);
+                }
+                else edgeSince=null;
                 if (allowed?.Invoke()==false) return new(CourierOutcome.Cancelled,"RendezvousStopped",d.Name);
                 if (seenNow is not {} seen) { last="partner not visible"; return null; }
                 last=close ? $"partner in range ({seen.Distance:0.00}) but not available to trade"
@@ -136,7 +140,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 catch { return null; }
                 if (busy) return null;
                 var path=nav.TryMoveCloseTo(seen.Position,2f);
-                if (path.Submitted) { if(!walking)firstWalkAt=now(); walking=ownsPath=true; walkedAt=now(); }
+                if (path.Submitted) { walking=ownsPath=true; walkedAt=now(); }
                 else last+=$"; approach refused: {path.Code}";
                 return null;
             });
