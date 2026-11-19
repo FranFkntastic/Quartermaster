@@ -27,6 +27,12 @@ public interface ICourierLink
     /// (housing interiors, apartments, private chambers).
     /// </summary>
     MeetingBell? StandingAt { get; }
+    bool InWard=>false;
+    int RoutePoints=>0;
+    string? RouteError=>null;
+    void StartRoute(){}
+    void CancelRoute(){}
+    MeetingBell? CaptureHere(ulong character)=>null;
 
     /// <summary>Why the logged-in character's current place cannot hold a meeting bell; null where one could.</summary>
     string? BellBlock { get; }
@@ -618,36 +624,39 @@ public sealed class CourierSession
             view is {Custody.IsEmpty:false}?CourierConductor.Rows(view.Custody,settings.Carrier):current?.Custody??[],
             blocked,projection?.Refusals??[],[..settings.Owners.Select(o=>o.CharacterName)],
             [.. known.Where(o=>settings.Bells.ContainsKey(o.LocalContentId!.Value))
-                .Select(o=>new CourierBellBridgeTruth(o.CharacterName,o.HomeWorldName,settings.Bells[o.LocalContentId!.Value].Label))]);
+                .Select(o=>{var b=settings.Bells[o.LocalContentId!.Value];return new CourierBellBridgeTruth(o.CharacterName,o.HomeWorldName,b.Label,b.HasRoute,b.Trail?.Length??0);})],
+            Link.RoutePoints>0,Link.RoutePoints);
     }
 
     // ---- Settings ---------------------------------------------------------------------------
 
-    internal void UpdateSettings(Func<CourierSettings, CourierSettings> change)
+    internal bool UpdateSettings(Func<CourierSettings, CourierSettings> change)
     {
         try
         {
             state.Mutate(document => { document.Courier = change(document.Courier); });
             plan = null;
+            return true;
         }
         catch (Exception exception)
         {
             Fail("Courier settings not saved", exception.ToString());
+            return false;
         }
     }
 
     /// <summary>The bell the logged-in character stands at, when it can be that character's meeting bell.</summary>
     internal MeetingBell? CapturableBell(QuartermasterRuntimeSnapshot runtime) =>
         runtime.Owner.HasStableIdentity && Link.StandingAt is { } bell && bell.World == runtime.Owner.HomeWorldId &&
-        !(runtime.State.Courier.Bells.GetValueOrDefault(runtime.Owner.LocalContentId!.Value) is { } stored && stored.SamePlace(bell))
+        (Link.RoutePoints>0 || !(runtime.State.Courier.Bells.GetValueOrDefault(runtime.Owner.LocalContentId!.Value) is { } stored && stored.SamePlace(bell)))
             ? bell
             : null;
 
     internal void CaptureBell(QuartermasterRuntimeSnapshot runtime)
     {
-        if (CapturableBell(runtime) is not { } bell)
+        if (runtime.Owner.LocalContentId is not {} id || CapturableBell(runtime) is not { } shown ||
+            Link.CaptureHere(id) is not {} bell || !shown.SamePlace(bell))
             return;
-        var id = runtime.Owner.LocalContentId!.Value;
-        UpdateSettings(settings => settings with { Bells = settings.Bells.SetItem(id, bell) });
+        if(UpdateSettings(settings => settings with { Bells = settings.Bells.SetItem(id, bell) }))Link.CancelRoute();
     }
 }

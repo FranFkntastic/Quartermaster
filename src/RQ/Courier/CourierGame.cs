@@ -101,6 +101,66 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         if(ward is {} w)label+=$", Ward {w.Number}"+(w.Subdivision?", Subdivision":"");
         return new(p.Territory,p.World,obj.BaseId,b.Position.X,b.Position.Y,b.Position.Z,label,ward?.Number,ward?.Subdivision??false);
     }
+    internal bool InWard => WardCity(client.TerritoryType)!=null && CurrentWard()!=null;
+    private (ulong Owner,uint World,uint Territory,(int,bool)? Ward) Location =>
+        (player.ContentId,player.CurrentWorld.RowId,client.TerritoryType,CurrentWard());
+    private (ulong Owner,uint World,uint Territory,(int,bool)? Ward) recordingAt;
+    private readonly List<WardPoint> trail=[];
+    private uint recordingShard;
+    internal int PointCount=>trail.Count;
+    internal string? RouteError {get;private set;}
+    private unsafe (uint Id,Vector3 Position)? NearestShard(Vector3 from)
+    {
+        (uint,Vector3)? nearest=null;
+        var best=float.MaxValue;
+        foreach(var row in data.GetExcelSheet<Lumina.Excel.Sheets.HousingAethernet>())
+        {
+            if(row.TerritoryType.RowId!=client.TerritoryType || row.Level.RowId==0)continue;
+            Vector3 at;
+            if(row.Level.ValueNullable is {} level)at=new(level.X,level.Y,level.Z);
+            else
+            {
+                // Some shard Level IDs identify a placed aetheryte rather than an Excel Level row.
+                var layout=FFXIVClientStructs.FFXIV.Client.LayoutEngine.LayoutWorld.Instance();
+                if(layout==null)continue;
+                var instance=layout->GetLayoutInstance(FFXIVClientStructs.FFXIV.Client.LayoutEngine.InstanceType.Aetheryte,row.Level.RowId);
+                if(instance==null)continue;
+                instance->GetTranslation(&at);
+            }
+            var distance=Vector3.DistanceSquared(at,from);
+            if(distance<best){best=distance;nearest=(row.RowId,at);}
+        }
+        return nearest;
+    }
+    internal void CancelRoute(){trail.Clear();RouteError=null;}
+    private void RouteRefusal(string reason){CancelRoute();RouteError=reason;warn("RouteRecording: "+reason);}
+    internal void StartRoute()
+    {
+        if(trail.Count!=0)return;
+        if(!InWard || objects.LocalPlayer is not {} me || BellBlock()!=null ||
+            NearestShard(me.Position) is not {} shard || Vector3.Distance(me.Position,shard.Position)>10)
+        {RouteRefusal("No eligible shard in reach");return;}
+        RouteError=null;recordingAt=Location;recordingShard=shard.Id;
+        trail.Add(new(me.Position.X,me.Position.Y,me.Position.Z));
+    }
+    internal void SampleRoute()
+    {
+        if(trail.Count==0)return;
+        if(objects.LocalPlayer is not {} me || recordingAt!=Location){RouteRefusal("Ward or character changed");return;}
+        if(Vector3.Distance(me.Position,trail[^1].Position)<1.5f)return;
+        if(trail.Count>=199){RouteRefusal("Route too long");return;}
+        trail.Add(new(me.Position.X,me.Position.Y,me.Position.Z));
+    }
+    internal MeetingBell? CaptureHere(ulong character)
+    {
+        if(!player.IsLoaded || player.ContentId!=character)return null;
+        var recording=trail.Count>0;
+        SampleRoute();
+        if(StandingAt() is not {} bell || recording && trail.Count==0)return null;
+        if(!recording)return bell;
+        var at=objects.LocalPlayer!.Position;
+        return bell with {Shard=recordingShard,Trail=[..trail,new(at.X,at.Y,at.Z)]};
+    }
     private const float TradeRange=3.5f, MeetRange=3.2f;
     private (TradePartner Partner,Vector3 Position,float Distance)? Sighting(OwnerScope expected) =>
         io.TryGetPartner(expected.CharacterName,expected.HomeWorldName,out var p) && p.HomeWorldId == expected.HomeWorldId &&
@@ -108,12 +168,27 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
             ? (p,other.Position,Vector3.Distance(me.Position,other.Position)) : null;
     internal TradePartner? Partner(OwnerScope expected) =>
         Sighting(expected) is {} seen && seen.Distance<=TradeRange && io.PartnerIsAvailable(seen.Partner) ? seen.Partner : null;
+    private sealed class WalkWatch
+    {
+        private Vector3? anchor;
+        private DateTimeOffset since;
+        internal string? Stalled(CourierGame game,Vector3? position,Vector3 target)
+        {
+            if(!game.ownsPath || position is not {} at || !game.Busy("vnavmesh.Path.IsRunning"))
+            {anchor=null;return null;}
+            if(anchor==null || Vector3.Distance(anchor.Value,at)>0.5f)
+            {anchor=at;since=DateTimeOffset.UtcNow;}
+            return DateTimeOffset.UtcNow-since<TimeSpan.FromSeconds(8)?null:
+                $"At {at}, target {target}, remaining {Vector3.Distance(at,target):0.0} yalms";
+        }
+    }
     public async Task<Result<bool>> ObserveTradeableAsync(OwnerScope who, Deadline d)
     {
         // Both characters stop near the bell on their own, which can leave them just outside trade range of each other.
         // Whoever sees the other out of range walks up; each client's view of the other's position differs slightly.
         var allowed=CanContinue.Value;
         bool walking=false, met=false;
+        var watch=new WalkWatch();Vector3 walkTarget=default;
         var last="partner not visible";
         var walkedAt=DateTimeOffset.MinValue;
         // Tradeable but outside the meeting margin: proceed after a short grace whether or not an approach could run.
@@ -124,6 +199,8 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
             var outcome=await Poll<bool>(d, () =>
             {
                 var seenNow=Sighting(who);
+                if(walking && watch.Stalled(this,objects.LocalPlayer?.Position,seenNow?.Position??walkTarget) is {} stalled)
+                {warn("NavigationStalled: "+stalled);return Result<bool>.Fail("NavigationStalled",stalled);}
                 // Meet inside a margin of trade range, so the other client's slightly different view is in range too.
                 var close=seenNow is {Distance:<=MeetRange};
                 if (Partner(who) != null)
@@ -142,13 +219,15 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 catch { return null; }
                 if (busy) return null;
                 var path=nav.TryMoveCloseTo(seen.Position,2f);
-                if (path.Submitted) { walking=ownsPath=true; walkedAt=now(); }
+                if (path.Submitted) { walking=ownsPath=true; walkedAt=now(); walkTarget=seen.Position;watch=new(); }
                 else last+=$"; approach refused: {path.Code}";
                 return null;
             });
             met=outcome.Outcome==CourierOutcome.Succeeded;
             return outcome;
         }
+        catch(Dalamud.Plugin.Ipc.Exceptions.IpcError e)
+        {warn("NavigationIpcUnavailable: "+e.Message);return Result<bool>.Fail("NavigationIpcUnavailable",e.Message);}
         finally
         {
             if (!met) warn($"{d.Name} not met for {who.CharacterName}: {last}");
@@ -183,6 +262,13 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         bool teleported=teleportMarker.Already, moving=pathMarker.Already;
         var idle=new IdleWindow();
         var target=new Vector3(p.X,p.Y,p.Z);
+        var recorded=bell?.HasRoute==true;
+        var wardHop=recorded?Marker("WardAethernet",Step.Value):default;
+        var shardWalk=recorded?Marker("WardShardApproach",Step.Value):default;
+        bool hopPending=wardHop.Already, walkingToShard=recorded && shardWalk.Already && !moving && !hopPending;
+        bool following=recorded && moving,rebuilt=false,rebuilding=false;
+        var hopIdle=new IdleWindow();var shardIdle=new IdleWindow();
+        var walkTarget=target;var watch=new WalkWatch();
         var allowed=CanContinue.Value;
         var wardNumber=bell?.Ward ?? p.Ward;
         var subdivision=bell?.Subdivision ?? p.Subdivision;
@@ -201,7 +287,25 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         {
             if(allowed?.Invoke()==false)return new(CourierOutcome.Cancelled,"RouteStopped",d.Name);
             if (Position() is not {} here) return null;
-            if ((teleported || hopped || moving) && idle.Ready(this,moving)) teleported=hopped=moving=false;
+            if(ownsPath && watch.Stalled(this,new(here.X,here.Y,here.Z),walkTarget) is {} stalled)
+            {
+                if(!nav.TryStop())return WardFailure("NavigationStalled",stalled+"; path stop refused");
+                ownsPath=moving=walkingToShard=false;
+                if(following || rebuilt)return WardFailure("NavigationStalled",stalled);
+                warn("NavigationStalled: "+stalled+"; retrying after rebuild");
+                rebuilt=rebuilding=true;watch=new();
+                try{if(!Busy("vnavmesh.Nav.Rebuild"))warn("NavRebuildRefused: "+stalled);}
+                catch(Exception e){warn("NavRebuildUnavailable: "+e.Message);}
+                return null;
+            }
+            if(rebuilding)
+            {
+                try{if(!Busy("vnavmesh.Nav.IsReady"))return null;}
+                catch(Exception e){return WardFailure("NavReadyUnavailable",e.Message);}
+                rebuilding=false;
+            }
+            if ((teleported || hopped || moving) && idle.Ready(this,moving))
+            {if(moving)ownsPath=false;teleported=hopped=moving=false;}
             if (here.World != p.World) return Result<bool>.Fail("WrongRendezvousWorld",d.Name);
             if(wardNumber is {} ward)
             {
@@ -249,20 +353,60 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 return teleported || result.Retryable ? null : Result<bool>.Fail(result.Code,result.Message);
             }
             var b=bell == null ? null : bells.ObserveNavigationTarget();
-            if (bell == null ? Vector3.Distance(target,new(here.X,here.Y,here.Z)) <= 2 :
+            if (bell == null ||
                 b is {Available:true} && b.Distance <= b.OrdinaryInteractionDistance &&
                 objects.SearchById(b.BellGameObjectId)?.BaseId == bell.ObjectId && Vector3.Distance(target,b.Position)<0.5f)
                 return Result<bool>.Ok(true);
             if (moving) return null;
+            if(recorded)
+            {
+                var points=bell!.Trail!;
+                var pos=new Vector3(here.X,here.Y,here.Z);
+                if(walkingToShard)
+                {
+                    if(!shardIdle.Ready(this,true))return null;
+                    walkingToShard=ownsPath=false;
+                }
+                if(!following && Vector3.Distance(pos,points[0].Position)>6)
+                {
+                    if(hopPending && !hopIdle.Ready(this))return null;
+                    var nearest=NearestShard(pos);
+                    if(nearest is not {} near)return WardFailure("WardShardMissing",place);
+                    if(Vector3.Distance(pos,near.Position)>10)
+                    {
+                        shardWalk.Save!();walkTarget=near.Position;
+                        var approach=nav.TryMoveCloseTo(walkTarget,2);
+                        ownsPath=walkingToShard=approach.Submitted;shardIdle=new();
+                        return walkingToShard || approach.Retryable ? null : WardFailure(approach.Code,approach.Message);
+                    }
+                    if(near.Id!=bell.Shard)
+                    {
+                        wardHop.Save!();
+                        try{hopPending=pi.GetIpcSubscriber<uint,bool>("Lifestream.HousingAethernetTeleportById").InvokeFunc(bell.Shard!.Value);}
+                        catch(Exception e){return WardFailure("WardHopUnavailable",e.Message);}
+                        if(!hopPending)return WardFailure("WardHopRefused",$"Shard {bell.Shard}");
+                        wardOwned=true;hopIdle=new();return null;
+                    }
+                }
+                if(Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.Nav.PathfindInProgress"))return null;
+                // A fresh replay walks the trail in order; only a resumed one continues from the nearest point,
+                // since a trail may pass close to its own start again.
+                var start=following ? Enumerable.Range(0,points.Length).MinBy(i=>Vector3.DistanceSquared(pos,points[i].Position)) : 0;
+                pathMarker.Save();
+                try{pi.GetIpcSubscriber<List<Vector3>,bool,object>("vnavmesh.Path.MoveTo").InvokeAction([..points.Skip(start).Select(x=>x.Position)],false);}
+                catch(Exception e){return WardFailure("WardRouteUnavailable",e.Message);}
+                walkTarget=target;ownsPath=moving=following=true;watch=new();return null;
+            }
             pathMarker.Save();
             var path=nav.TryMoveCloseTo(target,1.5f);
             ownsPath=moving=path.Submitted;
             return moving || path.Retryable ? null : Result<bool>.Fail(path.Code,path.Message);
-        }); arrived=outcome.Outcome==CourierOutcome.Succeeded; return outcome; }
+        }); arrived=outcome.Outcome==CourierOutcome.Succeeded; if(!arrived)warn($"{outcome.Code}: {outcome.Detail}");return outcome; }
+        catch(Dalamud.Plugin.Ipc.Exceptions.IpcError e){return WardFailure("NavigationIpcUnavailable",e.Message);}
         finally
         {
             // A stopped, failed or timed-out approach must not leave Lifestream walking the character on its own.
-            if ((moving || wardOwned && !arrived) && !unload.IsCancellationRequested) await dispatch(()=>
+            if ((ownsPath || wardOwned && !arrived) && !unload.IsCancellationRequested) await dispatch(()=>
             {
                 if(ownsPath)nav.TryStop();ownsPath=false;
                 if(!wardOwned || arrived)return;

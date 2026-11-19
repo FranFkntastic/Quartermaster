@@ -367,7 +367,7 @@ public sealed class CourierConductor
             if (r.Schedule.IsEmpty) r.Schedule = [.. Steps(r)];
             // Begin may succeed on the peer even if its acknowledgement is lost.
             if(stop)throw new CourierFault(CourierOutcome.Cancelled,"StopBeforeBegin","Begin was not dispatched.");
-            r.State = "Running"; store.Save(r); beginAttempted = true;
+            r.State = "Running"; r.Code=r.Detail=""; store.Save(r); beginAttempted = true;
             await Send(r, CourierCommand.Begin, r.Start, []);
             r.PeerClaimed = true; store.Save(r);
             var steps = r.Schedule;
@@ -376,7 +376,8 @@ public sealed class CourierConductor
                 (trade as ICourierHoldPort)?.CheckHold();
                 if (stop) throw new CourierFault(CourierOutcome.Cancelled, "StopRequested", "Stopped at verified checkpoint.");
                 var s = steps[r.Cursor]; var t = r.Plan.Trips[s.Trip];
-                owner = await Observe(); status = await Send(r, CourierCommand.Status, r.Start, []);
+                if (s.Phase<CourierPhase.ReturnOwner || r.Code=="")owner=await Observe();
+                status = await Send(r, CourierCommand.Status, r.Start, []);
                 carrier = status.Bags ?? throw Fault("CarrierBagsMissing", "Missing before snapshot");
                 if (s.Phase == CourierPhase.Retrieve && steps[r.Cursor - 1].Phase == CourierPhase.EnsureSource && s.Batch[0]==t.Manifest[0])
                 {
@@ -493,8 +494,26 @@ public sealed class CourierConductor
                         await calls.Call("CourierPlacement", 180, d => placement.MoveAsync(new() { Id = r.Plan.PlanId, Revision = r.Plan.Revision, Owner = owner.Character },
                             unit, deposit, lease!, () => !stop && automation.Owns(lease), d,id=>{r.Pending=intent with {PlacementOperation=id};store.Save(r);}));
                         break;
-                    case CourierPhase.ReturnOwner: await Switch(r.Start); break;
-                    case CourierPhase.ReturnCarrier: await Send(r, CourierCommand.ReturnHome, r.Start, [],id:intent.Id); break;
+                    case CourierPhase.ReturnOwner:
+                    case CourierPhase.ReturnCarrier:
+                        try
+                        {
+                            if(s.Phase==CourierPhase.ReturnOwner)await Switch(r.Start);
+                            else await Send(r,CourierCommand.ReturnHome,r.Start,[],id:intent.Id);
+                        }
+                        catch(CourierFault fault) when (!stop && !unloaded && fault.Outcome!=CourierOutcome.Cancelled &&
+                            r.Custody.IsEmpty && status.Custody.IsEmpty && status.Unconfirmed==null &&
+                            r.Plan.Trips.SelectMany(trip=>trip.Manifest).GroupBy(x=>x.Line)
+                                .All(g=>r.Delivered.GetValueOrDefault(g.Key)==g.Sum(x=>x.Units)))
+                        {
+                            finished=await Send(r,CourierCommand.Status,r.Start,[]);
+                            if(!finished.Custody.IsEmpty || finished.Unconfirmed!=null)
+                                throw Fault("ReturnCustodyUnsettled","Carrier reported custody or an unconfirmed hand-off after the return failed.");
+                            r.Code=fault.Code;
+                            r.Detail+=(r.Detail.Length==0?"":"; ")+$"{s.Phase}: {fault.Code}: {fault.Message}";
+                            warning($"{r.Run} {r.Detail}");
+                        }
+                        break;
                     case CourierPhase.Finish:
                         if (!r.Custody.IsEmpty) throw Fault("CustodyRemaining", "Carrier still holds stock");
                         // Finish closes the carrier's run, so its receipt is the terminal checkpoint;
@@ -508,14 +527,14 @@ public sealed class CourierConductor
                 }
                 else
                 {
-                    r.OwnerCheckpoint = await Observe();
+                    if(s.Phase<CourierPhase.ReturnOwner || r.Code=="")r.OwnerCheckpoint = await Observe();
                     r.CarrierCheckpoint = finished?.Bags ?? (s.Phase == CourierPhase.Finish ? r.CarrierCheckpoint :
                         (await Send(r, CourierCommand.Status, r.Start, [])).Bags);
                 }
                 if(s.Phase==CourierPhase.Deposit){var unit=s.Batch.Single();r.Delivered[unit.Line]=checked(r.Delivered.GetValueOrDefault(unit.Line)+unit.Units);}
                 r.Pending = null; r.Cursor++; store.Save(r);
             }
-            r.State = "Completed"; r.Code = "Succeeded"; r.Detail = ""; store.Save(r);
+            r.State = "Completed"; if(r.Code=="")r.Code="Succeeded"; store.Save(r);
         }
         catch (Exception e)
         {

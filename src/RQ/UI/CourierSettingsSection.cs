@@ -154,7 +154,7 @@ internal sealed class CourierSettingsSection
                 ImGui.SetTooltip(character.HomeWorldName);
             ImGui.TableNextColumn();
             if (settings.Bells.GetValueOrDefault(id) is { } bell)
-                ImGui.TextUnformatted(bell.Label);
+                ImGui.TextUnformatted(bell.HasRoute?$"{bell.Label} · {bell.Trail!.Length} points":bell.Label);
             else
                 ImGui.TextDisabled(current && courier.Link.BellBlock is { } block ? block : "—");
             ImGui.TableNextColumn();
@@ -169,5 +169,18 @@ internal sealed class CourierSettingsSection
             }
         }
         ImGui.EndTable();
+        var link=courier.Link;
+        if(link.RoutePoints>0)
+        {
+            ImGui.TextDisabled($"Recording · {link.RoutePoints} points");ImGui.SameLine();
+            if(ImGui.SmallButton("Cancel route"))link.CancelRoute();
+            reviewRegistry.RegisterLastButton("quartermaster.courier.cancel-route","Cancel route",true,link.CancelRoute);
+        }
+        else if(link.InWard)
+        {
+            if(ImGui.SmallButton("Record route"))link.StartRoute();
+            reviewRegistry.RegisterLastButton("quartermaster.courier.record-route","Record route",true,link.StartRoute);
+        }
+        if(link.RouteError is {} reason){ImGui.SameLine();ImGui.TextDisabled(reason);}
     }
 }

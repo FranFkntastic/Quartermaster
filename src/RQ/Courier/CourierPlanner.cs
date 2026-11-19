@@ -8,12 +8,19 @@ namespace RQ.Courier;
 // Null retainer means bags; zero is not a retainer. A null SourceCharacter means the plan owner.
 public sealed record CourierRoute(OwnerScope Character, ulong? RetainerId, ulong? SourceRetainerId,
     OwnerScope? SourceCharacter = null);
+public readonly record struct WardPoint(float X,float Y,float Z)
+{
+    internal System.Numerics.Vector3 Position => new(X,Y,Z);
+}
 public sealed record MeetingBell(uint Territory, uint World, uint ObjectId, float X, float Y, float Z, string Label,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? Ward = null,
-    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool Subdivision = false)
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool Subdivision = false,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] uint? Shard = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] WardPoint[]? Trail = null)
 {
     internal int ApproachSeconds => Ward.HasValue ? 300 : 150;
-    public bool SamePlace(MeetingBell other) => this with { Label = "" } == other with { Label = "" };
+    internal bool HasRoute => Ward!=null && Shard is >0 && Trail is {Length:>0};
+    public bool SamePlace(MeetingBell other) => this with { Label = "",Shard=null,Trail=null } == other with { Label = "",Shard=null,Trail=null };
 }
 public sealed record CourierSettings
 {
