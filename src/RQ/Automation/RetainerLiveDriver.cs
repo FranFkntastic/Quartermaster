@@ -60,6 +60,10 @@ public sealed class RetainerLiveDriver : IRetainerTransferDriver
     public async Task RequireRetainerListAsync(CancellationToken cancellationToken)
     {
         var result = await session.EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);
+        // A bell interaction sent while the game is still releasing the previous retainer session is swallowed.
+        // Opening the list moves nothing, so one more attempt is safe.
+        if (!result.Success && string.Equals(result.Code, "RetainerListTimeout", StringComparison.Ordinal))
+            result = await session.EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);
         if (result.Success)
             return;
         if (bellRoute is null || !RequiresBellRoute(result.Code))
