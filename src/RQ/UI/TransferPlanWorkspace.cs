@@ -1618,7 +1618,17 @@ internal sealed class TransferPlanWorkspace
                 reviewRegistry.RegisterLastButton($"{controlPrefix}.{key}.bags", $"Send to {character.CharacterName} · Bags", true,
                     () => choose(target, null), "Available");
             if (!open)
+            {
+                // A closed submenu still offers its retainers to the agent bridge, on the submenu's own row.
+                if (controlPrefix is not null)
+                    foreach (var closed in CourierSession.Retainers(runtime, character))
+                    {
+                        var closedId = closed.RetainerId;
+                        reviewRegistry.RegisterLastButton($"{controlPrefix}.{key}.{closedId}", $"Send to {character.CharacterName} · {closed.RetainerName}", true,
+                            () => choose(target, closedId), "Available");
+                    }
                 continue;
+            }
             if (ImGui.MenuItem($"Bags##courier:{key}:bags", string.Empty, here && currentRetainer is null))
                 choose(character, null);
             foreach (var retainer in CourierSession.Retainers(runtime, character))
