@@ -32,7 +32,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     private readonly CourierStore<CarrierLedger> store = new(Path.Combine(directory, "courier-custody.json"));
     private readonly CourierCalls calls = new(warning);
     private readonly SemaphoreSlim gate = new(1);
-    private IDisposable? lease, suppress;
+    private IDisposable? lease, suppress, tradeHold;
     private volatile bool stopped;
     private volatile bool disposed;
     private volatile CourierMessage? active;
@@ -90,16 +90,16 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                 && m.Command is not (CourierCommand.Stop or CourierCommand.Status or CourierCommand.Clear)) return Refuse("CarrierIntentUnsettled");
             if (m.Command == CourierCommand.Status)
             {
+                if (ledger.Unconfirmed==null && tradeHold!=null) (trade as ICourierHoldPort)?.CheckHold();
                 var snap = await Observe();
                 return Result<CourierReceipt>.Ok(new(m.Run, m.Step, snap, Custody: ledger.Units, Unconfirmed: ledger.Unconfirmed, LastConfirmed: ledger.LastConfirmed, ActiveRun: ledger.Run));
             }
             if (ledger.Completed.Contains(m.Run)) return Refuse("RunClosed");
-            if(m.Command==CourierCommand.Begin && trade is CourierTrade live && live.IncompatibleAcceptor()!=null)
-                return Refuse("UncoordinatedTradeAcceptor");
+
             if (ledger.Run == null && m.Command != CourierCommand.Begin) return Refuse("RunNotClaimed");
-            if (ledger.Paused && m.Command is not (CourierCommand.Begin or CourierCommand.Confirm or CourierCommand.Stop or CourierCommand.Settle or CourierCommand.Clear))
+            if (ledger.Paused && m.Command is not (CourierCommand.Begin or CourierCommand.Confirm or CourierCommand.Stop or CourierCommand.Settle or CourierCommand.VerifySettlement or CourierCommand.Clear))
                 return Refuse("CarrierStopped");
-            if (ledger.Unconfirmed != null && m.Command is not (CourierCommand.Confirm or CourierCommand.Stop or CourierCommand.Settle)) return Refuse("UnsettledHandOff");
+            if (ledger.Unconfirmed != null && m.Command is not (CourierCommand.Confirm or CourierCommand.Stop or CourierCommand.Settle or CourierCommand.VerifySettlement)) return Refuse("UnsettledHandOff");
             if (lease == null)
             {
                 if (!automation.TryAcquire("courier carrier", out lease)) return Refuse("AutomationBusy");
@@ -107,6 +107,12 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                 stopped = false;
             }
             if (suppression.IsBusy) return Refuse("AutoRetainerBusy");
+            if (trade is ICourierHoldPort holds && m.Command is not (CourierCommand.Stop or CourierCommand.Clear or CourierCommand.Finish or CourierCommand.Confirm))
+            {
+                if(tradeHold==null && m.Command is not (CourierCommand.Begin or CourierCommand.Settle or CourierCommand.VerifySettlement)) return Refuse("TradeHoldScopeMissing");
+                tradeHold ??= await calls.Call("CarrierTradeHold",10,d=>holds.BeginHold(m.Run,d));
+                holds.CheckHold();
+            }
             var before = await Observe();
             if (!CourierPlanner.Exact(before.Character, m.Carrier)) return Refuse("CarrierIdentityMismatch");
             if (ledger.Run == null && m.Command != CourierCommand.Stop)
@@ -159,7 +165,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                         var cancelled = new Result<CourierReceipt>(CourierOutcome.Cancelled, "CancelledPreLock", fault.Message,
                             new(m.Run, m.Step, Evidence: evidence, Custody: ledger.Units));
                         ledger.Unconfirmed = null; ledger.Steps[m.Step] = step with { Result = cancelled }; store.Save(ledger);
-                        return cancelled;
+                        refused = true; return cancelled;
                     }
                     catch (Exception fault)
                     {
@@ -169,28 +175,45 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                             new(m.Run, m.Step, Evidence: evidence, Custody: ledger.Units));
                         warning($"{m.Run}/{m.Step} {uncertain.Code}: {fault.Message}");
                         ledger.Steps[m.Step] = step with { Result = uncertain }; store.Save(ledger);
-                        return uncertain;
+                        refused = true; return uncertain;
                     }
                     evidence = new(before, await Observe()); break;
                 case CourierCommand.Confirm:
+                case CourierCommand.VerifySettlement:
                 case CourierCommand.Settle:
                     if (m.ConfirmStep == null || ledger.Unconfirmed != m.ConfirmStep ||
                         !ledger.Steps.TryGetValue(m.ConfirmStep.Value, out var staged)) return Refuse("NoPendingHandOff");
                     var pending = staged.Command;
                     var sign = pending.Command == CourierCommand.Receive ? 1 : -1;
-                    if (m.Command == CourierCommand.Settle && staged.Result?.Outcome != CourierOutcome.Succeeded)
+                    var credit = pending.Manifest;
+                    if(m.Command is CourierCommand.VerifySettlement or CourierCommand.Settle){
+                        if(staged.Before==null || m.OwnerEvidence==null ||
+                            !Custody.TrySlice(new(staged.Before,before),m.Carrier,m.OwnerEvidence,pending.Partner,pending.Manifest,sign,out credit,out _))
+                            return Refuse("SettlementDeltaMismatch");
+                    }
+                    if (m.Command is CourierCommand.Settle or CourierCommand.VerifySettlement && staged.Result?.Outcome==CourierOutcome.Succeeded &&
+                        (staged.Result.Value?.Evidence is not {} recorded || !Custody.TrySlice(recorded,m.Carrier,m.OwnerEvidence!,pending.Partner,pending.Manifest,sign,out var saved,out _) ||
+                        !saved.SequenceEqual(credit))) return Refuse("SettledReceiptChanged");
+                    if (m.Command is CourierCommand.Settle or CourierCommand.VerifySettlement && staged.Result?.Outcome != CourierOutcome.Succeeded)
                     {
-                        if (trade is not ICourierSettlement recovery || staged.Before == null ||
-                            !Custody.Matches(new(staged.Before,before),m.Carrier,pending.Manifest,sign) ||
-                            !Custody.Matches(m.OwnerEvidence,pending.Partner,pending.Manifest,-sign)) return Refuse("SettlementDeltaMismatch");
-                        await calls.Call("CarrierSettlement",15,d=>recovery.Settle(pending.Step,d));
+                        if (trade is not ICourierSettlement recovery || staged.Before == null) return Refuse("SettlementDeltaMismatch");
+                        await calls.Call("CarrierSettlement",15,d=>recovery.Settle(pending.Step,pending.Partner,m.OwnerEvidence!,d));
                         staged=staged with {Result=Result<CourierReceipt>.Ok(new(m.Run,pending.Step,Evidence:new(staged.Before,before),Custody:ledger.Units))};
                         ledger.Steps[pending.Step]=staged;
                     }
-                    if (staged.Result?.Outcome != CourierOutcome.Succeeded || !Custody.Matches(staged.Result?.Value?.Evidence, m.Carrier, pending.Manifest, sign) ||
-                        !Custody.Matches(m.OwnerEvidence, pending.Partner, pending.Manifest, -sign))
+                    if(m.Command==CourierCommand.VerifySettlement){
+                        if(sign!=-1)return Refuse("SenderSettlementRequired");
+                        break;
+                    }
+                    if (m.Command==CourierCommand.Confirm && (staged.Result?.Outcome != CourierOutcome.Succeeded || !Custody.Matches(staged.Result?.Value?.Evidence, m.Carrier, pending.Manifest, sign) ||
+                        !Custody.Matches(m.OwnerEvidence, pending.Partner, pending.Manifest, -sign)))
                         return Refuse("HandOffDeltaMismatch");
-                    ledger.Units = Custody.Apply(ledger.Units, pending.Manifest, sign);
+                    ledger.Units = Custody.Apply(ledger.Units, credit, sign);
+                    // A process may have died after persisting an older settlement request,
+                    // before returning its receipt. It can no longer own an unsettled intent.
+                    foreach(var abandoned in ledger.Steps.Where(x=>x.Key!=m.Step && x.Value.Result==null &&
+                        x.Value.Command.ConfirmStep==pending.Step && x.Value.Command.Command is CourierCommand.Settle or CourierCommand.VerifySettlement).ToArray())
+                        ledger.Steps[abandoned.Key]=abandoned.Value with {Result=Result<CourierReceipt>.Fail("SettlementSuperseded",pending.Step.ToString())};
                     ledger.LastConfirmed = ledger.Unconfirmed;
                     ledger.LastConfirmedBags = staged.Result!.Value!.Evidence!.After;
                     ledger.Unconfirmed = null; break;
@@ -222,7 +245,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         {
             Release();
             warning($"{m.Run}/{m.Step} {m.Command}: {e.Message}");
-            return new(CourierOutcome.Indeterminate, (e as CourierFault)?.Code ?? "CarrierUnsettled", e.Message);
+            return new((e as CourierFault)?.Outcome ?? CourierOutcome.Indeterminate, (e as CourierFault)?.Code ?? "CarrierUnsettled", e.Message);
         }
         finally
         {
@@ -253,7 +276,8 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     private void Release()
     {
         var heldSuppression = suppress; var heldLease = lease; suppress = null; lease = null;
-        calls.WhenSettled(() => { try { heldSuppression?.Dispose(); } finally { heldLease?.Dispose(); } });
+        var heldTrade = tradeHold; tradeHold = null;
+        calls.WhenSettled(() => { try { heldTrade?.Dispose(); heldSuppression?.Dispose(); } finally { heldLease?.Dispose(); } });
     }
     public void Dispose()
     {

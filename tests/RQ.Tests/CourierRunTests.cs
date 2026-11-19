@@ -148,6 +148,52 @@ public sealed class CourierRunTests : IDisposable
         Assert.Equal(credited,mule.Units);
         Assert.Equal("OwnerNotPaired",(await follower.HandleAsync(destination,m,Deadline.After("impostor",10),Guid.NewGuid())).Code);
     }
+    [Theory]
+    [InlineData(false,false)]
+    [InlineData(false,true)]
+    [InlineData(true,false)]
+    [InlineData(true,true)]
+    public async Task MissingOrRefusedHoldNeverDispatchesEitherTrade(bool onCarrier,bool missing)
+    {
+        (onCarrier?mule:owner).Hold = new("fixture",()=>true,()=>!missing,
+            ()=>"""{"Acknowledged":false,"Reason":"held by other courier"}""",()=>false,()=>{},_=>{});
+        var stopped=await engine.StartAsync(Plan(),cfg);
+        Assert.Equal(missing?"TradeHoldUnavailable":"TradeHoldRefused",stopped.Code);
+        Assert.Contains(missing?"gates":"other courier",stopped.Detail);
+        Assert.Equal(0,owner.Sends+mule.Sends+owner.Receives+mule.Receives);
+    }
+
+    [Theory]
+    [InlineData(3)]
+    [InlineData(2)]
+    [InlineData(0)]
+    public async Task ReceiverRestartSettlesDurableArmExactlyOnce(int delivered)
+    {
+        var manifest=Plan().Trips[0].Manifest;
+        var msg=new CourierMessage(1,Guid.NewGuid(),Guid.NewGuid(),CourierCommand.Receive,source,source,carrier,manifest);
+        async Task<Result<CourierReceipt>> Call(CourierMessage m)=>await follower.HandleAsync(source,m,Deadline.After("restart",10));
+        Assert.Equal(CourierOutcome.Succeeded,(await Call(msg with {Step=Guid.NewGuid(),Command=CourierCommand.Begin,Manifest=[]})).Outcome);
+        mule.CheckpointDirectory=dir; mule.ReceiveOffset=delivered-3; mule.UncertainTrade=true;
+        await Call(msg);
+        follower.Dispose();
+        // A hard exit has the intent and pre-arm checkpoint, but no returned receive receipt.
+        var ledger=new CourierStore<CarrierLedger>(Path.Combine(dir,"courier-custody.json"));
+        var interrupted=ledger.Load();
+        interrupted.Steps[msg.Step]=interrupted.Steps[msg.Step] with {Result=null};
+        ledger.Save(interrupted);
+        follower=Follower();
+        InventoryView Bag(int n)=>new(source,4,[new(1,false,n)]);
+        var settle=msg with {Step=Guid.NewGuid(),Command=CourierCommand.Settle,ConfirmStep=msg.Step,
+            Manifest=[],OwnerEvidence=new(Bag(3),Bag(3-delivered))};
+        var first=await Call(settle);Assert.True(first.Outcome==CourierOutcome.Succeeded,first.Code+":"+first.Detail);
+        follower.Dispose();follower=Follower();
+        Assert.Equal(CourierOutcome.Succeeded,(await Call(settle)).Outcome);
+        Assert.Equal(delivered,ledger.Load().Units.Sum(s=>s.Units));
+        Assert.Equal(1,mule.Receives);
+        var checkpoint=mule.ReceiveStore.Load();
+        Assert.Null(checkpoint.Arm);Assert.Equal(3-delivered,checkpoint.Items.Single().Quantity);
+    }
+
     sealed class AR : IAutoRetainerIpc
     {
         public bool IsAvailable => true; public bool IsBusy => false; public bool IsSuppressed { get; private set; }
@@ -173,7 +219,7 @@ public sealed class CourierRunTests : IDisposable
             return result;
         }
     }
-    sealed class Client(OwnerScope initial) : ICourierPlacementPort, ICourierTradePort, ICourierSettlement, ICharacterSwitchPort, IInventoryObservationPort, IWorldVisitPort, IMeetingBellPort
+    sealed class Client(OwnerScope initial) : ICourierPlacementPort, ICourierTradePort, ICourierSettlement, ICourierHoldPort, ICharacterSwitchPort, IInventoryObservationPort, IWorldVisitPort, IMeetingBellPort
     {
         OwnerScope who = initial;
         public Dictionary<OwnerScope, int> Quantities = new(); public int Units => Quantities.GetValueOrDefault(who);
@@ -181,9 +227,20 @@ public sealed class CourierRunTests : IDisposable
         static Task<Result<T>> OK<T>(T value) => Task.FromResult(Result<T>.Ok(value));
         public bool PauseTrade, UncertainTrade;
         public bool LoseSenderReply;
+        public CourierTradeHold? Hold;
+        public string? CheckpointDirectory;
+        public int Receives;
+        public CourierStore<TradeCheckpoint> ReceiveStore=>new(Path.Combine(CheckpointDirectory!,"courier-trade.json"));
+        public Task<Result<IDisposable>> BeginHold(Guid run,Deadline deadline)=>Task.FromResult(Hold?.Begin()??Result<IDisposable>.Ok(new MemoryStream()));
+        public void CheckHold()=>Hold?.Check(false);
         Guid? recoverable;
-        public Task<Result<bool>> Settle(Guid step,Deadline d)=>recoverable==step ? OK(true) :
-            Task.FromResult(Result<bool>.Fail("NoVerifiedCheckpoint","No matching locked-window proof."));
+        public Task<Result<bool>> Settle(Guid step,OwnerScope partner,TradeEvidence peer,Deadline d){
+            if(CheckpointDirectory!=null){
+                var store=ReceiveStore;var record=store.Load();
+                return Task.FromResult(CourierReceiveRecovery.Settle(record,step,partner,new(who,4,[new(1,false,Units)]),peer,()=>store.Save(record)));
+            }
+            return recoverable==step ? OK(true) :
+            Task.FromResult(Result<bool>.Fail("NoVerifiedCheckpoint","No matching locked-window proof.")); }
         public TaskCompletionSource Opened = new(TaskCreationOptions.RunContinuationsAsynchronously);
         readonly TaskCompletionSource<Result<bool>> cancelled = new(TaskCreationOptions.RunContinuationsAsynchronously);
         Task<Result<bool>> Pause() { Opened.TrySetResult(); return cancelled.Task; }
@@ -193,7 +250,14 @@ public sealed class CourierRunTests : IDisposable
                 return Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate,"AwaitingVerification","Reply lost."));}
             return OK(true);
         }
-        public Task<Result<bool>> ReceiveAsync(OwnerScope partner, ImmutableArray<Shipment> m, Deadline d) { if (PauseTrade) return Pause(); Quantities[who] = Units + m.Sum(x => x.Units) + ReceiveOffset; return UncertainTrade ? Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate, "LockUnknown", "Missing locked partner evidence")) : OK(true); }
+        public Task<Result<bool>> ReceiveAsync(OwnerScope partner, ImmutableArray<Shipment> m, Deadline d) {
+            Receives++;
+            if(CheckpointDirectory!=null){
+                var step=CourierGame.Step.Value;var item=m.Single();
+                ReceiveStore.Save(new(){Step=step,Receiving=true,Arm=new(step,partner,new(who,4,[new(1,false,Units)])),
+                    Items=[new(){ItemId=item.Item,Quantity=item.Units}],Original=[new(item.Item,false,item.Units)]});
+            }
+            if (PauseTrade) return Pause(); Quantities[who] = Units + m.Sum(x => x.Units) + ReceiveOffset; return UncertainTrade ? Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate, "LockUnknown", "Missing locked partner evidence")) : OK(true); }
         public Task<Result<bool>> CancelPreLockAsync(Deadline d) { cancelled.TrySetResult(new(CourierOutcome.Cancelled, "PreLock", "Trade cancelled")); return OK(true); }
         public Task<Result<bool>> MoveAsync(StowagePlan plan, Shipment s, bool deposit, IDisposable lease, Func<bool> auth, Deadline d)
         {

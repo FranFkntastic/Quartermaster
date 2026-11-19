@@ -13,7 +13,7 @@ public sealed record Deadline(string Name, DateTimeOffset Expires)
 {
     public static Deadline After(string name, int seconds) => new(name, DateTimeOffset.UtcNow.AddSeconds(seconds));
 }
-public enum CourierCommand { Status, Travel, Receive, Send, Confirm, ReturnHome, Stop, Begin, Finish, Settle, Clear }
+public enum CourierCommand { Status, Travel, Receive, Send, Confirm, ReturnHome, Stop, Begin, Finish, Settle, Clear, VerifySettlement }
 public sealed record TradeEvidence(InventoryView Before, InventoryView After);
 public sealed record CourierMessage(int Version, Guid Run, Guid Step, CourierCommand Command, OwnerScope Owner,
     OwnerScope Partner, OwnerScope Carrier, ImmutableArray<Shipment> Manifest, MeetingBell? Bell = null,
@@ -38,7 +38,7 @@ public interface ICourierTradePort
 // No dispatch: can only advance a durable, fully delivered checkpoint for this exact step.
 internal interface ICourierSettlement
 {
-    Task<Result<bool>> Settle(Guid step,Deadline deadline);
+    Task<Result<bool>> Settle(Guid step,OwnerScope partner,TradeEvidence peer,Deadline deadline);
 }
 public interface ICharacterSwitchPort
 {
@@ -71,6 +71,30 @@ internal static class Custody
         e.Before.Stock.Concat(e.After.Stock).Select(s => (Item: s.ItemId, s.Hq)).Concat(manifest.Select(s => (s.Item, s.Hq)))
             .Distinct().All(key => (long)e.After.Count(key.Item, key.Hq) - e.Before.Count(key.Item, key.Hq)
             == sign * manifest.Where(s => s.Item == key.Item && s.Hq == key.Hq).Sum(s => (long)s.Units));
+    // Allocate observed units in manifest order only after comparing every stock key,
+    // including unrelated decreases, both identities and both quality variants.
+    internal static bool TrySlice(TradeEvidence local, OwnerScope who, TradeEvidence remote, OwnerScope other,
+        ImmutableArray<Shipment> batch, int sign, out ImmutableArray<Shipment> moved, out ImmutableArray<Shipment> rest)
+    {
+        moved=rest=[];
+        if (!CourierPlanner.Exact(local.Before.Character,who) || !CourierPlanner.Exact(local.After.Character,who) ||
+            !CourierPlanner.Exact(remote.Before.Character,other) || !CourierPlanner.Exact(remote.After.Character,other)) return false;
+        var counts=new Dictionary<(uint,bool),long>();
+        foreach(var k in local.Before.Stock.Concat(local.After.Stock).Concat(remote.Before.Stock).Concat(remote.After.Stock)
+            .Select(x=>(x.ItemId,x.Hq)).Distinct())
+        {
+            var n=sign*((long)local.After.Count(k.ItemId,k.Hq)-local.Before.Count(k.ItemId,k.Hq));
+            if(n<0 || n>batch.Where(x=>x.Item==k.ItemId && x.Hq==k.Hq).Sum(x=>(long)x.Units) ||
+                n!=sign*((long)remote.Before.Count(k.ItemId,k.Hq)-remote.After.Count(k.ItemId,k.Hq)))return false;
+            counts[k]=n;
+        }
+        foreach(var s in batch){
+            var key=(s.Item,s.Hq);int n=(int)Math.Min(s.Units,counts.GetValueOrDefault(key));
+            if(n>0){moved=moved.Add(s with {Units=n});counts[key]-=n;}
+            if(n<s.Units)rest=rest.Add(s with {Units=s.Units-n});
+        }
+        return true;
+    }
     internal static bool Covers(IEnumerable<Shipment> held, IEnumerable<Shipment> wanted)
         => wanted.GroupBy(s => s with { Units = 0 }).All(g => held.Where(s => (s with { Units = 0 }) == g.Key)
             .Sum(s => (long)s.Units) >= g.Sum(s => (long)s.Units));
