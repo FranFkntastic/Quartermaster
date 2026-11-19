@@ -6,12 +6,24 @@ namespace RQ.UI;
 
 public enum WorkbenchView { Stock, Restock, Stowage, ItemGroups, Listings, Activity, Plans }
 
+internal sealed record RemovedLines(Guid PlanId, string Label, IReadOnlyList<TargetPlanItem> Rules, IReadOnlyList<TransferPlanListingLink> Links);
+
 public sealed class WorkbenchState
 {
     private readonly HashSet<uint> expanded = [];
     public WorkbenchView View { get; set; }
     public Guid? SelectedRestockPlanId { get; set; }
-    public Guid? SelectedStowagePlanId { get; set; }
+    internal RemovedLines? LastRemoved { get; set; }
+    public Guid? SelectedStowagePlanId
+    {
+        get;
+        set
+        {
+            if (field != value)
+                LastRemoved = null;
+            field = value;
+        }
+    }
     public string ScopeKey { get; set; } = BrowserScope.AllKey;
     public DalamudFilterAutocompleteState ItemFilterState { get; } = new();
     public DalamudFilterAutocompleteState ListingFilterState { get; } = new();

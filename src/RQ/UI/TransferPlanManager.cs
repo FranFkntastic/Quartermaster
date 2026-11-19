@@ -249,7 +249,7 @@ internal sealed class TransferPlanManager
         {
             ImGui.TableSetupScrollFreeze(0, 1);
             ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1f);
-            ImGui.TableSetupColumn("Keep", ImGuiTableColumnFlags.WidthFixed, 56);
+            ImGui.TableSetupColumn("Quantity", ImGuiTableColumnFlags.WidthFixed, ImGui.CalcTextSize("Keep 999,999").X);
             ImGui.TableSetupColumn("Stow to", ImGuiTableColumnFlags.WidthStretch, .8f);
             ImGui.TableHeadersRow();
             foreach (var row in resolveProjection(runtime, plan).Rows)
@@ -319,7 +319,7 @@ internal sealed class TransferPlanManager
         if (display.Length != full.Length && ImGui.IsItemHovered())
             ImGui.SetTooltip(full);
         ImGui.TableNextColumn();
-        ImGui.TextUnformatted(rule.TargetQuantity.ToString("N0"));
+        ImGui.TextUnformatted($"{(rule.Courier is null ? "Keep" : "Send")} {rule.TargetQuantity:N0}");
         ImGui.TableNextColumn();
         var destination = rule.Courier is { } route ? CourierSession.RouteLabel(runtime, route) : StowTo(runtime, rule.Routing);
         var shown = Fit(destination, ImGui.GetContentRegionAvail().X);

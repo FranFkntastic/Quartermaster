@@ -32,7 +32,20 @@ internal sealed record TransferWorkbenchProjection(
     bool HasMovement,
     bool HasUnknownListingDemand,
     IReadOnlyList<TransferWorkbenchRow> Rows,
-    Courier.CourierPlan? Courier = null);
+    Courier.CourierPlan? Courier = null)
+{
+    internal string MovementSummary
+    {
+        get
+        {
+            var moves = $"{Movements:N0} move{(Movements == 1 ? "" : "s")}";
+            if (Courier is not { Trips.Length: > 0 } courier)
+                return moves;
+            var trips = $"{courier.Trips.Length:N0} trip{(courier.Trips.Length == 1 ? "" : "s")}";
+            return Movements == 0 ? trips : $"{moves}, {trips}";
+        }
+    }
+}
 
 internal sealed record PendingTransferPlanRecovery(Guid PlanId, string RefreshRunId);
 

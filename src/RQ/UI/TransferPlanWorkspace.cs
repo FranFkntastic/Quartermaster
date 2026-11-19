@@ -43,12 +43,6 @@ internal sealed class TransferPlanWorkspace
         ImGuiWindowFlags.AlwaysAutoResize;
     private const int FocusGiveUpFrames = 120;
 
-    private sealed record RemovedLines(
-        Guid PlanId,
-        string Label,
-        IReadOnlyList<TargetPlanItem> Rules,
-        IReadOnlyList<TransferPlanListingLink> Links);
-
     private sealed record AddSuggestion(
         string Label,
         ItemChoice? Item,
@@ -86,7 +80,6 @@ internal sealed class TransferPlanWorkspace
     private int retainedSelectionCount = -1;
     private readonly Dictionary<Guid, string> lineErrors = [];
     private TransferWorkbenchProjection? transferWorkbenchProjection;
-    private object? projectedPeers;
     private int transferProjectionBuildCount;
     private int renderedTransferRowCount;
     private string? dismissedVendorRunId;
@@ -111,7 +104,6 @@ internal sealed class TransferPlanWorkspace
     private int focusTargetFrames;
     private Guid? noteRuleId;
     private string noteBuffer = string.Empty;
-    private RemovedLines? lastRemoved;
     private Guid[]? pendingSelection;
     private int pendingSelectionFrames;
 
@@ -628,9 +620,8 @@ internal sealed class TransferPlanWorkspace
         float ButtonWidth(string label) =>
             ImGui.CalcTextSize(label.Split("##")[0]).X + (style.FramePadding.X * 2f);
 
-        var movements = projection?.Movements ?? 0;
-        var executeLabel = movements > 0
-            ? $"Execute plan · {movements:N0} move{(movements == 1 ? string.Empty : "s")}###RQTransferExecute"
+        var executeLabel = projection is { Movements: > 0 } or { Courier.Trips.Length: > 0 }
+            ? $"Execute plan · {projection.MovementSummary}###RQTransferExecute"
             : "Execute plan###RQTransferExecute";
         var vendor = projection?.Vendor;
         var maximumGil = vendor?.MaximumGil ?? 0;
@@ -713,8 +704,7 @@ internal sealed class TransferPlanWorkspace
                         requestTransferReview(currentPlan.Id, currentPlan.Name);
                 },
                 canExecute
-                    ? projection!.Courier is { } plannedRun && !mixed ? $"{plannedRun.Trips.Length:N0} courier trips"
-                    : projection.HasUnknownListingDemand ? "Listing demand will be verified first" : $"{movements:N0} movements"
+                    ? projection!.HasUnknownListingDemand ? "Listing demand will be verified first" : projection.MovementSummary
                     : availability.BlockReason);
         }
 
@@ -1112,7 +1102,7 @@ internal sealed class TransferPlanWorkspace
 
     private void DrawUndoStrip(OwnerScope owner, StowagePlan plan)
     {
-        if (lastRemoved is not { } removed || removed.PlanId != plan.Id)
+        if (workbench.LastRemoved is not { } removed || removed.PlanId != plan.Id)
             return;
         switch (DalamudUndoStrip.Draw("RQTransferUndo", removed.Label))
         {
@@ -1120,7 +1110,7 @@ internal sealed class TransferPlanWorkspace
                 UndoRemoval(owner, removed);
                 break;
             case DalamudUndoStripResult.Dismiss:
-                lastRemoved = null;
+                workbench.LastRemoved = null;
                 break;
         }
     }
@@ -1921,10 +1911,10 @@ internal sealed class TransferPlanWorkspace
                 var label = rules.Length == 1
                     ? $"Removed {rules[0].ItemName}"
                     : $"Removed {rules.Length:N0} lines";
-                removed = new RemovedLines(planId, label, rules, dropped);
+                removed = new RemovedLines(plan.Id, label, rules, dropped);
                 return plan.Id;
             });
-            lastRemoved = removed;
+            workbench.LastRemoved = removed;
             foreach (var id in ruleIds)
             {
                 selection.SetSelected(id, false);
@@ -1963,7 +1953,7 @@ internal sealed class TransferPlanWorkspace
                 }
                 return plan.Id;
             });
-            lastRemoved = null;
+            workbench.LastRemoved = null;
             transferExecution.ClearInlineError();
         }
         catch (Exception exception)
@@ -2115,14 +2105,12 @@ internal sealed class TransferPlanWorkspace
         QuartermasterRuntimeSnapshot runtime,
         StowagePlan plan)
     {
-        var peers = courier.Link.Peers;
+        var courierPlan = courier.Plan(runtime, plan);
         if (transferWorkbenchProjection is { } cached &&
             cached.RuntimeRevision == runtime.Revision &&
             cached.PlanId == plan.Id &&
-            ReferenceEquals(projectedPeers, peers))
+            ReferenceEquals(cached.Courier, courierPlan))
             return cached;
-        projectedPeers = peers;
-        var courierPlan = courier.Plan(runtime, plan);
         var courierUnits = courierPlan?.Trips.SelectMany(trip => trip.Manifest)
             .GroupBy(shipment => shipment.Line)
             .ToDictionary(group => group.Key, group => group.Sum(shipment => shipment.Units)) ?? [];
@@ -2216,8 +2204,8 @@ internal sealed class TransferPlanWorkspace
             })
             .ToArray();
         // Count lines that will actually move something, from the same projection the rows show.
-        var movements = rows.Count(row => row.Projection.Retrieve > 0 || row.Projection.Stow > 0 || row.Projection.Send > 0) +
-                        rows.Sum(row => row.Line?.Moves.Count ?? 0);
+        var movements = rows.Where(row => row.Rule.Courier is null).Sum(row =>
+            (row.Projection.Retrieve > 0 || row.Projection.Stow > 0 ? 1 : 0) + (row.Line?.Moves.Count ?? 0));
         transferWorkbenchProjection = new(
             runtime.Revision,
             plan.Id,
