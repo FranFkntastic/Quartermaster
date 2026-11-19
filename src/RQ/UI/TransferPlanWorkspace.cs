@@ -212,23 +212,26 @@ internal sealed class TransferPlanWorkspace
     }
 
     /// <summary>
-    /// Adds courier lines that send the logged-in character's units of each item (one line per
-    /// container holding it) to another character's retainer or bags. Re-sending from the same
-    /// container to the same place replaces that line's quantity.
+    /// Adds courier lines that send a character's units of each item (one line per container
+    /// holding it) to another character's retainer or bags. The source is the logged-in character
+    /// unless <paramref name="source"/> names another. Re-sending from the same container to the
+    /// same place replaces that line's quantity.
     /// </summary>
-    public void AddCourier(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, OwnerScope destination, ulong? retainerId)
+    public void AddCourier(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, OwnerScope destination, ulong? retainerId, OwnerScope? source = null)
     {
         if (!runtime.Owner.HasStableIdentity || items.Count == 0)
             return;
         EnsureSelection(runtime);
         var planId = workbench.SelectedStowagePlanId!.Value;
         var target = destination with { };
+        var sourceCharacter = source is null || source.Matches(runtime.Owner) ? null : source with { };
+        var holder = sourceCharacter ?? runtime.Owner;
         var sources = items
             .SelectMany(item => item.Stacks
                 .Where(stack => stack.Quantity > 0 && stack.ScopeKind switch
                 {
                     BrowserScopeKind.Player => CourierSession.PlayerBags.Contains(stack.Storage, StringComparer.Ordinal),
-                    BrowserScopeKind.Retainer => stack.RetainerId is { } id && runtime.Retainers.GetValueOrDefault(id)?.Owner.Matches(runtime.Owner) == true,
+                    BrowserScopeKind.Retainer => stack.RetainerId is { } id && runtime.Retainers.GetValueOrDefault(id)?.Owner.Matches(holder) == true,
                     _ => false,
                 })
                 .GroupBy(stack => stack.ScopeKind == BrowserScopeKind.Player ? null : stack.RetainerId)
@@ -242,10 +245,10 @@ internal sealed class TransferPlanWorkspace
             {
                 var draft = StowagePlanCatalog.Draft(document, runtime.Owner, planId);
                 var ids = new List<Guid>();
-                foreach (var (itemId, name, source, units) in sources)
+                foreach (var (itemId, name, container, units) in sources)
                 {
                     var rule = draft.Rules.FirstOrDefault(candidate => candidate.ItemId == itemId && candidate.Courier is { } route &&
-                        route.SourceCharacter is null && route.SourceRetainerId == source &&
+                        (route.SourceCharacter ?? runtime.Owner).Matches(holder) && route.SourceRetainerId == container &&
                         route.Character.Matches(target) && route.RetainerId == retainerId);
                     if (rule is null)
                     {
@@ -254,7 +257,7 @@ internal sealed class TransferPlanWorkspace
                             StowagePlanId = planId,
                             ItemId = itemId,
                             ItemName = name,
-                            Courier = new CourierRoute(target, retainerId, source),
+                            Courier = new CourierRoute(target, retainerId, container, sourceCharacter),
                         };
                         draft.Rules.Add(rule);
                     }
@@ -676,13 +679,17 @@ internal sealed class TransferPlanWorkspace
             reviewRegistry.RegisterLastButton("quartermaster.transfer.placement.return", "Return to the plan lines", true,
                 () => showPlacement = false, "Ready");
 
-        var availability = courierGate is { } gate
+        // A mixed plan runs its ordinary lines first, then the courier run: both must be able to start.
+        var mixed = courierGate is not null && projection!.Rows.Any(row => row.Rule.Enabled && row.Rule.Courier is null);
+        var availability = courierGate is { } gate && !mixed
             ? new TransferExecutionAvailability(gate.CanStart, gate.Status)
             : TransferExecutionPolicy.ForExplicitRun(
                 projection is not null && (projection.HasMovement || projection.HasUnknownListingDemand),
                 owner.HasStableIdentity,
                 transfers.CanStart,
                 retainerRefresh.IsRefreshing || retainerRefresh.IsQueued);
+        if (mixed && courierGate is { CanStart: false } blocked)
+            availability = new(false, blocked.Status ?? availability.BlockReason);
         var canExecute = selected is not null && availability.CanExecute;
         if (offerExecute)
         {
@@ -706,7 +713,7 @@ internal sealed class TransferPlanWorkspace
                         requestTransferReview(currentPlan.Id, currentPlan.Name);
                 },
                 canExecute
-                    ? projection!.Courier is { } plannedRun ? $"{plannedRun.Trips.Length:N0} courier trips"
+                    ? projection!.Courier is { } plannedRun && !mixed ? $"{plannedRun.Trips.Length:N0} courier trips"
                     : projection.HasUnknownListingDemand ? "Listing demand will be verified first" : $"{movements:N0} movements"
                     : availability.BlockReason);
         }
@@ -1285,12 +1292,30 @@ internal sealed class TransferPlanWorkspace
             ImGui.SetKeyboardFocusHere();
             focusTargetRuleId = null;
         }
-        if (DalamudGroupedIntegerInput.InputGroupedInt("##target", ref units, 0, 0))
+        int Set(int requested)
         {
-            var clamped = available is int most && most > 0 ? Math.Clamp(units, 1, most) : Math.Max(1, units);
+            var clamped = available is int most && most > 0 ? Math.Clamp(requested, 1, most) : Math.Max(1, requested);
             if (clamped != row.Rule.TargetQuantity)
                 MutateRules(row.Owner, row.PlanId, [row.Rule.Id], draftRule => draftRule.TargetQuantity = clamped);
+            return clamped;
         }
+        if (DalamudGroupedIntegerInput.InputGroupedInt("##target", ref units, 0, 0))
+            Set(units);
+        reviewRegistry.RegisterLastAction(
+            $"quartermaster.transfer.line.quantity.{row.Rule.Id:N}",
+            $"Set the units of {row.Rule.ItemName} to send",
+            AgentBridgeUiControlKind.Input,
+            true,
+            false,
+            row.Rule.TargetQuantity.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            new AgentBridgeActionArgumentSchema([new("quantity", AgentBridgeActionArgumentKind.Integer)]),
+            arguments =>
+            {
+                if (arguments is not { ValueKind: System.Text.Json.JsonValueKind.Object } value ||
+                    !value.TryGetProperty("quantity", out var quantity) || !quantity.TryGetInt32(out var requested))
+                    return AgentBridgeUiActionResult.Fail("quantity must be a whole number.");
+                return AgentBridgeUiActionResult.Ok($"Units set to {Set(requested):N0}.");
+            });
     }
 
     private void DrawTransferSource(TransferWorkbenchRow row)
@@ -1592,23 +1617,24 @@ internal sealed class TransferPlanWorkspace
             {
                 if (!character.Matches(route.Character) || container != route.RetainerId)
                     MutateRules(row.Owner, row.PlanId, ids, draftRule => draftRule.Courier = route with { Character = character with { }, RetainerId = container });
-            }, route.Character, route.RetainerId);
+            }, route.Character, route.RetainerId, source: route.SourceCharacter);
             ImGui.EndMenu();
         }
     }
 
     /// <summary>
-    /// The courier destination chooser: one menu per other known character, holding its bags and
-    /// retainers. Shared by the stock browser and the line menu.
+    /// The courier destination chooser: one menu per character the source can send to, holding its
+    /// bags and retainers. Shared by the stock browser and the line menu.
     /// </summary>
     internal void DrawCourierDestinations(
         QuartermasterRuntimeSnapshot runtime,
         Action<OwnerScope, ulong?> choose,
         OwnerScope? current = null,
         ulong? currentRetainer = null,
-        string? controlPrefix = null)
+        string? controlPrefix = null,
+        OwnerScope? source = null)
     {
-        foreach (var character in courier.Destinations(runtime))
+        foreach (var character in courier.Destinations(runtime, source))
         {
             var key = character.LocalContentId!.Value;
             var here = current?.Matches(character) == true;
@@ -1644,7 +1670,8 @@ internal sealed class TransferPlanWorkspace
         }
     }
 
-    internal bool HasCourierDestinations(QuartermasterRuntimeSnapshot runtime) => courier.Destinations(runtime).Any();
+    internal bool HasCourierDestinations(QuartermasterRuntimeSnapshot runtime, OwnerScope? source = null) =>
+        courier.Destinations(runtime, source).Any();
 
     private static string CourierOutcome(TransferWorkbenchRow row) =>
         row.CourierRefusal is { } refusal && !CourierSession.IsPlanWide(refusal.Code)

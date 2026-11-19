@@ -120,7 +120,15 @@ public sealed class QuartermasterWindow : Window
             () => { },
             () => requestedView = WorkbenchView.Restock);
         listingSession = new(state, ResolveListingMaxStack, id => dataManager.GetExcelSheet<Item>().GetRowOrDefault(id)?.CanBeHq == true);
-        transferExecution = new(state, runtimeSnapshots, journal, transfers, retainerRefresh);
+        transferExecution = new(state, runtimeSnapshots, journal, transfers, retainerRefresh)
+        {
+            StartCourier = planId =>
+            {
+                var current = runtimeSnapshots.Current;
+                if (current.State.StowagePlans.FirstOrDefault(plan => plan.Id == planId && plan.Owner.Matches(current.Owner)) is { } plan)
+                    courier.Start(current, plan);
+            },
+        };
         TransferReviewDialog? transferReview = null;
         VendorProcurementReviewDialog? vendorReview = null;
         transferPlanWorkspace = new(

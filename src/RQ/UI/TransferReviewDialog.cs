@@ -102,7 +102,12 @@ internal sealed class TransferReviewDialog
         }
 
         var projection = resolveProjection(runtime, plan);
-        if (projection.Courier is { } courierPlan)
+        // A mixed plan runs its ordinary lines, then the courier run: one review lists both.
+        var mixedCourier = projection.Courier is { } plannedCourier &&
+            projection.Rows.Any(row => row.Rule.Enabled && row.Rule.Courier is null)
+                ? plannedCourier
+                : null;
+        if (projection.Courier is { } courierPlan && mixedCourier is null)
         {
             DrawCourier(runtime, plan, projection, courierPlan);
             ImGui.EndPopup();
@@ -111,6 +116,7 @@ internal sealed class TransferReviewDialog
             return;
         }
         var movements = projection.Movements;
+        var courierRows = mixedCourier is null ? [] : CourierRows(projection);
 
         ImGui.TextUnformatted($"{movements:N0} movements");
         ImGui.SameLine();
@@ -121,9 +127,15 @@ internal sealed class TransferReviewDialog
         ImGui.TextColored(
             new Vector4(.53f, .83f, .64f, 1f),
             projection.HasUnknownListingDemand ? "Stow —" : $"Stow {projection.Deposit.RequestedQuantity:N0}");
+        if (mixedCourier is not null)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(TransferPresentation.SendColor, $"Send {courierRows.Sum(row => row.Projection.Send):N0}");
+        }
         ImGui.Separator();
 
         var reviewRows = projection.Rows
+            .Where(row => mixedCourier is null || row.Rule.Courier is null)
             .Select(row => new TransferReviewRow(
                 row.Rule,
                 row.Line,
@@ -136,10 +148,11 @@ internal sealed class TransferReviewDialog
                     .Concat(line.Moves.Select(move => row with { Move = move }))
                 : [row])
             .ToArray();
+        var tableHeight = Math.Max(260, ImGui.GetContentRegionAvail().Y - 48);
         if (table.Begin(
                 "RQTransferReviewRows",
                 new DalamudTableLayout(
-                    new Vector2(0, Math.Max(260, ImGui.GetContentRegionAvail().Y - 48)),
+                    new Vector2(0, mixedCourier is null ? tableHeight : tableHeight * .55f),
                     ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
                     ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp)))
         {
@@ -148,6 +161,8 @@ internal sealed class TransferReviewDialog
                 (row, index) => table.DrawRow(row, id: row.Move is null ? $"transfer-review:{row.Rule.Id}" : $"transfer-review:{row.Rule.Id}:move:{index}"));
             table.End();
         }
+        if (mixedCourier is not null)
+            DrawCourierRows(courierRows, 120);
 
         if (ImGui.Button("Back"))
         {
@@ -165,12 +180,23 @@ internal sealed class TransferReviewDialog
             runtime.Owner.HasStableIdentity,
             transfersCanStart(),
             retainerRefreshBusy());
+        var courierGate = mixedCourier is null ? (CourierStartGate?)null : courier.StartGate(runtime, mixedCourier);
+        if (courierGate is { CanStart: false } blocked)
+            availability = new(false, blocked.Status ?? availability.BlockReason);
         ImGui.SameLine();
         ImGui.TextDisabled(
             projection.HasUnknownListingDemand
                 ? "Listing demand will be verified before any movement."
                 : availability.BlockReason ??
-                  "Balanced items remain in the plan but require no movement.");
+                  (mixedCourier is null ? "Balanced items remain in the plan but require no movement." : string.Empty));
+        // An active or unsettled courier run is handled on the run pane; Execute is not offered meanwhile.
+        if (courierGate is { Offer: false })
+        {
+            ImGui.EndPopup();
+            if (!open)
+                Clear();
+            return;
+        }
         var canExecute = availability.CanExecute;
         ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - 110));
         if (!canExecute)
@@ -206,7 +232,7 @@ internal sealed class TransferReviewDialog
         TransferWorkbenchProjection projection,
         RQ.Courier.CourierPlan courierPlan)
     {
-        var rows = projection.Rows.Where(row => row.Rule.Courier is not null && row.Rule.Enabled).ToArray();
+        var rows = CourierRows(projection);
         var units = rows.Sum(row => row.Projection.Send);
         ImGui.TextUnformatted($"{courierPlan.Trips.Length:N0} trip{(courierPlan.Trips.Length == 1 ? string.Empty : "s")}");
         ImGui.SameLine();
@@ -215,16 +241,7 @@ internal sealed class TransferReviewDialog
         ImGui.TextColored(TransferPresentation.SendColor, $"Send {units:N0}");
         ImGui.Separator();
 
-        if (courierTable.Begin(
-                "RQCourierReviewRows",
-                new DalamudTableLayout(
-                    new Vector2(0, Math.Max(260, ImGui.GetContentRegionAvail().Y - 48)),
-                    ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
-                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp)))
-        {
-            courierTable.DrawClippedRows(rows, (row, _) => courierTable.DrawRow(row, id: $"courier-review:{row.Rule.Id}"));
-            courierTable.End();
-        }
+        DrawCourierRows(rows, 260);
 
         if (ImGui.Button("Back"))
         {
@@ -237,19 +254,16 @@ internal sealed class TransferReviewDialog
             true,
             Clear,
             "No inventory movement");
-        var mixed = projection.Rows.Any(row=>row.Rule.Enabled && row.Rule.Courier==null);
         var gate = courier.StartGate(runtime, courierPlan);
-        var block = mixed
-            ? "Mixed execution unavailable: ordinary transfers have no completion receipt for the courier."
-            : gate.Status;
-        var canStart = !mixed && gate.CanStart;
+        var block = gate.Status;
+        var canStart = gate.CanStart;
         if (block is not null)
         {
             ImGui.SameLine();
             ImGui.TextDisabled(block);
         }
         // An active or unsettled run is handled on the run pane; Start is not offered meanwhile.
-        if (!mixed && !gate.Offer)
+        if (!gate.Offer)
             return;
         ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - 110));
         ImGui.BeginDisabled(!canStart);
@@ -270,6 +284,22 @@ internal sealed class TransferReviewDialog
                 Clear();
             },
             block ?? (canStart ? $"{courierPlan.Trips.Length:N0} courier trips" : "Lines refused"));
+    }
+
+    private static TransferWorkbenchRow[] CourierRows(TransferWorkbenchProjection projection) =>
+        projection.Rows.Where(row => row.Rule.Courier is not null && row.Rule.Enabled).ToArray();
+
+    private void DrawCourierRows(IReadOnlyList<TransferWorkbenchRow> rows, float minimumHeight)
+    {
+        if (!courierTable.Begin(
+                "RQCourierReviewRows",
+                new DalamudTableLayout(
+                    new Vector2(0, Math.Max(minimumHeight, ImGui.GetContentRegionAvail().Y - 48)),
+                    ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
+                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp)))
+            return;
+        courierTable.DrawClippedRows(rows, (row, _) => courierTable.DrawRow(row, id: $"courier-review:{row.Rule.Id}"));
+        courierTable.End();
     }
 
     private static DalamudTableProjection<TransferWorkbenchRow> CreateCourierTable() => new(

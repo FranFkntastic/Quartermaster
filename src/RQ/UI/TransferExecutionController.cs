@@ -51,11 +51,10 @@ internal sealed class TransferExecutionController
         var rules = current.State.PlanItems
             .Where(rule => rule.StowagePlanId == plan.Id)
             .ToArray();
-        if (rules.Any(r => r.Enabled && r.Courier is not null))
-        {
-            ReportInlineError("CourierRunRequired: this plan includes a cross-character shipment.");
-            return;
-        }
+        // Courier lines are not ordinary movements (the composed rules below exclude them); they
+        // run as a courier run once this plan's ordinary part has succeeded.
+        var courierPlanId = rules.Any(r => r.Enabled && r.Courier is not null) ? planId : (Guid?)null;
+        courierFollowUp = null;
         if (ListingPlanEvaluator.HasUnknownLinkedDemand(current.State, current.Browser, current.Owner, plan.Id))
         {
             if (allowCapacityRecovery && retainerRefresh.StartForPlan(out var refreshRunId))
@@ -117,9 +116,14 @@ internal sealed class TransferExecutionController
                 ReportInlineError($"PlacementStackSizeUnknown: cannot bound a batch for {unknown.ItemName}.");
                 return;
             }
-            Start(transfers.ExecutePlacementAsync(current.Owner, plan, enabled,
+            var startedAtUtc = DateTime.UtcNow;
+            var placementTask = transfers.ExecutePlacementAsync(current.Owner, plan, enabled,
                 () => state.ReadConfiguration(s => s.StowagePlans.Any(p => p.Id == plan.Id && p.Revision == plan.Revision && p.Owner.Matches(current.Owner))),
-                id => sizes[id]!.Value));
+                id => sizes[id]!.Value);
+            FollowWithCourier(placementTask, courierPlanId, () => journal.History(current.Owner, 16).FirstOrDefault(operation =>
+                operation.Kind == OperationKinds.Placement && operation.SourcePlanId == plan.Id &&
+                operation.CreatedAtUtc >= startedAtUtc)?.Status == OperationStatuses.Succeeded);
+            Start(placementTask);
             return;
         }
         var retrievalOperationId = currentRetrieval.NeededQuantity > 0
@@ -128,11 +132,36 @@ internal sealed class TransferExecutionController
         var depositOperationId = currentBatch.PlannedQuantity > 0
             ? journal.CreateTransferDeposit(current.Owner, plan, currentBatch).OperationId
             : null;
-        Start(transfers.ExecutePlanAsync(retrievalOperationId, depositOperationId));
+        if (retrievalOperationId is null && depositOperationId is null && courierPlanId is { } courierOnly)
+        {
+            // The ordinary lines need no movement: the courier run is all there is to do.
+            Volatile.Write(ref courierReady, courierOnly);
+            return;
+        }
+        var transfer = transfers.ExecutePlanAsync(retrievalOperationId, depositOperationId);
+        FollowWithCourier(transfer, courierPlanId, () =>
+            new[] { retrievalOperationId, depositOperationId }.OfType<string>()
+                .All(id => journal.Get(id)?.Status == OperationStatuses.Succeeded));
+        Start(transfer);
     }
+
+    /// <summary>
+    /// Starts the plan's courier run (on the framework thread, from <see cref="Tick"/>) once the
+    /// ordinary transfer finishes and its journal shows every operation succeeded.
+    /// </summary>
+    internal Action<Guid>? StartCourier { get; set; }
+
+    private (Task<TransferExecutionResult> Transfer, Guid PlanId, Func<bool> Succeeded)? courierFollowUp;
+    // A boxed plan id, swapped atomically: the transfer's observer sets it, Tick takes it.
+    private object? courierReady;
+
+    private void FollowWithCourier(Task<TransferExecutionResult> transfer, Guid? courierPlanId, Func<bool> succeeded) =>
+        courierFollowUp = courierPlanId is { } id ? (transfer, id, succeeded) : null;
 
     public void Tick()
     {
+        if (Interlocked.Exchange(ref courierReady, null) is Guid ready)
+            StartCourier?.Invoke(ready);
         if (pendingRecovery is not { } pending ||
             !string.Equals(retainerRefresh.LastCompletedRunId, pending.RefreshRunId, StringComparison.Ordinal))
             return;
@@ -268,10 +297,15 @@ internal sealed class TransferExecutionController
     private async Task ObserveAsync(Task<TransferExecutionResult> transfer)
     {
         activeTransferTask = transfer;
+        var followUp = courierFollowUp;
+        if (followUp is { } pending && !ReferenceEquals(pending.Transfer, transfer))
+            followUp = null;
         try
         {
             var result = await transfer;
             Status = result.Message;
+            if (followUp is { } next && result.Started && next.Succeeded())
+                Volatile.Write(ref courierReady, next.PlanId);
         }
         catch (Exception exception)
         {

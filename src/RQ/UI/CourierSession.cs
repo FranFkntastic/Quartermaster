@@ -5,6 +5,7 @@ using RQ.Courier;
 using RQ.Domain;
 using RQ.Inventory;
 using RQ.Persistence;
+using RQ.Planning;
 using RQ.Runtime;
 
 namespace RQ.UI;
@@ -149,9 +150,47 @@ public sealed class CourierSession
         return known;
     }
 
-    /// <summary>Characters a courier line can deliver to from the logged-in character.</summary>
-    internal IEnumerable<OwnerScope> Destinations(QuartermasterRuntimeSnapshot runtime) =>
-        Characters(runtime).Where(owner => !owner.Matches(runtime.Owner) && !IsCarrier(runtime, owner));
+    /// <summary>
+    /// Characters a courier line can deliver to from its source: from the logged-in character, every
+    /// other character; from another character, the logged-in one first, then the rest.
+    /// </summary>
+    internal IEnumerable<OwnerScope> Destinations(QuartermasterRuntimeSnapshot runtime, OwnerScope? source = null)
+    {
+        var others = Characters(runtime).Where(owner => !owner.Matches(runtime.Owner) && !IsCarrier(runtime, owner));
+        if (source is null || source.Matches(runtime.Owner))
+            return others;
+        var here = runtime.Owner.HasStableIdentity && !IsCarrier(runtime, runtime.Owner) ? new[] { runtime.Owner } : [];
+        return here.Concat(others.Where(owner => !owner.Matches(source)));
+    }
+
+    /// <summary>Other characters whose stock this client has observed, for the stock browser.</summary>
+    internal IEnumerable<OwnerScope> Browsable(QuartermasterRuntimeSnapshot runtime) =>
+        Characters(runtime).Where(owner => !owner.Matches(runtime.Owner) && !IsCarrier(runtime, owner) && Stock(runtime, owner) is not null);
+
+    private (long Revision, Dictionary<ulong, BrowserProjection?> Projections)? stock;
+
+    /// <summary>
+    /// Another character's last observed bags and retainers as a stock browser projection; null when
+    /// neither has been observed on this client. Cached per planning revision.
+    /// </summary>
+    internal BrowserProjection? Stock(QuartermasterRuntimeSnapshot runtime, OwnerScope character)
+    {
+        if (character.LocalContentId is not { } id)
+            return null;
+        if (stock is not { } cache || cache.Revision != runtime.PlanningRevision)
+            stock = cache = (runtime.PlanningRevision, []);
+        if (cache.Projections.TryGetValue(id, out var hit))
+            return hit;
+        var capture = cachedBags(character);
+        var bags = PlayerBagNames.All(name => capture.ObservedSources.Contains(name, StringComparer.Ordinal))
+            ? capture.Bags.Where(bag => PlayerBagNames.Contains(bag.BagName, StringComparer.Ordinal)).ToArray()
+            : [];
+        var observed = bags.Length > 0 || Retainers(runtime, character).Any(retainer =>
+            RetainerPageNames.All(name => retainer.ObservedSources.Contains(name, StringComparer.Ordinal)));
+        var projection = observed ? BrowserProjectionBuilder.Build(bags, runtime.Retainers, character, metadata) : null;
+        cache.Projections[id] = projection;
+        return projection;
+    }
 
     internal static bool IsCarrier(QuartermasterRuntimeSnapshot runtime, OwnerScope owner) =>
         runtime.State.Courier.Carrier is { } carrier && carrier.Matches(owner);
