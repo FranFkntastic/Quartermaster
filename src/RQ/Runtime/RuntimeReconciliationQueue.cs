@@ -67,6 +67,8 @@ public sealed record RuntimeReconciliationBatch(
     PlayerInventoryCacheChange? PlayerInventoryChange,
     IReadOnlyList<RuntimeChangeNotice> Notices)
 {
+    public int RequestCount { get; init; }
+    public TimeSpan Waited { get; init; }
     public static RuntimeReconciliationBatch Empty { get; } = new(RuntimeDomain.None, null, []);
     public bool HasWork => Domains != RuntimeDomain.None;
 }
@@ -78,15 +80,22 @@ public sealed record RuntimeReconciliationBatch(
 /// </summary>
 public sealed class RuntimeReconciliationQueue
 {
+    public static readonly TimeSpan BackgroundQuietPeriod = TimeSpan.FromMilliseconds(500);
+    public static readonly TimeSpan BackgroundMaximumDelay = TimeSpan.FromSeconds(2);
+    private readonly TimeProvider clock;
+    private sealed record PendingNotice(RuntimeChangeNotice Notice, long First, long Last, int Count, bool Immediate);
+
+    public RuntimeReconciliationQueue(TimeProvider? clock = null) => this.clock = clock ?? TimeProvider.System;
+
     private readonly object gate = new();
     private RuntimeDomain pendingDomains;
-    private readonly Dictionary<(RuntimeDomain Domain, string Kind, string? OperationId), RuntimeChangeNotice> notices = [];
+    private readonly Dictionary<(RuntimeDomain Domain, string Kind, string? OperationId), PendingNotice> notices = [];
     private OwnerScope? playerOwner;
     private DateTime playerObservedAtUtc;
     private bool playerRequiresFullRefresh;
     private readonly Dictionary<(string Container, int Slot), PlayerInventorySlotMutation> playerSlots = [];
 
-    public void Request(RuntimeDomain domain, string kind, string? operationId = null)
+    public void Request(RuntimeDomain domain, string kind, string? operationId = null, bool interactive = false)
     {
         if (domain == RuntimeDomain.None)
             return;
@@ -94,8 +103,7 @@ public sealed class RuntimeReconciliationQueue
         lock (gate)
         {
             pendingDomains |= domain;
-            var notice = new RuntimeChangeNotice(domain, kind, operationId);
-            notices[(domain, kind, operationId)] = notice;
+            AddNotice(domain, kind, operationId, interactive);
         }
     }
 
@@ -105,8 +113,7 @@ public sealed class RuntimeReconciliationQueue
         lock (gate)
         {
             pendingDomains |= RuntimeDomain.PlayerInventory;
-            notices[(RuntimeDomain.PlayerInventory, "player_inventory", null)] =
-                new(RuntimeDomain.PlayerInventory, "player_inventory", null);
+            AddNotice(RuntimeDomain.PlayerInventory, "player_inventory", null, false);
 
             // A baseline, owner transition, or uncertain sequence is repaired from
             // the authoritative cache once. Ordinary slot events retain the first
@@ -134,13 +141,54 @@ public sealed class RuntimeReconciliationQueue
         }
     }
 
-    public RuntimeReconciliationBatch Drain(RuntimeDomain allowedDomains = RuntimeDomain.All)
+    private void AddNotice(RuntimeDomain domain, string kind, string? operationId, bool interactive)
+    {
+        var now = clock.GetTimestamp();
+        var key = (domain, kind, operationId);
+        var immediate = interactive || kind is not ("player_inventory" or "cache" or "state" or "retainer_listings" or "periodic");
+        notices[key] = notices.TryGetValue(key, out var previous)
+            ? previous with { Last = now, Count = previous.Count + 1, Immediate = previous.Immediate || immediate }
+            : new(new(domain, kind, operationId), now, now, 1, immediate);
+    }
+
+    public bool HasPending(RuntimeDomain domains = RuntimeDomain.All)
+    {
+        lock (gate)
+            return (pendingDomains & domains) != 0;
+    }
+
+    public RuntimeReconciliationBatch Drain(RuntimeDomain allowedDomains = RuntimeDomain.All, bool force = true)
     {
         lock (gate)
         {
             var domains = pendingDomains & allowedDomains;
             if (domains == RuntimeDomain.None)
                 return RuntimeReconciliationBatch.Empty;
+
+            var now = clock.GetTimestamp();
+            if (!force)
+            {
+                var immediate = RuntimeDomain.Operations;
+                var first = now;
+                var last = long.MinValue;
+                foreach (var pending in notices.Values)
+                {
+                    if ((pending.Notice.Domain & domains) == 0)
+                        continue;
+                    if (pending.Immediate)
+                        immediate |= pending.Notice.Domain;
+                    // Operation churn must not restart the background quiet period.
+                    if ((pending.Notice.Domain & domains & ~RuntimeDomain.Operations) == 0)
+                        continue;
+                    first = Math.Min(first, pending.First);
+                    last = Math.Max(last, pending.Last);
+                }
+                if (last != long.MinValue && clock.GetElapsedTime(first, now) < BackgroundMaximumDelay &&
+                    clock.GetElapsedTime(last, now) < BackgroundQuietPeriod)
+                    domains &= immediate;
+                if (domains == RuntimeDomain.None)
+                    return RuntimeReconciliationBatch.Empty;
+            }
 
             pendingDomains &= ~domains;
             PlayerInventoryCacheChange? playerChange = null;
@@ -165,23 +213,41 @@ public sealed class RuntimeReconciliationQueue
             }
 
             var drainedNotices = new List<RuntimeChangeNotice>();
+            var retainedNotices = new List<PendingNotice>();
+            var requestCount = 0;
+            var oldest = now;
             foreach (var pair in notices.ToArray())
             {
-                var drainedDomain = pair.Value.Domain & domains;
+                var notice = pair.Value.Notice;
+                var drainedDomain = notice.Domain & domains;
                 if (drainedDomain == RuntimeDomain.None)
                     continue;
 
                 notices.Remove(pair.Key);
-                drainedNotices.Add(pair.Value with { Domain = drainedDomain });
-                var remainingDomain = pair.Value.Domain & ~domains;
+                drainedNotices.Add(notice with { Domain = drainedDomain });
+                requestCount += pair.Value.Count;
+                oldest = Math.Min(oldest, pair.Value.First);
+                var remainingDomain = notice.Domain & ~domains;
                 if (remainingDomain != RuntimeDomain.None)
                 {
-                    var remaining = pair.Value with { Domain = remainingDomain };
-                    notices[(remainingDomain, remaining.Kind, remaining.OperationId)] = remaining;
+                    var remaining = notice with { Domain = remainingDomain };
+                    retainedNotices.Add(pair.Value with { Notice = remaining });
                 }
             }
 
-            return new(domains, playerChange, drainedNotices);
+            // Merge only after removing drained keys: a split multi-domain notice
+            // can otherwise collide with a key still in the enumeration snapshot.
+            foreach (var pending in retainedNotices)
+            {
+                var notice = pending.Notice;
+                var key = (notice.Domain, notice.Kind, notice.OperationId);
+                var retained = pending;
+                if (notices.TryGetValue(key, out var other))
+                    retained = retained with { First = Math.Min(retained.First, other.First), Last = Math.Max(retained.Last, other.Last), Count = retained.Count + other.Count, Immediate = retained.Immediate || other.Immediate };
+                notices[key] = retained;
+            }
+
+            return new(domains, playerChange, drainedNotices) { RequestCount = requestCount, Waited = clock.GetElapsedTime(oldest, now) };
         }
     }
 }

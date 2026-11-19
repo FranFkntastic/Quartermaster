@@ -17,7 +17,7 @@ namespace RQ.UI;
 /// Side pane of the Market tab: the run bar, one row per planned or reserved item, and the craft export.
 /// </summary>
 internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, string configDirectory,
-    MarketMafiosoSavedJobClient importer)
+    MarketMafiosoSavedJobClient importer, Func<QuartermasterRuntimeSnapshot> freshRuntime)
 {
     // Pane widths at which the Listed and Goes to columns join Item | Reserve | Craft.
     private const float ListedColumnWidth = 470;
@@ -108,7 +108,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         DrawRunBar(runtime, session);
         ImGui.Dummy(new Vector2(0, 6));
         DrawTable(runtime, session, draft, retainers, selectedRetainerId);
-        DrawFooter();
+        DrawFooter(session);
     }
 
     // ---- Run bar ---------------------------------------------------------------------------------
@@ -340,7 +340,10 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         status = null;
         if (!session.IsDirty)
         {
-            if (Executor is { } executor && ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner) is { } plan)
+            var current = freshRuntime();
+            session.Ensure(current);
+            Update(current, session);
+            if (Executor is { } executor && ListingPlanCatalog.OwnerPlan(current.State, current.Owner) is { } plan)
                 _ = executor.RunAsync(plan, run, session.IsDirty, reorganizeRetainers);
             return;
         }
@@ -625,7 +628,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
 
     // ---- Footer ----------------------------------------------------------------------------------
 
-    private void DrawFooter()
+    private void DrawFooter(ListingPlanDraftSession session)
     {
         ImGui.Dummy(new Vector2(0, 4));
         var origin = ImGui.GetCursorScreenPos();
@@ -644,16 +647,27 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         var buttons = ButtonWidth("Copy") + spacing + (wide ? ButtonWidth("Save…") + spacing : 0) + ButtonWidth("Send to MarketMafioso");
         if (origin.X + width - buttons >= leftEnd + 12) ImGui.SameLine(origin.X + width - buttons - ImGui.GetWindowPos().X + ImGui.GetScrollX());
         ImGui.BeginDisabled(!run.IsComplete || export.Json is null);
-        if (ImGui.Button("Copy##RQMarketRunCopy")) { ImGui.SetClipboardText(export.Json!); status = "Craft queue copied."; }
+        if (ImGui.Button("Copy##RQMarketRunCopy") && RefreshExport(session)) { ImGui.SetClipboardText(export.Json!); status = "Craft queue copied."; }
         if (wide)
         {
             ImGui.SameLine();
-            if (ImGui.Button("Save…##RQMarketRunSave")) Save();
+            if (ImGui.Button("Save…##RQMarketRunSave") && RefreshExport(session)) Save();
         }
         ImGui.SameLine();
-        if (UiLayout.PrimaryButton("Send to MarketMafioso##RQMarketRunSend")) status = importer.Send(export.Json!).Message;
+        if (UiLayout.PrimaryButton("Send to MarketMafioso##RQMarketRunSend") && RefreshExport(session)) status = importer.Send(export.Json!).Message;
         ImGui.EndDisabled();
         if (!string.IsNullOrEmpty(status)) { ImGui.PushTextWrapPos(0); ImGui.TextDisabled(status); ImGui.PopTextWrapPos(); }
+    }
+
+    private bool RefreshExport(ListingPlanDraftSession session)
+    {
+        var current = freshRuntime();
+        session.Ensure(current);
+        Update(current, session);
+        if (run.IsComplete && export.Json is not null)
+            return true;
+        status = "Current observations do not produce a complete craft queue.";
+        return false;
     }
 
     private void Save()

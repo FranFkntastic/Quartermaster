@@ -70,7 +70,7 @@ public sealed class TransferVendorProcurementService : IDisposable
                 : "A vendor procurement run is already active.";
             return false;
         }
-        var runtime = runtimeSnapshots.Current;
+        var runtime = runtimeSnapshots.GetFresh();
         var plan = runtime.State.StowagePlans.FirstOrDefault(candidate =>
             candidate.Id == review.PlanId && candidate.Owner.Matches(runtime.Owner));
         if (plan is null || !review.Owner.Matches(runtime.Owner))
@@ -90,6 +90,23 @@ public sealed class TransferVendorProcurementService : IDisposable
             error = "The effective Transfer Plan target changed after review; review the current vendor shortfall again.";
             return false;
         }
+        // Reconcile stock without expanding the quantities or prices the user approved.
+        var counts = runtime.Browser.Items.ToDictionary(item => item.ItemId, item => item.PlayerQuantity);
+        var retrieval = RestockPlanner.Build(effectiveRules, counts, runtime.Retainers, runtime.Owner, runtime.CapturedAtUtc, runtime.Browser);
+        var fresh = planner.Build(runtime.Owner, plan, runtime.Revision, effectiveRules, retrieval);
+        var remaining = fresh.ReadyLines.ToDictionary(line => line.RuleId, line => line.ApprovedQuantity);
+        var lines = review.ReadyLines.Select(line => line with
+        {
+            ApprovedQuantity = Math.Min(line.ApprovedQuantity, remaining.GetValueOrDefault(line.RuleId)),
+        }).Where(line => line.ApprovedQuantity > 0).ToArray();
+        review = review with
+        {
+            Lines = lines,
+            Stops = review.Stops.Select(stop => stop with
+            {
+                Lines = lines.Where(line => stop.Lines.Any(old => old.RuleId == line.RuleId)).ToArray(),
+            }).Where(stop => stop.Lines.Count > 0).ToArray(),
+        };
         if (!review.CanStart)
         {
             error = "No reviewed vendor-purchasable shortfall remains.";
@@ -165,7 +182,7 @@ public sealed class TransferVendorProcurementService : IDisposable
 
     private string CurrentContextSignature()
     {
-        var runtime = runtimeSnapshots.Current;
+        var runtime = runtimeSnapshots.GetFresh();
         var run = coordinator.ActiveRun;
         if (run is null || !runtime.Owner.HasStableIdentity)
             return string.Empty;

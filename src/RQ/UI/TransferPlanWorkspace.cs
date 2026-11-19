@@ -190,6 +190,7 @@ internal sealed class TransferPlanWorkspace
     /// <summary>Adds stock-browser selections to the selected plan (or the Unsaved plan).</summary>
     public void AddStock(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, bool stow, ulong? retainerId = null)
     {
+        runtime = runtimeSnapshots.GetFresh();
         if (!runtime.Owner.HasStableIdentity)
             return;
         EnsureSelection(runtime);
@@ -198,7 +199,8 @@ internal sealed class TransferPlanWorkspace
         {
             var draft = StowagePlanCatalog.Draft(document, runtime.Owner, planId);
             foreach (var item in items)
-                StowagePlanCatalog.SetStockRule(draft, item.ItemId, item.ItemName, item.PlayerQuantity, stow, retainerId);
+                StowagePlanCatalog.SetStockRule(draft, item.ItemId, item.ItemName,
+                    runtime.Browser.Items.FirstOrDefault(current => current.ItemId == item.ItemId)?.PlayerQuantity ?? 0, stow, retainerId);
             StowagePlanCatalog.Apply(document, runtime.Owner, draft);
         });
     }
@@ -295,6 +297,7 @@ internal sealed class TransferPlanWorkspace
 
     private void AddToSelectedPlan(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<PlanAddEntry> entries)
     {
+        runtime = runtimeSnapshots.GetFresh();
         if (!runtime.Owner.HasStableIdentity || entries.Count == 0)
             return;
         EnsureSelection(runtime);
@@ -724,20 +727,13 @@ internal sealed class TransferPlanWorkspace
         UiLayout.SameLineIfFits(buyLabel);
         ImGui.BeginDisabled(!canReviewVendor);
         if (ImGui.Button(buyLabel) && vendor is not null)
-            requestVendorReview(vendor);
+            RequestSelectedVendorReview();
         ImGui.EndDisabled();
         reviewRegistry.RegisterLastButton(
             "quartermaster.vendor.review",
             "Review vendor coverage for the selected Transfer Plan",
             canReviewVendor,
-            () =>
-            {
-                var current = runtimeSnapshots.Current;
-                var currentPlan = ResolveSelectedStowagePlan(current.State, current.Owner);
-                if (currentPlan is null)
-                    return;
-                requestVendorReview(ResolveProjection(current, currentPlan).Vendor);
-            },
+            RequestSelectedVendorReview,
             canReviewVendor
                 ? $"{vendor!.ApprovedQuantity:N0} units · maximum {vendor.MaximumGil:N0} gil"
                 : vendorBlockReason);
@@ -2225,7 +2221,7 @@ internal sealed class TransferPlanWorkspace
 
     public void RequestSelectedTransferReview()
     {
-        var current = runtimeSnapshots.Current;
+        var current = runtimeSnapshots.GetFresh();
         var plan = ResolveSelectedStowagePlan(current.State, current.Owner);
         if (plan is null)
             return;
@@ -2234,7 +2230,7 @@ internal sealed class TransferPlanWorkspace
 
     public void RequestSelectedVendorReview()
     {
-        var current = runtimeSnapshots.Current;
+        var current = runtimeSnapshots.GetFresh();
         var plan = ResolveSelectedStowagePlan(current.State, current.Owner);
         if (plan is null)
             return;

@@ -43,7 +43,7 @@ internal sealed class TransferExecutionController
 
     public void ExecutePlan(Guid planId, bool allowCapacityRecovery = true)
     {
-        var current = runtimeSnapshots.Current;
+        var current = runtimeSnapshots.GetFresh();
         var plan = current.State.StowagePlans.FirstOrDefault(candidate =>
             candidate.Id == planId && candidate.Owner.Matches(current.Owner));
         if (plan is null)
@@ -178,10 +178,11 @@ internal sealed class TransferExecutionController
             });
             return;
         }
+        var runtime = runtimeSnapshots.GetFresh();
         var currentState = state.Snapshot();
         var recovery = currentState.TransferPlanRecovery;
         var currentPlan = currentState.StowagePlans.FirstOrDefault(plan =>
-            plan.Id == pending.PlanId && plan.Owner.Matches(runtimeSnapshots.Current.Owner));
+            plan.Id == pending.PlanId && plan.Owner.Matches(runtime.Owner));
         if (recovery is null || currentPlan is null ||
             recovery.PlanId != currentPlan.Id ||
             recovery.PlanRevision != currentPlan.Revision ||
@@ -199,6 +200,12 @@ internal sealed class TransferExecutionController
 
     public void RetryRecovery(StowagePlan plan)
     {
+        var runtime = runtimeSnapshots.GetFresh();
+        var currentPlan = runtime.State.StowagePlans.FirstOrDefault(candidate =>
+            candidate.Id == plan.Id && candidate.Owner.Matches(runtime.Owner));
+        if (currentPlan is null)
+            return;
+        plan = currentPlan;
         if (!retainerRefresh.StartForPlan(out var refreshRunId))
         {
             ReportInlineError(retainerRefresh.Status, updateStatus: false);
@@ -287,7 +294,7 @@ internal sealed class TransferExecutionController
     private void PersistRecovery(StowagePlan plan, string refreshRunId) =>
         state.Mutate(StateChangeKind.Recovery, document => document.TransferPlanRecovery = new()
         {
-            Owner = runtimeSnapshots.Current.Owner with { },
+            Owner = plan.Owner with { },
             PlanId = plan.Id,
             PlanRevision = plan.Revision,
             RefreshRunId = refreshRunId,
