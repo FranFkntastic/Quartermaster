@@ -70,14 +70,10 @@ public sealed class AgentBridgeHost : IDisposable
 
     public void Tick()
     {
-#if DEBUG
         if (configuration.EnableAgentBridge)
             host.Start();
         else
             host.Stop();
-#else
-        host.Stop();
-#endif
         UpdateRefreshOperation();
     }
 
@@ -85,7 +81,6 @@ public sealed class AgentBridgeHost : IDisposable
 
     private void RegisterCommands()
     {
-        // This host can only start under DEBUG (see Tick); compile its command contract in Release too.
         router.Register("set-courier-slot-cap",async (request,ct)=>{
             if(provider.SetCourierSlotCap is not {} set || !int.TryParse(request.Target,out var value) || value is <0 or >140)
                 return AgentBridgeResponse.Fail("Target must be 1–140 slots, or 0 to remove the cap.");
