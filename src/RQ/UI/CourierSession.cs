@@ -417,10 +417,11 @@ public sealed class CourierSession
             foreach (var line in completed.Lines)
             {
                 var rule = draft.Rules.Find(r => r.Id == line.Line && r.Courier is not null);
-                // A line re-routed during the run is a new instruction; what was delivered does not count against it.
+                // A line re-routed or re-qualified during the run is a new instruction; what was delivered does not count against it.
                 if (rule is null || line.Moved <= 0 || line.Route is not { } sent || rule.Courier!.RetainerId != sent.To ||
                     rule.Courier.SourceRetainerId != sent.From || !CourierPlanner.Exact(rule.Courier.Character, sent.Destination) ||
-                    !CourierPlanner.Exact(rule.Courier.SourceCharacter ?? scratch.Owner, sent.Source))
+                    !CourierPlanner.Exact(rule.Courier.SourceCharacter ?? scratch.Owner, sent.Source) ||
+                    rule.Quality != ItemQualityPolicy.Any && (rule.Quality == ItemQualityPolicy.HqOnly ? line.Nq : line.Hq))
                     continue;
                 if (rule.TargetQuantity <= line.Moved)
                     draft.Rules.Remove(rule);
