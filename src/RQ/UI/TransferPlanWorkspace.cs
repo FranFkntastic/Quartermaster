@@ -1502,6 +1502,7 @@ internal sealed class TransferPlanWorkspace
             ImGui.OpenPopup("line-menu");
         }
         DrawHoverRemove(row);
+        ImGui.SetNextWindowBgAlpha(1f);
         if (!ImGui.BeginPopup("line-menu"))
             return;
         Guid[] ids = [rule.Id];
@@ -1597,7 +1598,7 @@ internal sealed class TransferPlanWorkspace
         Guid[] ids = [row.Rule.Id];
         var runtime = row.Runtime;
         var source = route.SourceCharacter ?? row.Owner;
-        if (ImGui.BeginMenu($"From · {CourierSession.Side(runtime, route.SourceCharacter, route.SourceRetainerId)}###from"))
+        if (ImGui.BeginMenu($"From · {CourierSession.Side(runtime, source, route.SourceRetainerId, includeOwner: true)}###from"))
         {
             void From(ulong? container)
             {
@@ -1611,7 +1612,7 @@ internal sealed class TransferPlanWorkspace
                     From(retainer.RetainerId);
             ImGui.EndMenu();
         }
-        if (ImGui.BeginMenu($"To · {CourierSession.Side(runtime, route.Character, route.RetainerId)}###to"))
+        if (ImGui.BeginMenu($"To · {CourierSession.Side(runtime, route.Character, route.RetainerId, includeOwner: true)}###to"))
         {
             DrawCourierDestinations(runtime, (character, container) =>
             {

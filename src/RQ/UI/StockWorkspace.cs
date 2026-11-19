@@ -493,6 +493,7 @@ internal sealed class StockWorkspace
             ImGui.OpenPopup("RQStockOptions");
             optionsRequested = false;
         }
+        ImGui.SetNextWindowBgAlpha(1f);
         if (ImGui.BeginPopup("RQStockOptions"))
         {
             ImGui.TextDisabled("Included player storage");
@@ -770,6 +771,7 @@ internal sealed class StockWorkspace
             ImGui.OpenPopup("RQStockStow");
             stowRequested = false;
         }
+        ImGui.SetNextWindowBgAlpha(1f);
         if (ImGui.BeginPopup("RQStockStow"))
         {
             DrawStowDestinations(runtime, ResolveSelection(runtime).Stock.Where(item => item.PlayerQuantity > 0).ToArray());
@@ -795,6 +797,7 @@ internal sealed class StockWorkspace
                 ImGui.OpenPopup("RQStockSend");
                 sendRequested = false;
             }
+            ImGui.SetNextWindowBgAlpha(1f);
             if (ImGui.BeginPopup("RQStockSend"))
             {
                 DrawSendDestinations(runtime, ResolveSelection(runtime).Stock.Where(CanSend).ToArray(), "quartermaster.stock.send");

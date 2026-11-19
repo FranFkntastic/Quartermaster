@@ -80,6 +80,7 @@ internal sealed class TransferReviewDialog
         }
 
         var open = true;
+        ImGui.SetNextWindowBgAlpha(1f);
         if (!ImGui.BeginPopupModal(popup, ref open, ImGuiWindowFlags.NoScrollbar))
         {
             if (!open)
@@ -302,9 +303,9 @@ internal sealed class TransferReviewDialog
                 for (var i = 0; i < plan.Trips.Length; i++)
                 {
                     var trip = plan.Trips[i];
-                    var count = trip.Manifest.Length;
+                    var stacks = trip.Manifest.Length;
                     ImGui.TextDisabled($"Trip {i + 1} · {CourierSession.CharacterLabel(trip.Source)} at {trip.Pickup.Label} → " +
-                        $"{CourierSession.CharacterLabel(trip.Destination)} at {trip.Dropoff.Label} · {count:N0} shipment{(count == 1 ? string.Empty : "s")}");
+                        $"{CourierSession.CharacterLabel(trip.Destination)} at {trip.Dropoff.Label} · {stacks:N0} stack{(stacks == 1 ? string.Empty : "s")}");
                 }
             }
             ImGui.EndChild();
