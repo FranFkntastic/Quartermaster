@@ -72,7 +72,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             (CourierPlanner.Exact(m.Owner,peerOwner) || endpoint != null && held.Run == m.Run &&
                 (held.OwnerEndpoint == endpoint || held.RunKey is {Length:64} key && key==m.RunKey));
         if (!Authorized(cfg,store.Load())) return Refuse("OwnerNotPaired");
-        if (!CourierPlanner.Exact(cfg.Carrier, m.Carrier) || m.Version != 1 || m.Run == Guid.Empty || m.Step == Guid.Empty)
+        if (!CourierPlanner.Exact(cfg.Carrier, m.Carrier) || m.Version != (m.Bell?.Ward != null ? 2 : 1) || m.Run == Guid.Empty || m.Step == Guid.Empty)
             return Refuse("EnvelopeMismatch");
         var remaining = deadline.Expires - DateTimeOffset.UtcNow;
         if (remaining <= TimeSpan.Zero) return Refuse("CommandExpired");
@@ -164,7 +164,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                     if (m.Bell == null) return Refuse("BellMissing");
                     if ((await calls.Call("CarrierPosition", 15, bells.PositionAsync)).World != m.Bell.World)
                         await calls.Call("CarrierWorld", 180, d => worlds.EnsureWorldAsync(m.Bell.World, d));
-                    await calls.Call("CarrierBell", 150, d => bells.GoInRangeAsync(m.Bell, d)); break;
+                    await calls.Call(m.Bell.Ward.HasValue ? "WardTravel" : "CarrierBell", m.Bell.ApproachSeconds, d => bells.GoInRangeAsync(m.Bell, d)); break;
                 case CourierCommand.Receive:
                 case CourierCommand.Send:
                     bool send = m.Command == CourierCommand.Send;

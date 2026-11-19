@@ -47,6 +47,27 @@ public sealed class CourierRunTests : IDisposable
         new(carrier, 4, [new(1, false, 10)]), cfg, id => new ItemMetadata(id, "Titanium Ore", null, false, null, null, null, null, null, null, null, false, true, null, null, 3), 1);
 
     [Fact]
+    public void LegacyBellRoundTripsWithoutChangingReplayIdentity()
+    {
+        const string old="""{"Territory":1,"World":1,"ObjectId":1,"X":0,"Y":0,"Z":0,"Label":"Fixture bell"}""";
+        var restored=System.Text.Json.JsonSerializer.Deserialize<MeetingBell>(old)!;
+        Assert.True(bell.SamePlace(restored));
+        Assert.Equal(old,System.Text.Json.JsonSerializer.Serialize(restored));
+    }
+
+    [Fact]
+    public async Task IdenticalBellInDifferentWardRequiresCarrierTravel()
+    {
+        var pickup=bell with {Territory=339,Ward=1};
+        var drop=pickup with {Ward=2};
+        cfg=cfg with {Bells=cfg.Bells.SetItem(1,pickup).SetItem(2,drop)};
+        var plan=Plan();
+        var result=await engine.StartAsync(plan,cfg);
+        Assert.True(result.State=="Completed",result.Code+":"+result.Detail);
+        Assert.Equal(plan.Trips.SelectMany(t=>new[]{t.Pickup,t.Dropoff}),mule.Approaches);
+    }
+
+    [Fact]
     public async Task CarrierCapSplitsTripsAndDeliversExactUnits()
     {
         var p = Plan(); Assert.Equal(3, p.Trips.Length);
@@ -385,7 +406,8 @@ public sealed class CourierRunTests : IDisposable
         public Task<Result<OwnerScope>> SwitchAsync(OwnerScope target, Deadline d) => OK(who = target);
         public Task<Result<bool>> EnsureWorldAsync(uint world, Deadline d) => OK(true);
         public Task<Result<bool>> ReturnHomeAsync(Deadline d) => OK(true);
-        public Task<Result<bool>> GoInRangeAsync(MeetingBell bell, Deadline d) => OK(true);
+        public readonly List<MeetingBell> Approaches=[];
+        public Task<Result<bool>> GoInRangeAsync(MeetingBell bell, Deadline d) { Approaches.Add(bell); return OK(true); }
         public Task<Result<CourierPosition>> PositionAsync(Deadline d) => OK(new CourierPosition(1, 1, 0, 0, 0));
         public Task<Result<bool>> ReturnToAsync(CourierPosition position, Deadline d) => OK(true);
         public Task<Result<bool>> ObserveTradeableAsync(OwnerScope character, Deadline d) => RefusePartner?Task.FromResult(Result<bool>.Fail("CarrierPartnerDeadline","fixture")):OK(true);

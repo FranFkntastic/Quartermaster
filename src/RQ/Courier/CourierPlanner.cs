@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Text.Json.Serialization;
 using RQ.Domain;
 using RQ.Inventory;
 
@@ -7,8 +8,11 @@ namespace RQ.Courier;
 // Null retainer means bags; zero is not a retainer. A null SourceCharacter means the plan owner.
 public sealed record CourierRoute(OwnerScope Character, ulong? RetainerId, ulong? SourceRetainerId,
     OwnerScope? SourceCharacter = null);
-public sealed record MeetingBell(uint Territory, uint World, uint ObjectId, float X, float Y, float Z, string Label)
+public sealed record MeetingBell(uint Territory, uint World, uint ObjectId, float X, float Y, float Z, string Label,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? Ward = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool Subdivision = false)
 {
+    internal int ApproachSeconds => Ward.HasValue ? 300 : 150;
     public bool SamePlace(MeetingBell other) => this with { Label = "" } == other with { Label = "" };
 }
 public sealed record CourierSettings

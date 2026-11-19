@@ -84,7 +84,10 @@ public sealed record CourierBridgeTruth(
     bool CarrierPaused,
     bool CarrierUnconfirmed,
     string? Error,bool CanResume,bool CanClear,IReadOnlyList<RQ.Courier.CustodyRow> Custody,string? StartBlockCode,
-    IReadOnlyList<RQ.Courier.Refusal> StartRefusals,IReadOnlyList<string> PairedOwners);
+    IReadOnlyList<RQ.Courier.Refusal> StartRefusals,IReadOnlyList<string> PairedOwners,
+    IReadOnlyList<CourierBellBridgeTruth> MeetingBells);
+
+public sealed record CourierBellBridgeTruth(string Character, string HomeWorld, string Label);
 
 public sealed record CourierLineBridgeTruth(string Item, int Moved, int Remaining);
 

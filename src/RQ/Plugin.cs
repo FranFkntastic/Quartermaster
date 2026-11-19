@@ -669,7 +669,7 @@ public sealed class Plugin : IDalamudPlugin
         var listingPersistence = cache.LastListingPersistence;
         var vendorRun = vendorProcurement.ActiveRun;
         return new QuartermasterBridgeTruth(
-            16,
+            17,
             configuration.PluginInstanceId,
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",

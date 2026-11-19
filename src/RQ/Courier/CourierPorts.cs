@@ -11,6 +11,7 @@ public sealed record Result<T>(CourierOutcome Outcome, string Code, string Detai
 }
 public sealed record Deadline(string Name, DateTimeOffset Expires)
 {
+    internal static int PeerSeconds(MeetingBell? bell) => bell?.Ward != null ? 540 : 360;
     public static Deadline After(string name, int seconds) => new(name, DateTimeOffset.UtcNow.AddSeconds(seconds));
 }
 public enum CourierCommand { Status, Travel, Receive, Send, Confirm, ReturnHome, Stop, Begin, Finish, Settle, Clear, VerifySettlement, NotDelivered }
