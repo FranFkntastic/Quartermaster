@@ -76,7 +76,7 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
 j.Task.IsFaulted?Result<CourierReceipt>.Fail("CarrierStepFault",j.Task.Exception!.GetBaseException().Message):null,acknowledgements.GetValueOrDefault(key))
                 :new PeerResult.Refused("UnknownStep","No active step handle.");
         if(w.Kind!="start" || w.Command is not {} m || w.Limit is not {} d || m.Step!=w.Step || m.Run!=w.Run ||
-            d.Expires<=DateTimeOffset.UtcNow || d.Expires>DateTimeOffset.UtcNow.AddMinutes(6))
+            d.Expires<=DateTimeOffset.UtcNow || d.Expires>DateTimeOffset.UtcNow.AddSeconds(Deadline.PeerSeconds(m.Bell)))
             return new PeerResult.Refused("InvalidEnvelope","Invalid or expired courier step.");
         var p=presences.FirstOrDefault(p=>p.InstanceId==sender);
         if(p==null) return new PeerResult.Refused("UnknownOwnerEndpoint","No matching peer presence.");

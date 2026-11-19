@@ -192,8 +192,8 @@ public sealed class CourierConductor
         MeetingBell? bell = null, Guid? id = null, Guid? confirm = null, TradeEvidence? evidence = null, Action<CourierReceipt>? cancelled = null,InventoryView? carrierBaseline=null)
     {
         var step = id ?? Guid.NewGuid();
-        var message = new CourierMessage(1, r.Run, step, type, r.Start, partner, r.Settings.Carrier!, manifest, bell, confirm, evidence,r.RunKey,carrierBaseline);
-        var reply = await calls.Call("Peer" + type, 360, async d =>
+        var message = new CourierMessage(bell?.Ward != null ? 2 : 1, r.Run, step, type, r.Start, partner, r.Settings.Carrier!, manifest, bell, confirm, evidence,r.RunKey,carrierBaseline);
+        var reply = await calls.Call("Peer" + type, Deadline.PeerSeconds(bell), async d =>
         {
             var result = await peer.SendAsync(message, d);
             if (result is { Outcome: not CourierOutcome.Succeeded, Value: { } receipt } && receipt.Run == r.Run && receipt.Step == step)
@@ -537,7 +537,7 @@ public sealed class CourierConductor
     {
         if ((await calls.Call("OwnerPosition", 15, bells.PositionAsync)).World != bell.World)
             await calls.Call("OwnerWorld", 180, d => worlds.EnsureWorldAsync(bell.World, d));
-        await calls.Call("OwnerBell", 150, d => bells.GoInRangeAsync(bell, d));
+        await calls.Call(bell.Ward.HasValue ? "WardTravel" : "OwnerBell", bell.ApproachSeconds, d => bells.GoInRangeAsync(bell, d));
     }
     private async Task Fence(CourierJournal r,RunIntent intent,InventoryView owner)
     {

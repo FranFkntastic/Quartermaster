@@ -616,7 +616,9 @@ public sealed class CourierSession
             view?.Unconfirmed ?? false,
             ErrorDetail ?? Error,current?.CanResume==true && !IsActive,current?.CanClear==true && !IsActive,
             view is {Custody.IsEmpty:false}?CourierConductor.Rows(view.Custody,settings.Carrier):current?.Custody??[],
-            blocked,projection?.Refusals??[],[..settings.Owners.Select(o=>o.CharacterName)]);
+            blocked,projection?.Refusals??[],[..settings.Owners.Select(o=>o.CharacterName)],
+            [.. known.Where(o=>settings.Bells.ContainsKey(o.LocalContentId!.Value))
+                .Select(o=>new CourierBellBridgeTruth(o.CharacterName,o.HomeWorldName,settings.Bells[o.LocalContentId!.Value].Label))]);
     }
 
     // ---- Settings ---------------------------------------------------------------------------
