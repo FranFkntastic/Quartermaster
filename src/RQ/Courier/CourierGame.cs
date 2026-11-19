@@ -99,11 +99,54 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         if(ward is {} w)label+=$", Ward {w.Number}"+(w.Subdivision?", Subdivision":"");
         return new(p.Territory,p.World,obj.BaseId,b.Position.X,b.Position.Y,b.Position.Z,label,ward?.Number,ward?.Subdivision??false);
     }
-    internal TradePartner? Partner(OwnerScope expected) =>
+    private const float TradeRange=3.5f, MeetRange=3.2f;
+    private (TradePartner Partner,Vector3 Position,float Distance)? Sighting(OwnerScope expected) =>
         io.TryGetPartner(expected.CharacterName,expected.HomeWorldName,out var p) && p.HomeWorldId == expected.HomeWorldId &&
-        objects.LocalPlayer is {} me && objects.SearchById(p.GameObjectId) is {} other &&
-        Vector3.Distance(me.Position,other.Position)<=3.5f && io.PartnerIsAvailable(p) ? p : null;
-    public Task<Result<bool>> ObserveTradeableAsync(OwnerScope who, Deadline d) => Poll<bool>(d, () => Partner(who) != null ? Result<bool>.Ok(true) : null);
+        objects.LocalPlayer is {} me && objects.SearchById(p.GameObjectId) is {} other
+            ? (p,other.Position,Vector3.Distance(me.Position,other.Position)) : null;
+    internal TradePartner? Partner(OwnerScope expected) =>
+        Sighting(expected) is {} seen && seen.Distance<=TradeRange && io.PartnerIsAvailable(seen.Partner) ? seen.Partner : null;
+    public async Task<Result<bool>> ObserveTradeableAsync(OwnerScope who, Deadline d)
+    {
+        // Both characters stop near the bell on their own, which can leave them just outside trade range of each other.
+        // Whoever sees the other out of range walks up; each client's view of the other's position differs slightly.
+        var allowed=CanContinue.Value;
+        bool walking=false, met=false;
+        var last="partner not visible";
+        var walkedAt=DateTimeOffset.MinValue;
+        static DateTimeOffset now()=>DateTimeOffset.UtcNow;
+        try
+        {
+            var outcome=await Poll<bool>(d, () =>
+            {
+                var seenNow=Sighting(who);
+                // Meet inside a margin of trade range, so the other client's slightly different view is in range too.
+                var close=seenNow is {Distance:<=MeetRange};
+                if (Partner(who) != null && (close || walking && now()-walkedAt>TimeSpan.FromSeconds(6)))
+                    return Result<bool>.Ok(true);
+                if (allowed?.Invoke()==false) return new(CourierOutcome.Cancelled,"RendezvousStopped",d.Name);
+                if (seenNow is not {} seen) { last="partner not visible"; return null; }
+                last=close ? $"partner in range ({seen.Distance:0.00}) but not available to trade"
+                    : $"partner {seen.Distance:0.00} away, meeting range {MeetRange:0.0}";
+                if (close || seen.Distance>30 || now()-walkedAt<TimeSpan.FromSeconds(3) || !IdleCharacter()) return null;
+                bool busy;
+                try { busy=Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.Nav.PathfindInProgress"); }
+                catch { return null; }
+                if (busy) return null;
+                var path=nav.TryMoveCloseTo(seen.Position,2f);
+                if (path.Submitted) { walking=ownsPath=true; walkedAt=now(); }
+                else last+=$"; approach refused: {path.Code}";
+                return null;
+            });
+            met=outcome.Outcome==CourierOutcome.Succeeded;
+            return outcome;
+        }
+        finally
+        {
+            if (!met) warn($"{d.Name} not met for {who.CharacterName}: {last}");
+            if (walking && !unload.IsCancellationRequested) await dispatch(()=>{ if(ownsPath)nav.TryStop(); ownsPath=false; },unload.Token);
+        }
+    }
     public Task<Result<bool>> ReturnToAsync(CourierPosition p, Deadline d) => Navigate(p,null,d);
     public Task<Result<bool>> GoInRangeAsync(MeetingBell b, Deadline d) => Navigate(new(b.World,b.Territory,b.X,b.Y,b.Z),b,d);
     private sealed class IdleWindow
