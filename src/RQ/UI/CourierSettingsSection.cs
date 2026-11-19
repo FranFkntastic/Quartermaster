@@ -97,7 +97,18 @@ internal sealed class CourierSettingsSection
         reviewRegistry.RegisterLastItem(controlId, label, AgentBridgeUiControlKind.Select, true, false,
             preview == "—" ? null : preview, () => { });
         if (!open)
+        {
+            // A closed picker still offers its candidates to the agent bridge, on the picker's own rect.
+            foreach (var closed in candidates)
+            {
+                var pick = closed;
+                var picked = pairing?.IsPaired(closed) ?? CourierPlanner.Exact(closed, current);
+                reviewRegistry.RegisterLastSelectable($"{controlId}.{closed.LocalContentId}", $"{label}: {closed.CharacterName}", true, picked,
+                    () => { if (!picked || pairing != null) choose(pick); },
+                    courier.Link.Peers.Any(peer => CourierPlanner.Exact(peer.Character, closed)) ? "online" : "offline");
+            }
             return;
+        }
         foreach (var candidate in candidates)
         {
             var online = courier.Link.Peers.Any(peer => CourierPlanner.Exact(peer.Character, candidate));
