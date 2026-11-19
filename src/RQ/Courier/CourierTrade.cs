@@ -11,6 +11,8 @@ namespace RQ.Courier;
 internal sealed class TradeCheckpoint
 {
     public Guid Step {get;set;}
+    public bool? DispatchAuthorized {get;set;}
+    public bool PreLockCancelled {get;set;}
     public CourierReceiveArm? Arm {get;set;}
     public CourierReceiveArm? LastSettledArm {get;set;}
     public InventoryView? ReceiveAfter {get;set;}
@@ -21,7 +23,7 @@ internal sealed class TradeCheckpoint
     public TradeRecoveryState Recovery {get;set;}=new();
 }
 internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease lease,IDalamudPluginInterface pi,
-    DalamudExternalUiAutomationSuppression external,IPluginLog log,string directory) : ICourierTradePort, ICourierSettlement, ICourierHoldPort, ITradeSuppression, IDisposable
+    DalamudExternalUiAutomationSuppression external,IPluginLog log,string directory) : ICourierTradePort, ICourierDispatchEvidence, ICourierSettlement, ICourierHoldPort, ITradeSuppression, IDisposable
 {
     private sealed class Intent(CourierStore<TradeCheckpoint> store, TradeCheckpoint current) : ITradeIntentStore
     {
@@ -66,10 +68,13 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
         if(!locked && !io.IsRemoteLocked){sender?.Stop();receiver?.Stop();}
         return Result<bool>.Ok(true);
     });
+    public Task<Result<bool>> WasNotOpened(Guid step,Deadline d)=>game.Poll<bool>(d,()=>
+        Result<bool>.Ok(!io.IsTradeOpen && store.Load() is {} record && (record.Step!=step || record.DispatchAuthorized==false || record.PreLockCancelled)));
     public Task<Result<bool>> SendAsync(OwnerScope p,ImmutableArray<Shipment> m,Deadline d)=>Execute(p,m,d,false);
     public Task<Result<bool>> ReceiveAsync(OwnerScope p,ImmutableArray<Shipment> m,Deadline d)=>Execute(p,m,d,true);
     private Task<Result<bool>> Execute(OwnerScope p,ImmutableArray<Shipment> manifest,Deadline d,bool receive)
     {
+        var started=CourierGame.TradeStarted.Value;
         var step=CourierGame.Step.Value; TradePartner? partner=null;TradeCheckpoint? state=null;
         var allowed=CourierGame.CanContinue.Value;
         return game.Poll<bool>(d,()=>{
@@ -79,6 +84,9 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                     game.WatchLate(d.Name,()=>sent.ObserveLateEvidence()!=null);
                 if(outcome==CourierOutcome.Indeterminate && receiver is {} received && code=="ReceiveDeadline")
                     game.WatchLate(d.Name,()=>{received.Tick(DateTimeOffset.UtcNow);return received.Evidence!=null;});
+                if(outcome==CourierOutcome.Cancelled && state!=null && !locked && !io.IsRemoteLocked && !io.IsTradeOpen &&
+                    state.Arm==null && state.Recovery.AwaitingVerification==null && !state.Recovery.CancellationPending)
+                {state.PreLockCancelled=true;store.Save(state);}
                 sender?.Dispose();sender=null;receiver=null;locked=false;
                 if(state?.Recovery.CancellationPending!=true)RestoreTradeAutoConfirm();
                 return new(outcome,code,detail,outcome==CourierOutcome.Succeeded);
@@ -89,7 +97,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                 catch (CourierFault e) {
                     if (state == null) return Result<bool>.Fail(e.Code,e.Message);
                     lost = e; stopped = true;
-                    sender?.Stop(e.Message); receiver?.Stop();
+                    if(!locked && !io.IsRemoteLocked){sender?.Stop(e.Message); receiver?.Stop();}
                 }
                 if(allowed?.Invoke()==false){
                     if(state==null)return new(CourierOutcome.Cancelled,"TradeDisarmed",d.Name);
@@ -107,7 +115,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                         return new(CourierOutcome.Indeterminate,"SettlementRequired",prior.Step.ToString());
                     partner=game.Partner(p);
                     if(partner==null)return Result<bool>.Fail("PartnerNotTradeable",p.CharacterName);
-                    state=new(){Step=step,Receiving=receive,Items=[..manifest.GroupBy(s=>(s.Item,s.Hq)).Select(g=>new TradeItem{
+                    state=new(){Step=step,DispatchAuthorized=false,Receiving=receive,Items=[..manifest.GroupBy(s=>(s.Item,s.Hq)).Select(g=>new TradeItem{
                         ItemId=g.Key.Item,IsHighQuality=g.Key.Hq,Quantity=g.Sum(s=>s.Units),ItemName=g.First().Name})]};
                     state.Original=[..state.Items.Select(i=>new BagStock(i.ItemId,i.IsHighQuality,i.Quantity))];
                     store.Save(state);stopped=locked=false;
@@ -116,8 +124,10 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                         sender=new(new Intent(store,state),new(),io,this,log);
                         sender.BatchLocking+=(_,_)=>locked=true;
                         sender.BatchVerified+=(_,_)=>locked=false;
+                        state.DispatchAuthorized=true;store.Save(state);
                         var start=sender.Start(partner);
                         if(!start.Success)return End(CourierOutcome.Failed,start.Code??"SenderRejected",start.Message);
+                        started?.Invoke();started=null;
                     }
                 }
                 OperationResult? result;
@@ -128,9 +138,10 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                             if(DateTimeOffset.UtcNow>=d.Expires)return End(CourierOutcome.Failed,"ReceiveBaselineUnavailable",d.Name);
                             return null;
                         }
-                        state.Arm=new(step,p,baseline);store.Save(state);
+                        state.Arm=new(step,p,baseline);state.DispatchAuthorized=true;store.Save(state);
                         receiver=new(io,partner!,state.Items.Where(i=>i.Quantity>0).Select(i=>new TradeOfferedItem(i.ItemId,i.IsHighQuality,i.Quantity)).ToArray(),d.Expires,s=>log.Warning(s));
                     }
+                    started?.Invoke();started=null;
                     result=receiver.Tick(DateTimeOffset.UtcNow);
                     if(result.Status==OperationStatus.Succeeded){
                         var bag=game.Bags();
@@ -191,5 +202,5 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
         return !state.Recovery.CancellationPending && accounted ? Result<bool>.Ok(true) :
             new(CourierOutcome.Indeterminate,"TradeManifestUnsettled",step.ToString());
     });
-    public void Dispose(){hold?.Dispose();sender?.Dispose();receiver?.Stop();if(store.Load().Recovery.CancellationPending==false)RestoreTradeAutoConfirm();}
+    public void Dispose(){try{hold?.Dispose();sender?.Dispose();if(!locked && !io.IsRemoteLocked)receiver?.Stop();}finally{RestoreTradeAutoConfirm();}}
 }

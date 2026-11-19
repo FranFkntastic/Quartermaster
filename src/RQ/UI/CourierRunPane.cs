@@ -86,6 +86,7 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
 
     private void DrawClear(CourierSnapshot run)
     {
+        if(!run.CanClear)return;
         var held=courier.ClearAcknowledgement;
         var label=held==null?"Clear":"Acknowledge and clear: "+held;
         void Clear()=>courier.Clear(run.Run,held);
@@ -96,6 +97,7 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
     private void DrawUnresolved(CourierSnapshot run)
     {
         var height = BarHeight;
+        if(!run.CanResume){DrawLastOutcome(run);return;}
         if (UiLayout.PrimaryButton("Resume##RQCourierResume", new Vector2(ImGui.CalcTextSize("Resume").X + 40, height)))
             courier.Resume();
         reviewRegistry.RegisterLastButton("quartermaster.courier.run.resume", "Resume the courier run from its journal", true,

@@ -10,7 +10,7 @@ using RQ.Runtime;
 namespace RQ.UI;
 
 /// <summary>A character logged in on another linked client, with its latest bag observation.</summary>
-public sealed record CourierPeer(OwnerScope Character, InventoryView? Bags);
+public sealed record CourierPeer(OwnerScope Character, InventoryView? Bags,IReadOnlyList<OwnerScope>? Roster=null);
 
 /// <summary>
 /// The live facts only the courier wiring can supply to the UI. Both members are read on the
@@ -55,7 +55,6 @@ public sealed class CourierSession
 
     private readonly StateRepository state;
     private readonly Func<OwnerScope, PlayerStorageCapture> cachedBags;
-    private readonly Func<IReadOnlyList<OwnerScope>> cachedOwners;
     private readonly Func<uint, ItemMetadata> metadata;
     private (long Revision, IReadOnlyList<OwnerScope> Characters)? characters;
     private (long Revision, Guid PlanId, object Peers, CourierPlan? Plan)? plan;
@@ -74,12 +73,10 @@ public sealed class CourierSession
     public CourierSession(
         StateRepository state,
         Func<OwnerScope, PlayerStorageCapture> cachedBags,
-        Func<IReadOnlyList<OwnerScope>> cachedOwners,
         Func<uint, ItemMetadata> metadata)
     {
         this.state = state;
         this.cachedBags = cachedBags;
-        this.cachedOwners = cachedOwners;
         this.metadata = metadata;
     }
 
@@ -99,8 +96,7 @@ public sealed class CourierSession
     {
         if (characters is { } cached && cached.Revision == runtime.Revision)
             return cached.Characters;
-        var known = runtime.Retainers.Values.Select(retainer => retainer.Owner)
-            .Concat(cachedOwners())
+        var known = runtime.State.Courier.LocalRoster.AsEnumerable()
             .Append(runtime.Owner)
             .Where(owner => owner.HasStableIdentity && !string.IsNullOrWhiteSpace(owner.CharacterName))
             .DistinctBy(owner => (owner.LocalContentId, owner.HomeWorldId))
@@ -275,7 +271,7 @@ public sealed class CourierSession
     /// <summary>Resumes an interrupted run from its journal; the journal owns the plan and settings.</summary>
     internal void Resume()
     {
-        if (Conductor is not { } conductor || IsActive || !IsUnresolved)
+        if (Conductor is not { } conductor || IsActive || Run?.CanResume!=true)
             return;
         Launch(() => conductor.StartAsync(new(Guid.Empty, 0, [], []), new()));
     }
@@ -285,7 +281,8 @@ public sealed class CourierSession
         Error = null;
         starting = Task.Run(async () =>
         {
-            try { await start().ConfigureAwait(false); }
+            try { var result=await start().ConfigureAwait(false);
+                if(result.State is "Refused" or "Failed" or "Indeterminate" or "Interrupted")Error=result.Code+": "+result.Detail; }
             catch (Exception exception) { Error = exception.Message; }
             finally { polledAt = 0; }
         });
@@ -365,17 +362,22 @@ public sealed class CourierSession
 
     // ---- Agent bridge -----------------------------------------------------------------------
 
-    internal CourierBridgeTruth Truth(QuartermasterRuntimeSnapshot runtime)
+    internal CourierBridgeTruth Truth(QuartermasterRuntimeSnapshot runtime,Guid? planId=null)
     {
         var settings = runtime.State.Courier;
         var current = Run;
         var view = Carried;
         var known = Characters(runtime);
+        var selected=runtime.State.StowagePlans.FirstOrDefault(p=>p.Id==planId);
+        var projection=selected==null?null:Plan(runtime,selected);
+        var blocked=Conductor==null?"CourierUnavailable":!runtime.Owner.HasStableIdentity?"OwnerIdentityUnavailable":
+            IsActive?"CourierActive":IsUnresolved?"RunUnresolved":projection==null?"NothingToSend":
+            projection.Refusals.FirstOrDefault()?.Code ?? (projection.Trips.IsEmpty?"NothingToSend":null);
         return new(
             Conductor is not null || Follower is not null,
             settings.Carrier?.CharacterName,
             settings.CarrierOptIn,
-            settings.PairedOwner?.CharacterName,
+            settings.Owners.FirstOrDefault()?.CharacterName,
             [.. known.Where(owner => settings.Bells.ContainsKey(owner.LocalContentId!.Value)).Select(owner => owner.CharacterName)],
             IsStarting,
             current?.State,
@@ -390,7 +392,9 @@ public sealed class CourierSession
             view?.Custody.Sum(shipment => shipment.Units) ?? 0,
             view?.Paused ?? false,
             view?.Unconfirmed ?? false,
-            Error);
+            Error,current?.CanResume==true && !IsActive,current?.CanClear==true && !IsActive,
+            view is {Custody.IsEmpty:false}?CourierConductor.Rows(view.Custody,settings.Carrier):current?.Custody??[],
+            blocked,projection?.Refusals??[],[..settings.Owners.Select(o=>o.CharacterName)]);
     }
 
     // ---- Settings ---------------------------------------------------------------------------

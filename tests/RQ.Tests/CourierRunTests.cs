@@ -25,7 +25,7 @@ public sealed class CourierRunTests : IDisposable
 
     public CourierRunTests()
     {
-        cfg = new() { Carrier = carrier, PairedOwner = source, CarrierOptIn = true, Bells = ImmutableDictionary<ulong, MeetingBell>.Empty.Add(1, bell).Add(2, bell) };
+        cfg = new() { Carrier = carrier, LocalRoster=[source,destination], PairedOwner = source, CarrierOptIn = true, Bells = ImmutableDictionary<ulong, MeetingBell>.Empty.Add(1, bell).Add(2, bell) };
         line = new()
         {
             StowagePlanId = plan.Id,
@@ -36,7 +36,7 @@ public sealed class CourierRunTests : IDisposable
             Courier = new(destination, 22, 11)
         };
         mule.Quantities[carrier] = 10; // Private carrier stock must survive.
-        follower = Follower(); wire.Handler = m => follower.HandleAsync(source, m, Deadline.After("Fixture", 30));
+        follower = Follower(); wire.Handler = m => follower.HandleAsync(source, m, Deadline.After("Fixture", 30),started:wire.Started);
         engine = Conductor();
     }
     CourierFollower Follower(string? root = null) => new(root ?? dir, () => cfg, new(), new(new AR()), mule, mule, mule, mule, _ => { });
@@ -130,6 +130,108 @@ public sealed class CourierRunTests : IDisposable
         Assert.Equal(CourierOutcome.Succeeded, claim.Outcome);
         Assert.Equal("CustodyInsufficient", (await Handle(source)).Code); Assert.Equal(0, mule.Sends); Assert.Equal(10, mule.Units);
     }
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task UnstartedTradeIsFencedBeforeClearOrResume(bool refuseOnCarrier)
+    {
+        var handle=wire.Handler;
+        CourierMessage? delayed=null;
+        mule.RefusePartner=refuseOnCarrier;
+        wire.Handler=m=>{
+            if(m.Command==CourierCommand.Receive && delayed==null){
+                delayed=m;
+                if(!refuseOnCarrier)return Task.FromResult(Result<CourierReceipt>.Fail("StartNotReceived","fixture"));
+            }
+            return handle(m);
+        };
+        var result=await engine.StartAsync(Plan(),cfg);
+        Assert.True(result.CanResume && result.CanClear,result.Code+":"+result.Detail);
+        Assert.Equal(0,owner.Sends);Assert.Equal(0,mule.Receives);
+        Assert.Equal("NotDelivered",(await handle(delayed!)).Code);
+        mule.RefusePartner=false;
+        if(refuseOnCarrier){
+            wire.Handler=m=>Task.FromResult(Result<CourierReceipt>.Fail("CarrierEndpointAmbiguous","offline"));
+            Assert.Equal("Idle",(await engine.ClearAsync(result.Run,null)).State);
+            wire.Handler=handle;
+        }
+        Assert.Equal("Completed",(await engine.StartAsync(Plan(),cfg)).State);
+    }
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task LostPlacementReceiptResumesOnlyRemainingUnits(bool deposit)
+    {
+        owner.FailPlacement=deposit;
+        var result=await engine.StartAsync(Plan(),cfg);
+        Assert.False(result.CanClear);Assert.True(result.CanResume);
+        engine=Conductor();
+        var resumed=await engine.StartAsync(Plan(),cfg);
+        Assert.True(resumed.State=="Completed",resumed.Code+":"+resumed.Detail);
+        Assert.Equal(7,owner.Deposited);Assert.Equal(7,owner.Retrieved);
+        Assert.Equal(10,mule.Units);
+    }
+    [Fact]
+    public async Task ReverseRunCanStartFromSecondPairedOwner()
+    {
+        cfg=cfg with {PairedOwners=[destination]};
+        await owner.SwitchAsync(destination,Deadline.After("fixture",5));
+        wire.Handler=m=>follower.HandleAsync(destination,m,Deadline.After("fixture",10),started:wire.Started);
+        var p=Plan();
+        var reverse=p with {Trips=[..p.Trips.Select(t=>t with {Source=destination,Destination=source,
+            Manifest=[..t.Manifest.Select(s=>s with {Source=destination,Destination=source})]})]};
+        var result=await engine.StartAsync(reverse,cfg);
+        Assert.True(result.State=="Completed",result.Code+":"+result.Detail);
+        Assert.Equal(7,owner.Deposited);Assert.Equal(10,mule.Units);
+    }
+    [Fact]
+    public async Task LegacyUnopenedIntentsCanResumeWithoutRetrievingTwice()
+    {
+        var p=Plan();var trip=p.Trips[0];var run=Guid.NewGuid();var step=Guid.NewGuid();
+        var action=new CourierStep(CourierPhase.HandOut,0,trip.Manifest);
+        var before=new InventoryView(source,4,[new(1,false,3)]);
+        var cb=new InventoryView(carrier,4,[new(1,false,10)]);
+        owner.Quantities[source]=3;
+        new CourierStore<CourierJournal>(Path.Combine(dir,"courier-run.json")).Save(new(){
+            Run=run,Plan=p,Settings=cfg,Start=source,PeerClaimed=true,State="Indeterminate",
+            Schedule=[action,new(CourierPhase.SwitchToDestination,0,[]),new(CourierPhase.HandIn,0,trip.Manifest),
+                new(CourierPhase.Deposit,0,trip.Manifest),new(CourierPhase.Finish,0,[])],
+            Pending=new(step,action,before,cb)});
+        var msg=new CourierMessage(1,run,step,CourierCommand.Receive,source,source,carrier,trip.Manifest);
+        new CourierStore<CarrierLedger>(Path.Combine(dir,"courier-custody.json")).Save(new(){
+            Run=run,Unconfirmed=step,Steps={[step]=new("legacy",msg,null,cb)}});
+        var result=await engine.StartAsync(p,cfg);
+        Assert.True(result.State=="Completed",result.Code+":"+result.Detail);
+        Assert.Equal(0,owner.Retrieved);Assert.Equal(3,owner.Deposited);Assert.Equal(1,owner.Sends);
+    }
+    [Fact]
+    public async Task PreBeginFailureCreatesNoRunToResume()
+    {
+        wire.Handler=m=>Task.FromResult(Result<CourierReceipt>.Fail("CarrierEndpointAmbiguous","offline"));
+        var failed=await engine.StartAsync(Plan(),cfg);
+        Assert.Equal("CarrierEndpointAmbiguous",failed.Code);
+        Assert.False(File.Exists(Path.Combine(dir,"courier-run.json")));
+        Assert.False(failed.CanResume);Assert.False(failed.CanClear);
+    }
+    [Fact]
+    public async Task StoppedCarrierKeepsLeaseAcrossUnconfirmedAndCreditedCustody()
+    {
+        follower.Dispose();var lease=new AutomationLease();var ar=new AR();
+        follower=new(dir,()=>cfg,lease,new(ar),mule,mule,mule,mule,_=>{});
+        var m=new CourierMessage(1,Guid.NewGuid(),Guid.NewGuid(),CourierCommand.Begin,source,source,carrier,[]);
+        async Task<Result<CourierReceipt>> Send(CourierMessage msg)=>await follower.HandleAsync(source,msg,Deadline.After("fixture",10));
+        Assert.Equal(CourierOutcome.Succeeded,(await Send(m)).Outcome);
+        var recv=m with {Step=Guid.NewGuid(),Command=CourierCommand.Receive,Manifest=Plan().Trips[0].Manifest};
+        Assert.Equal(CourierOutcome.Succeeded,(await Send(recv)).Outcome);
+        await follower.StopLocalAsync();Assert.True(ar.IsSuppressed);Assert.False(lease.CanAcquire);
+        InventoryView Bags(int n)=>new(source,5,[new(1,false,n)]);
+        Assert.Equal(CourierOutcome.Succeeded,(await Send(m with {Step=Guid.NewGuid(),Command=CourierCommand.Confirm,
+            ConfirmStep=recv.Step,OwnerEvidence=new(Bags(3),Bags(0))})).Outcome);
+        var status=await Send(m with {Step=Guid.NewGuid(),Run=Guid.NewGuid(),Command=CourierCommand.Status});
+        Assert.Equal(m.Run,status.Value?.ActiveRun);Assert.Equal(3,status.Value!.Custody.Sum(x=>x.Units));
+        Assert.True(ar.IsSuppressed);Assert.False(lease.CanAcquire);
+        follower.Dispose();Assert.False(ar.IsSuppressed);Assert.True(lease.CanAcquire);
+    }
     public void Dispose() { follower.Dispose(); Directory.Delete(dir, true); }
 
     [Fact]
@@ -209,6 +311,7 @@ public sealed class CourierRunTests : IDisposable
         public Func<CourierMessage, Task<Result<CourierReceipt>>> Handler = null!;
         public event Action<CourierProgress>? Progress; public event Action? LinkLost;
         public event Action<Guid> StopRequested { add { } remove { } }
+        public void Started(CourierProgress p)=>Progress?.Invoke(p);
         public Action? CrashCheckpoint;
         bool confirmed;
         public async Task<Result<CourierReceipt>> SendAsync(CourierMessage m, Deadline d)
@@ -219,7 +322,7 @@ public sealed class CourierRunTests : IDisposable
             return result;
         }
     }
-    sealed class Client(OwnerScope initial) : ICourierPlacementPort, ICourierTradePort, ICourierSettlement, ICourierHoldPort, ICharacterSwitchPort, IInventoryObservationPort, IWorldVisitPort, IMeetingBellPort
+    sealed class Client(OwnerScope initial) : ICourierPlacementPort, ICourierTradePort, ICourierDispatchEvidence, ICourierSettlement, ICourierHoldPort, ICharacterSwitchPort, IInventoryObservationPort, IWorldVisitPort, IMeetingBellPort
     {
         OwnerScope who = initial;
         public Dictionary<OwnerScope, int> Quantities = new(); public int Units => Quantities.GetValueOrDefault(who);
@@ -233,7 +336,8 @@ public sealed class CourierRunTests : IDisposable
         public CourierStore<TradeCheckpoint> ReceiveStore=>new(Path.Combine(CheckpointDirectory!,"courier-trade.json"));
         public Task<Result<IDisposable>> BeginHold(Guid run,Deadline deadline)=>Task.FromResult(Hold?.Begin()??Result<IDisposable>.Ok(new MemoryStream()));
         public void CheckHold()=>Hold?.Check(false);
-        Guid? recoverable;
+        Guid? recoverable, openedStep;
+        public Task<Result<bool>> WasNotOpened(Guid step,Deadline d)=>OK(step!=openedStep);
         public Task<Result<bool>> Settle(Guid step,OwnerScope partner,TradeEvidence peer,Deadline d){
             if(CheckpointDirectory!=null){
                 var store=ReceiveStore;var record=store.Load();
@@ -245,12 +349,14 @@ public sealed class CourierRunTests : IDisposable
         readonly TaskCompletionSource<Result<bool>> cancelled = new(TaskCreationOptions.RunContinuationsAsynchronously);
         Task<Result<bool>> Pause() { Opened.TrySetResult(); return cancelled.Task; }
         public Task<Result<bool>> SendAsync(OwnerScope partner, ImmutableArray<Shipment> m, Deadline d) {
+            openedStep=CourierGame.Step.Value;CourierGame.TradeStarted.Value?.Invoke();
             if (PauseTrade) return Pause(); Sends++; Quantities[who] = Units - m.Sum(x => x.Units);
             if(LoseSenderReply){LoseSenderReply=false; recoverable=CourierGame.Step.Value;
                 return Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate,"AwaitingVerification","Reply lost."));}
             return OK(true);
         }
         public Task<Result<bool>> ReceiveAsync(OwnerScope partner, ImmutableArray<Shipment> m, Deadline d) {
+            openedStep=CourierGame.Step.Value;CourierGame.TradeStarted.Value?.Invoke();
             Receives++;
             if(CheckpointDirectory!=null){
                 var step=CourierGame.Step.Value;var item=m.Single();
@@ -259,9 +365,19 @@ public sealed class CourierRunTests : IDisposable
             }
             if (PauseTrade) return Pause(); Quantities[who] = Units + m.Sum(x => x.Units) + ReceiveOffset; return UncertainTrade ? Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate, "LockUnknown", "Missing locked partner evidence")) : OK(true); }
         public Task<Result<bool>> CancelPreLockAsync(Deadline d) { cancelled.TrySetResult(new(CourierOutcome.Cancelled, "PreLock", "Trade cancelled")); return OK(true); }
-        public Task<Result<bool>> MoveAsync(StowagePlan plan, Shipment s, bool deposit, IDisposable lease, Func<bool> auth, Deadline d)
+        public Task<Result<int>> RetainerUnits(OwnerScope owner,Shipment s,bool deposit,Deadline d)=>OK(deposit?Deposited:100-Retrieved);
+        public int Retrieved;
+        public bool? FailPlacement;
+        public bool RefusePartner;
+        readonly Dictionary<string,int> movements=[];
+        public int? JournalUnits(string id,OwnerScope owner,Shipment s)=>movements.GetValueOrDefault(id);
+        public Task<Result<bool>> MoveAsync(StowagePlan plan,Shipment s,bool deposit,IDisposable lease,Func<bool> auth,Deadline d,Action<string> recordOperation)
         {
             Assert.True(auth()); Assert.Equal(plan.Owner, who); Assert.Equal(deposit ? 22ul : 11ul, deposit ? s.To : s.From);
+            var id=Guid.NewGuid().ToString();recordOperation(id);
+            bool fail=FailPlacement==deposit;int n=fail?1:s.Units;movements[id]=n;if(!deposit)Retrieved+=n;
+            if(fail){FailPlacement=null;Quantities[who]=Units+(deposit?-n:n);if(deposit)Deposited+=n;
+                return Task.FromResult(Result<bool>.Fail("PlacementStopped","fixture"));}
             Quantities[who] = Units + (deposit ? -s.Units : s.Units); if (deposit) Deposited += s.Units; return OK(true);
         }
         public Task<Result<InventoryView>> ObserveAsync(Deadline d) => OK(new InventoryView(who, 4, [new(1, false, Units)]));
@@ -272,6 +388,6 @@ public sealed class CourierRunTests : IDisposable
         public Task<Result<bool>> GoInRangeAsync(MeetingBell bell, Deadline d) => OK(true);
         public Task<Result<CourierPosition>> PositionAsync(Deadline d) => OK(new CourierPosition(1, 1, 0, 0, 0));
         public Task<Result<bool>> ReturnToAsync(CourierPosition position, Deadline d) => OK(true);
-        public Task<Result<bool>> ObserveTradeableAsync(OwnerScope character, Deadline d) => OK(true);
+        public Task<Result<bool>> ObserveTradeableAsync(OwnerScope character, Deadline d) => RefusePartner?Task.FromResult(Result<bool>.Fail("CarrierPartnerDeadline","fixture")):OK(true);
     }
 }

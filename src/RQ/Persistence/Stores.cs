@@ -580,6 +580,12 @@ public sealed class QuartermasterStateStore
 
     public string Path => store.Path;
     public bool Exists => store.Exists;
-    public QuartermasterState Load() => store.Load();
+    public QuartermasterState Load()
+    {
+        var state=store.Load();
+        if(state.Courier.PairedOwner!=null)
+            state.Courier=state.Courier with {PairedOwners=[..state.Courier.Owners],PairedOwner=null};
+        return state;
+    }
     public void Save(QuartermasterState state) => store.Save(state);
 }

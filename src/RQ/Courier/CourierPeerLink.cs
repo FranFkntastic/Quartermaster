@@ -12,11 +12,13 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     private sealed record Reply(Result<CourierReceipt>? Result,CourierProgress? Progress);
     private sealed record Job(CourierMessage Message, string Fingerprint, Task<Result<CourierReceipt>> Task, DateTimeOffset Expires);
     private readonly Task<PeerEndpoint> endpoint;
+    private readonly Func<IReadOnlyList<OwnerScope>> roster;
     private readonly CourierGame game;
     private readonly CourierFollower follower;
     private readonly Action<string> warn;
     private readonly CancellationTokenSource unload = new();
     private readonly ConcurrentDictionary<(Guid,Guid),Job> jobs=new();
+    private readonly ConcurrentDictionary<(Guid,Guid),CourierProgress> acknowledgements=new();
     private readonly ConcurrentDictionary<Guid,Guid> owners=new(), carriers=new();
     private readonly ConcurrentDictionary<Guid,PeerConnection> connections=new();
     private volatile PeerPresence[] presences=[];
@@ -29,10 +31,10 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     public event Action<CourierProgress>? Progress;
     public event Action? LinkLost;
     public event Action<Guid>? StopRequested;
-    internal CourierPeerLink(CourierGame game,CourierFollower follower,Func<Action,CancellationToken,Task> dispatch,Action<string> warn)
+    internal CourierPeerLink(CourierGame game,CourierFollower follower,Func<Action,CancellationToken,Task> dispatch,Action<string> warn,Func<IReadOnlyList<OwnerScope>> roster)
     {
-        this.game=game; this.follower=follower; this.warn=warn;
-        endpoint=PeerEndpoint.StartAsync(new("Quartermaster.Courier.v1",dispatch,Handle,warn),JsonSerializer.SerializeToElement<CourierPeer?>(null));
+        this.roster=roster;this.game=game; this.follower=follower; this.warn=warn;
+        endpoint=PeerEndpoint.StartAsync(new("Quartermaster.Courier.v2",dispatch,Handle,warn),JsonSerializer.SerializeToElement<CourierPeer?>(null));
         follower.StopRequested+=NotifyStop;
     }
     internal void Tick(bool identityChanged)
@@ -44,9 +46,9 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
         InventoryView? bags=null;
         try{ StandingAt=game.StandingAt();bags=game.Bags(); }
         catch(Exception e){ StandingAt=null;warn("CourierPresenceObservation: "+e.Message); }
-        var identity=JsonSerializer.SerializeToElement(bags==null?null:new CourierPeer(bags.Character,bags));
+        var identity=JsonSerializer.SerializeToElement(bags==null?null:new CourierPeer(bags.Character,bags,roster()));
         refresh=Refresh(identity);
-        foreach(var p in jobs.Where(e=>e.Value.Task.IsCompleted && e.Value.Expires<now)) jobs.TryRemove(p.Key,out _);
+        foreach(var p in jobs.Where(e=>e.Value.Task.IsCompleted && e.Value.Expires<now)){ jobs.TryRemove(p.Key,out _); acknowledgements.TryRemove(p.Key,out _); }
     }
     private async Task Refresh(JsonElement identity)
     {
@@ -59,7 +61,7 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
             if(json!=projected){ peers=view; projected=json; }
         }catch(Exception e){presences=[];peers=[];projected=""; if(!unload.IsCancellationRequested)warn("PeerDiscovery: "+e.Message);}
     }
-    private PeerResult Delivered(Result<CourierReceipt>? result)=>new PeerResult.Delivered(JsonSerializer.SerializeToElement(new Reply(result,follower.Progress)));
+    private PeerResult Delivered(Result<CourierReceipt>? result,CourierProgress? ack=null)=>new PeerResult.Delivered(JsonSerializer.SerializeToElement(new Reply(result,ack??follower.Progress)));
     private PeerResult Handle(PeerMessage envelope)
     {
         var w=envelope.Payload.Deserialize<Wire>();
@@ -70,7 +72,7 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
         var key=(sender,w.Step);
         if(w.Kind=="query")
             return jobs.TryGetValue(key,out var j) && j.Message.Run==w.Run ? Delivered(j.Task.IsCompletedSuccessfully?j.Task.Result:
-                j.Task.IsFaulted?Result<CourierReceipt>.Fail("CarrierStepFault",j.Task.Exception!.GetBaseException().Message):null)
+j.Task.IsFaulted?Result<CourierReceipt>.Fail("CarrierStepFault",j.Task.Exception!.GetBaseException().Message):null,acknowledgements.GetValueOrDefault(key))
                 :new PeerResult.Refused("UnknownStep","No active step handle.");
         if(w.Kind!="start" || w.Command is not {} m || w.Limit is not {} d || m.Step!=w.Step || m.Run!=w.Run ||
             d.Expires<=DateTimeOffset.UtcNow || d.Expires>DateTimeOffset.UtcNow.AddMinutes(6))
@@ -80,7 +82,7 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
         var who=p.Identity.Deserialize<CourierPeer>()?.Character ?? new OwnerScope();
         var hash=JsonSerializer.Serialize(m);
         var job=jobs.GetOrAdd(key,unused=>new(m,hash,Task.Run(async ()=>{
-            var result=await follower.HandleAsync(who,m,d,sender);
+            var result=await follower.HandleAsync(who,m,d,sender,p=>acknowledgements[key]=p);
             if(m.Command==CourierCommand.Begin && result.Outcome==CourierOutcome.Succeeded){owners[m.Run]=sender;Connect(await endpoint,p);}
             if(m.Command is CourierCommand.Finish or CourierCommand.Clear && result.Outcome==CourierOutcome.Succeeded)owners.TryRemove(m.Run,out _);
             return result;

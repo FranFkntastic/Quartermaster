@@ -30,6 +30,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     private readonly DalamudLifestreamLogin login = new(pi);
     private readonly WorldCatalog worlds = new(data.GetExcelSheet<World>().Where(w => w.IsPublic)
         .Select(w => new WorldInfo(w.Name.ToString(), "", "", w.RowId)));
+    internal static readonly AsyncLocal<Action?> TradeStarted=new();
     internal static readonly AsyncLocal<Guid> Step = new();
     internal static readonly AsyncLocal<Func<bool>?> CanContinue = new();
     private readonly CourierStore<Dictionary<string,Guid>> submissions = new(Path.Combine(directory,"courier-travel.json"));
@@ -78,6 +79,23 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     public Task<Result<bool>> ObserveTradeableAsync(OwnerScope who, Deadline d) => Poll<bool>(d, () => Partner(who) != null ? Result<bool>.Ok(true) : null);
     public Task<Result<bool>> ReturnToAsync(CourierPosition p, Deadline d) => Navigate(p,null,d);
     public Task<Result<bool>> GoInRangeAsync(MeetingBell b, Deadline d) => Navigate(new(b.World,b.Territory,b.X,b.Y,b.Z),b,d);
+    private sealed class IdleWindow
+    {
+        CourierPosition? last;
+        DateTimeOffset since;
+        internal bool Ready(CourierGame game,bool path=false)
+        {
+            var now=DateTimeOffset.UtcNow;var here=game.Position();bool idle=false;
+            if(here!=null && game.IdleCharacter())
+                try { idle=!game.Busy("Lifestream.IsBusy") && (!path || !game.Busy("vnavmesh.Path.IsRunning") && !game.Busy("vnavmesh.Nav.PathfindInProgress")); }
+                catch { /* Missing IPC is unknown, not idle. */ }
+            if(!idle || here!=last){last=here;since=now;return false;}
+            if(now-since<TimeSpan.FromSeconds(5))return false;
+            since=now;return true;
+        }
+    }
+    private bool Busy(string gate)=>pi.GetIpcSubscriber<bool>(gate).InvokeFunc();
+    private bool IdleCharacter()=>CharacterSwitchPolicy.GetRefusal(CharacterSwitchGameState.Observe(client,objects,conditions,false,null))==null;
     private async Task<Result<bool>> Navigate(CourierPosition p, MeetingBell? bell, Deadline d)
     {
         var teleportMarker=Marker("Teleport",Step.Value);var pathMarker=Marker("Approach",Step.Value);
@@ -85,12 +103,14 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         bool hopped=shardMarker.Already;
         GilVendorTravelRoute? route=null;
         bool teleported=teleportMarker.Already, moving=pathMarker.Already;
+        var idle=new IdleWindow();
         var target=new Vector3(p.X,p.Y,p.Z);
         var allowed=CanContinue.Value;
         try { return await Poll<bool>(d, () =>
         {
             if(allowed?.Invoke()==false)return new(CourierOutcome.Cancelled,"RouteStopped",d.Name);
             if (Position() is not {} here) return null;
+            if ((teleported || hopped || moving) && idle.Ready(this,moving)) teleported=hopped=moving=false;
             if (here.World != p.World) return Result<bool>.Fail("WrongRendezvousWorld",d.Name);
             if (here.Territory != p.Territory)
             {
@@ -143,13 +163,15 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     }
     public Task<Result<OwnerScope>> SwitchAsync(OwnerScope target, Deadline d)
     {
-        CharacterSwitchOperation? op=null;
+        CharacterSwitchOperation? op=null;var idle=new IdleWindow();var marker=Marker("Switch",Step.Value);bool submitted=marker.Already;
+        void Save(){marker.Save();submitted=true;}
         var step=Step.Value;
         var allowed=CanContinue.Value;
         return Poll<OwnerScope>(d,()=>
         {
             if(allowed?.Invoke()==false)return new(CourierOutcome.Cancelled,"SwitchStopped",d.Name);
-            if (op==null) { var m=Marker("Switch",step); op=new(login,new(target.CharacterName,target.HomeWorldName),d.Expires,warn,m.Save,m.Already); }
+            var retry=submitted && !CourierPlanner.Exact(owner(),target) && idle.Ready(this);
+            if (op==null || retry) { op=new(login,new(target.CharacterName,target.HomeWorldName),d.Expires,warn,Save,submitted && !retry); }
             OperationResult Tick()=>op.Tick(CharacterSwitchGameState.Observe(client,objects,conditions,false,null),DateTimeOffset.UtcNow);
             var result=Tick();
             if(result.Status==OperationStatus.Indeterminate)WatchLate(d.Name,()=>{Tick();return op.LateIdentityObserved;});
@@ -160,14 +182,16 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     public Task<Result<bool>> ReturnHomeAsync(Deadline d) => Visit(null,d);
     private Task<Result<bool>> Visit(uint? world,Deadline d)
     {
-        WorldVisitOperation? op=null; var step=Step.Value;
+        WorldVisitOperation? op=null;var idle=new IdleWindow();var marker=Marker("Visit",Step.Value);bool submitted=marker.Already;
+        void Save(){marker.Save();submitted=true;}
         var allowed=CanContinue.Value;
         return Poll<bool>(d,()=>
         {
             if(allowed?.Invoke()==false)return new(CourierOutcome.Cancelled,"VisitStopped",d.Name);
-            if(op==null){ var m=Marker("Visit",step);
-                op=world is {} id ? new(worlds,data.GetExcelSheet<World>().GetRow(id).Name.ToString(),player,commands,client,conditions,d.Expires,player.ContentId,warn,m.Save,m.Already) :
-                    WorldVisitOperation.ReturnHome(worlds,player,commands,client,conditions,d.Expires,warn,m.Save,m.Already); }
+            var retry=Position() is {} here && here.World!=(world??player.HomeWorld.RowId) && submitted && idle.Ready(this);
+            if(op==null || retry){
+                op=world is {} id ? new(worlds,data.GetExcelSheet<World>().GetRow(id).Name.ToString(),player,commands,client,conditions,d.Expires,player.ContentId,warn,Save,submitted && !retry) :
+                    WorldVisitOperation.ReturnHome(worlds,player,commands,client,conditions,d.Expires,warn,Save,submitted && !retry); }
             var result=op.Tick(DateTimeOffset.UtcNow);
             if(result.Status==OperationStatus.Indeterminate)WatchLate(d.Name,()=>{op.Tick(DateTimeOffset.UtcNow);return op.LateArrivalObserved;});
             return Translate(result,()=>true);

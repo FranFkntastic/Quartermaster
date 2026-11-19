@@ -15,6 +15,10 @@ public sealed record CourierSettings
 {
     public OwnerScope? Carrier { get; init; }
     public OwnerScope? PairedOwner { get; init; }
+    public ImmutableArray<OwnerScope> PairedOwners { get; init; } = [];
+    internal IEnumerable<OwnerScope> Owners => PairedOwners.Concat(PairedOwner is {} one ? [one] : []).DistinctBy(x=>(x.LocalContentId,x.HomeWorldId));
+    internal bool IsPaired(OwnerScope who) => Owners.Any(o=>CourierPlanner.Exact(o,who));
+    public ImmutableArray<OwnerScope> LocalRoster { get; init; } = [];
     public bool CarrierOptIn { get; init; }
     public bool ReturnOwner { get; init; } = true;
     public bool ReturnCarrier { get; init; } = true;
@@ -30,7 +34,7 @@ public sealed record Shipment(Guid Line, uint Item, string Name, bool Hq, int Un
     ulong? From, ulong? To, OwnerScope Source, OwnerScope Destination);
 public sealed record CourierTrip(OwnerScope Source, OwnerScope Destination, MeetingBell Pickup, MeetingBell Dropoff,
     ImmutableArray<Shipment> Manifest);
-public sealed record Refusal(Guid Line, string Name, string Code);
+public sealed record Refusal(Guid Line, string Name, string Code, string? Source=null, string? Destination=null);
 public sealed record CourierPlan(Guid PlanId, long Revision, ImmutableArray<CourierTrip> Trips, ImmutableArray<Refusal> Refusals);
 
 public static class CourierPlanner
@@ -46,6 +50,7 @@ public static class CourierPlanner
     {
         var trips = ImmutableArray.CreateBuilder<CourierTrip>();
         var refusals = ImmutableArray.CreateBuilder<Refusal>();
+        var uniqueDestinations=new HashSet<(ulong?,uint)>();
         var stock = locations.ToDictionary(x => (x.Character.LocalContentId, x.Retainer), x => x.Inventory.Stock.ToList());
         var space = locations.ToDictionary(x => (x.Character.LocalContentId, x.Retainer), x => x.Inventory.FreeSlots);
         foreach (var group in rules.Where(r => r.Enabled && r.StowagePlanId == plan.Id && r.Courier != null)
@@ -58,6 +63,7 @@ public static class CourierPlanner
             var destBags = At(dst, null);
             var pickup = settings.Bells.GetValueOrDefault(src.LocalContentId ?? 0);
             var drop = settings.Bells.GetValueOrDefault(dst.LocalContentId ?? 0);
+            var tripUnique=new HashSet<uint>();
             var stacks = new List<Shipment>();
             foreach (var r in group)
             {
@@ -67,16 +73,17 @@ public static class CourierPlanner
                 var target = At(dst, route.RetainerId);
                 string? code = settings.Carrier is not { HasStableIdentity: true } ? "CarrierNotConfigured"
                     : !Exact(carrier?.Character, settings.Carrier) ? "CarrierUnreachable"
+                    : !settings.LocalRoster.Any(o=>Exact(o,src)) || !settings.LocalRoster.Any(o=>Exact(o,dst)) ? "OutsideClientRoster"
                     : sourceBags == null || destBags == null || Exact(src, dst) || Exact(src, settings.Carrier) || Exact(dst, settings.Carrier) ? "CharacterNotKnown"
                     : pickup?.World != src.HomeWorldId || drop?.World != dst.HomeWorldId || pickup == null || drop == null ? "MeetingBellMissing"
                     : meta.IsTradable != true ? "ItemNotTradeable"
                     : source == null ? "SourceUnknown" : target == null ? "DestinationUnknown"
                     : meta.MaxStackSize is not (> 0 and <= int.MaxValue) || meta.IsUnique == null ? "ItemMetadataUnknown"
                     : r.TargetQuantity <= 0 ? "InvalidQuantity" : null;
-                void Refuse(string reason) => refusals.Add(new(r.Id, r.ItemName, reason));
+                void Refuse(string reason) => refusals.Add(new(r.Id, r.ItemName, reason,src.CharacterName,dst.CharacterName));
                 if (code != null) { Refuse(code); continue; }
                 var targetKey = (dst.LocalContentId, route.RetainerId);
-                if (meta.IsUnique == true && (r.TargetQuantity != 1 || carrier!.Stock.Any(s => s.ItemId == r.ItemId && s.Units > 0)
+                if (meta.IsUnique == true && (r.TargetQuantity != 1 || tripUnique.Contains(r.ItemId) || uniqueDestinations.Contains((dst.LocalContentId,r.ItemId)) || carrier!.Stock.Any(s => s.ItemId == r.ItemId && s.Units > 0)
                     || locations.Where(l => Exact(l.Character, dst)).Any(l => stock[(dst.LocalContentId, l.Retainer)].Any(s => s.ItemId == r.ItemId && s.Units > 0))))
                 { Refuse("UniqueConflict"); continue; }
                 var size = (int)meta.MaxStackSize!.Value;
@@ -109,13 +116,14 @@ public static class CourierPlanner
                         var n = Math.Min(size, left);
                         stacks.Add(new(r.Id, r.ItemId, r.ItemName, hq, n, size, route.SourceRetainerId, route.RetainerId, src, dst)); left -= n;
                     }
+                    if(meta.IsUnique==true){tripUnique.Add(r.ItemId);uniqueDestinations.Add((dst.LocalContentId,r.ItemId));}
                     remaining -= units;
                 }
                 if (remaining > 0 && refusals.All(f => f.Line != r.Id)) Refuse("SourceShort");
             }
             var cap = Math.Min(testSlotCap ?? int.MaxValue, Math.Min(carrier?.FreeSlots ?? 0,
                 Math.Min(sourceBags?.Inventory.FreeSlots ?? 0, destBags?.Inventory.FreeSlots ?? 0)));
-            if (cap <= 0) foreach (var s in stacks.DistinctBy(s => s.Line)) refusals.Add(new(s.Line, s.Name, "BagSlotLimit"));
+            if (cap <= 0) foreach (var s in stacks.DistinctBy(s => s.Line)) refusals.Add(new(s.Line, s.Name, "BagSlotLimit",src.CharacterName,dst.CharacterName));
             else foreach (var batch in stacks.Chunk(cap)) trips.Add(new(src, dst, pickup!, drop!, [.. batch]));
         }
         return new(plan.Id, plan.Revision, trips.ToImmutable(), refusals.ToImmutable());

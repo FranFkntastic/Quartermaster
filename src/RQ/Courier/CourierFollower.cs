@@ -18,6 +18,7 @@ public sealed class CarrierLedger
     public ImmutableArray<Shipment> Units { get; set; } = [];
     public Dictionary<Guid, CarrierStep> Steps { get; set; } = [];
     public Guid? Unconfirmed { get; set; }
+    public HashSet<Guid> NotDelivered { get; set; } = [];
     public Guid? LastConfirmed { get; set; }
     public InventoryView? LastConfirmedBags { get; set; }
     public CourierPosition? Start { get; set; }
@@ -32,6 +33,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     private readonly CourierStore<CarrierLedger> store = new(Path.Combine(directory, "courier-custody.json"));
     private readonly CourierCalls calls = new(warning);
     private readonly SemaphoreSlim gate = new(1);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Action,byte> deferredReleases=new();
     private IDisposable? lease, suppress, tradeHold;
     private volatile bool stopped;
     private volatile bool disposed;
@@ -39,6 +41,14 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     internal CourierProgress? Progress => active is {} m ? new(m.Run,m.Step,m.Command.ToString()) : null;
     public event Action<Guid>? StopRequested;
 
+    internal void RestoreCustodyHold()
+    {
+        var held=store.Load();
+        if(held.Units.IsEmpty && held.Unconfirmed==null)return;
+        if(!automation.TryAcquire("courier carrier",out lease))throw new InvalidOperationException("CarrierCustodyLeaseUnavailable");
+        try{if(needsSuppression?.Invoke()!=false)suppress=suppression.Acquire();}
+        catch{lease?.Dispose();lease=null;throw;}
+    }
     public CarrierView View()
     {
         var ledger = store.Load();
@@ -46,7 +56,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     }
 
     // peerOwner comes from the authenticated session, never from the message body.
-    public async Task<Result<CourierReceipt>> HandleAsync(OwnerScope peerOwner, CourierMessage m, Deadline deadline, Guid? endpoint = null)
+    public async Task<Result<CourierReceipt>> HandleAsync(OwnerScope peerOwner, CourierMessage m, Deadline deadline, Guid? endpoint = null, Action<CourierProgress>? started = null)
     {
         var cfg = settings();
         var refused = false;
@@ -58,8 +68,8 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         }
         if (!cfg.CarrierOptIn) return Refuse("CarrierOptInOff");
         if(disposed)return Refuse("CarrierUnloaded");
-        bool Authorized(CourierSettings c, CarrierLedger held) => CourierPlanner.Exact(c.PairedOwner,m.Owner) &&
-            (CourierPlanner.Exact(c.PairedOwner,peerOwner) || endpoint != null && held.Run == m.Run &&
+        bool Authorized(CourierSettings c, CarrierLedger held) => c.IsPaired(m.Owner) &&
+            (CourierPlanner.Exact(m.Owner,peerOwner) || endpoint != null && held.Run == m.Run &&
                 (held.OwnerEndpoint == endpoint || held.RunKey is {Length:64} key && key==m.RunKey));
         if (!Authorized(cfg,store.Load())) return Refuse("OwnerNotPaired");
         if (!CourierPlanner.Exact(cfg.Carrier, m.Carrier) || m.Version != 1 || m.Run == Guid.Empty || m.Step == Guid.Empty)
@@ -76,6 +86,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                 return Refuse("PairingChanged");
             var ledger = store.Load();
             var hash = Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(m)));
+            if (ledger.NotDelivered.Contains(m.Step)) return Refuse("NotDelivered");
             bool travelResume=false;
             if (ledger.Steps.TryGetValue(m.Step, out var old))
             {
@@ -84,15 +95,34 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                 travelResume=m.Command is CourierCommand.Travel or CourierCommand.ReturnHome;
                 if(!travelResume)return new(CourierOutcome.Indeterminate,"StepUnsettled","Carrier intent has no receipt.");
             }
-            if (ledger.Run != null && ledger.Run != m.Run) return Refuse("CarrierRunConflict");
             if (!travelResume && ledger.Unconfirmed == null && ledger.Steps.Values.Any(x => x.Result == null && x.Command.Run == m.Run &&
                 !(m.Command==CourierCommand.Begin && x.Command.Command is CourierCommand.Travel or CourierCommand.ReturnHome))
-                && m.Command is not (CourierCommand.Stop or CourierCommand.Status or CourierCommand.Clear)) return Refuse("CarrierIntentUnsettled");
+                && m.Command is not (CourierCommand.Stop or CourierCommand.Status or CourierCommand.Clear or CourierCommand.NotDelivered)) return Refuse("CarrierIntentUnsettled");
             if (m.Command == CourierCommand.Status)
             {
-                if (ledger.Unconfirmed==null && tradeHold!=null) (trade as ICourierHoldPort)?.CheckHold();
                 var snap = await Observe();
                 return Result<CourierReceipt>.Ok(new(m.Run, m.Step, snap, Custody: ledger.Units, Unconfirmed: ledger.Unconfirmed, LastConfirmed: ledger.LastConfirmed, ActiveRun: ledger.Run));
+            }
+            if (ledger.Run != null && ledger.Run != m.Run) return Refuse("CarrierRunConflict");
+            if (m.Command == CourierCommand.NotDelivered && m.ConfirmStep is {} fence && ledger.Run == m.Run)
+            {
+                // Serialize with start; fencing an absent step also rejects a delayed start.
+                if (ledger.LastConfirmed == fence || ledger.Steps.TryGetValue(fence,out var prior) && prior.Result?.Outcome==CourierOutcome.Succeeded ||
+                    ledger.Unconfirmed==fence && (trade is not ICourierDispatchEvidence trace ||
+                    !(await trace.WasNotOpened(fence,Deadline.After("CarrierNeverOpened",10)).WaitAsync(TimeSpan.FromSeconds(10)) is {Outcome:CourierOutcome.Succeeded, Value:true})))
+                    return Refuse("TradeMayHaveOpened");
+                var fresh = await Observe();
+                if (!Custody.Matches(m.OwnerEvidence,m.Partner,m.Manifest,0) || m.CarrierBaseline==null || !Custody.Matches(new(m.CarrierBaseline,fresh),m.Carrier,m.Manifest,0))
+                {
+                    var refusal=Refuse("NotDeliveredEvidenceMismatch");
+                    return refusal with {Value=new(m.Run,m.Step,fresh,Custody:ledger.Units)};
+                }
+                if(ledger.Unconfirmed==fence)ledger.Unconfirmed=null;
+                ledger.NotDelivered.Add(fence);
+                if (ledger.Steps.TryGetValue(fence,out var abandoned))
+                    ledger.Steps[fence]=abandoned with {Result=Result<CourierReceipt>.Fail("NotDelivered",deadline.Name)};
+                store.Save(ledger);
+                return Result<CourierReceipt>.Ok(new(m.Run,m.Step,fresh,Custody:ledger.Units));
             }
             if (ledger.Completed.Contains(m.Run)) return Refuse("RunClosed");
 
@@ -124,8 +154,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                 current.CarrierOptIn && Authorized(current,ledger) && CourierPlanner.Exact(current.Carrier,m.Carrier);
             information?.Invoke($"{m.Run}/{m.Step} carrier {m.Command} ({deadline.Name}, expires {deadline.Expires:O})");
             var step = new CarrierStep(hash, m, null, m.Command is CourierCommand.Receive or CourierCommand.Send ? before : null);
-            ledger.Steps[m.Step]=step;
-            store.Save(ledger);
+            if (m.Command is not (CourierCommand.Receive or CourierCommand.Send)) { ledger.Steps[m.Step]=step; store.Save(ledger); }
             TradeEvidence? evidence = null;
             switch (m.Command)
             {
@@ -153,7 +182,8 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                     await calls.Call("CarrierPartner", 30, d => bells.ObserveTradeableAsync(m.Partner, d));
                     if (stopped || !settings().CarrierOptIn || !Authorized(settings(),ledger)) return Refuse("CarrierDisarmed");
                     ledger.Unconfirmed = m.Step;
-                    store.Save(ledger);
+                    ledger.Steps[m.Step]=step; store.Save(ledger);
+                    CourierGame.TradeStarted.Value=()=>started?.Invoke(new(m.Run,m.Step,"TradeStarted"));
                     try
                     {
                         await calls.Call("CarrierTrade", 120, d => send ? trade.SendAsync(m.Partner, m.Manifest, d) : trade.ReceiveAsync(m.Partner, m.Manifest, d));
@@ -230,7 +260,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                 case CourierCommand.Finish:
                     if (!ledger.Units.IsEmpty || ledger.Unconfirmed != null) return Refuse("CustodyRemaining");
                     ledger.Run = null; ledger.RunKey=null;ledger.OwnerEndpoint=null;ledger.Completed.Add(m.Run);
-                    Release(); break;
+                    Release(force:true); break;
                 case CourierCommand.Stop:
                     ledger.Paused = true;
                     Release(); break;
@@ -273,20 +303,25 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             try { var ledger=store.Load(); if(ledger.Run!=null){ledger.Paused=true;store.Save(ledger);} Release(); } finally { gate.Release(); }
         }
     }
-    private void Release()
+    private void Release(bool force=false)
     {
-        var heldSuppression = suppress; var heldLease = lease; suppress = null; lease = null;
-        var heldTrade = tradeHold; tradeHold = null;
-        calls.WhenSettled(() => { try { heldTrade?.Dispose(); heldSuppression?.Dispose(); } finally { heldLease?.Dispose(); } });
+        if (!force && store.Load() is {} held && (!held.Units.IsEmpty || held.Unconfirmed!=null)) return;
+        var heldSuppression=Interlocked.Exchange(ref suppress,null);
+        var heldLease=Interlocked.Exchange(ref lease,null);
+        var heldTrade=Interlocked.Exchange(ref tradeHold,null);
+        void Drop(){try{heldTrade?.Dispose();}finally{try{heldSuppression?.Dispose();}finally{heldLease?.Dispose();}}}
+        deferredReleases.TryAdd(Drop,0);
+        void Once(){if(deferredReleases.TryRemove(Drop,out _))Drop();}
+        if(disposed)Once();else calls.WhenSettled(Once);
     }
     public void Dispose()
     {
         stopped=disposed=true;
-        _=ReleaseAfterCommand();
-    }
-    private async Task ReleaseAfterCommand()
-    {
-        await gate.WaitAsync();
-        try{Release();}finally{gate.Release();}
+        var drained=gate.Wait(TimeSpan.FromSeconds(2));
+        if (!drained) warning("CarrierUnloadDrainDeadline: 2s elapsed.");
+        try {
+            Release(force:true);
+            foreach(var release in deferredReleases.Keys)if(deferredReleases.TryRemove(release,out _))release();
+        } finally { if (drained) gate.Release(); }
     }
 }

@@ -40,8 +40,9 @@ internal sealed class CourierSettingsSection
 
         if (carrying)
         {
-            DrawCharacterCombo("Owner", "##RQCourierOwner", "quartermaster.courier.paired-owner", settings.PairedOwner,
-                chosen => courier.UpdateSettings(current => current with { PairedOwner = chosen with { } }));
+            DrawCharacterCombo("Owner", "##RQCourierOwner", "quartermaster.courier.paired-owner", settings.Owners.FirstOrDefault(),
+                chosen => courier.UpdateSettings(current => current with { PairedOwner=null,PairedOwners=current.IsPaired(chosen)?
+                    [..current.Owners.Where(o=>!CourierPlanner.Exact(o,chosen))]:[..current.Owners,chosen] }),settings);
             return;
         }
 
@@ -68,12 +69,13 @@ internal sealed class CourierSettingsSection
     private void SetCarrying(OwnerScope owner, bool on) =>
         courier.UpdateSettings(current => on
             ? current with { Carrier = owner with { }, CarrierOptIn = true }
-            : current with { Carrier = null, CarrierOptIn = false, PairedOwner = null });
+            : current with { Carrier = null, CarrierOptIn = false, PairedOwner = null,PairedOwners=[] });
 
     /// <summary>A picker over the characters on the other linked clients; the stored one stays listed while offline.</summary>
-    private void DrawCharacterCombo(string label, string id, string controlId, OwnerScope? current, Action<OwnerScope> choose)
+    private void DrawCharacterCombo(string label, string id, string controlId, OwnerScope? current, Action<OwnerScope> choose,CourierSettings? pairing=null)
     {
-        var candidates = courier.Link.Peers.Select(peer => peer.Character)
+        var candidates = (pairing==null?courier.Link.Peers.Select(peer=>peer.Character):
+            courier.Link.Peers.SelectMany(peer=>peer.Roster??[peer.Character]).Concat(pairing.Owners)).DistinctBy(o=>(o.LocalContentId,o.HomeWorldId))
             .Where(character => character.HasStableIdentity)
             .ToList();
         if (current is { HasStableIdentity: true } stored && !candidates.Any(candidate => CourierPlanner.Exact(candidate, stored)))
@@ -92,11 +94,11 @@ internal sealed class CourierSettingsSection
         foreach (var candidate in candidates)
         {
             var online = courier.Link.Peers.Any(peer => CourierPlanner.Exact(peer.Character, candidate));
-            var selected = current is not null && CourierPlanner.Exact(candidate, current);
+            var selected = pairing?.IsPaired(candidate) ?? CourierPlanner.Exact(candidate,current);
             var text = $"{CourierSession.CharacterLabel(candidate)} · {candidate.HomeWorldName}##{candidate.LocalContentId}";
             if (!online)
                 ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetColorU32(ImGuiCol.TextDisabled));
-            if (ImGui.Selectable(text, selected) && !selected)
+            if (ImGui.Selectable(text, selected) && (!selected || pairing!=null))
                 choose(candidate);
             if (!online)
                 ImGui.PopStyleColor();
