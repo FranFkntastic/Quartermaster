@@ -71,6 +71,9 @@ internal sealed class StockWorkspace
     private bool catalogMode;
     private bool optionsRequested;
     private readonly CourierSettingsSection courierSettings;
+    /// <summary>Another character whose cached stock the browser shows instead of the logged-in one's.</summary>
+    private OwnerScope? viewedCharacter;
+    private (IReadOnlyList<StockGroup> QueryItems, StockWorkbenchRow[] Rows)? viewedRows;
 
     public StockWorkspace(
         StateRepository state,
@@ -201,12 +204,13 @@ internal sealed class StockWorkspace
             return;
         }
         timings.Section("stock filter");
-        var projection = runtime.Browser;
-        var availableItems = GetStockItemsWithListingDemand(runtime, workbench.ScopeKey);
+        var viewed = ViewedStock(runtime);
+        var projection = viewed ?? runtime.Browser;
+        var availableItems = viewed?.Items ?? GetStockItemsWithListingDemand(runtime, workbench.ScopeKey);
         // The toolbar runs first and updates IsInputActive. Use the same editing
         // snapshot for both cache lookups so a focus transition cannot rebuild twice.
         var isEditing = workbench.ItemFilterState.IsInputActive;
-        var scopeKey = workbench.ScopeKey;
+        var scopeKey = viewed is null ? workbench.ScopeKey : BrowserScope.AllKey;
         DrawStockToolbar(runtime, availableItems, scopeKey, isEditing);
         var result = queries.QueryItems(
             projection,
@@ -232,10 +236,13 @@ internal sealed class StockWorkspace
 
         var selectedPlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
         timings.Section("stock projection");
-        var sourceRows = ResolveStockWorkbenchProjection(runtime, visibleItems, selectedPlan);
+        var sourceRows = viewed is null
+            ? ResolveStockWorkbenchProjection(runtime, visibleItems, selectedPlan)
+            : ResolveViewedRows(runtime, visibleItems);
         timings.Section("stock table");
         DrawSelectionBar(runtime, stockVisible, canSelectVisible: true);
-        DrawSingleStockSelection(runtime);
+        if (viewed is null)
+            DrawSingleStockSelection(runtime);
         DrawTableColumnsToolbar(stockTable, "RQStockColumns", "Visible stock");
         var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
                      ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable |
@@ -285,6 +292,46 @@ internal sealed class StockWorkspace
             availableStockScopeKey = scopeKey;
         }
         return availableStockItems;
+    }
+
+    /// <summary>
+    /// The other character's cached stock while that scope is chosen; the scope lapses when the
+    /// character logs in here, becomes the carrier, or has nothing observed.
+    /// </summary>
+    private BrowserProjection? ViewedStock(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (viewedCharacter is not { } character || catalogMode)
+            return null;
+        if (!character.Matches(runtime.Owner) && !CourierSession.IsCarrier(runtime, character) &&
+            courier.Stock(runtime, character) is { } stock)
+            return stock;
+        viewedCharacter = null;
+        return null;
+    }
+
+    private void ViewCharacter(OwnerScope character)
+    {
+        viewedCharacter = character with { };
+        workbench.FocusedStockItemId = null;
+        LeaveCatalog();
+    }
+
+    /// <summary>Another character's rows: its stock only, with no plan, target or listing columns of its own.</summary>
+    private IReadOnlyList<StockWorkbenchRow> ResolveViewedRows(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> queryItems)
+    {
+        if (viewedRows is { } cached && ReferenceEquals(cached.QueryItems, queryItems))
+            return cached.Rows;
+        var retainers = TransferWorkbenchPresentation.AccessibleRetainerIds(runtime.Retainers, viewedCharacter!);
+        var rows = queryItems
+            .Select(item => new StockWorkbenchRow(
+                item,
+                TransferWorkbenchPresentation.AccessibleStorageQuantity(item, ItemQualityPolicy.Any, retainers),
+                null,
+                null,
+                []))
+            .ToArray();
+        viewedRows = (queryItems, rows);
+        return rows;
     }
 
     internal static IReadOnlyList<StockGroup> StockItemsWithListingDemand(QuartermasterRuntimeSnapshot runtime, string scopeKey)
@@ -379,10 +426,10 @@ internal sealed class StockWorkspace
         {
             catalogPicker.DrawSearch(Math.Max(100, ImGui.GetContentRegionAvail().X - ScopeComboWidth() - ImGui.GetStyle().ItemSpacing.X));
             ImGui.SameLine();
-            DrawScopeCombo(projection);
+            DrawScopeCombo(runtime);
             return;
         }
-        var context = queries.EnsureItemContext(sourceItems, projection.Owner, scopeKey, isEditing, runtime.PlanningRevision);
+        var context = queries.EnsureItemContext(sourceItems, viewedCharacter ?? projection.Owner, scopeKey, isEditing, runtime.PlanningRevision);
         var spacing = ImGui.GetStyle().ItemSpacing.X;
         var trailingWidth = SearchReference.ButtonWidth + spacing + ScopeComboWidth() + spacing +
             ImGui.CalcTextSize("…").X + (ImGui.GetStyle().FramePadding.X * 2f) + spacing;
@@ -424,7 +471,7 @@ internal sealed class StockWorkspace
             workbench.FocusedStockItemId = null;
         }
         ImGui.SameLine();
-        DrawScopeCombo(projection);
+        DrawScopeCombo(runtime);
 
         ImGui.SameLine();
         var openOptions = ImGui.SmallButton("…##RQStockOptions");
@@ -505,21 +552,31 @@ internal sealed class StockWorkspace
     private static float ScopeComboWidth() =>
         Math.Max(150, ImGui.CalcTextSize(CatalogPicker.ScopeLabel).X + ImGui.GetFrameHeight() + (ImGui.GetStyle().FramePadding.X * 2f));
 
-    private void DrawScopeCombo(BrowserProjection projection)
+    private void DrawScopeCombo(QuartermasterRuntimeSnapshot runtime)
     {
+        var projection = runtime.Browser;
+        var characters = courier.Browsable(runtime).ToArray();
         ImGui.SetNextItemWidth(ScopeComboWidth());
         var selectedScope = projection.Scopes.First(scope => scope.Key == workbench.ScopeKey);
-        if (ImGui.BeginCombo("##RQStockScope", catalogMode ? CatalogPicker.ScopeLabel : selectedScope.Label))
+        var selectedLabel = catalogMode ? CatalogPicker.ScopeLabel
+            : viewedCharacter is { } viewed ? CourierSession.CharacterLabel(viewed)
+            : selectedScope.Label;
+        if (ImGui.BeginCombo("##RQStockScope", selectedLabel))
         {
             foreach (var scope in projection.Scopes)
             {
-                if (ImGui.Selectable($"{scope.Label}##stock-scope:{scope.Key}", !catalogMode && scope.Key == workbench.ScopeKey))
+                if (ImGui.Selectable($"{scope.Label}##stock-scope:{scope.Key}", !catalogMode && viewedCharacter is null && scope.Key == workbench.ScopeKey))
                 {
                     workbench.ScopeKey = scope.Key;
                     workbench.FocusedStockItemId = null;
+                    viewedCharacter = null;
                     LeaveCatalog();
                 }
             }
+            foreach (var character in characters)
+                if (ImGui.Selectable($"{CourierSession.CharacterLabel(character)}##stock-scope:character:{character.LocalContentId}",
+                        !catalogMode && viewedCharacter?.Matches(character) == true))
+                    ViewCharacter(character);
             if (ImGui.Selectable($"{CatalogPicker.ScopeLabel}##stock-scope:catalog", catalogMode))
                 EnterCatalog();
             ImGui.EndCombo();
@@ -530,6 +587,16 @@ internal sealed class StockWorkspace
             true,
             EnterCatalog,
             catalogMode ? "Selected" : "Available");
+        foreach (var character in characters)
+        {
+            var target = character;
+            reviewRegistry.RegisterLastButton(
+                $"quartermaster.stock.scope.character.{character.LocalContentId}",
+                $"Browse {character.CharacterName}'s stock",
+                true,
+                () => ViewCharacter(target),
+                !catalogMode && viewedCharacter?.Matches(character) == true ? "Selected" : "Available");
+        }
     }
 
     private void EnterCatalog()
@@ -537,6 +604,7 @@ internal sealed class StockWorkspace
         if (catalogMode)
             return;
         catalogMode = true;
+        viewedCharacter = null;
         workbench.FocusedStockItemId = null;
     }
 
@@ -631,6 +699,26 @@ internal sealed class StockWorkspace
             SelectVisible,
             $"visible={visible.Ids.Length:N0}; selected={stockSelection.Count:N0}");
 
+        // Another character's stock can only be sent; the logged-in character's own actions do not apply.
+        if (viewedCharacter is null)
+            DrawOwnSelectionActions(runtime, hasSelection);
+        DrawSendSelection(runtime, hasSelection);
+
+        UiLayout.SameLineIfFits("Clear");
+        ImGui.BeginDisabled(!hasSelection);
+        if (ImGui.Button("Clear"))
+            ClearStockSelection();
+        ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.stock.clear-selection",
+            "Clear the item selection",
+            hasSelection,
+            ClearStockSelection,
+            $"{stockSelection.Count:N0} selected");
+    }
+
+    private void DrawOwnSelectionActions(QuartermasterRuntimeSnapshot runtime, bool hasSelection)
+    {
         var canPlan = hasSelection && runtime.Owner.HasStableIdentity;
         UiLayout.SameLineIfFits("Add to plan");
         ImGui.BeginDisabled(!canPlan);
@@ -674,9 +762,12 @@ internal sealed class StockWorkspace
             DrawStowDestinations(runtime, ResolveSelection(runtime).Stock.Where(item => item.PlayerQuantity > 0).ToArray());
             ImGui.EndPopup();
         }
+    }
 
+    private void DrawSendSelection(QuartermasterRuntimeSnapshot runtime, bool hasSelection)
+    {
         // Sending to another character exists only once another character is known.
-        if (transferPlans.HasCourierDestinations(runtime))
+        if (transferPlans.HasCourierDestinations(runtime, viewedCharacter))
         {
             var canSend = hasSelection && runtime.Owner.HasStableIdentity && SelectionHasSendable(runtime);
             UiLayout.SameLineIfFits("Send to…");
@@ -697,18 +788,6 @@ internal sealed class StockWorkspace
                 ImGui.EndPopup();
             }
         }
-
-        UiLayout.SameLineIfFits("Clear");
-        ImGui.BeginDisabled(!hasSelection);
-        if (ImGui.Button("Clear"))
-            ClearStockSelection();
-        ImGui.EndDisabled();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.stock.clear-selection",
-            "Clear the item selection",
-            hasSelection,
-            ClearStockSelection,
-            $"{stockSelection.Count:N0} selected");
     }
 
     private void SelectVisible()
@@ -787,6 +866,13 @@ internal sealed class StockWorkspace
 
     private bool TryResolveStock(QuartermasterRuntimeSnapshot runtime, uint itemId, out StockGroup item, out bool carried)
     {
+        // Another character's scope resolves only against that character's stock.
+        if (!catalogMode && viewedCharacter is { } viewed)
+        {
+            item = courier.Stock(runtime, viewed)?.FindItem(itemId)!;
+            carried = item?.PlayerQuantity > 0;
+            return item is not null;
+        }
         var scopeKey = catalogMode ? BrowserScope.AllKey : workbench.ScopeKey;
         var scoped = ResolveLookup(ref scopedLookup, runtime, scopeKey);
         if (scoped.ById.TryGetValue(itemId, out item!))
@@ -942,6 +1028,12 @@ internal sealed class StockWorkspace
         var runtime = runtimeSnapshots.Current;
         var item = row.Item;
 
+        if (viewedCharacter is not null)
+        {
+            DrawSendMenu(runtime, item);
+            return;
+        }
+
         if (!runtime.Owner.HasStableIdentity)
             ImGui.BeginDisabled();
         if (ImGui.MenuItem("Add to plan"))
@@ -964,7 +1056,12 @@ internal sealed class StockWorkspace
         if (item.PlayerQuantity == 0 || !runtime.Owner.HasStableIdentity)
             ImGui.EndDisabled();
 
-        if (runtime.Owner.HasStableIdentity && CanSend(item) && transferPlans.HasCourierDestinations(runtime) &&
+        DrawSendMenu(runtime, item);
+    }
+
+    private void DrawSendMenu(QuartermasterRuntimeSnapshot runtime, StockGroup item)
+    {
+        if (runtime.Owner.HasStableIdentity && CanSend(item) && transferPlans.HasCourierDestinations(runtime, viewedCharacter) &&
             ImGui.BeginMenu("Send to"))
         {
             DrawSendDestinations(runtime, [item]);
@@ -977,13 +1074,19 @@ internal sealed class StockWorkspace
     private bool SelectionHasSendable(QuartermasterRuntimeSnapshot runtime) =>
         ResolveSelection(runtime).Stock.Any(CanSend);
 
-    /// <summary>Adds courier lines for the items' owned units, grouped by destination character.</summary>
-    private void DrawSendDestinations(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, string? controlPrefix = null) =>
+    /// <summary>
+    /// Adds courier lines for the items' owned units, grouped by destination character. In another
+    /// character's scope that character is the source.
+    /// </summary>
+    private void DrawSendDestinations(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, string? controlPrefix = null)
+    {
+        var source = viewedCharacter;
         transferPlans.DrawCourierDestinations(runtime, (character, retainer) =>
         {
-            transferPlans.AddCourier(runtime, items, character, retainer);
+            transferPlans.AddCourier(runtime, items, character, retainer, source);
             stockSelection.Clear();
-        }, controlPrefix: controlPrefix);
+        }, controlPrefix: controlPrefix, source: source);
+    }
 
     private void AddStockItemsToItemGroup(
         QuartermasterRuntimeSnapshot runtime,
@@ -1049,6 +1152,7 @@ internal sealed class StockWorkspace
     public void FocusFromListings(QuartermasterRuntimeSnapshot runtime, ListingItemKey group)
     {
         LeaveCatalog();
+        viewedCharacter = null;
         stockSelection.Clear();
         stockSelection.SetSelected(group.ItemId, true);
         workbench.SelectedStockListingQuality = group.Quality;
