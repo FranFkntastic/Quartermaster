@@ -129,7 +129,7 @@ public static class ListingPlanEvaluator
         var contributions = Contributions(state, stowagePlanId, evaluation)
             .ToDictionary(contribution => (contribution.Link.ItemId, contribution.Link.Quality));
         return state.PlanItems
-            .Where(rule => rule.StowagePlanId == stowagePlanId)
+            .Where(rule => rule.StowagePlanId == stowagePlanId && rule.Courier is null)
             .Select(rule =>
             {
                 var copy = StowagePlanCatalog.CopyRule(rule, stowagePlanId, newIdentity: false);

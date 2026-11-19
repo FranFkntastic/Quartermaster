@@ -37,6 +37,8 @@ internal sealed class StockWorkspace
     private readonly WorkbenchState workbench;
     private readonly ItemGroupWorkspace itemGroupWorkspace;
     private readonly TransferPlanWorkspace transferPlans;
+    private readonly CourierSession courier;
+    private bool sendRequested;
     private readonly ListingPlanDraftSession listingSession;
     private readonly Action<QuartermasterRuntimeSnapshot, ListingItemKey> showInListings;
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
@@ -67,6 +69,8 @@ internal sealed class StockWorkspace
     private double stockDrawMilliseconds;
     private bool stowRequested;
     private bool catalogMode;
+    private bool optionsRequested;
+    private readonly CourierSettingsSection courierSettings;
 
     public StockWorkspace(
         StateRepository state,
@@ -82,8 +86,10 @@ internal sealed class StockWorkspace
         Action<QuartermasterRuntimeSnapshot, ListingItemKey> showInListings,
         AgentBridgeUiReviewRegistry reviewRegistry,
         Action requestStockView,
-        GameItemCatalog gameCatalog)
+        GameItemCatalog gameCatalog,
+        CourierSession courier)
     {
+        this.courier = courier;
         this.state = state;
         this.runtimeSnapshots = runtimeSnapshots;
         this.retainerRefresh = retainerRefresh;
@@ -99,6 +105,7 @@ internal sealed class StockWorkspace
         this.requestStockView = requestStockView;
         this.gameCatalog = gameCatalog;
         catalogPicker = new CatalogPicker(gameCatalog, reviewRegistry, stockSelection);
+        courierSettings = new CourierSettingsSection(courier, reviewRegistry);
         stockTable = CreateTable();
     }
 
@@ -327,7 +334,7 @@ internal sealed class StockWorkspace
         var rules = selectedPlan is null
             ? new Dictionary<uint, TargetPlanItem>()
             : runtime.State.PlanItems
-                .Where(rule => rule.StowagePlanId == selectedPlan.Id)
+                .Where(rule => rule.StowagePlanId == selectedPlan.Id && rule.Courier is null)
                 .GroupBy(rule => rule.ItemId)
                 .ToDictionary(group => group.Key, group => group.First());
         var evaluated = selectedPlan is null
@@ -420,8 +427,14 @@ internal sealed class StockWorkspace
         DrawScopeCombo(projection);
 
         ImGui.SameLine();
-        if (ImGui.SmallButton("…##RQStockOptions"))
+        var openOptions = ImGui.SmallButton("…##RQStockOptions");
+        reviewRegistry.RegisterLastButton("quartermaster.stock.options.open", "Open stock and courier options", true,
+            () => optionsRequested = true, "Available");
+        if (courier.TakeSettingsRequest() | openOptions | optionsRequested)
+        {
             ImGui.OpenPopup("RQStockOptions");
+            optionsRequested = false;
+        }
         if (ImGui.BeginPopup("RQStockOptions"))
         {
             ImGui.TextDisabled("Included player storage");
@@ -439,6 +452,7 @@ internal sealed class StockWorkspace
                 configuration.IncludeArmoury = includeArmoury;
                 saveConfiguration();
             }
+            courierSettings.Draw(runtime);
             ImGui.EndPopup();
         }
 
@@ -659,6 +673,29 @@ internal sealed class StockWorkspace
         {
             DrawStowDestinations(runtime, ResolveSelection(runtime).Stock.Where(item => item.PlayerQuantity > 0).ToArray());
             ImGui.EndPopup();
+        }
+
+        // Sending to another character exists only once another character is known.
+        if (transferPlans.HasCourierDestinations(runtime))
+        {
+            var canSend = hasSelection && runtime.Owner.HasStableIdentity && SelectionHasSendable(runtime);
+            UiLayout.SameLineIfFits("Send to…");
+            ImGui.BeginDisabled(!canSend);
+            if (ImGui.Button("Send to…"))
+                sendRequested = true;
+            ImGui.EndDisabled();
+            reviewRegistry.RegisterLastButton("quartermaster.stock.send", "Choose another character to send to", canSend,
+                () => sendRequested = true, "Selected owned stock");
+            if (sendRequested)
+            {
+                ImGui.OpenPopup("RQStockSend");
+                sendRequested = false;
+            }
+            if (ImGui.BeginPopup("RQStockSend"))
+            {
+                DrawSendDestinations(runtime, ResolveSelection(runtime).Stock.Where(CanSend).ToArray(), "quartermaster.stock.send");
+                ImGui.EndPopup();
+            }
         }
 
         UiLayout.SameLineIfFits("Clear");
@@ -926,7 +963,27 @@ internal sealed class StockWorkspace
         }
         if (item.PlayerQuantity == 0 || !runtime.Owner.HasStableIdentity)
             ImGui.EndDisabled();
+
+        if (runtime.Owner.HasStableIdentity && CanSend(item) && transferPlans.HasCourierDestinations(runtime) &&
+            ImGui.BeginMenu("Send to"))
+        {
+            DrawSendDestinations(runtime, [item]);
+            ImGui.EndMenu();
+        }
     }
+
+    private static bool CanSend(StockGroup item) => item.PlayerQuantity > 0 || item.RetainerQuantity > 0;
+
+    private bool SelectionHasSendable(QuartermasterRuntimeSnapshot runtime) =>
+        ResolveSelection(runtime).Stock.Any(CanSend);
+
+    /// <summary>Adds courier lines for the items' owned units, grouped by destination character.</summary>
+    private void DrawSendDestinations(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, string? controlPrefix = null) =>
+        transferPlans.DrawCourierDestinations(runtime, (character, retainer) =>
+        {
+            transferPlans.AddCourier(runtime, items, character, retainer);
+            stockSelection.Clear();
+        }, controlPrefix: controlPrefix);
 
     private void AddStockItemsToItemGroup(
         QuartermasterRuntimeSnapshot runtime,

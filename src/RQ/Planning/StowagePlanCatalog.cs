@@ -41,7 +41,7 @@ public static class StowagePlanCatalog
 
     public static void SetStockRule(StowagePlanDraft draft, uint itemId, string name, int retrieveTarget, bool stow, ulong? retainerId = null)
     {
-        var rule = draft.Rules.FirstOrDefault(r => r.ItemId == itemId && r.Quality == ItemQualityPolicy.Any);
+        var rule = draft.Rules.FirstOrDefault(r => r.Courier is null && r.ItemId == itemId && r.Quality == ItemQualityPolicy.Any);
         if (rule is null)
         {
             rule = new TargetPlanItem { StowagePlanId = draft.PlanId, ItemId = itemId, ItemName = name, TargetQuantity = Math.Max(0, retrieveTarget) };
@@ -71,7 +71,7 @@ public static class StowagePlanCatalog
         ItemQualityPolicy quality,
         int playerQuantity)
     {
-        var rule = draft.Rules.FirstOrDefault(r => r.ItemId == itemId && r.Quality == quality);
+        var rule = draft.Rules.FirstOrDefault(r => r.Courier is null && r.ItemId == itemId && r.Quality == quality);
         if (rule is not null)
             return rule;
         rule = new TargetPlanItem
@@ -266,7 +266,7 @@ public static class StowagePlanCatalog
         state.PlanItems.RemoveAll(rule => rule.StowagePlanId == plan.Id);
         state.PlanItems.AddRange(draft.Rules
             .Where(rule => rule.ItemId > 0)
-            .GroupBy(rule => (rule.ItemId, rule.Quality))
+            .GroupBy(LineKey)
             .Select(group => CopyRule(group.First(), plan.Id, newIdentity: false)));
         state.TransferPlanListingLinks.RemoveAll(link =>
             link.StowagePlanId == plan.Id &&
@@ -276,6 +276,15 @@ public static class StowagePlanCatalog
         state.Schema = "gooseworks-quartermaster-state/v5";
         return plan;
     }
+
+    /// <summary>
+    /// A plan holds one ordinary line per item and quality, plus one courier line per distinct route
+    /// (source container and destination) for that item and quality.
+    /// </summary>
+    public static (uint ItemId, ItemQualityPolicy Quality, ulong? To, ulong? ToRetainer, ulong? From, ulong? FromRetainer, bool Courier) LineKey(TargetPlanItem rule) =>
+        rule.Courier is { } route
+            ? (rule.ItemId, rule.Quality, route.Character.LocalContentId, route.RetainerId, route.SourceCharacter?.LocalContentId, route.SourceRetainerId, true)
+            : (rule.ItemId, rule.Quality, (ulong?)null, (ulong?)null, (ulong?)null, (ulong?)null, false);
 
     public static void ClearStaleRecovery(QuartermasterState state)
     {
@@ -320,6 +329,7 @@ public static class StowagePlanCatalog
         TargetQuantity = Math.Max(0, source.TargetQuantity),
         Quality = source.Quality,
         Routing = StowageRoutingPolicy.CopyOf(source.Routing),
+        Courier = source.Courier,
         AllowVendorPurchase = source.AllowVendorPurchase,
         PreferredVendorNpcId = source.PreferredVendorNpcId,
         Notes = source.Notes,

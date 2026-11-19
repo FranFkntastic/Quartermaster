@@ -31,7 +31,8 @@ internal sealed record TransferWorkbenchProjection(
     int Movements,
     bool HasMovement,
     bool HasUnknownListingDemand,
-    IReadOnlyList<TransferWorkbenchRow> Rows);
+    IReadOnlyList<TransferWorkbenchRow> Rows,
+    Courier.CourierPlan? Courier = null);
 
 internal sealed record PendingTransferPlanRecovery(Guid PlanId, string RefreshRunId);
 
@@ -56,7 +57,8 @@ internal sealed record TransferWorkbenchRow(
     Guid PlanId,
     QuartermasterRuntimeSnapshot Runtime,
     TransferLineProjection Projection,
-    TransferVendorProcurementLine? VendorPreview);
+    TransferVendorProcurementLine? VendorPreview,
+    Courier.Refusal? CourierRefusal = null);
 
 internal sealed record TransferReviewRow(
     TargetPlanItem Rule,

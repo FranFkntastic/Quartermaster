@@ -60,7 +60,33 @@ public sealed record QuartermasterBridgeTruth(
     string? VendorProcurementPhase,
     string? VendorProcurementMessage,
     int VendorPurchasedQuantity,
-    ulong VendorSpentGil);
+    ulong VendorSpentGil,
+    CourierBridgeTruth? Courier = null);
+
+/// <summary>Courier run and carrier state as the UI shows it; names only, no internal ids.</summary>
+public sealed record CourierBridgeTruth(
+    bool Available,
+    string? Carrier,
+    bool CarrierOptIn,
+    string? PairedOwner,
+    IReadOnlyList<string> CharactersWithMeetingBell,
+    bool Starting,
+    string? RunState,
+    string? OwnerPhase,
+    string? CarrierPhase,
+    int Trip,
+    int Trips,
+    string? Code,
+    string? Detail,
+    IReadOnlyList<CourierLineBridgeTruth> Lines,
+    string? CarrierCommand,
+    int CarrierHoldingUnits,
+    bool CarrierPaused,
+    bool CarrierUnconfirmed,
+    string? Error,bool CanResume,bool CanClear,IReadOnlyList<RQ.Courier.CustodyRow> Custody,string? StartBlockCode,
+    IReadOnlyList<RQ.Courier.Refusal> StartRefusals,IReadOnlyList<string> PairedOwners);
+
+public sealed record CourierLineBridgeTruth(string Item, int Moved, int Remaining);
 
 public sealed class QuartermasterBridgeProvider
 {
@@ -101,6 +127,7 @@ public sealed class QuartermasterBridgeProvider
     }
 
     public QuartermasterBridgeTruth CreateTruth() => createTruth();
+    internal Action<int?>? SetCourierSlotCap {get;init;}
     public IReadOnlyList<AgentBridgeReviewSurfaceDescriptor> GetReviewSurfaces() => ReviewSurfaces;
     public IReadOnlyList<AgentBridgeCaptureSurfaceDescriptor> GetCaptureSurfaces() => CaptureSurfaces;
     public AgentBridgeUiReviewFrame GetControlSurface() => reviewRegistry.Snapshot();

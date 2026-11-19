@@ -15,6 +15,9 @@ internal static class TransferPresentation
         _ => new Vector4(.69f, .74f, .77f, 1f),
     };
 
+    /// <summary>Courier sends: units leaving for another character.</summary>
+    public static readonly Vector4 SendColor = new(.78f, .68f, .94f, 1f);
+
     public static string SignedQuantity(int quantity) =>
         quantity > 0
             ? $"+{quantity:N0}"

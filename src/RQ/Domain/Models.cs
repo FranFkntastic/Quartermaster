@@ -127,6 +127,8 @@ public sealed class CachedPlayerBag
 
 public sealed class TargetPlanItem
 {
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Courier.CourierRoute? Courier { get; set; }
     public Guid Id { get; set; } = Guid.NewGuid();
     public Guid StowagePlanId { get; set; }
     public uint ItemId { get; set; }
@@ -469,6 +471,7 @@ public sealed class RetainerListingCaptureItem
 
 public sealed class QuartermasterState
 {
+    public Courier.CourierSettings Courier { get; set; } = new();
     public string Schema { get; set; } = "gooseworks-quartermaster-state/v5";
     public long Revision { get; set; }
     public List<StowagePlan> StowagePlans { get; set; } = [];

@@ -16,6 +16,8 @@ internal sealed class TransferReviewDialog
     private readonly Action<Guid> executePlan;
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
     private readonly DalamudTableProjection<TransferReviewRow> table = CreateTable();
+    private readonly DalamudTableProjection<TransferWorkbenchRow> courierTable = CreateCourierTable();
+    private readonly CourierSession courier;
     private TransferReviewRequest? request;
     private bool openRequested;
 
@@ -25,8 +27,10 @@ internal sealed class TransferReviewDialog
         Func<bool> transfersCanStart,
         Func<bool> retainerRefreshBusy,
         Action<Guid> executePlan,
-        AgentBridgeUiReviewRegistry reviewRegistry)
+        AgentBridgeUiReviewRegistry reviewRegistry,
+        CourierSession courier)
     {
+        this.courier = courier ?? throw new ArgumentNullException(nameof(courier));
         this.runtimeSnapshot = runtimeSnapshot ?? throw new ArgumentNullException(nameof(runtimeSnapshot));
         this.resolveProjection = resolveProjection ?? throw new ArgumentNullException(nameof(resolveProjection));
         this.transfersCanStart = transfersCanStart ?? throw new ArgumentNullException(nameof(transfersCanStart));
@@ -98,6 +102,14 @@ internal sealed class TransferReviewDialog
         }
 
         var projection = resolveProjection(runtime, plan);
+        if (projection.Courier is { } courierPlan)
+        {
+            DrawCourier(runtime, plan, projection, courierPlan);
+            ImGui.EndPopup();
+            if (!open)
+                Clear();
+            return;
+        }
         var movements = projection.Movements;
 
         ImGui.TextUnformatted($"{movements:N0} movements");
@@ -186,6 +198,110 @@ internal sealed class TransferReviewDialog
         if (!open)
             Clear();
     }
+
+    /// <summary>A plan with courier lines runs as a courier run: its review lists what goes where.</summary>
+    private void DrawCourier(
+        QuartermasterRuntimeSnapshot runtime,
+        StowagePlan plan,
+        TransferWorkbenchProjection projection,
+        RQ.Courier.CourierPlan courierPlan)
+    {
+        var rows = projection.Rows.Where(row => row.Rule.Courier is not null && row.Rule.Enabled).ToArray();
+        var units = rows.Sum(row => row.Projection.Send);
+        ImGui.TextUnformatted($"{courierPlan.Trips.Length:N0} trip{(courierPlan.Trips.Length == 1 ? string.Empty : "s")}");
+        ImGui.SameLine();
+        ImGui.TextDisabled("·");
+        ImGui.SameLine();
+        ImGui.TextColored(TransferPresentation.SendColor, $"Send {units:N0}");
+        ImGui.Separator();
+
+        if (courierTable.Begin(
+                "RQCourierReviewRows",
+                new DalamudTableLayout(
+                    new Vector2(0, Math.Max(260, ImGui.GetContentRegionAvail().Y - 48)),
+                    ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH |
+                    ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp)))
+        {
+            courierTable.DrawClippedRows(rows, (row, _) => courierTable.DrawRow(row, id: $"courier-review:{row.Rule.Id}"));
+            courierTable.End();
+        }
+
+        if (ImGui.Button("Back"))
+        {
+            Clear();
+            ImGui.CloseCurrentPopup();
+        }
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.transfer.review.back",
+            "Return to the Transfer Plan without executing",
+            true,
+            Clear,
+            "No inventory movement");
+        var mixed = projection.Rows.Any(row=>row.Rule.Enabled && row.Rule.Courier==null);
+        var gate = courier.StartGate(runtime, courierPlan);
+        var block = mixed
+            ? "Mixed execution unavailable: ordinary transfers have no completion receipt for the courier."
+            : gate.Status;
+        var canStart = !mixed && gate.CanStart;
+        if (block is not null)
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled(block);
+        }
+        // An active or unsettled run is handled on the run pane; Start is not offered meanwhile.
+        if (!mixed && !gate.Offer)
+            return;
+        ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - 110));
+        ImGui.BeginDisabled(!canStart);
+        if (ImGui.Button("Execute plan"))
+        {
+            courier.Start(runtime, plan);
+            Clear();
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.EndDisabled();
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.transfer.review.execute",
+            "Start the reviewed courier run",
+            canStart,
+            () =>
+            {
+                courier.Start(runtimeSnapshot(), plan);
+                Clear();
+            },
+            block ?? (canStart ? $"{courierPlan.Trips.Length:N0} courier trips" : "Lines refused"));
+    }
+
+    private static DalamudTableProjection<TransferWorkbenchRow> CreateCourierTable() => new(
+    [
+        new(
+            "Item",
+            1.3f,
+            row => row.Rule.ItemName,
+            row => row.Rule.ItemName,
+            ImGuiTableColumnFlags.WidthStretch),
+        new(
+            "From",
+            1f,
+            row => CourierSession.Side(row.Runtime, row.Rule.Courier!.SourceCharacter, row.Rule.Courier.SourceRetainerId),
+            Flags: ImGuiTableColumnFlags.WidthStretch),
+        new(
+            "To",
+            1f,
+            row => CourierSession.Side(row.Runtime, row.Rule.Courier!.Character, row.Rule.Courier.RetainerId),
+            Flags: ImGuiTableColumnFlags.WidthStretch),
+        new(
+            "Units",
+            72,
+            row => row.Rule.TargetQuantity.ToString("N0"),
+            row => row.Rule.TargetQuantity),
+        new(
+            "Outcome",
+            1f,
+            row => row.CourierRefusal is { } refusal ? CourierSession.RefusalLabel(refusal.Code) : $"Send {row.Projection.Send:N0}",
+            Flags: ImGuiTableColumnFlags.WidthStretch,
+            TextColor: row => row.CourierRefusal is null ? TransferPresentation.SendColor : new Vector4(1f, .45f, .4f, 1f)),
+    ]);
 
     private static DalamudTableProjection<TransferReviewRow> CreateTable() => new(
     [

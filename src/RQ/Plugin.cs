@@ -13,6 +13,8 @@ using Franthropy.Dalamud.Observations;
 using Franthropy.Dalamud.Travel;
 using Franthropy.Observations.V1;
 using RQ.AgentBridge;
+using RQ.Courier;
+using Franthropy.Dalamud.Automation.Trades;
 using RQ.Automation;
 using RQ.Domain;
 using RQ.Interop;
@@ -42,6 +44,12 @@ public sealed class Plugin : IDalamudPlugin
     private readonly string providerInstanceId = Guid.NewGuid().ToString("N");
     private readonly FrameworkWorkQueue workQueue;
     private readonly InventoryScanner scanner;
+    // Courier wiring (Q2) sets Link, Conductor and Follower on this session.
+    private readonly CourierSession courier;
+    private readonly CourierPeerLink courierPeer;
+    private readonly CourierGame courierGame;
+    private readonly CourierTrade courierTrade;
+    private ulong courierActor;
     private readonly PlayerInventoryCacheRepository playerInventory;
     private readonly PlayerInventoryReconciler playerInventoryReconciler;
     private readonly RetainerCacheRepository cache;
@@ -133,6 +141,10 @@ public sealed class Plugin : IDalamudPlugin
             log.Error(exception, "Quartermaster could not persist its latest retainer listings; the in-memory projection remains current.");
         cache.CachePersistenceFailed += failure => LogCacheWriteFailure(log, "retainer", failure);
         state = new(new QuartermasterStateStore(statePath));
+        // Player bag baselines come from characters observed on this client; imported retainer caches do not.
+        var priorActors=playerInventory.Owners().Where(o=>o.HasStableIdentity && !string.IsNullOrWhiteSpace(o.CharacterName)).ToArray();
+        if(state.ReadConfiguration(s=>priorActors.Any(o=>!s.Courier.LocalRoster.Any(x=>CourierPlanner.Exact(x,o)))))
+            state.Mutate(s=>s.Courier=s.Courier with {LocalRoster=[..priorActors.Concat(s.Courier.LocalRoster).DistinctBy(o=>o.LocalContentId)]});
         workQueue = new();
         var observationPaths = SharedObservationPaths.FromPluginConfigDirectory(configDirectory);
         var captureSessions = new ObservationCaptureSessionRegistry(observationPaths.CaptureSessionsPath);
@@ -324,7 +336,23 @@ public sealed class Plugin : IDalamudPlugin
             new ItemMetadataCatalog(dataManager, log).ResolveWorkshopProject,
             configDirectory,
             new MarketMafiosoSavedJobClient(pluginInterface),
-            log);
+            log,
+            courier = new CourierSession(
+                state,
+                owner => playerInventory.Snapshot(owner, CourierSession.PlayerBags),
+                scanner.ResolveItemMetadata));
+        var tradeIo = new DalamudTradeIo(gameGui,targets,objects,playerState,condition,sigScanner,dataManager,log);
+        courierGame = new(pluginInterface,playerState,clientState,objects,condition,commands,dataManager,aetheryteList,
+            new DalamudSummoningBellInteractor(objects,targets,dataManager),tradeIo,scanner,CurrentOwner,DispatchOnFramework,configDirectory,s=>log.Warning(s));
+        courierTrade = new(courierGame,tradeIo,automation,pluginInterface,externalUiSuppression,log,configDirectory);
+        bool AutoRetainerLoaded()=>pluginInterface.InstalledPlugins.Any(p=>p.IsLoaded && p.InternalName=="AutoRetainer");
+        courier.Warn = s => log.Warning(s);
+        courier.Follower = new(configDirectory,()=>state.ReadConfiguration(s=>s.Courier),automation,autoRetainerSuppression,courierTrade,
+            courierGame,courierGame,courierGame,s=>log.Warning(s),s=>log.Information(s),AutoRetainerLoaded);
+        courier.Follower.RestoreCustodyHold();
+        courier.Link = courierPeer = new(courierGame,courier.Follower,DispatchOnFramework,s=>log.Warning(s),()=>state.ReadConfiguration(s=>s.Courier.LocalRoster));
+        courier.Conductor = new(configDirectory,courierPeer,courierTrade,courierGame,courierGame,courierGame,courierGame,
+            transfers,automation,autoRetainerSuppression,s=>log.Warning(s),s=>log.Information(s),AutoRetainerLoaded);
         var marketHistory = new MarketRunHistoryWindow(marketRunStore.History, CurrentOwner, window.DrawTimings)
         {
             Size = new System.Numerics.Vector2(780, 650),
@@ -348,7 +376,8 @@ public sealed class Plugin : IDalamudPlugin
             pluginInterface.AssemblyLocation.FullName,
             SaveConfiguration,
             DispatchOnFramework,
-            new QuartermasterBridgeProvider(CreateAgentBridgeTruth, window.OpenReviewSurface, window.CloseReviewSurface, agentReviewRegistry),
+            new QuartermasterBridgeProvider(CreateAgentBridgeTruth, window.OpenReviewSurface, window.CloseReviewSurface, agentReviewRegistry)
+                {SetCourierSlotCap=courier.SetTestSlotCap},
             window.BeginAgentCapturePresentation,
             window.CompleteAgentCapturePresentation,
             window.CancelAgentCapturePresentation,
@@ -448,6 +477,12 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnFrameworkUpdate(IFramework _)
     {
+        var actor=playerState.IsLoaded?playerState.ContentId:0;
+        if(actor!=0 && actor!=courierActor && CurrentOwner() is {HasStableIdentity:true} seen &&
+            !state.ReadConfiguration(s=>s.Courier.LocalRoster.Any(o=>CourierPlanner.Exact(o,seen))))
+            state.Mutate(s=>s.Courier=s.Courier with {LocalRoster=[..s.Courier.LocalRoster.Where(o=>o.LocalContentId!=actor),seen]});
+        courierPeer.Tick(actor!=courierActor);
+        courierActor=actor;
         using var timing = updateTimings.Start("owner and migrations");
         var liveOwner = CurrentOwner();
         StowagePlanMigration.EnsureOwnerPlan(state, liveOwner);
@@ -638,7 +673,7 @@ public sealed class Plugin : IDalamudPlugin
         var listingPersistence = cache.LastListingPersistence;
         var vendorRun = vendorProcurement.ActiveRun;
         return new QuartermasterBridgeTruth(
-            14,
+            16,
             configuration.PluginInstanceId,
             Environment.ProcessId,
             typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown",
@@ -694,7 +729,8 @@ public sealed class Plugin : IDalamudPlugin
             vendorRun?.Phase.ToString(),
             vendorRun?.Message,
             vendorRun?.Receipts.Sum(receipt => receipt.Quantity) ?? 0,
-            vendorRun?.Receipts.Aggregate(0UL, (sum, receipt) => checked(sum + receipt.SpentGil)) ?? 0);
+            vendorRun?.Receipts.Aggregate(0UL, (sum, receipt) => checked(sum + receipt.SpentGil)) ?? 0,
+            courier.Truth(runtime,selectedPlanId));
     }
 
     private void ApplyInventoryObservation(SharedObservationDelivery delivery)
@@ -909,6 +945,12 @@ public sealed class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
+        courier.Conductor?.Unload();
+        courierPeer.Dispose();
+        courierGame.Dispose();
+        courier.Conductor?.DrainUnload();
+        courier.Follower?.Dispose();
+        courierTrade.Dispose();
         playerInventory.Flush();
         automaticRetrievals.Dispose();
         marketCompetition.Dispose();

@@ -148,6 +148,7 @@ public sealed class StateRepository
 
     private static QuartermasterState Combine(QuartermasterState configuration, QuartermasterState operations) => new()
     {
+        Courier = configuration.Courier,
         Schema = configuration.Schema,
         Revision = Math.Max(configuration.Revision, operations.Revision),
         StowagePlans = configuration.StowagePlans,

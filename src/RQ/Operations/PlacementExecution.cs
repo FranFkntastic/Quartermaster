@@ -9,7 +9,8 @@ public sealed partial class TransferCoordinator
     private CancellationTokenSource? placementCancellation;
     private sealed record PlacementLeg(Func<bool> Authorized,
         IReadOnlyDictionary<(uint, ItemQualityPolicy), int>? RetrievalBaselines = null, ulong? Source = null,
-        IReadOnlyDictionary<(uint, bool), (ItemQualityPolicy Quality, int Quantity)>? DepositFloors = null)
+        IReadOnlyDictionary<(uint, bool), (ItemQualityPolicy Quality, int Quantity)>? DepositFloors = null,
+        bool KeepListOpen = true)
     {
         public void Check()
         {
