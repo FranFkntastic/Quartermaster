@@ -62,7 +62,9 @@ public interface IMeetingBellPort
     Task<Result<bool>> GoInRangeAsync(MeetingBell bell, Deadline deadline);
     Task<Result<bool>> ObserveTradeableAsync(OwnerScope character, Deadline deadline);
 }
-public sealed record CourierPosition(uint World, uint Territory, float X, float Y, float Z);
+public sealed record CourierPosition(uint World, uint Territory, float X, float Y, float Z,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] int? Ward = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)] bool Subdivision = false);
 public interface IInventoryObservationPort
 {
     Task<Result<InventoryView>> ObserveAsync(Deadline deadline);
