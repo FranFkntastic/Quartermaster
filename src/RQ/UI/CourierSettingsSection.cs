@@ -135,10 +135,10 @@ internal sealed class CourierSettingsSection
         if (characters.Count == 0)
             return;
         var capturable = courier.CapturableBell(runtime);
-        if (!ImGui.BeginTable("##RQCourierBells", 3, ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.BordersInnerH, new(360, 0)))
+        if (!ImGui.BeginTable("##RQCourierBells", 3, ImGuiTableFlags.SizingFixedFit | ImGuiTableFlags.NoHostExtendX | ImGuiTableFlags.BordersInnerH))
             return;
-        ImGui.TableSetupColumn("Character", ImGuiTableColumnFlags.WidthStretch, 1f);
-        ImGui.TableSetupColumn("Meeting bell", ImGuiTableColumnFlags.WidthStretch, 1.4f);
+        ImGui.TableSetupColumn("Character");
+        ImGui.TableSetupColumn("Meeting bell");
         ImGui.TableSetupColumn("##capture", ImGuiTableColumnFlags.WidthFixed, 64);
         ImGui.TableHeadersRow();
         foreach (var character in characters)

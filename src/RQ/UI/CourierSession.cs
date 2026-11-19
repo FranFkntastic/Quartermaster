@@ -215,10 +215,12 @@ public sealed class CourierSession
     internal static string RouteLabel(QuartermasterRuntimeSnapshot runtime, CourierRoute route) =>
         $"{Side(runtime, route.SourceCharacter, route.SourceRetainerId)} → {Side(runtime, route.Character, route.RetainerId)}";
 
-    internal static string Side(QuartermasterRuntimeSnapshot runtime, OwnerScope? character, ulong? retainer)
+    internal static string Side(QuartermasterRuntimeSnapshot runtime, OwnerScope? character, ulong? retainer, bool includeOwner = false)
     {
         var container = ContainerLabel(runtime, retainer);
-        return character is null || character.Matches(runtime.Owner) ? container : $"{CharacterLabel(character)} · {container}";
+        if (!includeOwner && (character is null || character.Matches(runtime.Owner)))
+            return container;
+        return $"{CharacterLabel(character ?? runtime.Owner)} · {container}";
     }
 
     // ---- Planning ---------------------------------------------------------------------------
