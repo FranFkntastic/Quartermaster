@@ -18,13 +18,18 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
 
     public void Draw(QuartermasterRuntimeSnapshot runtime)
     {
-        var drew = DrawOwner();
+        var drew = DrawOwner(runtime.State.Courier.Carrier?.CharacterName);
         drew |= DrawCarrier();
+        if (courier.Error is { Length: > 0 } error)
+        {
+            ImGui.TextColored(ErrorColor, error);
+            drew = true;
+        }
         if (drew)
             ImGui.Separator();
     }
 
-    private bool DrawOwner()
+    private bool DrawOwner(string? carrier)
     {
         var run = courier.Run;
         if (courier.IsActive)
@@ -37,15 +42,27 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
             return false;
         if (courier.IsUnresolved)
         {
-            DrawUnresolved(run);
-            DrawClear(run);
+            DrawUnresolved(run, carrier);
+            if (run.CanClear)
+                DrawClear(run, false);
+            else if (!run.CanResume && run.Unverified is { } step)
+                DrawCustody("##RQCourierUnverified", step.Rows);
+            else if (!run.CanResume && !run.Custody.IsEmpty)
+                DrawCustody("##RQCourierRunCustody", run.Custody);
             DrawLines(run);
             return true;
         }
-        DrawLastOutcome(run);
-        DrawClear(run);
+        DrawLastOutcome(run, carrier);
+        if (run.CanClear)
+            DrawClear(run, true);
         return true;
     }
+
+    private static string StateLabel(string state) => state switch
+    {
+        "Indeterminate" => "Unverified",
+        _ => CourierSession.Words(state),
+    };
 
     private void DrawRunning(CourierSnapshot? run)
     {
@@ -84,48 +101,64 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
         ImGui.Dummy(new Vector2(width, height));
     }
 
-    private void DrawClear(CourierSnapshot run)
+    /// <summary>What the run still holds, then a plain Clear: the table is what Clear acknowledges.</summary>
+    private void DrawClear(CourierSnapshot run, bool sameLine)
     {
-        if(!run.CanClear)return;
-        var held=courier.ClearAcknowledgement;
-        var label=held==null?"Clear":"Acknowledge and clear: "+held;
-        void Clear()=>courier.Clear(run.Run,held);
-        if(ImGui.SmallButton(label+"##RQCourierClear"))Clear();
-        reviewRegistry.RegisterLastButton("quartermaster.courier.run.clear",label,true,Clear,label);
+        var rows = courier.ClearLedger.IsEmpty ? run.Custody : courier.ClearLedger;
+        if (!rows.IsEmpty)
+            DrawCustody("##RQCourierRunCustody", rows);
+        else if (sameLine)
+            ImGui.SameLine(0, 16);
+        void Clear() => courier.Clear(run.Run, rows);
+        if (ImGui.SmallButton("Clear##RQCourierClear"))
+            Clear();
+        var units = rows.Sum(row => row.Quantity);
+        reviewRegistry.RegisterLastButton("quartermaster.courier.run.clear", "Clear the courier run", true, Clear,
+            units > 0 ? $"{units:N0} held by {string.Join(", ", rows.Select(row => row.Holder).Distinct())}" : "Nothing held");
     }
 
-    private void DrawUnresolved(CourierSnapshot run)
+    private void DrawUnresolved(CourierSnapshot run, string? carrier)
     {
         var height = BarHeight;
-        if(!run.CanResume){DrawLastOutcome(run);return;}
-        if (UiLayout.PrimaryButton("Resume##RQCourierResume", new Vector2(ImGui.CalcTextSize("Resume").X + 40, height)))
-            courier.Resume();
-        reviewRegistry.RegisterLastButton("quartermaster.courier.run.resume", "Resume the courier run from its journal", true,
-            courier.Resume, $"{run.State}: {run.Code}");
-        ImGui.SameLine(0, 16);
+        if (run.CanResume)
+        {
+            if (UiLayout.PrimaryButton("Resume##RQCourierResume", new Vector2(ImGui.CalcTextSize("Resume").X + 40, height)))
+                courier.Resume();
+            reviewRegistry.RegisterLastButton("quartermaster.courier.run.resume", "Resume the courier run from its journal", true,
+                courier.Resume, $"{run.State}: {run.Code}");
+            ImGui.SameLine(0, 16);
+        }
         ImGui.BeginGroup();
         var top = ImGui.GetCursorPosY();
         ImGui.SetCursorPosY(top + Math.Max(0, (height - (ImGui.GetTextLineHeight() * 2) - ImGui.GetStyle().ItemSpacing.Y) / 2));
-        ImGui.TextColored(ListingWorkspace.Color(ListingStateTone.Amber), CourierSession.Words(run.State));
-        ImGui.TextDisabled(run.Trips > 0
-            ? $"{CourierSession.Words(run.Code)} · Trip {Math.Max(1, run.Trip):N0} of {run.Trips:N0}"
-            : CourierSession.Words(run.Code));
+        var amber = ListingWorkspace.Color(ListingStateTone.Amber);
+        if (!run.CanResume && !run.CanClear && run.Unverified is { } step)
+        {
+            ImGui.TextColored(amber, CourierSession.UnverifiedLabel(step));
+        }
+        else if (!run.CanResume && !run.CanClear && !run.Custody.IsEmpty)
+        {
+            ImGui.TextColored(amber, $"{run.Custody[0].Holder} not connected");
+        }
+        else
+        {
+            ImGui.TextColored(amber, StateLabel(run.State));
+            var outcome = CourierSession.OutcomeLabel(run.Code, carrier);
+            ImGui.TextDisabled(run.Trips > 0 ? $"{outcome} · Trip {Math.Max(1, run.Trip):N0} of {run.Trips:N0}" : outcome);
+        }
         ImGui.EndGroup();
-        if (!string.IsNullOrWhiteSpace(run.Detail) && ImGui.IsItemHovered())
-            ImGui.SetTooltip(run.Detail);
-        if (courier.Error is { Length: > 0 } error)
-            ImGui.TextColored(ErrorColor, error);
     }
 
     /// <summary>The finished run's outcome; the line counts sit in the tooltip.</summary>
-    private static void DrawLastOutcome(CourierSnapshot run)
+    private static void DrawLastOutcome(CourierSnapshot run, string? carrier)
     {
+        ImGui.AlignTextToFramePadding();
         ImGui.TextDisabled("Last courier run");
         ImGui.SameLine();
         var color = run.State == "Completed"
             ? ListingWorkspace.Color(ListingStateTone.Green)
             : ListingWorkspace.Color(ListingStateTone.Amber);
-        ImGui.TextColored(color, run.State == "Completed" ? "Completed" : $"{CourierSession.Words(run.State)} · {CourierSession.Words(run.Code)}");
+        ImGui.TextColored(color, run.State == "Completed" ? "Completed" : $"{StateLabel(run.State)} · {CourierSession.OutcomeLabel(run.Code, carrier)}");
         if (!ImGui.IsItemHovered())
             return;
         var lines = run.Lines.Select(progress => $"{progress.Name}: {progress.Moved:N0} moved" +
@@ -163,6 +196,36 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
                 ImGui.TextUnformatted(progress.Remaining.ToString("N0"));
             else
                 ImGui.TextDisabled("—");
+        }
+        ImGui.EndTable();
+    }
+
+    private static void DrawCustody(string id, IReadOnlyList<CustodyRow> custody)
+    {
+        if (custody.Count == 0)
+            return;
+        var height = (Math.Min(custody.Count, 6) + 1) * ImGui.GetFrameHeight();
+        if (!ImGui.BeginTable(id, 4,
+                ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp,
+                new Vector2(0, height)))
+            return;
+        ImGui.TableSetupScrollFreeze(0, 1);
+        ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1f);
+        ImGui.TableSetupColumn("Quality", ImGuiTableColumnFlags.WidthFixed, 56);
+        ImGui.TableSetupColumn("Quantity", ImGuiTableColumnFlags.WidthFixed, 72);
+        ImGui.TableSetupColumn("Holder", ImGuiTableColumnFlags.WidthStretch, .6f);
+        ImGui.TableHeadersRow();
+        foreach (var row in custody.OrderBy(row => row.Item, StringComparer.OrdinalIgnoreCase).ThenBy(row => row.Quality, StringComparer.Ordinal))
+        {
+            ImGui.TableNextRow();
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(row.Item);
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(row.Quality);
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(row.Quantity.ToString("N0"));
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(row.Holder);
         }
         ImGui.EndTable();
     }

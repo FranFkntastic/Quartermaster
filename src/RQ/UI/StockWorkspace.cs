@@ -430,7 +430,7 @@ internal sealed class StockWorkspace
         var openOptions = ImGui.SmallButton("…##RQStockOptions");
         reviewRegistry.RegisterLastButton("quartermaster.stock.options.open", "Open stock and courier options", true,
             () => optionsRequested = true, "Available");
-        if (openOptions || optionsRequested)
+        if (courier.TakeSettingsRequest() | openOptions | optionsRequested)
         {
             ImGui.OpenPopup("RQStockOptions");
             optionsRequested = false;

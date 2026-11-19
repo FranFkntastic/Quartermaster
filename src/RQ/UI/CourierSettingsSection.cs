@@ -40,7 +40,7 @@ internal sealed class CourierSettingsSection
 
         if (carrying)
         {
-            DrawCharacterCombo("Owner", "##RQCourierOwner", "quartermaster.courier.paired-owner", settings.Owners.FirstOrDefault(),
+            DrawCharacterCombo("Owners", "##RQCourierOwner", "quartermaster.courier.paired-owner", null,
                 chosen => courier.UpdateSettings(current => current with { PairedOwner=null,PairedOwners=current.IsPaired(chosen)?
                     [..current.Owners.Where(o=>!CourierPlanner.Exact(o,chosen))]:[..current.Owners,chosen] }),settings);
             return;
@@ -71,24 +71,31 @@ internal sealed class CourierSettingsSection
             ? current with { Carrier = owner with { }, CarrierOptIn = true }
             : current with { Carrier = null, CarrierOptIn = false, PairedOwner = null,PairedOwners=[] });
 
-    /// <summary>A picker over the characters on the other linked clients; the stored one stays listed while offline.</summary>
+    /// <summary>
+    /// A picker over the characters on the other linked clients; stored ones stay listed while offline.
+    /// With <paramref name="pairing"/> it is a multi-select of the paired owners and stays open while toggling.
+    /// </summary>
     private void DrawCharacterCombo(string label, string id, string controlId, OwnerScope? current, Action<OwnerScope> choose,CourierSettings? pairing=null)
     {
         var candidates = (pairing==null?courier.Link.Peers.Select(peer=>peer.Character):
             courier.Link.Peers.SelectMany(peer=>peer.Roster??[peer.Character]).Concat(pairing.Owners)).DistinctBy(o=>(o.LocalContentId,o.HomeWorldId))
             .Where(character => character.HasStableIdentity)
+            .OrderBy(character => character.CharacterName, StringComparer.OrdinalIgnoreCase)
             .ToList();
         if (current is { HasStableIdentity: true } stored && !candidates.Any(candidate => CourierPlanner.Exact(candidate, stored)))
             candidates.Insert(0, stored);
         if (candidates.Count == 0)
             return;
+        var preview = pairing is null
+            ? current is null ? "—" : CourierSession.CharacterLabel(current)
+            : pairing.Owners.Any() ? string.Join(", ", pairing.Owners.Select(CourierSession.CharacterLabel)) : "—";
         ImGui.AlignTextToFramePadding();
         ImGui.TextUnformatted(label);
         ImGui.SameLine();
-        ImGui.SetNextItemWidth(200);
-        var open = ImGui.BeginCombo(id, current is null ? "—" : CourierSession.CharacterLabel(current));
+        ImGui.SetNextItemWidth(pairing is null ? 200 : 260);
+        var open = ImGui.BeginCombo(id, preview);
         reviewRegistry.RegisterLastItem(controlId, label, AgentBridgeUiControlKind.Select, true, false,
-            current?.CharacterName, () => { });
+            preview == "—" ? null : preview, () => { });
         if (!open)
             return;
         foreach (var candidate in candidates)
@@ -98,7 +105,8 @@ internal sealed class CourierSettingsSection
             var text = $"{CourierSession.CharacterLabel(candidate)} · {candidate.HomeWorldName}##{candidate.LocalContentId}";
             if (!online)
                 ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetColorU32(ImGuiCol.TextDisabled));
-            if (ImGui.Selectable(text, selected) && (!selected || pairing!=null))
+            if (ImGui.Selectable(text, selected, pairing is null ? ImGuiSelectableFlags.None : ImGuiSelectableFlags.DontClosePopups) &&
+                (!selected || pairing!=null))
                 choose(candidate);
             if (!online)
                 ImGui.PopStyleColor();

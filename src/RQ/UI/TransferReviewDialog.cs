@@ -237,16 +237,22 @@ internal sealed class TransferReviewDialog
             true,
             Clear,
             "No inventory movement");
-        var block = projection.Rows.Any(row=>row.Rule.Enabled && row.Rule.Courier==null)
+        var mixed = projection.Rows.Any(row=>row.Rule.Enabled && row.Rule.Courier==null);
+        var gate = courier.StartGate(runtime, courierPlan);
+        var block = mixed
             ? "Mixed execution unavailable: ordinary transfers have no completion receipt for the courier."
-            : courier.StartBlock(runtime, courierPlan);
+            : gate.Status;
+        var canStart = !mixed && gate.CanStart;
         if (block is not null)
         {
             ImGui.SameLine();
             ImGui.TextDisabled(block);
         }
+        // An active or unsettled run is handled on the run pane; Start is not offered meanwhile.
+        if (!mixed && !gate.Offer)
+            return;
         ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - 110));
-        ImGui.BeginDisabled(block is not null);
+        ImGui.BeginDisabled(!canStart);
         if (ImGui.Button("Execute plan"))
         {
             courier.Start(runtime, plan);
@@ -257,13 +263,13 @@ internal sealed class TransferReviewDialog
         reviewRegistry.RegisterLastButton(
             "quartermaster.transfer.review.execute",
             "Start the reviewed courier run",
-            block is null,
+            canStart,
             () =>
             {
                 courier.Start(runtimeSnapshot(), plan);
                 Clear();
             },
-            block ?? $"{courierPlan.Trips.Length:N0} courier trips");
+            block ?? (canStart ? $"{courierPlan.Trips.Length:N0} courier trips" : "Lines refused"));
     }
 
     private static DalamudTableProjection<TransferWorkbenchRow> CreateCourierTable() => new(

@@ -10,6 +10,9 @@ using RQ.Runtime;
 namespace RQ.UI;
 
 /// <summary>A character logged in on another linked client, with its latest bag observation.</summary>
+/// <summary>Whether Start is offered, whether it can run, and the short cause when it cannot.</summary>
+internal readonly record struct CourierStartGate(bool Offer, bool CanStart, string? Status, bool OpensSettings);
+
 public sealed record CourierPeer(OwnerScope Character, InventoryView? Bags,IReadOnlyList<OwnerScope>? Roster=null);
 
 /// <summary>
@@ -63,6 +66,9 @@ public sealed class CourierSession
     private long polledAt;
     private Task? starting;
     internal string? ClearAcknowledgement { get; private set; }
+    /// <summary>The carrier's confirmed ledger behind <see cref="ClearAcknowledgement"/>.</summary>
+    internal ImmutableArray<CustodyRow> ClearLedger { get; private set; } = [];
+    private long? settingsRequestedAt;
     private int? testSlotCap;
     internal void SetTestSlotCap(int? value)
     {
@@ -84,8 +90,34 @@ public sealed class CourierSession
     public CourierConductor? Conductor { get; set; }
     public CourierFollower? Follower { get; set; }
 
-    /// <summary>The last start, stop or resume failure; cleared by the next successful request.</summary>
+    /// <summary>Warning-level log sink for failure detail that never reaches the visible status.</summary>
+    public Action<string>? Warn { get; set; }
+
+    /// <summary>The last start, stop, resume or clear failure in plain words; cleared by the next request.</summary>
     internal string? Error { get; private set; }
+
+    /// <summary>The raw failure behind <see cref="Error"/>, for the agent bridge and the log only.</summary>
+    internal string? ErrorDetail { get; private set; }
+
+    private void Fail(string visible, string detail)
+    {
+        if (Error == visible && ErrorDetail == detail)
+            return;
+        Error = visible;
+        ErrorDetail = detail;
+        Warn?.Invoke($"Courier: {visible} ({detail})");
+    }
+
+    /// <summary>Asks the stock options popup, which holds the courier settings, to open.</summary>
+    internal void RequestSettings() => settingsRequestedAt = Environment.TickCount64;
+
+    /// <summary>Takes a pending settings request; one the stock pane could not show promptly lapses.</summary>
+    internal bool TakeSettingsRequest()
+    {
+        var requested = settingsRequestedAt is { } at && Environment.TickCount64 - at < 500;
+        settingsRequestedAt = null;
+        return requested;
+    }
 
     internal static IReadOnlyList<string> PlayerBags => PlayerBagNames;
 
@@ -163,10 +195,10 @@ public sealed class CourierSession
             {
                 built = new(stowagePlan.Id, stowagePlan.Revision, [],
                     [.. rules.Select(rule => new Refusal(rule.Id, rule.ItemName, "PlanningFailed"))]);
-                Error = exception.Message;
+                Warn?.Invoke($"Courier planning failed for transfer plan {stowagePlan.Id}: {exception}");
             }
         }
-        plan = (runtime.Revision, stowagePlan.Id, peers, built);
+        plan =(runtime.Revision, stowagePlan.Id, peers, built);
         return built;
     }
 
@@ -197,8 +229,42 @@ public sealed class CourierSession
         return locations;
     }
 
+    private (long Revision, Dictionary<(ulong?, ulong?, uint, ItemQualityPolicy), int?> Units)? available;
+
+    /// <summary>
+    /// Units of an item at a courier source container, by the line's quality policy; null while
+    /// that container has not been observed. Cached per runtime revision.
+    /// </summary>
+    internal int? Available(QuartermasterRuntimeSnapshot runtime, OwnerScope source, ulong? retainer, uint itemId, ItemQualityPolicy quality)
+    {
+        if (available is not { } cache || cache.Revision != runtime.Revision)
+            available = cache = (runtime.Revision, []);
+        var key = (source.LocalContentId, retainer, itemId, quality);
+        if (cache.Units.TryGetValue(key, out var hit))
+            return hit;
+        IEnumerable<(uint ItemId, bool Hq, long Quantity)>? items = null;
+        if (retainer is { } id)
+        {
+            if (runtime.Retainers.GetValueOrDefault(id) is { } cached && RetainerPageNames.All(name => cached.ObservedSources.Contains(name, StringComparer.Ordinal)))
+                items = cached.Bags.Where(bag => RetainerPageNames.Contains(bag.BagName, StringComparer.Ordinal))
+                    .SelectMany(bag => bag.Items).Select(item => (item.ItemId, item.IsHq, (long)item.Quantity));
+        }
+        else
+        {
+            var capture = cachedBags(source);
+            if (PlayerBagNames.All(name => capture.ObservedSources.Contains(name, StringComparer.Ordinal)))
+                items = capture.Bags.Where(bag => PlayerBagNames.Contains(bag.BagName, StringComparer.Ordinal))
+                    .SelectMany(bag => bag.Items).Select(item => (item.ItemId, item.IsHq, (long)item.Quantity));
+        }
+        int? units = items is null ? null : (int)Math.Min(int.MaxValue, items
+            .Where(item => item.ItemId == itemId && (quality == ItemQualityPolicy.Any || item.Hq == (quality == ItemQualityPolicy.HqOnly)))
+            .Sum(item => Math.Max(0, item.Quantity)));
+        cache.Units[key] = units;
+        return units;
+    }
+
     /// <summary>Refusals that hold for every courier line, so the plan shows them once.</summary>
-    internal static bool IsPlanWide(string code) => code is "CarrierNotConfigured" or "CarrierUnreachable";
+    internal static bool IsPlanWide(string code) => code is "CarrierNotConfigured" or "CarrierUnreachable" or "PlanningFailed";
 
     internal static string RefusalLabel(string code) => code switch
     {
@@ -215,8 +281,48 @@ public sealed class CourierSession
         "DestinationFull" => "Destination full",
         "SourceShort" => "Source short",
         "BagSlotLimit" => "No bag room",
+        "OutsideClientRoster" => "Not on this account",
+        "PlanningFailed" => "Courier plan failed",
         _ => Words(code),
     };
+
+    /// <summary>The line's refusal as a sentence naming the item and characters involved.</summary>
+    internal string RefusalDetail(QuartermasterRuntimeSnapshot runtime, Refusal refusal)
+    {
+        var settings = runtime.State.Courier;
+        var carrier = settings.Carrier?.CharacterName ?? "the carrier";
+        var source = refusal.Source ?? "the source";
+        var destination = refusal.Destination ?? "the destination";
+        string[] named = [.. new[] { refusal.Source, refusal.Destination }.OfType<string>().Distinct(StringComparer.OrdinalIgnoreCase)];
+        static bool Same(string? a, string? b) => string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+        return refusal.Code switch
+        {
+            "CarrierNotConfigured" => "No carrier chosen",
+            "CarrierUnreachable" => $"{carrier} is not running",
+            "OutsideClientRoster" => $"{string.Join(" and ", named.Where(name => !settings.LocalRoster.Any(owner => Same(owner.CharacterName, name))).DefaultIfEmpty(source))} not on this account",
+            "CharacterNotKnown" when Same(source, destination) => $"{refusal.Name} would go from {source} to {source}",
+            "CharacterNotKnown" when named.FirstOrDefault(name => Same(name, settings.Carrier?.CharacterName)) is { } isCarrier => $"{isCarrier} is the carrier",
+            "CharacterNotKnown" => $"Bags of {source} or {destination} not observed",
+            "MeetingBellMissing" => $"No meeting bell for {string.Join(" or ", MissingBells(runtime, named).DefaultIfEmpty(source))}",
+            "ItemNotTradeable" => $"{refusal.Name} cannot be traded",
+            "SourceUnknown" => $"Source container on {source} not observed",
+            "DestinationUnknown" => $"Destination container on {destination} not observed",
+            "ItemMetadataUnknown" => $"No item data for {refusal.Name}",
+            "InvalidQuantity" => $"No quantity for {refusal.Name}",
+            "UniqueConflict" => $"{refusal.Name} is unique and {destination} or {carrier} already holds one",
+            "DestinationFull" => $"No room for {refusal.Name} on {destination}",
+            "SourceShort" => $"Not enough {refusal.Name} on {source}",
+            "BagSlotLimit" => $"No free bag slot on {source}, {destination} or {carrier}",
+            "PlanningFailed" => $"Courier plan failed for {refusal.Name}",
+            _ => $"{refusal.Name}: {RefusalLabel(refusal.Code)}",
+        };
+    }
+
+    /// <summary>The named characters that have no meeting bell on their home world.</summary>
+    internal IEnumerable<string> MissingBells(QuartermasterRuntimeSnapshot runtime, IEnumerable<string> names) =>
+        names.Distinct(StringComparer.OrdinalIgnoreCase).Where(name =>
+            Characters(runtime).FirstOrDefault(owner => string.Equals(owner.CharacterName, name, StringComparison.OrdinalIgnoreCase)) is not { LocalContentId: { } id } owner ||
+            runtime.State.Courier.Bells.GetValueOrDefault(id) is not { } bell || bell.World != owner.HomeWorldId);
 
     // ---- Run control ------------------------------------------------------------------------
 
@@ -234,56 +340,114 @@ public sealed class CourierSession
             return;
         polledAt = now;
         try { run = Conductor?.Snapshot(); }
-        catch (Exception exception) { Error = exception.Message; }
+        catch (Exception exception) { Fail("Courier run state unreadable", exception.ToString()); }
         try { carried = Follower?.View(); }
-        catch (Exception exception) { Error = exception.Message; }
+        catch (Exception exception) { Fail("Carrier state unreadable", exception.ToString()); }
     }
 
-    /// <summary>Why a courier plan cannot start now, or null when it can.</summary>
-    internal string? StartBlock(QuartermasterRuntimeSnapshot runtime, CourierPlan? courierPlan) =>
-        Conductor is null ? "Courier runs are unavailable."
-        : !runtime.Owner.HasStableIdentity ? "Character identity is unavailable."
-        : IsActive ? "A courier run is active."
-        : IsUnresolved ? "Resume the interrupted courier run first."
-        : courierPlan is null || courierPlan.Trips.IsEmpty && courierPlan.Refusals.IsEmpty ? "Nothing to send."
-        : courierPlan.Refusals.FirstOrDefault(refusal => IsPlanWide(refusal.Code)) is { } wide ? RefusalLabel(wide.Code) + "."
-        : !courierPlan.Refusals.IsEmpty ? $"{courierPlan.Refusals.Length:N0} line{(courierPlan.Refusals.Length == 1 ? string.Empty : "s")} cannot be sent."
-        : null;
+    /// <summary>
+    /// Whether Start is offered for a courier plan and, when offered but blocked, the short cause.
+    /// Start is not offered while a run is active or unsettled: the run pane owns that state.
+    /// Lines refused one by one block without a status; each line carries its own mark.
+    /// </summary>
+    internal CourierStartGate StartGate(QuartermasterRuntimeSnapshot runtime, CourierPlan? courierPlan)
+    {
+        if (Conductor is null)
+            return new(true, false, "Courier not loaded", false);
+        if (!runtime.Owner.HasStableIdentity)
+            return new(true, false, "Character not identified", false);
+        if (IsActive || IsUnresolved)
+            return new(false, false, null, false);
+        if (courierPlan is null || courierPlan.Trips.IsEmpty && courierPlan.Refusals.IsEmpty)
+            return new(true, false, "Nothing to send", false);
+        var refusals = courierPlan.Refusals;
+        if (refusals.Any(refusal => refusal.Code == "CarrierNotConfigured"))
+            return new(true, false, "No carrier chosen", true);
+        if (refusals.Any(refusal => refusal.Code == "CarrierUnreachable"))
+            return new(true, false, $"{runtime.State.Courier.Carrier?.CharacterName ?? "Carrier"} not running", false);
+        if (refusals.Any(refusal => refusal.Code == "PlanningFailed"))
+            return new(true, false, "Courier plan failed", false);
+        if (refusals.Any(refusal => refusal.Code == "MeetingBellMissing"))
+        {
+            var missing = MissingBells(runtime, refusals.Where(refusal => refusal.Code == "MeetingBellMissing")
+                .SelectMany(refusal => new[] { refusal.Source, refusal.Destination }).OfType<string>()).ToArray();
+            return new(true, false, missing.Length == 0 ? "No meeting bell" : $"No meeting bell for {string.Join(", ", missing)}", true);
+        }
+        return new(true, refusals.IsEmpty, null, false);
+    }
 
     internal void Start(QuartermasterRuntimeSnapshot runtime, StowagePlan stowagePlan)
     {
         plan = null;
         var courierPlan = Plan(runtime, stowagePlan);
-        if (Conductor is not { } conductor || StartBlock(runtime, courierPlan) is not null)
+        if (Conductor is not { } conductor || !StartGate(runtime, courierPlan).CanStart)
             return;
-        Launch(() => conductor.StartAsync(courierPlan!, runtime.State.Courier));
+        var settings = runtime.State.Courier;
+        Launch(async () => await conductor.StartAsync(courierPlan!, settings).ConfigureAwait(false));
     }
 
-    internal void Clear(Guid expectedRun,string? acknowledgement)
+    /// <summary>
+    /// Clears a settled run. When the carrier's confirmed ledger equals the custody the pane showed,
+    /// that view was the acknowledgement; otherwise the carrier's ledger replaces it on the pane and
+    /// the next Clear acknowledges that.
+    /// </summary>
+    internal void Clear(Guid expectedRun, ImmutableArray<CustodyRow> shown)
     {
-        if(Conductor is not {} conductor || IsActive) return;
-        Launch(async ()=>{
-            try{var snapshot=await conductor.ClearAsync(expectedRun,acknowledgement);ClearAcknowledgement=null;return snapshot;}
-            catch(CourierConductor.CustodyAcknowledgementRequired e){ClearAcknowledgement=e.Message;throw;}
+        if (Conductor is not { } conductor || IsActive) return;
+        var acknowledgement = ClearAcknowledgement;
+        Launch(async () =>
+        {
+            try
+            {
+                var snapshot = await conductor.ClearAsync(expectedRun, acknowledgement).ConfigureAwait(false);
+                ClearAcknowledgement = null;
+                ClearLedger = [];
+                return snapshot;
+            }
+            catch (CourierConductor.CustodyAcknowledgementRequired required) when (acknowledgement is null && SameRows(required.CarrierRows, shown))
+            {
+                var snapshot = await conductor.ClearAsync(expectedRun, required.Message).ConfigureAwait(false);
+                ClearAcknowledgement = null;
+                ClearLedger = [];
+                return snapshot;
+            }
+            catch (CourierConductor.CustodyAcknowledgementRequired required)
+            {
+                ClearAcknowledgement = required.Message;
+                ClearLedger = required.CarrierRows;
+                return null;
+            }
         });
     }
+
+    private static bool SameRows(ImmutableArray<CustodyRow> a, ImmutableArray<CustodyRow> b) =>
+        a.Length == b.Length &&
+        a.OrderBy(row => (row.Item, row.Quality, row.Holder)).SequenceEqual(b.OrderBy(row => (row.Item, row.Quality, row.Holder)));
 
     /// <summary>Resumes an interrupted run from its journal; the journal owns the plan and settings.</summary>
     internal void Resume()
     {
         if (Conductor is not { } conductor || IsActive || Run?.CanResume!=true)
             return;
-        Launch(() => conductor.StartAsync(new(Guid.Empty, 0, [], []), new()));
+        Launch(async () => await conductor.StartAsync(new(Guid.Empty, 0, [], []), new()).ConfigureAwait(false));
     }
 
-    private void Launch(Func<Task<CourierSnapshot>> start)
+    private string? CarrierName() => state.ReadConfiguration(document => document.Courier.Carrier?.CharacterName);
+
+    private void Launch(Func<Task<CourierSnapshot?>> start)
     {
         Error = null;
+        ErrorDetail = null;
+        var carrier = CarrierName();
         starting = Task.Run(async () =>
         {
-            try { var result=await start().ConfigureAwait(false);
-                if(result.State is "Refused" or "Failed" or "Indeterminate" or "Interrupted")Error=result.Code+": "+result.Detail; }
-            catch (Exception exception) { Error = exception.Message; }
+            try
+            {
+                // Failed, interrupted and indeterminate runs are journaled; the run pane shows those.
+                if (await start().ConfigureAwait(false) is { State: "Refused" } refused)
+                    Fail(OutcomeLabel(refused.Code, carrier), $"{refused.Code}: {refused.Detail}");
+            }
+            catch (Exception exception) { Fail(FailureLabel(exception, carrier), exception.ToString()); }
             finally { polledAt = 0; }
         });
         polledAt = 0;
@@ -293,10 +457,11 @@ public sealed class CourierSession
     {
         if (Conductor is not { } conductor)
             return;
+        var carrier = CarrierName();
         _ = Task.Run(async () =>
         {
             try { await conductor.StopAsync().ConfigureAwait(false); }
-            catch (Exception exception) { Error = exception.Message; }
+            catch (Exception exception) { Fail(FailureLabel(exception, carrier), exception.ToString()); }
             finally { polledAt = 0; }
         });
     }
@@ -308,10 +473,63 @@ public sealed class CourierSession
         _ = Task.Run(async () =>
         {
             try { await follower.StopLocalAsync().ConfigureAwait(false); }
-            catch (Exception exception) { Error = exception.Message; }
+            catch (Exception exception) { Fail("Could not stop carrying", exception.ToString()); }
             finally { polledAt = 0; }
         });
     }
+
+    /// <summary>A failed request in plain words; unknown failures stay generic and their detail goes to the log.</summary>
+    private static string FailureLabel(Exception exception, string? carrier) => exception switch
+    {
+        CourierFault fault => OutcomeLabel(fault.Code, carrier),
+        OperationCanceledException => "Courier unloaded",
+        InvalidOperationException { Message: "CourierAlreadyRunning" } => "A courier run is already active",
+        InvalidOperationException { Message: "RunNotClearable" } => "This run can no longer be cleared",
+        InvalidOperationException { Message: "Settle the pending trade before clearing custody." } => "A hand-off is still unverified",
+        InvalidOperationException { Message: "Carrier does not acknowledge this run's custody." } => $"{carrier ?? "The carrier"} does not report holding this run's items",
+        InvalidOperationException { Message: "Carrier trade is unsettled." } => $"{carrier ?? "The carrier"} has an unconfirmed trade",
+        _ => "Courier request failed",
+    };
+
+    /// <summary>A run outcome code in plain words.</summary>
+    internal static string OutcomeLabel(string code, string? carrier)
+    {
+        var who = carrier ?? "The carrier";
+        return code switch
+        {
+            "" or "Succeeded" => "Completed",
+            "StopRequested" or "StopBeforeBegin" or "StopBeforeTrade" or "StopBeforeLocalTrade" or "CancelledPreLock" => "Stopped",
+            "PlanRefused" => "Some lines cannot be sent",
+            "AutomationBusy" => "Another automation is running",
+            "AutoRetainerBusy" => "AutoRetainer is still running",
+            "BagSlotLimit" => "No free bag slot",
+            "DestinationBagsFull" => "Destination bags full",
+            "SenderStockShort" => "Items no longer at the source",
+            "CustodyInsufficient" => $"{who} holds fewer items than expected",
+            "CustodyRemaining" => $"{who} still holds items",
+            "CarrierBagsMissing" => $"{who} did not report bags",
+            "CarrierIdentityMismatch" => "A different character is carrying",
+            "OwnerIdentityMismatch" or "SwitchIdentityMismatch" => "Wrong character logged in",
+            "PeerLinkLost" or "CarrierEndpointAmbiguous" => $"Lost contact with {who}",
+            "TradeStartNotAcknowledged" => $"{who} did not accept the trade",
+            "TradeHoldLost" or "TradeHoldRefused" or "TradeHoldUnavailable" => "Trade hold unavailable",
+            "HandOffDeltaMismatch" or "LedgerMismatch" or "SettlementDeltaMismatch" or "SettlementLedgerMismatch" or "CustodyMismatch"
+                or "ReceiptMismatch" or "NotDeliveredDeltaMismatch" or "PlacementSettlementMismatch" or "PlacementSettlementIdentity"
+                => "Hand-off did not match the plan",
+            "TradeClosureUnproven" or "ResumeUnsettled" => "Hand-off unverified",
+            _ when code.EndsWith("Deadline", StringComparison.Ordinal) => "Timed out",
+            _ => "Run stopped",
+        };
+    }
+
+    /// <summary>The unverified step's hand-off in plain words.</summary>
+    internal static string UnverifiedLabel(CourierUnverified step) => step.Step switch
+    {
+        nameof(CourierPhase.HandOut) or nameof(CourierPhase.HandIn) => $"Trade {step.From} → {step.To} unverified",
+        nameof(CourierPhase.Retrieve) => $"Retrieval for {step.From} unverified",
+        nameof(CourierPhase.Deposit) => $"Deposit for {step.From} unverified",
+        _ => $"{PhaseLabel(step.Step)} unverified",
+    };
 
     internal static string PhaseLabel(string phase) => phase switch
     {
@@ -392,7 +610,7 @@ public sealed class CourierSession
             view?.Custody.Sum(shipment => shipment.Units) ?? 0,
             view?.Paused ?? false,
             view?.Unconfirmed ?? false,
-            Error,current?.CanResume==true && !IsActive,current?.CanClear==true && !IsActive,
+            ErrorDetail ?? Error,current?.CanResume==true && !IsActive,current?.CanClear==true && !IsActive,
             view is {Custody.IsEmpty:false}?CourierConductor.Rows(view.Custody,settings.Carrier):current?.Custody??[],
             blocked,projection?.Refusals??[],[..settings.Owners.Select(o=>o.CharacterName)]);
     }
@@ -408,7 +626,7 @@ public sealed class CourierSession
         }
         catch (Exception exception)
         {
-            Error = exception.Message;
+            Fail("Courier settings not saved", exception.ToString());
         }
     }
 

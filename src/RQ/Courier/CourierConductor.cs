@@ -39,8 +39,11 @@ public sealed class CourierJournal
 }
 public sealed record LineProgress(Guid Line, string Name, int Moved, int Remaining);
 public sealed record CourierSnapshot(Guid Run, string State, string OwnerPhase, string CarrierPhase, int Trip, int Trips,
-    string Code, string Detail, ImmutableArray<LineProgress> Lines, ImmutableArray<Refusal> Refusals,bool CanResume,bool CanClear,ImmutableArray<CustodyRow> Custody);
+    string Code, string Detail, ImmutableArray<LineProgress> Lines, ImmutableArray<Refusal> Refusals,bool CanResume,bool CanClear,ImmutableArray<CustodyRow> Custody,
+    CourierUnverified? Unverified=null);
 public sealed record CustodyRow(string Item,string Quality,int Quantity,string Holder);
+/// <summary>The journaled step whose outcome is not yet proven; Rows hold its batch at the last verified holder (From).</summary>
+public sealed record CourierUnverified(string Step,string From,string To,ImmutableArray<CustodyRow> Rows);
 
 public sealed class CourierConductor
 {
@@ -125,7 +128,15 @@ public sealed class CourierConductor
             [..r.Plan.Trips.SelectMany(t=>t.Manifest).GroupBy(s=>s.Line).Select(g=>new LineProgress(g.Key,g.First().Name,
                 r.Delivered.GetValueOrDefault(g.Key),g.Sum(s=>s.Units)-r.Delivered.GetValueOrDefault(g.Key)))], r.Plan.Refusals,
             connected && attempt && r.State is "Failed" or "Interrupted" or "Indeterminate",
-            (connected || r.Custody.IsEmpty) && r.Pending==null && r.State is "Completed" or "Failed" or "Interrupted" or "Indeterminate" or "Refused",Rows(r.Custody,r.Settings.Carrier));
+            (connected || r.Custody.IsEmpty) && r.Pending==null && r.State is "Completed" or "Failed" or "Interrupted" or "Indeterminate" or "Refused",Rows(r.Custody,r.Settings.Carrier),
+            Unverified(r));
+    }
+    private static CourierUnverified? Unverified(CourierJournal r)
+    {
+        if(r.Pending is not {} p || p.Action.Batch.IsEmpty || r.State is not ("Failed" or "Interrupted" or "Indeterminate")) return null;
+        var owner=p.OwnerBefore.Character; var carrier=r.Settings.Carrier;
+        var (from,to)=p.Action.Phase==CourierPhase.HandIn?(carrier,owner):p.Action.Phase==CourierPhase.HandOut?(owner,carrier):(owner,owner);
+        return new(p.Action.Phase.ToString(),from?.CharacterName??"Unknown",to?.CharacterName??"Unknown",Rows(p.Action.Batch,from));
     }
     internal static ImmutableArray<CustodyRow> Rows(IEnumerable<Shipment> units,OwnerScope? holder)=>
         [..units.GroupBy(s=>(s.Item,s.Hq)).Select(g=>new CustodyRow(g.First().Name,g.Key.Hq?"HQ":"NQ",g.Sum(s=>s.Units),holder?.CharacterName??"Unknown"))];
@@ -156,7 +167,7 @@ public sealed class CourierConductor
                 static string Describe(IEnumerable<Shipment> units)=>string.Join(", ", units.OrderBy(s=>s.Line)
                     .Select(s=>$"{s.Name}{(s.Hq?" HQ":"")} × {s.Units}"));
                 var required=$"Owner ledger [{Describe(r.Custody)}]; carrier ledger [{Describe(held)}]";
-                if(acknowledgement!=required)throw new CustodyAcknowledgementRequired(required);
+                if(acknowledgement!=required)throw new CustodyAcknowledgementRequired(required,Rows(held,r.Settings.Carrier));
                 r.ClearAcknowledgement=required;store.Save(r);
             }
             if(receipt?.ActiveRun==r.Run)await Send(r,CourierCommand.Clear,r.Start,held);
@@ -165,7 +176,11 @@ public sealed class CourierConductor
         }
         finally{gate.Release();}
     }
-    public sealed class CustodyAcknowledgementRequired(string held) : Exception(held);
+    public sealed class CustodyAcknowledgementRequired(string held,ImmutableArray<CustodyRow> carrierRows=default) : Exception(held)
+    {
+        /// <summary>The carrier's confirmed ledger behind this acknowledgement, for display.</summary>
+        public ImmutableArray<CustodyRow> CarrierRows => carrierRows.IsDefault ? [] : carrierRows;
+    }
     public async Task StopAsync()
     {
         stop = true;

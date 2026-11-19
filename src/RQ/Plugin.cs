@@ -346,6 +346,7 @@ public sealed class Plugin : IDalamudPlugin
             new DalamudSummoningBellInteractor(objects,targets,dataManager),tradeIo,scanner,CurrentOwner,DispatchOnFramework,configDirectory,s=>log.Warning(s));
         courierTrade = new(courierGame,tradeIo,automation,pluginInterface,externalUiSuppression,log,configDirectory);
         bool AutoRetainerLoaded()=>pluginInterface.InstalledPlugins.Any(p=>p.IsLoaded && p.InternalName=="AutoRetainer");
+        courier.Warn = s => log.Warning(s);
         courier.Follower = new(configDirectory,()=>state.ReadConfiguration(s=>s.Courier),automation,autoRetainerSuppression,courierTrade,
             courierGame,courierGame,courierGame,s=>log.Warning(s),s=>log.Information(s),AutoRetainerLoaded);
         courier.Follower.RestoreCustodyHold();
