@@ -233,6 +233,7 @@ public sealed class StowageRoutingPolicy : IJsonOnDeserialized
 public sealed class StowagePlan
 {
     public bool IsEphemeral { get; set; }
+    public Guid? LastAppliedCourierRun { get; set; }
     public Guid Id { get; set; } = Guid.NewGuid();
     public long Revision { get; set; } = 1;
     public OwnerScope Owner { get; set; } = new();
