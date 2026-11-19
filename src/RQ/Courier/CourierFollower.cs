@@ -96,7 +96,8 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                 if(!travelResume)return new(CourierOutcome.Indeterminate,"StepUnsettled","Carrier intent has no receipt.");
             }
             if (!travelResume && ledger.Unconfirmed == null && ledger.Steps.Values.Any(x => x.Result == null && x.Command.Run == m.Run &&
-                !(m.Command==CourierCommand.Begin && x.Command.Command is CourierCommand.Travel or CourierCommand.ReturnHome))
+                !(m.Command==CourierCommand.Begin && x.Command.Command is CourierCommand.Travel or CourierCommand.ReturnHome) &&
+                !(m.Command==CourierCommand.Finish && x.Command.Command==CourierCommand.ReturnHome))
                 && m.Command is not (CourierCommand.Stop or CourierCommand.Status or CourierCommand.Clear or CourierCommand.NotDelivered)) return Refuse("CarrierIntentUnsettled");
             if (m.Command == CourierCommand.Status)
             {

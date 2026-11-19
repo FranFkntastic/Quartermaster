@@ -155,16 +155,18 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
         ImGui.AlignTextToFramePadding();
         ImGui.TextDisabled("Last courier run");
         ImGui.SameLine();
-        var color = run.State == "Completed"
+        var returnWarning=run.State=="Completed" && run.Code!="Succeeded";
+        var color = run.State == "Completed" && !returnWarning
             ? ListingWorkspace.Color(ListingStateTone.Green)
             : ListingWorkspace.Color(ListingStateTone.Amber);
-        ImGui.TextColored(color, run.State == "Completed" ? "Completed" : $"{StateLabel(run.State)} · {CourierSession.OutcomeLabel(run.Code, carrier)}");
+        ImGui.TextColored(color, returnWarning?"Completed · return warning":run.State == "Completed" ? "Completed" : $"{StateLabel(run.State)} · {CourierSession.OutcomeLabel(run.Code, carrier)}");
         if (!ImGui.IsItemHovered())
             return;
         var lines = run.Lines.Select(progress => $"{progress.Name}: {progress.Moved:N0} moved" +
             (progress.Remaining > 0 ? $", {progress.Remaining:N0} left" : string.Empty));
         var refusals = run.Refusals.Select(refusal => $"{refusal.Name}: {CourierSession.RefusalLabel(refusal.Code)}");
         var text = string.Join("\n", lines.Concat(refusals));
+        if(returnWarning)text=run.Detail+"\n"+text;
         if (text.Length > 0)
             ImGui.SetTooltip(text);
     }

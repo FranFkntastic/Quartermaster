@@ -85,9 +85,9 @@ public sealed record CourierBridgeTruth(
     bool CarrierUnconfirmed,
     string? Error,bool CanResume,bool CanClear,IReadOnlyList<RQ.Courier.CustodyRow> Custody,string? StartBlockCode,
     IReadOnlyList<RQ.Courier.Refusal> StartRefusals,IReadOnlyList<string> PairedOwners,
-    IReadOnlyList<CourierBellBridgeTruth> MeetingBells);
+    IReadOnlyList<CourierBellBridgeTruth> MeetingBells,bool Recording=false,int RecordingPointCount=0);
 
-public sealed record CourierBellBridgeTruth(string Character, string HomeWorld, string Label);
+public sealed record CourierBellBridgeTruth(string Character, string HomeWorld, string Label,bool HasRoute=false,int PointCount=0);
 
 public sealed record CourierLineBridgeTruth(string Item, int Moved, int Remaining);
 

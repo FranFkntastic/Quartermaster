@@ -76,6 +76,29 @@ public sealed class CourierRunTests : IDisposable
         Assert.Equal(7, owner.Deposited); Assert.Equal(10, mule.Units);
         Assert.Empty(new AtomicDocumentStore<CarrierLedger>(Path.Combine(dir, "courier-custody.json")).Load().Units);
     }
+    [Theory]
+    [InlineData(false,false)]
+    [InlineData(false,true)]
+    [InlineData(true,false)]
+    public async Task ReturnFailureOnlyCompletesWithEmptyCustody(bool ownerReturn,bool held)
+    {
+        var p=Plan();
+        owner.FailReturnSwitch=ownerReturn;
+        if(!ownerReturn)mule.ReturnFailure=()=>{
+            if(held)
+            {
+                var store=new CourierStore<CarrierLedger>(Path.Combine(dir,"courier-custody.json"));
+                var ledger=store.Load();ledger.Units=[p.Trips[0].Manifest[0]];store.Save(ledger);
+            }
+            return new(CourierOutcome.Indeterminate,"CarrierReturnDeadline","ward arrival timed out");
+        };
+        var result=await engine.StartAsync(p,cfg);
+        Assert.All(result.Lines,l=>Assert.Equal(0,l.Remaining));
+        Assert.Equal(held?"Indeterminate":"Completed",result.State);
+        Assert.Equal(held?"ReturnCustodyUnsettled":ownerReturn?"CharacterSwitchDeadline":"CarrierReturnDeadline",result.Code);
+        if(!held)Assert.Contains(ownerReturn?"login timed out":"ward arrival timed out",engine.Snapshot().Detail);
+        Assert.Equal(held,new CourierStore<CarrierLedger>(Path.Combine(dir,"courier-custody.json")).Load().Run.HasValue);
+    }
     [Fact]
     public async Task ReloadWithCustodyDeliversForwardOnly()
     {
@@ -403,13 +426,17 @@ public sealed class CourierRunTests : IDisposable
         }
         public Task<Result<InventoryView>> ObserveAsync(Deadline d) => OK(new InventoryView(who, 4, [new(1, false, Units)]));
         public Task<Result<string>> SwitchRefusalAsync(Deadline deadline) => OK("");
-        public Task<Result<OwnerScope>> SwitchAsync(OwnerScope target, Deadline d) => OK(who = target);
+        public bool FailReturnSwitch;
+        public Task<Result<OwnerScope>> SwitchAsync(OwnerScope target, Deadline d) =>
+            FailReturnSwitch && Deposited==7
+                ?Task.FromResult(new Result<OwnerScope>(CourierOutcome.Indeterminate,"CharacterSwitchDeadline","login timed out")):OK(who = target);
         public Task<Result<bool>> EnsureWorldAsync(uint world, Deadline d) => OK(true);
         public Task<Result<bool>> ReturnHomeAsync(Deadline d) => OK(true);
         public readonly List<MeetingBell> Approaches=[];
         public Task<Result<bool>> GoInRangeAsync(MeetingBell bell, Deadline d) { Approaches.Add(bell); return OK(true); }
         public Task<Result<CourierPosition>> PositionAsync(Deadline d) => OK(new CourierPosition(1, 1, 0, 0, 0));
-        public Task<Result<bool>> ReturnToAsync(CourierPosition position, Deadline d) => OK(true);
+        public Func<Result<bool>>? ReturnFailure;
+        public Task<Result<bool>> ReturnToAsync(CourierPosition position, Deadline d) => ReturnFailure==null?OK(true):Task.FromResult(ReturnFailure());
         public Task<Result<bool>> ObserveTradeableAsync(OwnerScope character, Deadline d) => RefusePartner?Task.FromResult(Result<bool>.Fail("CarrierPartnerDeadline","fixture")):OK(true);
     }
 }

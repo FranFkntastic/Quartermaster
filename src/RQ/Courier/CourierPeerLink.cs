@@ -28,6 +28,12 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     private string published="", projected="";
     public MeetingBell? StandingAt {get;private set;}
     public string? BellBlock {get;private set;}
+    public bool InWard=>game.InWard;
+    public int RoutePoints=>game.PointCount;
+    public string? RouteError=>game.RouteError;
+    public void StartRoute()=>game.StartRoute();
+    public void CancelRoute()=>game.CancelRoute();
+    public MeetingBell? CaptureHere(ulong character)=>game.CaptureHere(character);
     public IReadOnlyList<CourierPeer> Peers => peers;
     public event Action<CourierProgress>? Progress;
     public event Action? LinkLost;
@@ -40,6 +46,7 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     }
     internal void Tick(bool identityChanged)
     {
+        game.SampleRoute();
         var now=DateTimeOffset.UtcNow;
         if(identityChanged)next=DateTimeOffset.MinValue;
         if(now<next || !refresh.IsCompleted) return;
