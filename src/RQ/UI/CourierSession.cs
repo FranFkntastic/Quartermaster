@@ -193,6 +193,26 @@ public sealed class CourierSession
         return projection;
     }
 
+    private (long Revision, BrowserProjection Browser, AccountStockProjection Projection)? account;
+
+    /// <summary>
+    /// The logged-in character's stock merged with every other observed, non-carrier character's
+    /// (<see cref="Browsable"/>). The logged-in character's own projection stays the source for its
+    /// planning; this view only adds the other characters beside it. Cached per planning revision.
+    /// </summary>
+    internal AccountStockProjection AccountStock(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (account is { } cached && cached.Revision == runtime.PlanningRevision && ReferenceEquals(cached.Browser, runtime.Browser))
+            return cached.Projection;
+        var others = Browsable(runtime)
+            .Select(character => (character, Stock(runtime, character)))
+            .Where(entry => entry.Item2 is not null)
+            .Select(entry => (entry.character, entry.Item2!));
+        var projection = AccountStockProjection.Build(runtime.Owner, runtime.Browser, others);
+        account = (runtime.PlanningRevision, runtime.Browser, projection);
+        return projection;
+    }
+
     private (long Revision, Dictionary<(Guid, ulong, ItemQualityPolicy), PlacementMovePlan?> Plans)? gathers;
 
     /// <summary>

@@ -12,13 +12,18 @@ internal sealed record StockWorkbenchRow(
     int AccessibleRetainerQuantity,
     TargetPlanItem? Rule,
     StowageEvaluationLine? Line,
-    IReadOnlyList<ListingPlanItemEvaluation> ListingDemand);
+    IReadOnlyList<ListingPlanItemEvaluation> ListingDemand,
+    AccountStockItem? Account = null,
+    int Sends = 0,
+    string RetainerHint = "");
 
 internal sealed record StockWorkbenchProjection(
     long PlanningRevision,
     Guid? PlanId,
     IReadOnlyList<StockGroup> QueryItems,
-    IReadOnlyList<StockWorkbenchRow> Rows);
+    IReadOnlyList<StockWorkbenchRow> Rows,
+    AccountStockProjection? Account = null,
+    bool AccountMode = false);
 
 internal sealed record TransferWorkbenchProjection(
     long RuntimeRevision,
