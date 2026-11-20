@@ -15,12 +15,11 @@ internal sealed class TransferReviewDialog
     private readonly Func<bool> transfersCanStart;
     private readonly Func<bool> retainerRefreshBusy;
     private readonly Action<Guid> executePlan;
-    private readonly AgentBridgeUiReviewRegistry reviewRegistry;
     private readonly DalamudTableProjection<TransferReviewRow> table = CreateTable();
     private readonly DalamudTableProjection<TransferWorkbenchRow> courierTable = CreateCourierTable();
     private readonly CourierSession courier;
+    private readonly ReviewModal modal;
     private TransferReviewRequest? request;
-    private bool openRequested;
 
     public TransferReviewDialog(
         Func<QuartermasterRuntimeSnapshot> runtimeSnapshot,
@@ -37,22 +36,22 @@ internal sealed class TransferReviewDialog
         this.transfersCanStart = transfersCanStart ?? throw new ArgumentNullException(nameof(transfersCanStart));
         this.retainerRefreshBusy = retainerRefreshBusy ?? throw new ArgumentNullException(nameof(retainerRefreshBusy));
         this.executePlan = executePlan ?? throw new ArgumentNullException(nameof(executePlan));
-        this.reviewRegistry = reviewRegistry ?? throw new ArgumentNullException(nameof(reviewRegistry));
+        modal = new(reviewRegistry ?? throw new ArgumentNullException(nameof(reviewRegistry)), 860, Clear);
     }
 
     public void Request(Guid planId, string planName)
     {
         request = new(planId, planName);
-        openRequested = true;
+        modal.OpenRequested = true;
     }
 
     public void Clear()
     {
         request = null;
-        openRequested = false;
+        modal.OpenRequested = false;
     }
 
-    public TransferReviewDialogState CaptureState() => new(request, openRequested);
+    public TransferReviewDialogState CaptureState() => new(request, modal.OpenRequested);
 
     public string? CaptureWindowName => request is { } current
         ? $"Execute {current.PlanName}##RQTransferReview"
@@ -61,7 +60,7 @@ internal sealed class TransferReviewDialog
     public void RestoreState(TransferReviewDialogState state)
     {
         request = state.Request;
-        openRequested = state.OpenRequested;
+        modal.OpenRequested = state.OpenRequested;
     }
 
     public void Draw()
@@ -69,25 +68,20 @@ internal sealed class TransferReviewDialog
         if (request is not { } currentRequest)
             return;
 
-        var popup = CaptureWindowName!;
-        if (openRequested)
-        {
-            ImGui.SetNextWindowSize(
-                new Vector2(Math.Min(860, ImGui.GetMainViewport().WorkSize.X - 80), 520),
-                ImGuiCond.Appearing);
-            ImGui.OpenPopup(popup);
-            openRequested = false;
-        }
-
-        var open = true;
-        ImGui.SetNextWindowBgAlpha(1f);
-        if (!ImGui.BeginPopupModal(popup, ref open, ImGuiWindowFlags.NoScrollbar))
-        {
-            if (!open)
-                Clear();
+        if (!modal.Begin(CaptureWindowName!))
             return;
+        try
+        {
+            DrawBody(currentRequest);
         }
+        finally
+        {
+            modal.End();
+        }
+    }
 
+    private void DrawBody(TransferReviewRequest currentRequest)
+    {
         var runtime = runtimeSnapshot();
         var plan = runtime.State.StowagePlans.FirstOrDefault(candidate =>
             candidate.Id == currentRequest.PlanId && candidate.Owner.Matches(runtime.Owner));
@@ -95,11 +89,7 @@ internal sealed class TransferReviewDialog
         {
             ImGui.TextColored(new Vector4(1f, .4f, .4f, 1f), "This Transfer Plan no longer exists.");
             if (ImGui.Button("Close"))
-            {
-                Clear();
-                ImGui.CloseCurrentPopup();
-            }
-            ImGui.EndPopup();
+                modal.Close();
             return;
         }
 
@@ -108,9 +98,6 @@ internal sealed class TransferReviewDialog
         if (plan.Kind == StowagePlanKind.Courier)
         {
             DrawCourier(runtime, plan, projection, projection.Courier);
-            ImGui.EndPopup();
-            if (!open)
-                Clear();
             return;
         }
         var movementSummary = projection.MovementSummary;
@@ -154,53 +141,38 @@ internal sealed class TransferReviewDialog
             table.End();
         }
 
-        if (ImGui.Button("Back"))
-        {
-            Clear();
-            ImGui.CloseCurrentPopup();
-        }
-        reviewRegistry.RegisterLastButton(
+        modal.DrawBack(
+            "Back",
             "quartermaster.transfer.review.back",
             "Return to the Transfer Plan without executing",
-            true,
-            Clear,
             "No inventory movement");
         var availability = TransferExecutionPolicy.ForExplicitRun(
             projection.HasMovement || projection.HasUnknownListingDemand,
             runtime.Owner.HasStableIdentity,
             transfersCanStart(),
             retainerRefreshBusy());
-        ImGui.SameLine();
-        ImGui.TextDisabled(
+        const string executeLabel = "Execute plan";
+        ReviewModal.DrawNote(
             projection.HasUnknownListingDemand
                 ? "Listing demand will be verified before any movement."
-                : availability.BlockReason ?? "Balanced items remain in the plan but require no movement.");
+                : availability.BlockReason ?? "Balanced items remain in the plan but require no movement.",
+            executeLabel);
         var canExecute = availability.CanExecute;
-        ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - 110));
-        if (!canExecute)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Execute plan"))
+        if (modal.DrawPrimary(
+                executeLabel,
+                canExecute,
+                "quartermaster.transfer.review.execute",
+                "Execute the reviewed Transfer Plan",
+                () =>
+                {
+                    executePlan(plan.Id);
+                    Clear();
+                },
+                canExecute ? movementSummary : availability.BlockReason))
         {
             executePlan(plan.Id);
-            Clear();
-            ImGui.CloseCurrentPopup();
+            modal.Close();
         }
-        if (!canExecute)
-            ImGui.EndDisabled();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.transfer.review.execute",
-            "Execute the reviewed Transfer Plan",
-            canExecute,
-            () =>
-            {
-                executePlan(plan.Id);
-                Clear();
-            },
-            canExecute ? movementSummary : availability.BlockReason);
-
-        ImGui.EndPopup();
-        if (!open)
-            Clear();
     }
 
     /// <summary>A Courier plan runs as a courier run: its review lists the trips and what goes where.</summary>
@@ -222,49 +194,35 @@ internal sealed class TransferReviewDialog
 
         DrawCourierRows(runtime, courierPlan, rows);
 
-        if (ImGui.Button("Back"))
-        {
-            Clear();
-            ImGui.CloseCurrentPopup();
-        }
-        reviewRegistry.RegisterLastButton(
+        modal.DrawBack(
+            "Back",
             "quartermaster.transfer.review.back",
             "Return to the Courier Plan without executing",
-            true,
-            Clear,
             "No inventory movement");
+        const string executeLabel = "Execute courier run";
         var gate = courier.StartGate(runtime, courierPlan);
         var block = gate.Status;
         var canStart = gate.CanStart;
         if (block is not null)
-        {
-            ImGui.SameLine();
-            ImGui.TextDisabled(block);
-        }
+            ReviewModal.DrawNote(block, gate.Offer ? executeLabel : null);
         // An active or unsettled run is handled on the run pane; Start is not offered meanwhile.
         if (!gate.Offer)
             return;
-        const string executeLabel = "Execute courier run";
-        ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(),
-            ImGui.GetContentRegionMax().X - ImGui.CalcTextSize(executeLabel).X - (ImGui.GetStyle().FramePadding.X * 2f)));
-        ImGui.BeginDisabled(!canStart);
-        if (ImGui.Button(executeLabel))
+        if (modal.DrawPrimary(
+                executeLabel,
+                canStart,
+                "quartermaster.transfer.review.execute",
+                "Start the reviewed courier run",
+                () =>
+                {
+                    courier.Start(runtimeSnapshot(), plan);
+                    Clear();
+                },
+                block ?? (canStart ? $"{trips:N0} courier trips" : "Lines refused")))
         {
             courier.Start(runtime, plan);
-            Clear();
-            ImGui.CloseCurrentPopup();
+            modal.Close();
         }
-        ImGui.EndDisabled();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.transfer.review.execute",
-            "Start the reviewed courier run",
-            canStart,
-            () =>
-            {
-                courier.Start(runtimeSnapshot(), plan);
-                Clear();
-            },
-            block ?? (canStart ? $"{trips:N0} courier trips" : "Lines refused"));
     }
 
     private static TransferWorkbenchRow[] CourierRows(TransferWorkbenchProjection projection) =>

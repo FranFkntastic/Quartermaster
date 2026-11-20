@@ -5,6 +5,7 @@ using Dalamud.Interface.Components;
 using Dalamud.Interface.Utility;
 using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.UI.Inputs;
+using Franthropy.Dalamud.UI.Layout;
 using Franthropy.Dalamud.UI.Tables;
 using Franthropy.FFXIV.Filtering;
 using RQ.Automation;
@@ -120,11 +121,7 @@ internal sealed class ListingWorkspace
         slotsWithoutMarket = new(slotColumns[..^1], selection);
     }
 
-    internal static Vector4 Color(ListingStateTone tone) => tone switch
-    {
-        ListingStateTone.Amber => new(1, .7f, .3f, 1), ListingStateTone.Green => new(.45f, .78f, .58f, 1),
-        ListingStateTone.Info => new(.56f, .70f, .85f, 1), ListingStateTone.Run => new(.29f, .62f, .85f, 1), _ => ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled],
-    };
+    private static Vector4 Color(ListingStateTone tone) => QuartermasterPalette.Tone(tone);
 
     private IReadOnlyList<ListingRetainerRow> Resolve(QuartermasterRuntimeSnapshot runtime)
     {
@@ -176,13 +173,13 @@ internal sealed class ListingWorkspace
         // Name-only search applies equally to drafts and observed items.
         var search = workbench.ListingFilterState.Expression;
         const string replanAllLabel = "Replan all as listed";
-        var replanWidth = ImGui.CalcTextSize(replanAllLabel).X + ImGui.GetStyle().FramePadding.X * 2;
+        var replanWidth = DalamudUiLayout.ButtonWidth(replanAllLabel);
         var searchWidth = ImGui.GetContentRegionAvail().X - replanWidth - ImGui.GetStyle().ItemSpacing.X;
         ImGui.SetNextItemWidth(searchWidth >= 160 ? searchWidth : -1);
         if (ImGui.InputTextWithHint("##ListingNameSearch", "Search listed or planned items", ref search, 160))
             workbench.ListingFilterState.SetExpression(search);
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Search item names in both planned and observed listings.");
-        UiLayout.SameLineIfFits(replanAllLabel);
+        DalamudUiLayout.SameLineIfFits(replanAllLabel);
         var currentRetainerIds = session.CurrentRetainerIds(runtime);
         ImGui.BeginDisabled(!session.CanReplanAll(runtime.Browser, currentRetainerIds));
         if (ImGui.SmallButton(replanAllLabel)) session.ReplanAll(runtime.Browser, currentRetainerIds);
@@ -278,7 +275,7 @@ internal sealed class ListingWorkspace
             return new PlacementMatrixRow<(uint, ItemQualityPolicy)>(
                 (item.ItemId, item.Quality),
                 $"{item.ItemId}-{item.Quality}",
-                $"{item.ItemName} {QualityLabel(item.Quality)}",
+                $"{item.ItemName} {TransferPresentation.QualityLabel(item.Quality, anyLabel: "NQ")}",
                 MarketRunPresentation.Number(item.SpareUnits),
                 reserve?.Location ?? new StowageRoutingPolicy(),
                 PlacementMatrixData.Holdings(runtime, item.ItemId, item.Quality));
@@ -514,7 +511,7 @@ internal sealed class ListingWorkspace
         if (slot.Assignment is not { } a) { ImGui.TextDisabled("Free"); return; }
         if (Dim(slot)) ImGui.TextDisabled(a.ItemName); else ImGui.TextUnformatted(a.ItemName);
         if (ImGui.IsItemClicked(ImGuiMouseButton.Right)) OpenItem(a.ItemId);
-        ImGui.SameLine(); ImGui.TextDisabled(QualityLabel(a.Quality));
+        ImGui.SameLine(); ImGui.TextDisabled(TransferPresentation.QualityLabel(a.Quality, anyLabel: "NQ"));
     }
 
     private void DrawSlotListed(ListingSlotView slot)
@@ -592,11 +589,11 @@ internal sealed class ListingWorkspace
         ImGui.TextUnformatted(picked.Count == 1 ? "1 slot" : $"{picked.Count:N0} slots");
         if (editable)
         {
-            var reserved = buttons.Sum(b => ImGui.CalcTextSize(b.Label).X + style.FramePadding.X * 2 + style.ItemSpacing.X) +
+            var reserved = buttons.Sum(b => DalamudUiLayout.ButtonWidth(b.Label) + style.ItemSpacing.X) +
                 (planned.Length > 0 ? BulkUnitsWidth + BulkPriceWidth + style.ItemSpacing.X * 2 : 0) + style.ItemSpacing.X;
             var itemWidth = Math.Max(BulkItemMinWidth, ImGui.GetContentRegionAvail().X - reserved);
             var items = picked.Select(s => s.Assignment is { } a ? (a.ItemId, a.Quality, a.ItemName) : default).Distinct().ToArray();
-            var hint = items.Length == 1 && items[0].ItemId != 0 ? $"{items[0].ItemName} {QualityLabel(items[0].Quality)}" :
+            var hint = items.Length == 1 && items[0].ItemId != 0 ? $"{items[0].ItemName} {TransferPresentation.QualityLabel(items[0].Quality, anyLabel: "NQ")}" :
                 planned.Length > 0 ? "Mixed" : "Item";
             ImGui.SameLine();
             ResolveChoices(runtime, retainer.RetainerId, bulkItemInput);
@@ -635,7 +632,7 @@ internal sealed class ListingWorkspace
         }
         foreach (var (label, apply) in buttons)
         {
-            UiLayout.SameLineIfFits(label);
+            DalamudUiLayout.SameLineIfFits(label);
             if (ImGui.Button(label)) apply();
         }
     }
@@ -752,16 +749,15 @@ internal sealed class ListingWorkspace
             .Where(i => i.Quality != ItemQualityPolicy.HqOnly || canBeHq(i.ItemId))
             .OrderByDescending(i => i.Here).ThenByDescending(i => i.Owned).ThenBy(i => i.ItemId)
             .Select(i => new DalamudSuggestion<ListingAddChoice>(new(i.ItemId, i.ItemName, i.Quality),
-                $"{i.ItemName} {QualityLabel(i.Quality)}", i.Here > 0 ? $"{i.Here:N0} here" : $"{i.Owned:N0} owned")).ToList();
+                $"{i.ItemName} {TransferPresentation.QualityLabel(i.Quality, anyLabel: "NQ")}", i.Here > 0 ? $"{i.Here:N0} here" : $"{i.Owned:N0} owned")).ToList();
         var seen = owned.Select(i => (i.Value.ItemId, i.Value.Quality)).ToHashSet();
         if (query.Length >= 2)
             foreach (var i in catalog.Where(i => listability(i.ItemId) is true && Match(i.ItemId, i.Name)))
                 foreach (var q in canBeHq(i.ItemId) ? new[] { ItemQualityPolicy.NqOnly, ItemQualityPolicy.HqOnly } : new[] { ItemQualityPolicy.NqOnly })
-                    if (seen.Add((i.ItemId, q))) owned.Add(new(new(i.ItemId, i.Name, q), $"{i.Label} {QualityLabel(q)}"));
+                    if (seen.Add((i.ItemId, q))) owned.Add(new(new(i.ItemId, i.Name, q), $"{i.Label} {TransferPresentation.QualityLabel(q, anyLabel: "NQ")}"));
         var duplicateNames = owned.GroupBy(s => s.Value.ItemName, StringComparer.OrdinalIgnoreCase)
             .Where(g => g.Select(s => s.Value.ItemId).Distinct().Count() > 1).Select(g => g.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
         return owned.Select(s => duplicateNames.Contains(s.Value.ItemName)
-            ? s with { Label = $"{s.Value.ItemName} · #{s.Value.ItemId} {QualityLabel(s.Value.Quality)}" } : s).Take(64).ToArray();
+            ? s with { Label = $"{s.Value.ItemName} · #{s.Value.ItemId} {TransferPresentation.QualityLabel(s.Value.Quality, anyLabel: "NQ")}" } : s).Take(64).ToArray();
     }
-    private static string QualityLabel(ItemQualityPolicy quality) => quality == ItemQualityPolicy.HqOnly ? "HQ" : "NQ";
 }

@@ -4,6 +4,7 @@ using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.UI.Tables;
+using Franthropy.Dalamud.UI.Windows;
 using RQ.Domain;
 using RQ.Persistence;
 using RQ.Planning;
@@ -22,7 +23,8 @@ internal sealed class RestockPlanEditor
     private readonly WorkbenchState workbench;
     private readonly ItemGroupWorkspace itemGroupWorkspace;
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
-    private readonly Func<string, int, IReadOnlyList<ItemChoice>> searchItems;
+    private readonly ItemChoiceSuggestions restockSuggestions;
+    private readonly DalamudSuggestionInputState restockItemInput = new();
     private readonly Action closeTransferEditor;
     private readonly Action requestRestockView;
     private readonly DalamudTableProjection<RestockPlanItem> restockDraftTable;
@@ -30,9 +32,7 @@ internal sealed class RestockPlanEditor
     private readonly TableSelectionModel<Guid> selectedRestockItemIds = new();
     private Guid? activeRestockItemId;
     private Guid? selectedRestockItemGroupId;
-    private string restockItemSearch = string.Empty;
     private string restockItemFilter = string.Empty;
-    private ItemChoice? selectedRestockChoice;
     private string restockEditorError = string.Empty;
     private int bulkRestockQuality = -1;
     private int bulkRestockTarget = -1;
@@ -53,7 +53,7 @@ internal sealed class RestockPlanEditor
         this.workbench = workbench;
         this.itemGroupWorkspace = itemGroupWorkspace;
         this.reviewRegistry = reviewRegistry;
-        this.searchItems = searchItems;
+        restockSuggestions = new(searchItems, 8);
         this.closeTransferEditor = closeTransferEditor;
         this.requestRestockView = requestRestockView;
         restockDraftTable = CreateDraftTable();
@@ -91,7 +91,7 @@ internal sealed class RestockPlanEditor
         new("Rule", 52, item => item.Enabled ? "On" : "Off", Draw: item =>
             item.Enabled = DrawRuleToggle($"restock{item.Id}", item.Enabled)),
         new("Target", 80, item => item.TargetQuantity.ToString("N0"), Draw: DrawRestockTarget),
-        new("Quality", 112, item => QualityLabel(item.Quality), Draw: DrawRestockDraftQuality),
+        new("Quality", 112, item => TransferPresentation.QualityLabel(item.Quality), Draw: DrawRestockDraftQuality),
         new(
             "Note",
             1f,
@@ -118,9 +118,8 @@ internal sealed class RestockPlanEditor
         selectedRestockItemIds.Clear();
         activeRestockItemId = draft.Items.FirstOrDefault()?.Id;
         selectedRestockItemGroupId = null;
-        restockItemSearch = string.Empty;
+        restockItemInput.Text = string.Empty;
         restockItemFilter = string.Empty;
-        selectedRestockChoice = null;
         restockEditorError = string.Empty;
         bulkRestockQuality = -1;
         bulkRestockTarget = -1;
@@ -146,7 +145,7 @@ internal sealed class RestockPlanEditor
         ImGui.SetNextWindowSize(
             new Vector2(Math.Min(1160, available.X - 48), Math.Min(700, available.Y - 48)),
             ImGuiCond.Appearing);
-        if (!ImGui.BeginPopupModal(popup, ImGuiWindowFlags.NoScrollbar))
+        if (!DalamudOwnedPopup.BeginOwnedModal(popup, ImGuiWindowFlags.NoScrollbar))
         {
             Close();
             return;
@@ -289,47 +288,34 @@ internal sealed class RestockPlanEditor
             ImGui.EndDisabled();
     }
 
+    /// <summary>Item search; picking a suggestion (click, or Enter/Tab on the highlighted one) adds it at once.</summary>
     private void DrawRestockDraftAdd(RestockPlanDraft draft)
     {
-        ImGui.SetNextItemWidth(260);
-        if (ImGui.InputTextWithHint("##RQRestockItemName", "Add item by name", ref restockItemSearch, 96))
-            selectedRestockChoice = null;
-        if (restockItemSearch.Trim().Length >= 2 && selectedRestockChoice is null)
-        {
-            foreach (var choice in searchItems(restockItemSearch, 5))
-                if (ImGui.Selectable(
-                        $"{choice.Label}##restockchoice{choice.ItemId}",
-                        false,
-                        ImGuiSelectableFlags.DontClosePopups))
-                {
-                    selectedRestockChoice = choice;
-                    restockItemSearch = choice.Name;
-                }
-        }
-        if (selectedRestockChoice is null)
+        if (!DalamudSuggestionInputRenderer.Draw(
+                "RQRestockItemName",
+                restockItemInput,
+                restockSuggestions.For(restockItemInput.Text),
+                260,
+                "Add item by name",
+                8,
+                out var choice) ||
+            choice is null)
             return;
-        ImGui.SameLine();
-        if (ImGui.Button("Add item##restockdraft"))
+        var existing = draft.Items.FirstOrDefault(item =>
+            item.ItemId == choice.ItemId && item.Quality == ItemQualityPolicy.Any);
+        if (existing is null)
         {
-            var choice = selectedRestockChoice;
-            var existing = draft.Items.FirstOrDefault(item =>
-                item.ItemId == choice.ItemId && item.Quality == ItemQualityPolicy.Any);
-            if (existing is null)
+            existing = new RestockPlanItem
             {
-                existing = new RestockPlanItem
-                {
-                    ItemId = choice.ItemId,
-                    ItemName = choice.Name,
-                    TargetQuantity = 1,
-                };
-                draft.Items.Add(existing);
-            }
-            activeRestockItemId = existing.Id;
-            selectedRestockItemIds.Clear();
-            selectedRestockItemIds.SetSelected(existing.Id, true);
-            selectedRestockChoice = null;
-            restockItemSearch = string.Empty;
+                ItemId = choice.ItemId,
+                ItemName = choice.Name,
+                TargetQuantity = 1,
+            };
+            draft.Items.Add(existing);
         }
+        activeRestockItemId = existing.Id;
+        selectedRestockItemIds.Clear();
+        selectedRestockItemIds.SetSelected(existing.Id, true);
     }
 
     private void DrawRestockEditorBulkBar(RestockPlanDraft draft)
@@ -344,7 +330,7 @@ internal sealed class RestockPlanEditor
         ImGui.SameLine();
         ImGui.TextDisabled("Quality");
         ImGui.SameLine();
-        DrawOptionalEnumCombo("##restockbulkquality", ref bulkRestockQuality, Enum.GetValues<ItemQualityPolicy>(), QualityChoiceLabel);
+        DrawOptionalEnumCombo("##restockbulkquality", ref bulkRestockQuality, Enum.GetValues<ItemQualityPolicy>(), quality => TransferPresentation.QualityLabel(quality, "Any quality", " only"));
         ImGui.SameLine();
         ImGui.TextDisabled("Note");
         ImGui.SameLine();
@@ -490,10 +476,10 @@ internal sealed class RestockPlanEditor
     private static void DrawRestockDraftQuality(RestockPlanItem item)
     {
         ImGui.SetNextItemWidth(-1);
-        if (!ImGui.BeginCombo($"##draftrestockquality{item.Id}", QualityLabel(item.Quality)))
+        if (!ImGui.BeginCombo($"##draftrestockquality{item.Id}", TransferPresentation.QualityLabel(item.Quality)))
             return;
         foreach (var quality in Enum.GetValues<ItemQualityPolicy>())
-            if (ImGui.Selectable(QualityChoiceLabel(quality), item.Quality == quality))
+            if (ImGui.Selectable(TransferPresentation.QualityLabel(quality, "Any quality", " only"), item.Quality == quality))
                 item.Quality = quality;
         ImGui.EndCombo();
     }
@@ -509,19 +495,7 @@ internal sealed class RestockPlanEditor
     }
 
 
-    private static string QualityLabel(ItemQualityPolicy quality) => quality switch
-    {
-        ItemQualityPolicy.NqOnly => "NQ",
-        ItemQualityPolicy.HqOnly => "HQ",
-        _ => "Any",
-    };
 
-    private static string QualityChoiceLabel(ItemQualityPolicy quality) => quality switch
-    {
-        ItemQualityPolicy.NqOnly => "NQ only",
-        ItemQualityPolicy.HqOnly => "HQ only",
-        _ => "Any quality",
-    };
 
     public void Close()
     {
@@ -532,7 +506,7 @@ internal sealed class RestockPlanEditor
         restockEditorVisible = false;
         selectedRestockItemIds.Clear();
         activeRestockItemId = null;
-        selectedRestockChoice = null;
+        restockItemInput.Text = string.Empty;
         restockEditorError = string.Empty;
     }
 

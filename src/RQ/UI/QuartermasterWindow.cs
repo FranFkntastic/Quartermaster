@@ -9,6 +9,8 @@ using Dalamud.Utility;
 using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.Automation.Vendors;
 using Franthropy.Dalamud.Automation.Vendors.Coordination;
+using Franthropy.Dalamud.UI.Layout;
+using Franthropy.Dalamud.UI.Windows;
 using Lumina.Excel.Sheets;
 using RQ.Automation;
 using RQ.Domain;
@@ -31,7 +33,7 @@ public sealed class QuartermasterWindow : Window
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
     private readonly AgentBridgeUiCaptureTransactionManager captureTransactions;
     private readonly WorkbenchState workbench = new();
-    private readonly RootConfirmationDialog confirmationDialog = new();
+    private readonly DalamudRootConfirmationDialog confirmationDialog = new("RQConfirm");
     private readonly OperationHistoryDialog historyDialog;
     private readonly ItemGroupWorkspace itemGroupWorkspace;
     private readonly RestockPlanEditor restockPlanEditor;
@@ -96,6 +98,7 @@ public sealed class QuartermasterWindow : Window
         this.runtimeSnapshots = runtimeSnapshots;
         this.dataManager = dataManager;
         this.reviewRegistry = reviewRegistry;
+        confirmationDialog.ControlSubmitted = RegisterConfirmationControl;
         marketRunPane = new(resolveWorkshopProject, configDirectory, marketImporter);
         var gameCatalog = new GameItemCatalog(dataManager, log);
         historyDialog = new(journal);
@@ -518,6 +521,17 @@ public sealed class QuartermasterWindow : Window
         confirmationDialog.Draw();
     }
 
+    /// <summary>Exposes the root confirmation's buttons to the agent bridge; invoking one answers on the next frame.</summary>
+    private void RegisterConfirmationControl(DalamudConfirmationControl control, DalamudConfirmationRequest request)
+    {
+        if (control == DalamudConfirmationControl.Confirm)
+            reviewRegistry.RegisterLastButton("quartermaster.confirm.accept", $"{request.ConfirmLabel}: {request.Title}", true,
+                confirmationDialog.QueueConfirm, request.Message);
+        else
+            reviewRegistry.RegisterLastButton("quartermaster.confirm.cancel", $"{request.CancelLabel}: {request.Title}", true,
+                confirmationDialog.QueueCancel, request.Message);
+    }
+
     private static ImGuiTabItemFlags TabFlags(bool requested) =>
         requested ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
 
@@ -624,16 +638,13 @@ public sealed class QuartermasterWindow : Window
         var message = listingSession.Error ?? (listingSession.ConflictCount > 0
             ? $"Listing Plan changed elsewhere · {listingSession.ConflictCount} conflicts resolved using your draft"
             : listingSession.MergedElsewhere ? "Listing Plan changed elsewhere · merged into your draft" : null);
-        var buttonWidth = ImGui.CalcTextSize("DiscardSave Listing Plan").X + ImGui.GetStyle().FramePadding.X * 4 + ImGui.GetStyle().ItemSpacing.X;
+        var buttonWidth = DalamudUiLayout.ButtonWidth("Discard") + ImGui.GetStyle().ItemSpacing.X + DalamudUiLayout.ButtonWidth("Save Listing Plan");
         var buttonX = ImGui.GetContentRegionMax().X - buttonWidth;
         if (message is not null)
         {
             ImGui.SameLine();
-            var available = Math.Max(0, buttonX - ImGui.GetCursorPosX() - ImGui.GetStyle().ItemSpacing.X);
-            var display = message;
-            while (display.Length > 0 && ImGui.CalcTextSize(display + "…").X > available) display = display[..^1];
-            if (display.Length < message.Length) display += "…";
-            ImGui.TextColored(ListingWorkspace.Color(ListingStateTone.Amber), display);
+            var display = DalamudUiLayout.ElideText(message, buttonX - ImGui.GetCursorPosX() - ImGui.GetStyle().ItemSpacing.X);
+            ImGui.TextColored(QuartermasterPalette.Amber, display);
             if (ImGui.IsItemHovered()) ImGui.SetTooltip(message);
         }
         ImGui.SameLine(buttonX);

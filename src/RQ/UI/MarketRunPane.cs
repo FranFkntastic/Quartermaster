@@ -1,8 +1,11 @@
+using Franthropy.Dalamud.UI.Drawing;
 using Franthropy.Dalamud.UI.Inputs;
 using System.Globalization;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Franthropy.Dalamud.AgentBridge;
+using Franthropy.Dalamud.UI.Layout;
+using Franthropy.Dalamud.UI.Windows;
 using Franthropy.FFXIV.Filtering;
 using Franthropy.Filtering.Evaluation;
 using RQ.Domain;
@@ -132,7 +135,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
 
     private static void Notice(string text)
     {
-        ImGui.PushStyleColor(ImGuiCol.Text, ListingWorkspace.Color(ListingStateTone.Amber));
+        ImGui.PushStyleColor(ImGuiCol.Text, QuartermasterPalette.Amber);
         ImGui.TextWrapped(text);
         ImGui.PopStyleColor();
     }
@@ -154,16 +157,16 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         if (reason is not null && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) ImGui.SetTooltip(reason);
 
         ImGui.SameLine(0, 16);
-        DrawStat(ToList(out var listTooltip), "to list", ListingWorkspace.Color(ListingStateTone.Run), listTooltip);
+        DrawStat(ToList(out var listTooltip), "to list", QuartermasterPalette.Run, listTooltip);
         ImGui.SameLine(0, 22);
-        DrawStat(stowKnown && run.IsComplete ? run.StowUnits.ToString("N0") : "—", "to stow", ListingWorkspace.Color(ListingStateTone.Green), null);
+        DrawStat(stowKnown && run.IsComplete ? run.StowUnits.ToString("N0") : "—", "to stow", QuartermasterPalette.Green, null);
         ImGui.SameLine(0, 22);
         DrawStat(run.IsComplete ? run.CraftQueue.Sum(l => (long)l.Quantity).ToString("N0") : "—", "to craft",
-            ListingWorkspace.Color(ListingStateTone.Amber), null);
+            QuartermasterPalette.Amber, null);
         if (reorganizeRetainers && stowKnown && run.MoveUnits > 0)
         {
             ImGui.SameLine(0, 22);
-            DrawStat(run.MoveUnits.ToString("N0"), "to move", ListingWorkspace.Color(ListingStateTone.Info), null);
+            DrawStat(run.MoveUnits.ToString("N0"), "to move", QuartermasterPalette.Info, null);
         }
         var statsRight = ImGui.GetItemRectMax().X;
 
@@ -292,7 +295,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         if (target > 0)
         {
             var barTop = top + line + 4;
-            draw.AddRectFilled(new Vector2(origin.X, barTop), new Vector2(origin.X + width, barTop + 6), ImGui.GetColorU32(SegmentBar.Empty));
+            draw.AddRectFilled(new Vector2(origin.X, barTop), new Vector2(origin.X + width, barTop + 6), ImGui.GetColorU32(DalamudSegmentBarStyle.Default.Empty));
             var fraction = Math.Clamp((float)posted / target, 0, 1);
             if (fraction > 0)
                 draw.AddRectFilled(new Vector2(origin.X, barTop), new Vector2(origin.X + (width * fraction), barTop + 6),
@@ -316,13 +319,13 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         var line = ImGui.GetTextLineHeightWithSpacing();
         ImGui.SetCursorPosY(top + Math.Max(0, (height - line - ImGui.GetTextLineHeight()) / 2));
         ImGui.PushTextWrapPos(0);
-        ImGui.TextColored(ListingWorkspace.Color(ListingStateTone.Amber), headline);
+        ImGui.TextColored(QuartermasterPalette.Amber, headline);
         ImGui.PopTextWrapPos();
         ImGui.TextDisabled($"Last run stopped here · {When(result.StartedAtUtc)}");
         ImGui.EndGroup();
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(string.Join("\n", unconfirmed.Select(m => $"{m.Label}: {m.Detail}")));
 
-        if (ImGui.BeginPopup(AcknowledgePopup))
+        if (DalamudOwnedPopup.BeginOpaquePopup(AcknowledgePopup))
         {
             ImGui.TextWrapped($"Quartermaster couldn't confirm {unconfirmed.Length} item move(s). Check your retainer and inventory in game. New runs stay blocked until you confirm. Nothing will be retried automatically; the summary stays in Market run history.");
             foreach (var move in unconfirmed) ImGui.TextWrapped($"{move.Label}: {move.Detail}");
@@ -387,7 +390,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         var showGoesTo = width >= GoesToColumnWidth;
         var showListed = width >= ListedColumnWidth;
         var layout = new RowLayout(showGoesTo ? 80 : 60, width < ReserveBarWidth);
-        var listedBar = SegmentBar.Width(40);
+        var listedBar = DalamudSegmentBar.MeasureWidth(40);
         var listedWidth = listedBar + 6 + ImGui.CalcTextSize("000/000").X;
         var craftWidth = Math.Max(ImGui.CalcTextSize("Craft").X, ImGui.CalcTextSize("0,000").X);
         if (!ImGui.BeginTable("RQMarketRunItems", 3 + (showListed ? 1 : 0) + (showGoesTo ? 1 : 0),
@@ -462,8 +465,8 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         if (showListed) { ImGui.TableSetColumnIndex(column++); ImGui.TableHeader("Listed"); }
         ImGui.TableSetColumnIndex(column++);
         var reserveCell = Header("Reserve");
-        var stays = ListingWorkspace.Color(ListingStateTone.Green);
-        var listings = ListingWorkspace.Color(ListingStateTone.Run);
+        var stays = QuartermasterPalette.Green;
+        var listings = QuartermasterPalette.Run;
         var keyWidth = ImGui.CalcTextSize("stays").X + ImGui.CalcTextSize("to listings").X + 44;
         if (reserveCell.Width - reserveCell.Label >= keyWidth)
         {
@@ -517,9 +520,9 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
     private void DrawListed(MarketRunItem item, float barWidth)
     {
         var inPlace = MarketRunPresentation.InPlaceUnits(run, item);
-        SegmentBar.Draw(barWidth, item.PlannedUnits,
-            (inPlace ?? 0, ListingWorkspace.Color(ListingStateTone.Green)),
-            (inPlace is null || !item.RefillUnits.IsKnown ? 0 : item.RefillUnits.Value, ListingWorkspace.Color(ListingStateTone.Run)));
+        DalamudSegmentBar.Draw(barWidth, item.PlannedUnits,
+            (inPlace ?? 0, QuartermasterPalette.Green),
+            (inPlace is null || !item.RefillUnits.IsKnown ? 0 : item.RefillUnits.Value, QuartermasterPalette.Run));
         ImGui.SameLine(0, 6);
         ImGui.AlignTextToFramePadding();
         ImGui.TextUnformatted($"{(inPlace is { } units ? units.ToString("N0") : "—")}/{item.PlannedUnits:N0}");
@@ -530,10 +533,10 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         public RowLayout(float bar, bool compact)
         {
             Compact = compact;
-            Bar = SegmentBar.Width(bar);
+            Bar = DalamudSegmentBar.MeasureWidth(bar);
             Number = ImGui.CalcTextSize("0,000").X;
             Of = ImGui.CalcTextSize("of").X;
-            Input = ImGui.CalcTextSize("00,000").X + (ImGui.GetStyle().FramePadding.X * 2);
+            Input = DalamudUiLayout.ButtonWidth("00,000");
             Over = ImGui.CalcTextSize("+0,000").X;
             Width = compact ? Number + 4 + Of + 4 + Input : Bar + 7 + Number + 4 + Of + 4 + Input + 5 + Over;
         }
@@ -556,9 +559,9 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         var total = units > 0 ? units : stays + listing;
         if (!layout.Compact)
         {
-            SegmentBar.Draw(layout.Bar, known ? total : 0,
-                (Math.Min(stays, total), ListingWorkspace.Color(ListingStateTone.Green)),
-                (Math.Min(listing, Math.Max(0, total - stays)), ListingWorkspace.Color(ListingStateTone.Run)));
+            DalamudSegmentBar.Draw(layout.Bar, known ? total : 0,
+                (Math.Min(stays, total), QuartermasterPalette.Green),
+                (Math.Min(listing, Math.Max(0, total - stays)), QuartermasterPalette.Run));
             ImGui.SameLine(0, 7);
         }
         var number = known ? stays.ToString("N0") : "—";
@@ -578,7 +581,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         if (!layout.Compact && known && stays > units)
         {
             ImGui.SameLine(0, 5);
-            ImGui.TextColored(ListingWorkspace.Color(ListingStateTone.Green), $"+{stays - units:N0}");
+            ImGui.TextColored(QuartermasterPalette.Green, $"+{stays - units:N0}");
         }
     }
 
@@ -590,7 +593,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         ImGui.AlignTextToFramePadding();
         ImGui.SetCursorPosX(ImGui.GetCursorPosX() + Math.Max(0, ImGui.GetContentRegionAvail().X - ImGui.CalcTextSize(text).X));
         if (!known || noProject) ImGui.TextDisabled(text);
-        else ImGui.TextColored(ListingWorkspace.Color(ListingStateTone.Amber), text);
+        else ImGui.TextColored(QuartermasterPalette.Amber, text);
         if (!ImGui.IsItemHovered()) return;
         if (!known) { if (item.CraftUnits.UnknownReason is { } why) ImGui.SetTooltip(why); }
         else if (noProject) ImGui.SetTooltip("No workshop project; not included in the export.");
@@ -604,7 +607,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         ImGui.AlignTextToFramePadding();
         if (stowByItem.GetValueOrDefault((item.ItemId, item.Quality)) is var stow and > 0 && run.IsComplete)
         {
-            ImGui.TextColored(ListingWorkspace.Color(ListingStateTone.Run), $"{stow:N0} →");
+            ImGui.TextColored(QuartermasterPalette.Run, $"{stow:N0} →");
             ImGui.SameLine(0, 5);
         }
         if (OpenPlacement is not { } openPlacement)
@@ -632,16 +635,15 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         var width = ImGui.GetContentRegionAvail().X;
         var wide = width >= ListedColumnWidth;
         ImGui.AlignTextToFramePadding();
-        ImGui.TextColored(ListingWorkspace.Color(ListingStateTone.Amber),
+        ImGui.TextColored(QuartermasterPalette.Amber,
             run.IsComplete ? run.CraftQueue.Sum(l => (long)l.Quantity).ToString("N0") : "—");
         ImGui.SameLine(0, 4);
         ImGui.TextDisabled(wide ? $"to craft · {run.CraftQueue.Count:N0} items" : "to craft");
         var leftEnd = ImGui.GetItemRectMax().X;
 
-        var pad = ImGui.GetStyle().FramePadding.X * 2;
         var spacing = ImGui.GetStyle().ItemSpacing.X;
-        float ButtonWidth(string label) => ImGui.CalcTextSize(label).X + pad;
-        var buttons = ButtonWidth("Copy") + spacing + (wide ? ButtonWidth("Save…") + spacing : 0) + ButtonWidth("Send to MarketMafioso");
+        var buttons = DalamudUiLayout.ButtonWidth("Copy") + spacing + (wide ? DalamudUiLayout.ButtonWidth("Save…") + spacing : 0) +
+                      DalamudUiLayout.ButtonWidth("Send to MarketMafioso");
         if (origin.X + width - buttons >= leftEnd + 12) ImGui.SameLine(origin.X + width - buttons - ImGui.GetWindowPos().X + ImGui.GetScrollX());
         ImGui.BeginDisabled(!run.IsComplete || export.Json is null);
         if (ImGui.Button("Copy##RQMarketRunCopy")) { ImGui.SetClipboardText(export.Json!); status = "Craft queue copied."; }
@@ -670,5 +672,5 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         { status = $"Could not save craft queue: {ex.Message}"; }
     }
 
-    private static string Label(string name, ItemQualityPolicy quality) => $"{name} {(quality == ItemQualityPolicy.HqOnly ? "HQ" : "NQ")}";
+    private static string Label(string name, ItemQualityPolicy quality) => $"{name} {TransferPresentation.QualityLabel(quality, anyLabel: "NQ")}";
 }

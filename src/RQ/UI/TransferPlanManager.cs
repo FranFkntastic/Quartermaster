@@ -1,6 +1,8 @@
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Franthropy.Dalamud.AgentBridge;
+using Franthropy.Dalamud.UI.Feedback;
+using Franthropy.Dalamud.UI.Layout;
 using RQ.Domain;
 using RQ.Persistence;
 using RQ.Planning;
@@ -10,24 +12,18 @@ namespace RQ.UI;
 
 /// <summary>
 /// Lists the current character's saved Transfer Plans beside a detail pane for renaming,
-/// opening, duplicating, and deleting them. Mirrors the Item Groups workspace layout.
+/// opening, duplicating, and deleting them. Shares its layout with the Item Groups workspace.
 /// </summary>
 internal sealed class TransferPlanManager
 {
     private static readonly Vector4 ErrorColor = new(1f, .45f, .4f, 1f);
-    private static readonly Vector4 ArmedColor = new(.78f, .2f, .2f, 1f);
-    private static readonly Vector4 ArmedHoveredColor = new(.86f, .25f, .25f, 1f);
-    private static readonly Vector4 ArmedActiveColor = new(.92f, .3f, .3f, 1f);
-    private static readonly TimeSpan ArmWindow = TimeSpan.FromSeconds(4);
-    private static readonly TimeSpan UndoWindow = TimeSpan.FromSeconds(15);
 
     private sealed record DeletedPlan(
         OwnerScope Owner,
         StowagePlan Plan,
         int Index,
         IReadOnlyList<TargetPlanItem> Rules,
-        IReadOnlyList<TransferPlanListingLink> Links,
-        DateTime DeletedAtUtc);
+        IReadOnlyList<TransferPlanListingLink> Links);
 
     private readonly StateRepository state;
     private readonly QuartermasterRuntimeSnapshotSource runtimeSnapshots;
@@ -35,6 +31,8 @@ internal sealed class TransferPlanManager
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
     private readonly Func<QuartermasterRuntimeSnapshot, StowagePlan, TransferWorkbenchProjection> resolveProjection;
     private readonly Action<Guid> openPlan;
+    private readonly DalamudArmedConfirmButton<Guid> deleteButton = new();
+    private readonly DalamudTimedUndoStrip<DeletedPlan> undoStrip = new() { ExpireWhenHidden = true };
 
     private Guid? selectedPlanId;
     private string filter = string.Empty;
@@ -42,9 +40,6 @@ internal sealed class TransferPlanManager
     private string nameBuffer = string.Empty;
     private bool focusName;
     private bool nameEditing;
-    private Guid? armedPlanId;
-    private DateTime armedAtUtc;
-    private DeletedPlan? lastDeleted;
     private string error = string.Empty;
     private int lastDrawFrame = -1;
 
@@ -69,7 +64,7 @@ internal sealed class TransferPlanManager
     {
         if (planId is not null)
             selectedPlanId = planId;
-        armedPlanId = null;
+        deleteButton.Disarm();
         error = string.Empty;
     }
 
@@ -78,9 +73,10 @@ internal sealed class TransferPlanManager
         var frame = ImGui.GetFrameCount();
         if (lastDrawFrame != frame - 1)
         {
-            // The manager was hidden since the last frame: drop transient delete/undo state.
-            lastDeleted = null;
-            armedPlanId = null;
+            // The manager was hidden since the last frame: drop transient delete/undo state, even
+            // an arm or offer a bridge invocation made while nothing was drawn.
+            undoStrip.Clear();
+            deleteButton.Disarm();
         }
         lastDrawFrame = frame;
 
@@ -90,11 +86,10 @@ internal sealed class TransferPlanManager
             .GroupBy(rule => rule.StowagePlanId)
             .ToDictionary(group => group.Key, group => group.Count());
 
-        if (lastDeleted is { } deleted &&
-            (!deleted.Owner.Matches(owner) || DateTime.UtcNow - deleted.DeletedAtUtc > UndoWindow))
-            lastDeleted = null;
-        if (armedPlanId is not null && (armedPlanId != selectedPlanId || DateTime.UtcNow - armedAtUtc > ArmWindow))
-            armedPlanId = null;
+        if (undoStrip.TryPeek(out var deleted) && !deleted.Owner.Matches(owner))
+            undoStrip.Clear();
+        if (deleteButton.TryGetArmedKey(out var armedId) && armedId != selectedPlanId)
+            deleteButton.Disarm();
         if (selectedPlanId is null || plans.All(plan => plan.Id != selectedPlanId))
         {
             selectedPlanId = plans.FirstOrDefault(plan => plan.Id == workbench.SelectedStowagePlanId)?.Id
@@ -102,28 +97,14 @@ internal sealed class TransferPlanManager
         }
         var selected = plans.FirstOrDefault(plan => plan.Id == selectedPlanId);
 
-        var flags = ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.Resizable |
-                    ImGuiTableFlags.SizingStretchProp;
-        if (!ImGui.BeginTable(
-                "RQTransferPlanManager",
-                2,
-                flags,
-                new Vector2(0, Math.Max(260, ImGui.GetContentRegionAvail().Y - ImGui.GetStyle().ItemSpacing.Y))))
-            return;
-
-        ImGui.TableSetupColumn("Plans", ImGuiTableColumnFlags.WidthFixed, 210);
-        ImGui.TableSetupColumn("Detail", ImGuiTableColumnFlags.WidthStretch, 1f);
-        ImGui.TableNextRow();
-        ImGui.TableNextColumn();
-        if (ImGui.BeginChild("RQTransferPlanManagerList", Vector2.Zero, false))
-            DrawList(owner, plans, lineCounts);
-        ImGui.EndChild();
-
-        ImGui.TableNextColumn();
-        if (ImGui.BeginChild("RQTransferPlanManagerDetail", Vector2.Zero, false) && selected is not null)
-            DrawDetail(runtime, selected);
-        ImGui.EndChild();
-        ImGui.EndTable();
+        MasterDetailPane.Draw(
+            "RQTransferPlanManager",
+            () => DrawList(owner, plans, lineCounts),
+            () =>
+            {
+                if (selected is not null)
+                    DrawDetail(runtime, selected);
+            });
     }
 
     // ---- List -----------------------------------------------------------------------------
@@ -131,15 +112,12 @@ internal sealed class TransferPlanManager
     private void DrawList(OwnerScope owner, IReadOnlyList<StowagePlan> plans, IReadOnlyDictionary<Guid, int> lineCounts)
     {
         var stable = owner.HasStableIdentity;
-        ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##transferplanfilter", "Filter plans", ref filter, 80);
-        ImGui.Separator();
+        MasterDetailPane.DrawFilter("##transferplanfilter", "Filter plans", ref filter);
 
-        var footerHeight = (ImGui.GetFrameHeightWithSpacing() * 2f) + ImGui.GetStyle().ItemSpacing.Y + 2;
-        if (ImGui.BeginChild("RQTransferPlanManagerRows", new Vector2(0, -footerHeight), false))
+        MasterDetailPane.DrawRows("RQTransferPlanManagerRows", 2, () =>
         {
-            if (lastDeleted is { } deleted && stable)
-                DrawUndoRow(deleted);
+            if (stable)
+                DrawUndoStrip();
 
             var needle = filter.Trim();
             StowagePlanKind? section = null;
@@ -156,13 +134,11 @@ internal sealed class TransferPlanManager
                 }
                 DrawPlanRow(plan, lineCounts.GetValueOrDefault(plan.Id));
             }
-        }
-        ImGui.EndChild();
+        });
 
-        ImGui.Separator();
         if (!stable)
             return;
-        if (ImGui.Button("+ New transfer plan##transferplanmanager", new Vector2(-1, 0)))
+        if (MasterDetailPane.FooterButton("+ New transfer plan##transferplanmanager"))
             NewPlan(owner, StowagePlanKind.Transfer);
         reviewRegistry.RegisterLastButton(
             "quartermaster.transfer.plans.new",
@@ -170,7 +146,7 @@ internal sealed class TransferPlanManager
             true,
             () => NewPlan(runtimeSnapshots.Current.Owner, StowagePlanKind.Transfer),
             "Available");
-        if (ImGui.Button("+ New courier plan##transferplanmanager", new Vector2(-1, 0)))
+        if (MasterDetailPane.FooterButton("+ New courier plan##transferplanmanager"))
             NewPlan(owner, StowagePlanKind.Courier);
         reviewRegistry.RegisterLastButton(
             "quartermaster.transfer.plans.new-courier",
@@ -190,21 +166,12 @@ internal sealed class TransferPlanManager
     private void DrawPlanRow(StowagePlan plan, int lineCount)
     {
         var selected = plan.Id == selectedPlanId;
-        var rowHeight = ImGui.GetTextLineHeightWithSpacing() * 1.8f;
-        var nameWidth = ImGui.GetContentRegionAvail().X - (ImGui.GetStyle().FramePadding.X * 2f);
-        var display = Fit(plan.Name, nameWidth);
-        if (ImGui.Selectable(
-                $"{display}##transferplanmanager:{plan.Id}",
-                selected,
-                ImGuiSelectableFlags.AllowDoubleClick,
-                new Vector2(0, rowHeight)))
+        if (MasterDetailPane.Row($"transferplanmanager:{plan.Id}", plan.Name, selected, ImGuiSelectableFlags.AllowDoubleClick))
         {
             SelectPlan(plan.Id);
             if (ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
                 Open(plan.Id);
         }
-        if (display.Length != plan.Name.Length && ImGui.IsItemHovered())
-            ImGui.SetTooltip(plan.Name);
         var planId = plan.Id;
         reviewRegistry.RegisterLastButton(
             $"quartermaster.transfer.plans.select.{plan.Id:N}",
@@ -212,38 +179,41 @@ internal sealed class TransferPlanManager
             true,
             () => SelectPlan(planId),
             selected ? "Selected" : $"{PlanKindPresentation.Label(plan.Kind)} · {lineCount:N0} lines");
-        if (ImGui.IsItemVisible())
+        MasterDetailPane.RowDetail(() =>
         {
-            var cursor = ImGui.GetCursorPos();
-            ImGui.SetCursorPosY(cursor.Y - ImGui.GetTextLineHeightWithSpacing());
-            ImGui.Indent();
             ImGui.TextColored(PlanKindPresentation.Color(plan.Kind), PlanKindPresentation.Label(plan.Kind));
             ImGui.SameLine(0, 0);
             ImGui.TextDisabled($" · {lineCount:N0} line{(lineCount == 1 ? string.Empty : "s")}");
-            ImGui.Unindent();
-        }
+        });
     }
 
-    private void DrawUndoRow(DeletedPlan deleted)
+    private void DrawUndoStrip()
     {
-        const string undoLabel = "Undo##transferplanmanager";
-        var undoWidth = ImGui.CalcTextSize("Undo").X + (ImGui.GetStyle().FramePadding.X * 2f);
-        var labelWidth = ImGui.GetContentRegionAvail().X - undoWidth - ImGui.GetStyle().ItemSpacing.X;
-        var full = $"Deleted \"{deleted.Plan.Name}\"";
-        var text = Fit(full, labelWidth);
-        ImGui.AlignTextToFramePadding();
-        ImGui.TextDisabled(text);
-        if (text.Length != full.Length && ImGui.IsItemHovered())
-            ImGui.SetTooltip(full);
-        ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - undoWidth));
-        if (ImGui.SmallButton(undoLabel))
-            Undo();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.transfer.plans.undo",
-            $"Restore the deleted Transfer Plan {deleted.Plan.Name}",
-            true,
-            Undo,
-            "Available");
+        if (!undoStrip.TryPeek(out var offered))
+            return;
+        var restoring = undoStrip.Draw(
+            "transferplanmanager-undo",
+            deleted => $"Deleted \"{deleted.Plan.Name}\"",
+            out var restored,
+            result =>
+            {
+                if (result == DalamudUndoStripResult.Undo)
+                    reviewRegistry.RegisterLastButton(
+                        "quartermaster.transfer.plans.undo",
+                        $"Restore the deleted Transfer Plan {offered.Plan.Name}",
+                        true,
+                        Undo,
+                        "Available");
+                else
+                    reviewRegistry.RegisterLastButton(
+                        "quartermaster.transfer.plans.undo-dismiss",
+                        $"Dismiss the undo offer for {offered.Plan.Name}",
+                        true,
+                        undoStrip.Clear,
+                        "Available");
+            });
+        if (restoring)
+            Restore(restored!);
         ImGui.Separator();
     }
 
@@ -341,12 +311,12 @@ internal sealed class TransferPlanManager
         var rule = row.Rule;
         ImGui.TableNextRow();
         ImGui.TableNextColumn();
-        var quality = QualityLabel(rule.Quality);
+        var quality = TransferPresentation.QualityLabel(rule.Quality, anyLabel: string.Empty);
         var suffix = quality.Length == 0 ? string.Empty : $" {quality}";
         if (!rule.Enabled)
             suffix += " · paused";
         var full = rule.ItemName + suffix;
-        var display = Fit(full, ImGui.GetContentRegionAvail().X);
+        var display = DalamudUiLayout.ElideText(full, ImGui.GetContentRegionAvail().X);
         if (rule.Enabled)
             ImGui.TextUnformatted(display);
         else
@@ -359,7 +329,7 @@ internal sealed class TransferPlanManager
         var destination = rule.Courier is { } route
             ? $"{CourierSession.Side(runtime, route.SourceCharacter ?? row.Owner, route.SourceRetainerId, includeOwner: true)} → {CourierSession.Destination(runtime, route.Character, rule.Routing, includeOwner: true)}"
             : StowTo(runtime, rule.Routing);
-        var shown = Fit(destination, ImGui.GetContentRegionAvail().X);
+        var shown = DalamudUiLayout.ElideText(destination, ImGui.GetContentRegionAvail().X);
         ImGui.TextUnformatted(shown);
         if (shown.Length != destination.Length && ImGui.IsItemHovered())
             ImGui.SetTooltip(destination);
@@ -390,7 +360,7 @@ internal sealed class TransferPlanManager
         if (!stable)
             return;
 
-        UiLayout.SameLineIfFits("Duplicate");
+        DalamudUiLayout.SameLineIfFits("Duplicate");
         if (ImGui.Button("Duplicate##transferplanmanager"))
             DuplicatePlan(owner, planId);
         reviewRegistry.RegisterLastButton(
@@ -400,29 +370,17 @@ internal sealed class TransferPlanManager
             () => DuplicatePlan(runtimeSnapshots.Current.Owner, planId),
             "Available");
 
-        var armed = armedPlanId == planId;
-        var deleteLabel = armed ? "Delete?###transferplanmanagerdelete" : "Delete###transferplanmanagerdelete";
-        UiLayout.SameLineIfFits(deleteLabel);
-        if (armed)
-        {
-            ImGui.PushStyleColor(ImGuiCol.Button, ArmedColor);
-            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, ArmedHoveredColor);
-            ImGui.PushStyleColor(ImGuiCol.ButtonActive, ArmedActiveColor);
-        }
-        var clicked = ImGui.Button(deleteLabel);
-        if (armed)
-            ImGui.PopStyleColor(3);
-        var hovered = ImGui.IsItemHovered();
+        const string deleteLabel = "Delete";
+        const string armedLabel = "Delete?";
+        DalamudUiLayout.SameLineIfFits(deleteButton.IsArmed(planId) ? armedLabel : deleteLabel);
+        if (deleteButton.Draw("transferplanmanagerdelete", planId, deleteLabel, armedLabel))
+            Delete(owner, planId);
         reviewRegistry.RegisterLastButton(
             "quartermaster.transfer.plans.delete",
             $"Delete Transfer Plan {plan.Name} (invoke twice)",
             true,
             () => PressDelete(runtimeSnapshots.Current.Owner, planId),
-            armed ? "Armed: invoke again to delete" : "Invoke once to arm, again to delete");
-        if (clicked)
-            PressDelete(owner, planId);
-        else if (armed && !hovered && (ImGui.IsMouseClicked(ImGuiMouseButton.Left) || ImGui.IsMouseClicked(ImGuiMouseButton.Right)))
-            armedPlanId = null;
+            deleteButton.IsArmed(planId) ? "Armed: invoke again to delete" : "Invoke once to arm, again to delete");
     }
 
     // ---- Actions --------------------------------------------------------------------------
@@ -432,13 +390,13 @@ internal sealed class TransferPlanManager
         if (selectedPlanId == planId)
             return;
         selectedPlanId = planId;
-        armedPlanId = null;
+        deleteButton.Disarm();
         error = string.Empty;
     }
 
     private void Open(Guid planId)
     {
-        armedPlanId = null;
+        deleteButton.Disarm();
         openPlan(planId);
     }
 
@@ -475,7 +433,7 @@ internal sealed class TransferPlanManager
     private void SelectWithRename(Guid planId)
     {
         selectedPlanId = planId;
-        armedPlanId = null;
+        deleteButton.Disarm();
         nameBufferPlanId = null;
         focusName = true;
         filter = string.Empty;
@@ -510,19 +468,14 @@ internal sealed class TransferPlanManager
         }
     }
 
+    /// <summary>The bridge's delete: the first invocation selects and arms the plan, the second deletes it.</summary>
     private void PressDelete(OwnerScope owner, Guid planId)
     {
         if (!owner.HasStableIdentity)
             return;
-        if (armedPlanId != planId || DateTime.UtcNow - armedAtUtc > ArmWindow)
-        {
-            selectedPlanId = planId;
-            armedPlanId = planId;
-            armedAtUtc = DateTime.UtcNow;
-            return;
-        }
-        armedPlanId = null;
-        Delete(owner, planId);
+        selectedPlanId = planId;
+        if (deleteButton.Press(planId))
+            Delete(owner, planId);
     }
 
     private void Delete(OwnerScope owner, Guid planId)
@@ -545,12 +498,12 @@ internal sealed class TransferPlanManager
                 StowagePlanCatalog.ClearStaleRecovery(document);
                 var scratch = StowagePlanCatalog.EnsureScratch(document, owner, plan.Kind);
                 var next = openPlanId == planId ? scratch.Id : openPlanId;
-                return (new DeletedPlan(owner with { }, plan, index, rules, links, DateTime.UtcNow), next);
+                return (new DeletedPlan(owner with { }, plan, index, rules, links), next);
             });
             workbench.SelectedStowagePlanId = nextOpen;
             if (deleted is null)
                 return;
-            lastDeleted = deleted;
+            undoStrip.Offer(deleted);
             selectedPlanId = NeighbourAfterDelete(owner, deleted.Plan);
             error = string.Empty;
         }
@@ -580,11 +533,15 @@ internal sealed class TransferPlanManager
         return after.Id != Guid.Empty ? after.Id : remaining[^1].Id;
     }
 
+    /// <summary>The bridge's undo: restores the offered plan if the offer is still live.</summary>
     private void Undo()
     {
-        if (lastDeleted is not { } deleted)
-            return;
-        lastDeleted = null;
+        if (undoStrip.TryTake(out var deleted))
+            Restore(deleted);
+    }
+
+    private void Restore(DeletedPlan deleted)
+    {
         try
         {
             var restored = state.Mutate(document =>
@@ -617,23 +574,4 @@ internal sealed class TransferPlanManager
             error = exception.Message;
         }
     }
-
-    // ---- Helpers --------------------------------------------------------------------------
-
-    private static string Fit(string text, float width)
-    {
-        if (width <= 0 || ImGui.CalcTextSize(text).X <= width)
-            return text;
-        var display = text;
-        while (display.Length > 1 && ImGui.CalcTextSize(display + "…").X > width)
-            display = display[..^1];
-        return display + "…";
-    }
-
-    private static string QualityLabel(ItemQualityPolicy quality) => quality switch
-    {
-        ItemQualityPolicy.NqOnly => "NQ",
-        ItemQualityPolicy.HqOnly => "HQ",
-        _ => string.Empty,
-    };
 }
