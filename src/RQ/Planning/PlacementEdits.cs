@@ -10,6 +10,34 @@ public static class PlacementEdits
 {
     public const ulong AnySpace = 0;
 
+    /// <summary>
+    /// The player's bags as a placement column (Courier Placement). Never a retainer id and
+    /// distinct from <see cref="AnySpace"/>; a courier route stores bags as a null retainer.
+    /// </summary>
+    public const ulong PlayerBags = ulong.MaxValue;
+
+    /// <summary>The placement column a courier route's destination retainer lands in (null is bags).</summary>
+    public static ulong CourierColumn(ulong? retainerId) => retainerId ?? PlayerBags;
+
+    /// <summary>The courier route retainer for a placement column (bags is null).</summary>
+    public static ulong? CourierRetainer(ulong column) => column == PlayerBags ? null : column;
+
+    /// <summary>
+    /// The retainer holding the most units (ties go to the lower id), limited to the candidates
+    /// when given; null when none holds any. Bags and Any space never count as a holder.
+    /// </summary>
+    public static ulong? CurrentHolder(IReadOnlyDictionary<ulong, int> holdings, IEnumerable<ulong>? candidates = null)
+    {
+        var allowed = candidates?.ToHashSet();
+        return holdings
+            .Where(entry => entry.Key != AnySpace && entry.Key != PlayerBags && entry.Value > 0 &&
+                            (allowed is null || allowed.Contains(entry.Key)))
+            .OrderByDescending(entry => entry.Value)
+            .ThenBy(entry => entry.Key)
+            .Select(entry => (ulong?)entry.Key)
+            .FirstOrDefault();
+    }
+
     /// <summary>1-based rank of the target in the destination order, or 0 when not listed.</summary>
     public static int Rank(StowageRoutingPolicy routing, ulong target)
     {
@@ -72,7 +100,7 @@ public static class PlacementEdits
     public static StowageRoutingPolicy WhereItLives(StowageRoutingPolicy routing, IReadOnlyDictionary<ulong, int> holdings)
     {
         var homes = holdings
-            .Where(entry => entry.Key != AnySpace && entry.Value > 0)
+            .Where(entry => entry.Key != AnySpace && entry.Key != PlayerBags && entry.Value > 0)
             .OrderByDescending(entry => entry.Value)
             .ThenBy(entry => entry.Key)
             .Select(entry => entry.Key)

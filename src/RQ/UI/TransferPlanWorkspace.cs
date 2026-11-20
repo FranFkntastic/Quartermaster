@@ -73,11 +73,13 @@ internal sealed class TransferPlanWorkspace
     private readonly DalamudTableProjection<TransferWorkbenchRow> transferWorkbenchTable;
     private readonly DalamudTableProjection<TransferWorkbenchRow> courierWorkbenchTable;
     private DalamudTableProjection<TransferWorkbenchRow>? drawingTable;
-    private readonly CourierPlacementMatrix courierPlacement;
+    private readonly PlacementMatrix<Guid> courierPlacement;
     /// <summary>The destination character the Courier Placement view shows; null picks the first targeted one.</summary>
     private OwnerScope? placementDestination;
     /// <summary>A destination picked from Courier Placement's + menu; it keeps the plan's other lines listed until another plan opens.</summary>
     private OwnerScope? placementAddedDestination;
+    /// <summary>The destination Courier Placement drew last frame, so picking it again keeps the row selection.</summary>
+    private OwnerScope? shownPlacementDestination;
     private readonly TableSelectionModel<Guid> selection = new();
     private Guid[]? drawingRowKeys;
     private IReadOnlyList<TransferWorkbenchRow>? drawingRowKeysSource;
@@ -153,7 +155,7 @@ internal sealed class TransferPlanWorkspace
         transferWorkbenchTable = CreateTable();
         courierWorkbenchTable = CreateCourierTable();
         placement = new PlacementMatrix<Guid>("quartermaster.transfer.placement", "Stow", reviewRegistry, allowConsolidation: true);
-        courierPlacement = new CourierPlacementMatrix("quartermaster.courier.placement", reviewRegistry);
+        courierPlacement = new PlacementMatrix<Guid>("quartermaster.courier.placement", "Send", reviewRegistry, fromHeader: "From");
     }
 
     public TransferPlanWorkspaceSnapshot Snapshot() =>
@@ -773,6 +775,7 @@ internal sealed class TransferPlanWorkspace
                 row.Rule.Routing.Consolidate ? GatherSummary(row.Line) : null))
             .ToArray();
         var columns = PlacementMatrixData.Columns(runtime, rows.Select(row => row.Routing));
+        DrawPlacementErrors(rows);
         placement.Draw(rows, rows, columns, changes =>
         {
             var routing = changes.ToDictionary(change => change.Key, change => change.Routing);
@@ -781,12 +784,37 @@ internal sealed class TransferPlanWorkspace
         });
     }
 
-    /// <summary>Opens Courier Placement on a destination character; null picks the plan's first.</summary>
-    private void OpenCourierPlacement(OwnerScope? destination)
+    /// <summary>
+    /// Opens Courier Placement on a destination character (null picks the plan's first), with
+    /// the given line selected so the selection bar acts on it straight away.
+    /// </summary>
+    private void OpenCourierPlacement(OwnerScope? destination, Guid? ruleId = null)
     {
         showPlacement = true;
         placementDestination = destination;
         placementAddedDestination = null;
+        courierPlacement.ClearSelection();
+        if (ruleId is { } id)
+            courierPlacement.Select(id);
+    }
+
+    /// <summary>Switches Courier Placement to another destination; the row selection belongs to the old one.</summary>
+    private void ShowCourierDestination(OwnerScope character)
+    {
+        if (shownPlacementDestination?.Matches(character) != true)
+            courierPlacement.ClearSelection();
+        placementDestination = character;
+    }
+
+    /// <summary>
+    /// Refusals from <see cref="MutateRules"/> for the shown rows, drawn above the matrix: the
+    /// matrix fills the remaining height, so anything below it would be clipped out of view.
+    /// </summary>
+    private void DrawPlacementErrors(IEnumerable<PlacementMatrixRow<Guid>> rows)
+    {
+        foreach (var row in rows)
+            if (lineErrors.TryGetValue(row.Key, out var error))
+                ImGui.TextColored(ErrorColor, $"{row.Label}: {error}");
     }
 
     /// <summary>The characters a plan's courier lines deliver to, in line order.</summary>
@@ -813,6 +841,7 @@ internal sealed class TransferPlanWorkspace
             ? chosen
             : targeted.FirstOrDefault() ?? placementAddedDestination;
         DrawDestinationBar(runtime, targeted, destination);
+        shownPlacementDestination = destination;
         if (destination is null)
             return;
 
@@ -823,29 +852,42 @@ internal sealed class TransferPlanWorkspace
                           (route.Character.Matches(destination) || (added && !(route.SourceCharacter ?? owner).Matches(destination))))
             .Select(row =>
             {
-                var route = row.Rule.Courier!;
+                var rule = row.Rule;
+                var route = rule.Courier!;
                 var targets = route.Character.Matches(destination);
-                return new CourierPlacementRow(
-                    row.Rule.Id,
-                    row.Rule.Quality == ItemQualityPolicy.Any ? row.Rule.ItemName : $"{row.Rule.ItemName} {QualityLabel(row.Rule.Quality)}",
-                    row.Rule.TargetQuantity,
-                    CourierSession.Side(runtime, route.SourceCharacter ?? owner, route.SourceRetainerId, includeOwner: true),
-                    targets,
-                    targets ? route.RetainerId : null,
-                    PlacementMatrixData.BagHoldings(runtime, row.Rule.ItemId, row.Rule.Quality, destination, stock),
-                    PlacementMatrixData.Holdings(runtime, row.Rule.ItemId, row.Rule.Quality, destination, stock),
-                    targets ? null : CourierSession.Side(runtime, route.Character, route.RetainerId, includeOwner: true));
+                // Bags sit in the holdings under their own column id, beside the retainers.
+                var holdings = PlacementMatrixData.Holdings(runtime, rule.ItemId, rule.Quality, destination, stock)
+                    .ToDictionary(entry => entry.Key, entry => entry.Value);
+                holdings[PlacementEdits.PlayerBags] = PlacementMatrixData.BagHoldings(runtime, rule.ItemId, rule.Quality, destination, stock);
+                return new PlacementMatrixRow<Guid>(
+                    rule.Id,
+                    rule.Id.ToString("N"),
+                    rule.Quality == ItemQualityPolicy.Any ? rule.ItemName : $"{rule.ItemName} {QualityLabel(rule.Quality)}",
+                    rule.TargetQuantity.ToString("N0"),
+                    rule.Routing,
+                    holdings)
+                {
+                    From = CourierSession.Side(runtime, route.SourceCharacter ?? owner, route.SourceRetainerId, includeOwner: true),
+                    Lands = targets ? PlacementEdits.CourierColumn(route.RetainerId) : null,
+                    Elsewhere = targets ? null : CourierSession.Side(runtime, route.Character, route.RetainerId, includeOwner: true),
+                };
             })
             .ToArray();
-        var referenced = rows.Where(row => row.Targeted && row.Assigned is not null).Select(row => row.Assigned!.Value);
-        var columns = PlacementMatrixData.Columns(runtime, [], destination, referenced);
+        var referenced = rows
+            .Select(row => row.Lands)
+            .OfType<ulong>()
+            .Where(column => column != PlacementEdits.PlayerBags);
+        var columns = PlacementMatrixData.Columns(runtime, [], destination, referenced)
+            .Prepend(new PlacementMatrixColumn(PlacementEdits.PlayerBags, "Bags", courier.FreeBagSlots(destination)))
+            .ToArray();
         var target = destination;
-        courierPlacement.Draw(rows, columns, courier.FreeBagSlots(destination), CourierSession.CharacterLabel(destination),
-            (ruleId, container) => MutateRules(owner, plan.Id, [ruleId],
-                rule => rule.Courier = rule.Courier! with { Character = target with { }, RetainerId = container }));
-        foreach (var row in rows)
-            if (lineErrors.TryGetValue(row.Key, out var error))
-                ImGui.TextColored(ErrorColor, $"{row.Label}: {error}");
+        DrawPlacementErrors(rows);
+        courierPlacement.DrawSingleDestination(rows, rows, columns, CourierSession.CharacterLabel(destination), changes =>
+        {
+            var landing = changes.ToDictionary(change => change.Key, change => PlacementEdits.CourierRetainer(change.Container));
+            return MutateRules(owner, plan.Id, landing.Keys.ToArray(),
+                rule => rule.Courier = rule.Courier! with { Character = target with { }, RetainerId = landing[rule.Id] });
+        });
     }
 
     /// <summary>One pill per destination character the plan delivers to, then + for any other known character.</summary>
@@ -867,7 +909,7 @@ internal sealed class TransferPlanWorkspace
                 ImGui.PushStyleColor(ImGuiCol.Button, style.Colors[(int)ImGuiCol.ButtonActive]);
             var pick = character;
             if (ImGui.Button(label))
-                placementDestination = pick;
+                ShowCourierDestination(pick);
             if (selectedPill)
                 ImGui.PopStyleColor();
             reviewRegistry.RegisterLastSelectable(
@@ -875,7 +917,7 @@ internal sealed class TransferPlanWorkspace
                 $"Place lines going to {character.CharacterName}",
                 true,
                 selectedPill,
-                () => placementDestination = pick,
+                () => ShowCourierDestination(pick),
                 selectedPill ? "Selected" : "Available");
         }
 
@@ -893,7 +935,7 @@ internal sealed class TransferPlanWorkspace
         void Add(OwnerScope character)
         {
             placementAddedDestination = character;
-            placementDestination = character;
+            ShowCourierDestination(character);
         }
         foreach (var other in others)
         {
@@ -1898,7 +1940,7 @@ internal sealed class TransferPlanWorkspace
         {
             DrawCourierRoute(row, lineRoute);
             if (ImGui.Selectable($"Placement · {CourierSession.CharacterLabel(lineRoute.Character)}"))
-                OpenCourierPlacement(lineRoute.Character);
+                OpenCourierPlacement(lineRoute.Character, rule.Id);
         }
         else
             DrawStorageSourcing(row);
