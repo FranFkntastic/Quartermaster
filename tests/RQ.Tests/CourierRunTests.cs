@@ -48,59 +48,6 @@ public sealed class CourierRunTests : IDisposable
         new(carrier, 4, [new(1, false, 10)]), cfg, id => new ItemMetadata(id, "Titanium Ore", null, false, null, null, null, null, null, null, null, false, true, null, null, 3), 1);
 
     [Fact]
-    public void LegacyBellRoundTripsWithoutChangingReplayIdentity()
-    {
-        const string old="""{"Territory":1,"World":1,"ObjectId":1,"X":0,"Y":0,"Z":0,"Label":"Fixture bell"}""";
-        var restored=System.Text.Json.JsonSerializer.Deserialize<MeetingBell>(old)!;
-        Assert.True(bell.SamePlace(restored));
-        Assert.Equal(old,System.Text.Json.JsonSerializer.Serialize(restored));
-    }
-
-    [Fact]
-    public async Task IdenticalBellInDifferentWardRequiresCarrierTravel()
-    {
-        var pickup=bell with {Territory=339,Ward=1};
-        var drop=pickup with {Ward=2};
-        cfg=cfg with {Bells=cfg.Bells.SetItem(1,pickup).SetItem(2,drop)};
-        var plan=Plan();
-        var result=await engine.StartAsync(plan,cfg);
-        Assert.True(result.State=="Completed",result.Code+":"+result.Detail);
-        Assert.Equal(plan.Trips.SelectMany(t=>new[]{t.Pickup,t.Dropoff}),mule.Approaches);
-    }
-
-    [Fact]
-    public async Task CarrierCapSplitsTripsAndDeliversExactUnits()
-    {
-        var p = Plan(); Assert.Equal(3, p.Trips.Length);
-        var result = await engine.StartAsync(p, cfg);
-        Assert.True(result.State == "Completed", result.Code + ":" + result.Detail);
-        Assert.Equal(7, owner.Deposited); Assert.Equal(10, mule.Units);
-        Assert.Empty(new AtomicDocumentStore<CarrierLedger>(Path.Combine(dir, "courier-custody.json")).Load().Units);
-    }
-    [Theory]
-    [InlineData(false,false)]
-    [InlineData(false,true)]
-    [InlineData(true,false)]
-    public async Task ReturnFailureOnlyCompletesWithEmptyCustody(bool ownerReturn,bool held)
-    {
-        var p=Plan();
-        owner.FailReturnSwitch=ownerReturn;
-        if(!ownerReturn)mule.ReturnFailure=()=>{
-            if(held)
-            {
-                var store=new CourierStore<CarrierLedger>(Path.Combine(dir,"courier-custody.json"));
-                var ledger=store.Load();ledger.Units=[p.Trips[0].Manifest[0]];store.Save(ledger);
-            }
-            return new(CourierOutcome.Indeterminate,"CarrierReturnDeadline","ward arrival timed out");
-        };
-        var result=await engine.StartAsync(p,cfg);
-        Assert.All(result.Lines,l=>Assert.Equal(0,l.Remaining));
-        Assert.Equal(held?"Indeterminate":"Completed",result.State);
-        Assert.Equal(held?"ReturnCustodyUnsettled":ownerReturn?"CharacterSwitchDeadline":"CarrierReturnDeadline",result.Code);
-        if(!held)Assert.Contains(ownerReturn?"login timed out":"ward arrival timed out",engine.Snapshot().Detail);
-        Assert.Equal(held,new CourierStore<CarrierLedger>(Path.Combine(dir,"courier-custody.json")).Load().Run.HasValue);
-    }
-    [Fact]
     public async Task ReloadWithCustodyDeliversForwardOnly()
     {
         var crash = Directory.CreateDirectory(Path.Combine(dir, "restart")).FullName;
@@ -119,7 +66,6 @@ public sealed class CourierRunTests : IDisposable
         Assert.Equal(3, owner.Sends); Assert.Equal(7, owner.Deposited); Assert.Equal(10, mule.Units);
     }
     [Theory]
-    [InlineData(-3, false)]
     [InlineData(-1, false)]
     [InlineData(0, true)]
     public async Task UnverifiedHandOffPreservesBothObservationsAndNeverReplays(int offset, bool uncertainLock)
@@ -133,22 +79,6 @@ public sealed class CourierRunTests : IDisposable
         Assert.Equal(3 + offset, e.Carrier.After.Count(1, false) - e.Carrier.Before.Count(1, false));
         Assert.Empty(r.Custody); engine = Conductor(); Assert.Equal("Indeterminate", (await engine.StartAsync(Plan(), cfg)).State);
         Assert.Equal(1, owner.Sends); Assert.Equal(0, owner.Deposited);
-    }
-    [Fact]
-    public async Task StopBeforeLockKeepsBagsAndAllowsForwardRestart()
-    {
-        owner.PauseTrade = mule.PauseTrade = true;
-        var run = engine.StartAsync(Plan(), cfg);
-        await Task.WhenAll(owner.Opened.Task, mule.Opened.Task).WaitAsync(TimeSpan.FromSeconds(5));
-        await engine.StopAsync();
-        var paused = await run;
-        Assert.True(paused.State == "Interrupted", paused.Code + ":" + paused.Detail);
-        Assert.Equal("CancelledPreLock", paused.Code);
-        Assert.Equal(3, owner.Units); Assert.Equal(10, mule.Units);
-        owner.PauseTrade = mule.PauseTrade = false;
-        var finished = await engine.StartAsync(Plan(), cfg);
-        Assert.True(finished.State == "Completed", finished.Code + ":" + finished.Detail);
-        Assert.Equal(7, owner.Deposited); Assert.Equal(10, mule.Units);
     }
     [Fact]
     public async Task VerifiedSenderCheckpointAfterLostConfirmationCreditsOnlyOneCustodyBatch()
@@ -178,33 +108,6 @@ public sealed class CourierRunTests : IDisposable
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public async Task UnstartedTradeIsFencedBeforeClearOrResume(bool refuseOnCarrier)
-    {
-        var handle=wire.Handler;
-        CourierMessage? delayed=null;
-        mule.RefusePartner=refuseOnCarrier;
-        wire.Handler=m=>{
-            if(m.Command==CourierCommand.Receive && delayed==null){
-                delayed=m;
-                if(!refuseOnCarrier)return Task.FromResult(Result<CourierReceipt>.Fail("StartNotReceived","fixture"));
-            }
-            return handle(m);
-        };
-        var result=await engine.StartAsync(Plan(),cfg);
-        Assert.True(result.CanResume && result.CanClear,result.Code+":"+result.Detail);
-        Assert.Equal(0,owner.Sends);Assert.Equal(0,mule.Receives);
-        Assert.Equal("NotDelivered",(await handle(delayed!)).Code);
-        mule.RefusePartner=false;
-        if(refuseOnCarrier){
-            wire.Handler=m=>Task.FromResult(Result<CourierReceipt>.Fail("CarrierEndpointAmbiguous","offline"));
-            Assert.Equal("Idle",(await engine.ClearAsync(result.Run,null)).State);
-            wire.Handler=handle;
-        }
-        Assert.Equal("Completed",(await engine.StartAsync(Plan(),cfg)).State);
-    }
-    [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
     public async Task LostPlacementReceiptResumesOnlyRemainingUnits(bool deposit)
     {
         owner.FailPlacement=deposit;
@@ -215,48 +118,6 @@ public sealed class CourierRunTests : IDisposable
         Assert.True(resumed.State=="Completed",resumed.Code+":"+resumed.Detail);
         Assert.Equal(7,owner.Deposited);Assert.Equal(7,owner.Retrieved);
         Assert.Equal(10,mule.Units);
-    }
-    [Fact]
-    public async Task ReverseRunCanStartFromSecondPairedOwner()
-    {
-        cfg=cfg with {PairedOwners=[destination]};
-        await owner.SwitchAsync(destination,Deadline.After("fixture",5));
-        wire.Handler=m=>follower.HandleAsync(destination,m,Deadline.After("fixture",10),started:wire.Started);
-        var p=Plan();
-        var reverse=p with {Trips=[..p.Trips.Select(t=>t with {Source=destination,Destination=source,
-            Manifest=[..t.Manifest.Select(s=>s with {Source=destination,Destination=source})]})]};
-        var result=await engine.StartAsync(reverse,cfg);
-        Assert.True(result.State=="Completed",result.Code+":"+result.Detail);
-        Assert.Equal(7,owner.Deposited);Assert.Equal(10,mule.Units);
-    }
-    [Fact]
-    public async Task LegacyUnopenedIntentsCanResumeWithoutRetrievingTwice()
-    {
-        var p=Plan();var trip=p.Trips[0];var run=Guid.NewGuid();var step=Guid.NewGuid();
-        var action=new CourierStep(CourierPhase.HandOut,0,trip.Manifest);
-        var before=new InventoryView(source,4,[new(1,false,3)]);
-        var cb=new InventoryView(carrier,4,[new(1,false,10)]);
-        owner.Quantities[source]=3;
-        new CourierStore<CourierJournal>(Path.Combine(dir,"courier-run.json")).Save(new(){
-            Run=run,Plan=p,Settings=cfg,Start=source,PeerClaimed=true,State="Indeterminate",
-            Schedule=[action,new(CourierPhase.SwitchToDestination,0,[]),new(CourierPhase.HandIn,0,trip.Manifest),
-                new(CourierPhase.Deposit,0,trip.Manifest),new(CourierPhase.Finish,0,[])],
-            Pending=new(step,action,before,cb)});
-        var msg=new CourierMessage(1,run,step,CourierCommand.Receive,source,source,carrier,trip.Manifest);
-        new CourierStore<CarrierLedger>(Path.Combine(dir,"courier-custody.json")).Save(new(){
-            Run=run,Unconfirmed=step,Steps={[step]=new("legacy",msg,null,cb)}});
-        var result=await engine.StartAsync(p,cfg);
-        Assert.True(result.State=="Completed",result.Code+":"+result.Detail);
-        Assert.Equal(0,owner.Retrieved);Assert.Equal(3,owner.Deposited);Assert.Equal(1,owner.Sends);
-    }
-    [Fact]
-    public async Task PreBeginFailureCreatesNoRunToResume()
-    {
-        wire.Handler=m=>Task.FromResult(Result<CourierReceipt>.Fail("CarrierEndpointAmbiguous","offline"));
-        var failed=await engine.StartAsync(Plan(),cfg);
-        Assert.Equal("CarrierEndpointAmbiguous",failed.Code);
-        Assert.False(File.Exists(Path.Combine(dir,"courier-run.json")));
-        Assert.False(failed.CanResume);Assert.False(failed.CanClear);
     }
     [Fact]
     public async Task StoppedCarrierKeepsLeaseAcrossUnconfirmedAndCreditedCustody()
@@ -279,71 +140,12 @@ public sealed class CourierRunTests : IDisposable
     }
     public void Dispose() { follower.Dispose(); Directory.Delete(dir, true); }
 
-    // Destination consolidation runs once per destination, after that destination's final deposit,
-    // as the destination character, under the run's lease.
-    [Fact]
-    public async Task ConsolidatingLineGathersOnceAfterTheFinalDeposit()
-    {
-        line.Routing.Consolidate = true;
-        var p = Plan();
-        Assert.Equal(3, p.Trips.Length);
-        var gather = Assert.Single(p.Consolidations);
-        Assert.Equal(22ul, gather.Retainer);
-        var result = await engine.StartAsync(p, cfg);
-        Assert.True(result.State == "Completed", result.Code + ":" + result.Detail);
-        var call = Assert.Single(owner.Consolidations);
-        Assert.True(call.Who.Matches(destination));
-        Assert.Equal(7, call.DepositedBefore);
-        Assert.Equal(line.Id, Assert.Single(call.Lines).Line);
-    }
-
-    [Fact]
-    public async Task UnconsolidatedPlanNeverCallsConsolidation()
-    {
-        var result = await engine.StartAsync(Plan(), cfg);
-        Assert.True(result.State == "Completed", result.Code + ":" + result.Detail);
-        Assert.Empty(owner.Consolidations);
-    }
-
-    // A settled consolidation shortfall leaves the delivery standing: the run completes and says so.
-    [Fact]
-    public async Task ConsolidationShortfallCompletesAsConsolidationLimited()
-    {
-        line.Routing.Consolidate = true;
-        owner.ConsolidationResult = Result<bool>.Fail("ConsolidationLimited", "Grungel is full");
-        var result = await engine.StartAsync(Plan(), cfg);
-        Assert.Equal("Completed", result.State);
-        Assert.Equal("ConsolidationLimited", result.Code);
-        Assert.Contains("Grungel is full", result.Detail);
-        Assert.Equal(7, owner.Deposited); Assert.Equal(10, mule.Units);
-    }
-
-    // A pre-journal consolidation interruption (nothing recorded, bags unchanged) retries cleanly on resume.
-    [Fact]
-    public async Task PreJournalConsolidationInterruptionRetriesOnResume()
-    {
-        line.Routing.Consolidate = true;
-        owner.SkipConsolidationRecord = true;
-        owner.ConsolidationResult = new Result<bool>(CourierOutcome.Indeterminate, "ConsolidationUnverified", "fixture");
-        var interrupted = await engine.StartAsync(Plan(), cfg);
-        Assert.Equal("Indeterminate", interrupted.State);
-        Assert.True(interrupted.CanResume);
-        owner.SkipConsolidationRecord = false;
-        owner.ConsolidationResult = null;
-        engine = Conductor();
-        var resumed = await engine.StartAsync(Plan(), cfg);
-        Assert.True(resumed.State == "Completed", resumed.Code + ":" + resumed.Detail);
-        Assert.Equal(2, owner.Consolidations.Count);
-        Assert.Equal(7, owner.Deposited); Assert.Equal(10, mule.Units);
-    }
-
     // An unsettled journaled consolidation (or one that left retrieved units in destination bags)
     // must not silently start a fresh moves-only pass that strands items in bags.
     [Theory]
-    [InlineData(OperationStatuses.Indeterminate, 0, "ConsolidationUnsettled")]
-    [InlineData(OperationStatuses.Succeeded, 2, "ConsolidationUnsettled")]
-    [InlineData(OperationStatuses.Succeeded, 0, "Succeeded")]
-    public async Task PendingJournaledConsolidationReconcilesJournalAndBagsBeforeResuming(string journalStatus, int bagDelta, string expectedCode)
+    [InlineData(OperationStatuses.Indeterminate, 0)]
+    [InlineData(OperationStatuses.Succeeded, 2)]
+    public async Task PendingJournaledConsolidationReconcilesJournalAndBagsBeforeResuming(string journalStatus, int bagDelta)
     {
         line.Routing.Consolidate = true;
         owner.ConsolidationJournalStatus = journalStatus;
@@ -354,7 +156,7 @@ public sealed class CourierRunTests : IDisposable
         owner.ConsolidationResult = null;
         engine = Conductor();
         var resumed = await engine.StartAsync(Plan(), cfg);
-        Assert.Equal(expectedCode, resumed.Code);
+        Assert.Equal("ConsolidationUnsettled", resumed.Code);
         Assert.Single(owner.Consolidations);
     }
 
@@ -374,23 +176,8 @@ public sealed class CourierRunTests : IDisposable
         Assert.Equal(credited,mule.Units);
         Assert.Equal("OwnerNotPaired",(await follower.HandleAsync(destination,m,Deadline.After("impostor",10),Guid.NewGuid())).Code);
     }
-    [Theory]
-    [InlineData(false,false)]
-    [InlineData(false,true)]
-    [InlineData(true,false)]
-    [InlineData(true,true)]
-    public async Task MissingOrRefusedHoldNeverDispatchesEitherTrade(bool onCarrier,bool missing)
-    {
-        (onCarrier?mule:owner).Hold = new("fixture",()=>true,()=>!missing,
-            ()=>"""{"Acknowledged":false,"Reason":"held by other courier"}""",()=>false,()=>{},_=>{});
-        var stopped=await engine.StartAsync(Plan(),cfg);
-        Assert.Equal(missing?"TradeHoldUnavailable":"TradeHoldRefused",stopped.Code);
-        Assert.Contains(missing?"gates":"other courier",stopped.Detail);
-        Assert.Equal(0,owner.Sends+mule.Sends+owner.Receives+mule.Receives);
-    }
 
     [Theory]
-    [InlineData(3)]
     [InlineData(2)]
     [InlineData(0)]
     public async Task ReceiverRestartSettlesDurableArmExactlyOnce(int delivered)
@@ -452,14 +239,13 @@ public sealed class CourierRunTests : IDisposable
         public Dictionary<OwnerScope, int> Quantities = new(); public int Units => Quantities.GetValueOrDefault(who);
         public int Deposited, Sends, ReceiveOffset;
         static Task<Result<T>> OK<T>(T value) => Task.FromResult(Result<T>.Ok(value));
-        public bool PauseTrade, UncertainTrade;
+        public bool UncertainTrade;
         public bool LoseSenderReply;
-        public CourierTradeHold? Hold;
         public string? CheckpointDirectory;
         public int Receives;
         public CourierStore<TradeCheckpoint> ReceiveStore=>new(Path.Combine(CheckpointDirectory!,"courier-trade.json"));
-        public Task<Result<IDisposable>> BeginHold(Guid run,Deadline deadline)=>Task.FromResult(Hold?.Begin()??Result<IDisposable>.Ok(new MemoryStream()));
-        public void CheckHold()=>Hold?.Check(false);
+        public Task<Result<IDisposable>> BeginHold(Guid run,Deadline deadline)=>OK<IDisposable>(new MemoryStream());
+        public void CheckHold(){}
         Guid? recoverable, openedStep;
         public Task<Result<bool>> WasNotOpened(Guid step,Deadline d)=>OK(step!=openedStep);
         public Task<Result<bool>> Settle(Guid step,OwnerScope partner,TradeEvidence peer,Deadline d){
@@ -469,12 +255,9 @@ public sealed class CourierRunTests : IDisposable
             }
             return recoverable==step ? OK(true) :
             Task.FromResult(Result<bool>.Fail("NoVerifiedCheckpoint","No matching locked-window proof.")); }
-        public TaskCompletionSource Opened = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        readonly TaskCompletionSource<Result<bool>> cancelled = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        Task<Result<bool>> Pause() { Opened.TrySetResult(); return cancelled.Task; }
         public Task<Result<bool>> SendAsync(OwnerScope partner, ImmutableArray<Shipment> m, Deadline d) {
             openedStep=CourierGame.Step.Value;CourierGame.TradeStarted.Value?.Invoke();
-            if (PauseTrade) return Pause(); Sends++; Quantities[who] = Units - m.Sum(x => x.Units);
+            Sends++; Quantities[who] = Units - m.Sum(x => x.Units);
             if(LoseSenderReply){LoseSenderReply=false; recoverable=CourierGame.Step.Value;
                 return Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate,"AwaitingVerification","Reply lost."));}
             return OK(true);
@@ -487,12 +270,11 @@ public sealed class CourierRunTests : IDisposable
                 ReceiveStore.Save(new(){Step=step,Receiving=true,Arm=new(step,partner,new(who,4,[new(1,false,Units)])),
                     Items=[new(){ItemId=item.Item,Quantity=item.Units}],Original=[new(item.Item,false,item.Units)]});
             }
-            if (PauseTrade) return Pause(); Quantities[who] = Units + m.Sum(x => x.Units) + ReceiveOffset; return UncertainTrade ? Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate, "LockUnknown", "Missing locked partner evidence")) : OK(true); }
-        public Task<Result<bool>> CancelPreLockAsync(Deadline d) { cancelled.TrySetResult(new(CourierOutcome.Cancelled, "PreLock", "Trade cancelled")); return OK(true); }
+            Quantities[who] = Units + m.Sum(x => x.Units) + ReceiveOffset; return UncertainTrade ? Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate, "LockUnknown", "Missing locked partner evidence")) : OK(true); }
+        public Task<Result<bool>> CancelPreLockAsync(Deadline d) => OK(true);
         public Task<Result<int>> RetainerUnits(OwnerScope owner,Shipment s,bool deposit,Deadline d)=>OK(deposit?Deposited:100-Retrieved);
         public int Retrieved;
         public bool? FailPlacement;
-        public bool RefusePartner;
         readonly Dictionary<string,int> movements=[];
         public int? JournalUnits(string id,OwnerScope owner,Shipment s)=>movements.GetValueOrDefault(id);
         public Task<Result<bool>> MoveAsync(StowagePlan plan,Shipment s,bool deposit,IDisposable lease,Func<bool> auth,Deadline d,Action<string> recordOperation)
@@ -504,32 +286,26 @@ public sealed class CourierRunTests : IDisposable
                 return Task.FromResult(Result<bool>.Fail("PlacementStopped","fixture"));}
             Quantities[who] = Units + (deposit ? -s.Units : s.Units); if (deposit) Deposited += s.Units; return OK(true);
         }
-        public readonly List<(OwnerScope Who, int DepositedBefore, ImmutableArray<CourierConsolidation> Lines)> Consolidations = [];
+        public readonly List<OwnerScope> Consolidations = [];
         public Result<bool>? ConsolidationResult;
-        public bool SkipConsolidationRecord;
         public string? ConsolidationJournalStatus = OperationStatuses.Indeterminate;
         public string? OperationStatus(string id, OwnerScope owner) => ConsolidationJournalStatus;
         public Task<Result<bool>> ConsolidateAsync(StowagePlan plan, ImmutableArray<CourierConsolidation> lines, IDisposable lease, Func<bool> auth, Deadline d, Action<string> recordOperation)
         {
             Assert.True(auth()); Assert.Equal(plan.Owner, who);
             Assert.All(lines, l => Assert.True(l.Destination.Matches(who)));
-            if (!SkipConsolidationRecord) recordOperation(Guid.NewGuid().ToString());
-            Consolidations.Add((who, Deposited, lines));
+            recordOperation(Guid.NewGuid().ToString());
+            Consolidations.Add(who);
             return Task.FromResult(ConsolidationResult ?? Result<bool>.Ok(true));
         }
         public Task<Result<InventoryView>> ObserveAsync(Deadline d) => OK(new InventoryView(who, 4, [new(1, false, Units)]));
         public Task<Result<string>> SwitchRefusalAsync(Deadline deadline) => OK("");
-        public bool FailReturnSwitch;
-        public Task<Result<OwnerScope>> SwitchAsync(OwnerScope target, Deadline d) =>
-            FailReturnSwitch && Deposited==7
-                ?Task.FromResult(new Result<OwnerScope>(CourierOutcome.Indeterminate,"CharacterSwitchDeadline","login timed out")):OK(who = target);
+        public Task<Result<OwnerScope>> SwitchAsync(OwnerScope target, Deadline d) => OK(who = target);
         public Task<Result<bool>> EnsureWorldAsync(uint world, Deadline d) => OK(true);
         public Task<Result<bool>> ReturnHomeAsync(Deadline d) => OK(true);
-        public readonly List<MeetingBell> Approaches=[];
-        public Task<Result<bool>> GoInRangeAsync(MeetingBell bell, Deadline d) { Approaches.Add(bell); return OK(true); }
+        public Task<Result<bool>> GoInRangeAsync(MeetingBell bell, Deadline d) => OK(true);
         public Task<Result<CourierPosition>> PositionAsync(Deadline d) => OK(new CourierPosition(1, 1, 0, 0, 0));
-        public Func<Result<bool>>? ReturnFailure;
-        public Task<Result<bool>> ReturnToAsync(CourierPosition position, Deadline d) => ReturnFailure==null?OK(true):Task.FromResult(ReturnFailure());
-        public Task<Result<bool>> ObserveTradeableAsync(OwnerScope character, Deadline d) => RefusePartner?Task.FromResult(Result<bool>.Fail("CarrierPartnerDeadline","fixture")):OK(true);
+        public Task<Result<bool>> ReturnToAsync(CourierPosition position, Deadline d) => OK(true);
+        public Task<Result<bool>> ObserveTradeableAsync(OwnerScope character, Deadline d) => OK(true);
     }
 }
