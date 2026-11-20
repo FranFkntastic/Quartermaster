@@ -3,16 +3,28 @@ using Dalamud.Bindings.ImGui;
 
 namespace RQ.UI;
 
+/// <summary>Quartermaster's semantic state colours, shared by every surface.</summary>
+internal static class QuartermasterPalette
+{
+    internal static readonly Vector4 Amber = new(1, .7f, .3f, 1);
+    internal static readonly Vector4 Green = new(.45f, .78f, .58f, 1);
+    internal static readonly Vector4 Info = new(.56f, .70f, .85f, 1);
+    internal static readonly Vector4 Run = new(.29f, .62f, .85f, 1);
+
+    internal static Vector4 Dim => ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled];
+
+    internal static Vector4 Tone(ListingStateTone tone) => tone switch
+    {
+        ListingStateTone.Amber => Amber,
+        ListingStateTone.Green => Green,
+        ListingStateTone.Info => Info,
+        ListingStateTone.Run => Run,
+        _ => Dim,
+    };
+}
+
 internal static class UiLayout
 {
-    /// <summary>Continues the current row when a button with this label still fits; otherwise wraps.</summary>
-    internal static void SameLineIfFits(string label)
-    {
-        ImGui.SameLine();
-        var needed = ImGui.CalcTextSize(label.Split("##")[0]).X + (ImGui.GetStyle().FramePadding.X * 2f);
-        if (ImGui.GetContentRegionAvail().X < needed) ImGui.NewLine();
-    }
-
     internal static readonly Vector4 Primary = new(.48f, .13f, .13f, 1f);
     internal static readonly Vector4 PrimaryHovered = new(.57f, .16f, .16f, 1f);
     internal static readonly Vector4 PrimaryActive = new(.64f, .19f, .19f, 1f);

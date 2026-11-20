@@ -3,7 +3,9 @@ using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.UI.Filtering;
+using Franthropy.Dalamud.UI.Layout;
 using Franthropy.Dalamud.UI.Tables;
+using Franthropy.Dalamud.UI.Windows;
 using Franthropy.FFXIV.Filtering;
 using Franthropy.Filtering.Evaluation;
 using RQ.Automation;
@@ -62,7 +64,7 @@ internal sealed class StockWorkspace
     private StockLookup? allLookup;
     private long prunedRevision = -1;
     private OwnerScope? selectionOwner;
-    private int selectionBarLines = 1;
+    private readonly DalamudSelectionBar selectionBar = new("RQStockSelectionBar");
     private int stockProjectionBuildCount;
     private int visibleStockCount;
     private int renderedStockRowCount;
@@ -443,7 +445,7 @@ internal sealed class StockWorkspace
         var context = queries.EnsureItemContext(sourceItems, viewedCharacter ?? projection.Owner, scopeKey, isEditing, runtime.PlanningRevision);
         var spacing = ImGui.GetStyle().ItemSpacing.X;
         var trailingWidth = SearchReference.ButtonWidth + spacing + ScopeComboWidth() + spacing +
-            ImGui.CalcTextSize("…").X + (ImGui.GetStyle().FramePadding.X * 2f) + spacing;
+            DalamudUiLayout.ButtonWidth("…") + spacing;
         var filterBeforeDraw = workbench.ItemFilterState.Expression;
         DalamudFilterAutocompleteRenderer.Draw(
             "RQStockWorkbench",
@@ -493,8 +495,7 @@ internal sealed class StockWorkspace
             ImGui.OpenPopup("RQStockOptions");
             optionsRequested = false;
         }
-        ImGui.SetNextWindowBgAlpha(1f);
-        if (ImGui.BeginPopup("RQStockOptions"))
+        if (DalamudOwnedPopup.BeginOpaquePopup("RQStockOptions"))
         {
             ImGui.TextDisabled("Included player storage");
             var includeCrystals = configuration.IncludeCrystals;
@@ -659,37 +660,17 @@ internal sealed class StockWorkspace
     private void DrawSelectionBar(QuartermasterRuntimeSnapshot runtime, VisibleItemIds visible, bool canSelectVisible)
     {
         var count = stockSelection.Count;
-        var hasSelection = count > 0;
-        var info = ListingWorkspace.Color(ListingStateTone.Info);
-        var background = Scale(info, hasSelection ? .16f : .09f, .96f);
-        var border = Scale(info, hasSelection ? .65f : .38f, 1f);
-        var barHeight = (ImGui.GetFrameHeightWithSpacing() * selectionBarLines) + 10f;
-        ImGui.PushStyleColor(ImGuiCol.ChildBg, background);
-        ImGui.PushStyleColor(ImGuiCol.Border, border);
-        ImGui.PushStyleVar(ImGuiStyleVar.ChildRounding, 2f);
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new Vector2(8f, 5f));
-        if (ImGui.BeginChild("RQStockSelectionBar", new Vector2(0f, barHeight), true,
-                ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse))
+        selectionBar.Draw(count, QuartermasterPalette.Info, hasSelection =>
         {
-            var top = ImGui.GetCursorPosY();
-            ImGui.AlignTextToFramePadding();
-            ImGui.TextColored(
-                hasSelection ? info : ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled],
-                hasSelection ? $"{count:N0} item{(count == 1 ? string.Empty : "s")} selected" : "No items selected");
             if (hasSelection && visible.CountSelected(stockSelection) is var visibleSelected && visibleSelected != count)
             {
                 var detail = $"{visibleSelected:N0} visible";
-                UiLayout.SameLineIfFits(detail);
+                DalamudUiLayout.SameLineIfFits(detail);
                 ImGui.AlignTextToFramePadding();
                 ImGui.TextDisabled(detail);
             }
             DrawSelectionActions(runtime, visible, canSelectVisible, hasSelection);
-            var lines = (int)MathF.Round((ImGui.GetCursorPosY() - top) / ImGui.GetFrameHeightWithSpacing());
-            selectionBarLines = Math.Max(1, lines);
-        }
-        ImGui.EndChild();
-        ImGui.PopStyleVar(2);
-        ImGui.PopStyleColor(2);
+        });
     }
 
     private void DrawSelectionActions(
@@ -699,7 +680,7 @@ internal sealed class StockWorkspace
         bool hasSelection)
     {
         var selectVisibleEnabled = canSelectVisible && visible.Ids.Length > 0;
-        UiLayout.SameLineIfFits("Select visible");
+        DalamudUiLayout.SameLineIfFits("Select visible");
         ImGui.BeginDisabled(!selectVisibleEnabled);
         if (ImGui.Button("Select visible"))
             SelectVisible();
@@ -718,7 +699,7 @@ internal sealed class StockWorkspace
             DrawOwnSelectionActions(runtime, hasSelection);
         DrawSendSelection(runtime, hasSelection);
 
-        UiLayout.SameLineIfFits("Clear");
+        DalamudUiLayout.SameLineIfFits("Clear");
         ImGui.BeginDisabled(!hasSelection);
         if (ImGui.Button("Clear"))
             ClearStockSelection();
@@ -734,7 +715,7 @@ internal sealed class StockWorkspace
     private void DrawOwnSelectionActions(QuartermasterRuntimeSnapshot runtime, bool hasSelection)
     {
         var canPlan = hasSelection && runtime.Owner.HasStableIdentity;
-        UiLayout.SameLineIfFits("Add to plan");
+        DalamudUiLayout.SameLineIfFits("Add to plan");
         ImGui.BeginDisabled(!canPlan);
         if (ImGui.Button("Add to plan"))
             AddSelectionToPlan(runtime);
@@ -746,7 +727,7 @@ internal sealed class StockWorkspace
             () => AddSelectionToPlan(runtimeSnapshots.Current),
             $"{stockSelection.Count:N0} selected");
 
-        UiLayout.SameLineIfFits("Add to item group");
+        DalamudUiLayout.SameLineIfFits("Add to item group");
         ImGui.BeginDisabled(!hasSelection);
         if (ImGui.Button("Add to item group"))
             AddSelectionToItemGroup(runtime);
@@ -759,7 +740,7 @@ internal sealed class StockWorkspace
             $"{stockSelection.Count:N0} selected");
 
         var canStow = hasSelection && runtime.Owner.HasStableIdentity && SelectionHasCarried(runtime);
-        UiLayout.SameLineIfFits("Stow carried");
+        DalamudUiLayout.SameLineIfFits("Stow carried");
         ImGui.BeginDisabled(!canStow);
         if (ImGui.Button("Stow carried"))
             stowRequested = true;
@@ -771,8 +752,7 @@ internal sealed class StockWorkspace
             ImGui.OpenPopup("RQStockStow");
             stowRequested = false;
         }
-        ImGui.SetNextWindowBgAlpha(1f);
-        if (ImGui.BeginPopup("RQStockStow"))
+        if (DalamudOwnedPopup.BeginOpaquePopup("RQStockStow"))
         {
             DrawStowDestinations(runtime, ResolveSelection(runtime).Stock.Where(item => item.PlayerQuantity > 0).ToArray());
             ImGui.EndPopup();
@@ -785,7 +765,7 @@ internal sealed class StockWorkspace
         if (transferPlans.HasCourierDestinations(runtime, viewedCharacter))
         {
             var canSend = hasSelection && runtime.Owner.HasStableIdentity && SelectionHasSendable(runtime);
-            UiLayout.SameLineIfFits("Send to…");
+            DalamudUiLayout.SameLineIfFits("Send to…");
             ImGui.BeginDisabled(!canSend);
             if (ImGui.Button("Send to…"))
                 sendRequested = true;
@@ -797,8 +777,7 @@ internal sealed class StockWorkspace
                 ImGui.OpenPopup("RQStockSend");
                 sendRequested = false;
             }
-            ImGui.SetNextWindowBgAlpha(1f);
-            if (ImGui.BeginPopup("RQStockSend"))
+            if (DalamudOwnedPopup.BeginOpaquePopup("RQStockSend"))
             {
                 DrawSendDestinations(runtime, ResolveSelection(runtime).Stock.Where(CanSend).ToArray(), "quartermaster.stock.send");
                 ImGui.EndPopup();
@@ -958,9 +937,6 @@ internal sealed class StockWorkspace
                 stockSelection.SetSelected(id, false);
     }
 
-    private static Vector4 Scale(Vector4 color, float scale, float alpha) =>
-        new(color.X * scale, color.Y * scale, color.Z * scale, alpha);
-
     private void DrawSingleStockSelection(QuartermasterRuntimeSnapshot runtime)
     {
         if (stockSelection.Count != 1 ||
@@ -990,10 +966,10 @@ internal sealed class StockWorkspace
             if (demand.All(item => item.Quality != workbench.SelectedStockListingQuality))
                 workbench.SelectedStockListingQuality = demand[0].Quality;
             ImGui.SetNextItemWidth(62);
-            if (ImGui.BeginCombo("##stocklistingquality", QualityLabel(workbench.SelectedStockListingQuality)))
+            if (ImGui.BeginCombo("##stocklistingquality", TransferPresentation.QualityLabel(workbench.SelectedStockListingQuality)))
             {
                 foreach (var item in demand)
-                    if (ImGui.Selectable(QualityLabel(item.Quality), item.Quality == workbench.SelectedStockListingQuality))
+                    if (ImGui.Selectable(TransferPresentation.QualityLabel(item.Quality), item.Quality == workbench.SelectedStockListingQuality))
                         workbench.SelectedStockListingQuality = item.Quality;
                 ImGui.EndCombo();
             }
@@ -1029,7 +1005,7 @@ internal sealed class StockWorkspace
         string context)
     {
 
-        var buttonWidth = ImGui.CalcTextSize("Columns").X + (ImGui.GetStyle().FramePadding.X * 2f);
+        var buttonWidth = DalamudUiLayout.ButtonWidth("Columns");
         ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - buttonWidth));
         table.DrawColumnMenuButton(id);
         reviewRegistry.RegisterLastButton(
@@ -1158,7 +1134,7 @@ internal sealed class StockWorkspace
             return "—";
         return string.Join(" · ", demand.Where(item => item.IsPlanned).Select(item =>
         {
-            var quality = QualityLabel(item.Quality);
+            var quality = TransferPresentation.QualityLabel(item.Quality);
             if (!item.NeedUnits.IsKnown)
                 return $"{quality} unknown";
             return $"{quality} {item.NeedUnits.Value:N0}";
@@ -1181,12 +1157,6 @@ internal sealed class StockWorkspace
     }
 
 
-    private static string QualityLabel(ItemQualityPolicy quality) => quality switch
-    {
-        ItemQualityPolicy.NqOnly => "NQ",
-        ItemQualityPolicy.HqOnly => "HQ",
-        _ => "Any",
-    };
 
 
     private StowagePlan? ResolveSelectedStowagePlan(QuartermasterState document, OwnerScope owner) =>

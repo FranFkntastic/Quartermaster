@@ -6,7 +6,9 @@ using Franthropy.Dalamud.Automation.Vendors;
 using Franthropy.Dalamud.Automation.Vendors.Coordination;
 using Franthropy.Dalamud.UI.Feedback;
 using Franthropy.Dalamud.UI.Inputs;
+using Franthropy.Dalamud.UI.Layout;
 using Franthropy.Dalamud.UI.Tables;
+using Franthropy.Dalamud.UI.Windows;
 using Franthropy.Filtering.Evaluation;
 using RQ.Automation;
 using RQ.Courier;
@@ -31,16 +33,6 @@ internal sealed class TransferPlanWorkspace
     private static readonly Vector4 AmberColor = new(1f, .7f, .3f, 1f);
     private static readonly Vector4 VendorColor = new(.92f, .72f, .35f, 1f);
     private static readonly Vector4 PausedRowColor = new(.13f, .15f, .17f, .42f);
-    private const string AddSuggestionsPopup = "##RQPlanAddSuggestions";
-    private const ImGuiWindowFlags SuggestionWindowFlags =
-        ImGuiWindowFlags.NoTitleBar |
-        ImGuiWindowFlags.NoResize |
-        ImGuiWindowFlags.NoMove |
-        ImGuiWindowFlags.NoSavedSettings |
-        ImGuiWindowFlags.NoFocusOnAppearing |
-        ImGuiWindowFlags.NoNav |
-        ImGuiWindowFlags.NoDocking |
-        ImGuiWindowFlags.AlwaysAutoResize;
     private const int FocusGiveUpFrames = 120;
 
     private sealed record AddSuggestion(
@@ -103,7 +95,10 @@ internal sealed class TransferPlanWorkspace
     private readonly PlacementMatrix<Guid> placement;
     private bool showPlacement;
 
-    private string addText = string.Empty;
+    private readonly DalamudSuggestionInputState addInput = new();
+    private QuartermasterState? cachedAddDocument;
+    private string cachedAddText = string.Empty;
+    private IReadOnlyList<DalamudSuggestion<AddSuggestion>> cachedAddChoices = [];
     private bool focusAddInput;
     private readonly SearchReference.Button addHelp = new("quartermaster.plan.addHelp", "Plan add syntax");
     private string cachedItemSearch = string.Empty;
@@ -774,7 +769,7 @@ internal sealed class TransferPlanWorkspace
             .Select(row => new PlacementMatrixRow<Guid>(
                 row.Rule.Id,
                 row.Rule.Id.ToString("N"),
-                row.Rule.Quality == ItemQualityPolicy.Any ? row.Rule.ItemName : $"{row.Rule.ItemName} {QualityLabel(row.Rule.Quality)}",
+                row.Rule.Quality == ItemQualityPolicy.Any ? row.Rule.ItemName : $"{row.Rule.ItemName} {TransferPresentation.QualityLabel(row.Rule.Quality)}",
                 (row.Line?.DepositQuantity ?? 0).ToString("N0"),
                 row.Rule.Routing,
                 PlacementMatrixData.Holdings(runtime, row.Rule.ItemId, row.Rule.Quality),
@@ -869,7 +864,7 @@ internal sealed class TransferPlanWorkspace
                 return new PlacementMatrixRow<Guid>(
                     rule.Id,
                     rule.Id.ToString("N"),
-                    rule.Quality == ItemQualityPolicy.Any ? rule.ItemName : $"{rule.ItemName} {QualityLabel(rule.Quality)}",
+                    rule.Quality == ItemQualityPolicy.Any ? rule.ItemName : $"{rule.ItemName} {TransferPresentation.QualityLabel(rule.Quality)}",
                     rule.TargetQuantity.ToString("N0"),
                     routing,
                     PlacementMatrixData.Holdings(runtime, rule.ItemId, rule.Quality, destination, stock),
@@ -907,7 +902,7 @@ internal sealed class TransferPlanWorkspace
         {
             var label = $"{CourierSession.CharacterLabel(character)}##destination:{character.LocalContentId}";
             if (!first)
-                UiLayout.SameLineIfFits(label);
+                DalamudUiLayout.SameLineIfFits(label);
             first = false;
             var selectedPill = current?.Matches(character) == true;
             if (selectedPill)
@@ -952,7 +947,7 @@ internal sealed class TransferPlanWorkspace
                 () => Add(pick),
                 "Available");
         }
-        if (ImGui.BeginPopup("RQCourierPlacementAdd"))
+        if (DalamudOwnedPopup.BeginOpaquePopup("RQCourierPlacementAdd"))
         {
             foreach (var other in others)
                 if (ImGui.Selectable($"{CourierSession.CharacterLabel(other)}##add:{other.LocalContentId}"))
@@ -987,8 +982,7 @@ internal sealed class TransferPlanWorkspace
     {
         var owner = runtime.Owner;
         var style = ImGui.GetStyle();
-        float ButtonWidth(string label) =>
-            ImGui.CalcTextSize(label.Split("##")[0]).X + (style.FramePadding.X * 2f);
+        static float ButtonWidth(string label) => DalamudUiLayout.ButtonWidth(label);
 
         var isCourier = selected?.Kind == StowagePlanKind.Courier;
         var trips = projection?.Courier?.Trips.Length ?? 0;
@@ -1033,7 +1027,7 @@ internal sealed class TransferPlanWorkspace
         DrawPlanMenu(runtime, selected, projection, menuLabel);
 
         var canPlace = selected is not null && projection is not null && (isCourier || lines > 0 || projection.Rules.Count == 0);
-        UiLayout.SameLineIfFits(placementLabel);
+        DalamudUiLayout.SameLineIfFits(placementLabel);
         ImGui.BeginDisabled(!canPlace);
         var wasOpen = showPlacement;
         if (wasOpen) ImGui.PushStyleColor(ImGuiCol.Button, style.Colors[(int)ImGuiCol.ButtonActive]);
@@ -1067,7 +1061,7 @@ internal sealed class TransferPlanWorkspace
         var canExecute = selected is not null && availability.CanExecute;
         if (offerExecute)
         {
-            UiLayout.SameLineIfFits(executeLabel);
+            DalamudUiLayout.SameLineIfFits(executeLabel);
             ImGui.BeginDisabled(!canExecute);
             if (ImGui.Button(executeLabel) && selected is not null)
                 requestTransferReview(selected.Id, selected.Name);
@@ -1107,7 +1101,7 @@ internal sealed class TransferPlanWorkspace
             : projection?.HasUnknownListingDemand == true
                 ? "Listing demand must be verified first"
                 : "No reviewed vendor-purchasable shortfall";
-        UiLayout.SameLineIfFits(buyLabel);
+        DalamudUiLayout.SameLineIfFits(buyLabel);
         ImGui.BeginDisabled(!canReviewVendor);
         if (ImGui.Button(buyLabel) && vendor is not null)
             requestVendorReview(vendor);
@@ -1303,7 +1297,7 @@ internal sealed class TransferPlanWorkspace
                 hasLines ? "Available" : "Plan is empty");
         }
 
-        if (!ImGui.BeginPopup("RQTransferPlanMenu"))
+        if (!DalamudOwnedPopup.BeginOpaquePopup("RQTransferPlanMenu"))
             return;
         if (MenuItem("New transfer plan", stable))
             NewPlan(owner, StowagePlanKind.Transfer);
@@ -1484,12 +1478,12 @@ internal sealed class TransferPlanWorkspace
         ImGui.TextDisabled("Quality");
         ImGui.SameLine();
         ImGui.SetNextItemWidth(84);
-        if (ImGui.BeginCombo("##RQBulkQuality", bulkQuality is { } quality ? QualityLabel(quality) : "—"))
+        if (ImGui.BeginCombo("##RQBulkQuality", bulkQuality is { } quality ? TransferPresentation.QualityLabel(quality) : "—"))
         {
             if (ImGui.Selectable("—##bulk-quality", bulkQuality is null))
                 bulkQuality = null;
             foreach (var value in Enum.GetValues<ItemQualityPolicy>())
-                if (ImGui.Selectable(QualityLabel(value), bulkQuality == value))
+                if (ImGui.Selectable(TransferPresentation.QualityLabel(value), bulkQuality == value))
                     bulkQuality = value;
             ImGui.EndCombo();
         }
@@ -1499,7 +1493,7 @@ internal sealed class TransferPlanWorkspace
             ? parsed
             : null;
         var canApply = target.HasValue || bulkQuality.HasValue;
-        UiLayout.SameLineIfFits("Apply");
+        DalamudUiLayout.SameLineIfFits("Apply");
         ImGui.BeginDisabled(!canApply);
         if (ImGui.Button("Apply##RQBulk"))
         {
@@ -1632,7 +1626,7 @@ internal sealed class TransferPlanWorkspace
         ImGui.AlignTextToFramePadding();
         ImGui.TextUnformatted(rule.ItemName);
         if (rule.Quality != ItemQualityPolicy.Any)
-            Tag(QualityLabel(rule.Quality));
+            Tag(TransferPresentation.QualityLabel(rule.Quality));
         // A courier line's route has its own From and To columns.
         if (rule.Courier is null && TransferPresentation.RouteSummary(rule.Routing, row.Runtime.Retainers, row.Owner) is { Length: > 0 } routeSummary)
             Tag($"→ {routeSummary}");
@@ -1930,8 +1924,7 @@ internal sealed class TransferPlanWorkspace
             ImGui.OpenPopup("line-menu");
         }
         DrawHoverRemove(row);
-        ImGui.SetNextWindowBgAlpha(1f);
-        if (!ImGui.BeginPopup("line-menu"))
+        if (!DalamudOwnedPopup.BeginOpaquePopup("line-menu"))
             return;
         Guid[] ids = [rule.Id];
         ImGui.Dummy(new Vector2(280, 0));
@@ -1942,7 +1935,7 @@ internal sealed class TransferPlanWorkspace
             if (!firstQuality)
                 ImGui.SameLine();
             firstQuality = false;
-            if (ImGui.RadioButton(QualityLabel(quality), rule.Quality == quality) && rule.Quality != quality)
+            if (ImGui.RadioButton(TransferPresentation.QualityLabel(quality), rule.Quality == quality) && rule.Quality != quality)
                 MutateRules(row.Owner, row.PlanId, ids, draftRule => draftRule.Quality = quality);
         }
 
@@ -2166,8 +2159,7 @@ internal sealed class TransferPlanWorkspace
         }
         if (clicked)
             ImGui.OpenPopup($"courier-{side}");
-        ImGui.SetNextWindowBgAlpha(1f);
-        return ImGui.BeginPopup($"courier-{side}");
+        return DalamudOwnedPopup.BeginOpaquePopup($"courier-{side}");
     }
 
     private void DrawCourierFrom(TransferWorkbenchRow row)
@@ -2250,64 +2242,46 @@ internal sealed class TransferPlanWorkspace
 
     private void DrawAddInput(QuartermasterRuntimeSnapshot runtime, StowagePlan plan)
     {
-        ImGui.SetNextItemWidth(Math.Max(1, ImGui.GetContentRegionAvail().X - SearchReference.ButtonWidth - ImGui.GetStyle().ItemSpacing.X));
+        var width = Math.Max(1, ImGui.GetContentRegionAvail().X - SearchReference.ButtonWidth - ImGui.GetStyle().ItemSpacing.X);
         if (focusAddInput)
         {
             ImGui.SetKeyboardFocusHere();
             focusAddInput = false;
         }
-        var entered = ImGui.InputTextWithHint(
-            "##RQPlanAddItem",
+        // Help open: the reference replaces the suggestions until it hands back a prefix.
+        var suggestions = addHelp.IsOpen ? [] : AddSuggestionChoices(runtime.State, addInput.Text);
+        // Enter or Tab adds the highlighted suggestion (the first by default); arrows move it.
+        var picked = DalamudSuggestionInputRenderer.Draw(
+            "RQPlanAddItem",
+            addInput,
+            suggestions,
+            width,
             "+ Add item, @group, #category or >craft…",
-            ref addText,
-            96,
-            ImGuiInputTextFlags.EnterReturnsTrue);
-        var active = ImGui.IsItemActive();
+            10,
+            out var suggestion);
         var inputMin = ImGui.GetItemRectMin();
         var inputMax = ImGui.GetItemRectMax();
         ImGui.SetCursorScreenPos(new Vector2(inputMax.X + ImGui.GetStyle().ItemSpacing.X, inputMin.Y));
         addHelp.Draw(reviewRegistry);
-        if (addHelp.IsOpen)
+        if (addHelp.IsOpen && addHelp.DrawPlan() is { } prefix)
         {
-            if (addHelp.DrawPlan() is { } prefix)
-            {
-                addText = prefix;
-                focusAddInput = true;
-            }
-            return;
+            addInput.Text = prefix;
+            focusAddInput = true;
         }
-        var suggestions = AddSuggestions(runtime.State, addText);
-        if (entered && suggestions.Count > 0)
-        {
-            AddSuggestionToPlan(runtime, plan, suggestions[0]);
-            suggestions = [];
-        }
-        else if (active && suggestions.Count > 0)
-        {
-            ImGui.OpenPopup(AddSuggestionsPopup);
-        }
+        if (picked && suggestion is not null)
+            AddSuggestionToPlan(runtime, plan, suggestion);
+    }
 
-        ImGui.SetNextWindowPos(new Vector2(inputMin.X, inputMax.Y), ImGuiCond.Always);
-        ImGui.SetNextWindowSizeConstraints(
-            new Vector2(Math.Clamp(inputMax.X - inputMin.X, 240f, 620f), 0),
-            new Vector2(620f, 360f));
-        if (!ImGui.BeginPopup(AddSuggestionsPopup, SuggestionWindowFlags))
-            return;
-        if (suggestions.Count == 0)
-        {
-            ImGui.CloseCurrentPopup();
-            ImGui.EndPopup();
-            return;
-        }
-        for (var index = 0; index < suggestions.Count; index++)
-        {
-            if (!ImGui.Selectable($"{suggestions[index].Label}##add-suggestion:{index}", index == 0))
-                continue;
-            AddSuggestionToPlan(runtime, plan, suggestions[index]);
-            ImGui.CloseCurrentPopup();
-            break;
-        }
-        ImGui.EndPopup();
+    private IReadOnlyList<DalamudSuggestion<AddSuggestion>> AddSuggestionChoices(QuartermasterState document, string text)
+    {
+        if (ReferenceEquals(document, cachedAddDocument) && string.Equals(text, cachedAddText, StringComparison.Ordinal))
+            return cachedAddChoices;
+        cachedAddDocument = document;
+        cachedAddText = text;
+        cachedAddChoices = AddSuggestions(document, text)
+            .Select(suggestion => new DalamudSuggestion<AddSuggestion>(suggestion, suggestion.Label))
+            .ToArray();
+        return cachedAddChoices;
     }
 
     private IReadOnlyList<AddSuggestion> AddSuggestions(QuartermasterState document, string text)
@@ -2381,7 +2355,6 @@ internal sealed class TransferPlanWorkspace
 
     private void AddSuggestionToPlan(QuartermasterRuntimeSnapshot runtime, StowagePlan plan, AddSuggestion suggestion)
     {
-        addText = string.Empty;
         Func<IReadOnlyList<PlanAddEntry>, bool, IReadOnlyList<Guid>> add = plan.Kind == StowagePlanKind.Courier
             ? (entries, select) => AddCourierLines(runtime, plan.Id, entries, select)
             : (entries, select) => AddLines(runtime, plan.Id, entries, select);
@@ -2433,7 +2406,7 @@ internal sealed class TransferPlanWorkspace
                     .FirstOrDefault(group => group.Count() > 1);
                 if (duplicate is not null)
                     throw new InvalidOperationException(
-                        $"{duplicate.First().ItemName} ({QualityLabel(duplicate.Key.Quality)}) is already in this plan.");
+                        $"{duplicate.First().ItemName} ({TransferPresentation.QualityLabel(duplicate.Key.Quality)}) is already in this plan.");
                 return StowagePlanCatalog.Apply(document, owner, draft).Id;
             });
             foreach (var id in ruleIds)
@@ -2590,7 +2563,7 @@ internal sealed class TransferPlanWorkspace
         if (!string.IsNullOrWhiteSpace(vendorStatus))
             DrawWrappedStatus(vendorStatus, ErrorColor);
         if (!string.IsNullOrWhiteSpace(vendorProcurement.CoordinationWarning))
-            DrawWrappedStatus(vendorProcurement.CoordinationWarning, ListingWorkspace.Color(ListingStateTone.Info));
+            DrawWrappedStatus(vendorProcurement.CoordinationWarning, QuartermasterPalette.Info);
     }
 
     internal static bool ShowVendorMessage(GilVendorBuyPhase phase, string? message) =>
@@ -2807,12 +2780,6 @@ internal sealed class TransferPlanWorkspace
         requestVendorReview(ResolveProjection(current, plan).Vendor);
     }
 
-    private static string QualityLabel(ItemQualityPolicy quality) => quality switch
-    {
-        ItemQualityPolicy.NqOnly => "NQ",
-        ItemQualityPolicy.HqOnly => "HQ",
-        _ => "Any",
-    };
 
     private static RetrievalPlan BuildTransferRetrievalEvaluation(
         QuartermasterRuntimeSnapshot runtime,

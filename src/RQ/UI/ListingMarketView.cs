@@ -1,4 +1,5 @@
 using Dalamud.Bindings.ImGui;
+using Franthropy.Dalamud.UI.Windows;
 using Franthropy.FFXIV.Filtering;
 using RQ.Interop;
 using RQ.Planning;
@@ -195,7 +196,7 @@ internal sealed class ListingMarketView
     private void DrawCell(Figure? f, Action? expand)
     {
         if (f == null) return;
-        ImGui.TextColored(ListingWorkspace.Color(f.Tone), f.Text);
+        ImGui.TextColored(QuartermasterPalette.Tone(f.Tone), f.Text);
         if (ImGui.IsItemClicked())
         {
             expand?.Invoke();
@@ -206,23 +207,15 @@ internal sealed class ListingMarketView
             if (f.Reason != null) ImGui.SetTooltip(f.Reason);
             else if (!popupVisible && f.Mine.UnitPrice.IsKnown)
             {
-                ImGui.PushStyleColor(ImGuiCol.PopupBg, OpaquePopupBg());
+                // The game theme's translucent popup background lets the panes behind bleed through the ladder.
+                ImGui.SetNextWindowBgAlpha(1f);
                 ImGui.BeginTooltip();
-                ImGui.PopStyleColor();
                 DrawLadder(f, f.Mine);
                 ImGui.EndTooltip();
             }
         }
         if (f.Timestamp is > 0 && DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - f.Timestamp > 600000)
         { ImGui.SameLine(); ImGui.TextDisabled(Age(f.Timestamp.Value)); }
-    }
-
-    // The game theme's translucent popup background lets the panes behind bleed through the ladder.
-    private static System.Numerics.Vector4 OpaquePopupBg()
-    {
-        var bg = ImGui.GetStyle().Colors[(int)ImGuiCol.PopupBg];
-        bg.W = 1;
-        return bg;
     }
 
     // Shared by the hover tooltip and the click popup: every competitor below, ties, yours, then up to two above.
@@ -243,7 +236,7 @@ internal sealed class ListingMarketView
         var price = mine.UnitPrice.Value;
         var atOrBelow = f.Competitors.Where(l => l.PricePerUnit <= price).Take(11).ToArray();
         foreach (var l in atOrBelow) Row(l.PricePerUnit, l.Quantity, l.WorldName, l.RetainerName);
-        ImGui.PushStyleColor(ImGuiCol.Text, ListingWorkspace.Color(ListingStateTone.Info));
+        ImGui.PushStyleColor(ImGuiCol.Text, QuartermasterPalette.Info);
         Row(price, mine.Quantity, homeWorld, "yours");
         ImGui.PopStyleColor();
         foreach (var l in f.Competitors.Where(l => l.PricePerUnit > price).Take(Math.Min(2, 11 - atOrBelow.Length)))
@@ -254,9 +247,7 @@ internal sealed class ListingMarketView
     private void DrawPopup(QuartermasterRuntimeSnapshot runtime)
     {
         if (openPopup) { ImGui.OpenPopup("RQMarketLadder"); openPopup = false; }
-        ImGui.PushStyleColor(ImGuiCol.PopupBg, OpaquePopupBg());
-        var open = ImGui.BeginPopup("RQMarketLadder");
-        ImGui.PopStyleColor();
+        var open = DalamudOwnedPopup.BeginOpaquePopup("RQMarketLadder");
         popupVisible = open;
         if (!open) return;
         try

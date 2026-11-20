@@ -2,6 +2,8 @@ using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Utility;
 using Franthropy.Dalamud.AgentBridge;
+using Franthropy.Dalamud.UI.Drawing;
+using Franthropy.Dalamud.UI.Layout;
 using Franthropy.Dalamud.UI.Tables;
 using RQ.Domain;
 using RQ.Inventory;
@@ -119,38 +121,6 @@ internal static class PlacementMatrixData
     };
 }
 
-/// <summary>Drawing primitives shared by the placement matrices.</summary>
-internal static class PlacementMatrixDrawing
-{
-    internal const float HeaderAngle = 48f * MathF.PI / 180f;
-
-    internal static void RightAligned(string text, Vector4? color)
-    {
-        var width = ImGui.CalcTextSize(text).X;
-        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + Math.Max(0f, ImGui.GetContentRegionAvail().X - width));
-        if (color is { } value)
-            ImGui.TextColored(value, text);
-        else
-            ImGui.TextUnformatted(text);
-    }
-
-    /// <summary>Draws text with its bottom-left corner at the pivot, rotated about the pivot.</summary>
-    internal static unsafe void AddRotatedText(ImDrawListPtr drawList, Vector2 pivot, float radians, uint color, string text, float lineHeight)
-    {
-        var start = drawList.VtxBuffer.Size;
-        drawList.AddText(new Vector2(pivot.X, pivot.Y - lineHeight), color, text);
-        var end = drawList.VtxBuffer.Size;
-        var cos = MathF.Cos(radians);
-        var sin = MathF.Sin(radians);
-        var vertices = drawList.VtxBuffer.Data;
-        for (var index = start; index < end; index++)
-        {
-            var offset = vertices[index].Pos - pivot;
-            vertices[index].Pos = pivot + new Vector2((offset.X * cos) - (offset.Y * sin), (offset.X * sin) + (offset.Y * cos));
-        }
-    }
-}
-
 /// <summary>
 /// Placement editor shared by Transfer, Listing and Courier Placement: rows are items, columns
 /// are one character's retainers then Any space, and a cell is the retainer's rank in the item's
@@ -180,7 +150,7 @@ internal sealed class PlacementMatrix<TKey>
     private TKey? anchor;
     private bool hasAnchor;
     private ulong target = PlacementEdits.AnySpace;
-    private int selectionBarLines = 1;
+    private readonly DalamudSelectionBar selectionBar;
 
     // Set by Draw each frame; bridge actions registered this frame use it too.
     private Func<IReadOnlyList<(TKey Key, StowageRoutingPolicy Routing)>, bool> applyRouting = _ => false;
@@ -201,6 +171,7 @@ internal sealed class PlacementMatrix<TKey>
         this.fromHeader = fromHeader;
         this.emptyText = emptyText;
         this.registry = registry;
+        selectionBar = new($"{surfaceId}.selection-bar");
     }
 
     public int SelectedCount => selected.Count;
@@ -258,33 +229,8 @@ internal sealed class PlacementMatrix<TKey>
     private void DrawSelectionBar(
         IReadOnlyList<PlacementMatrixRow<TKey>> allRows,
         IReadOnlyList<PlacementMatrixRow<TKey>> visibleRows,
-        IReadOnlyList<PlacementMatrixColumn> columns)
-    {
-        var count = selected.Count;
-        var hasSelection = count > 0;
-        var background = hasSelection ? Scale(InfoColor, .16f, .96f) : Scale(InfoColor, .09f, .96f);
-        var border = hasSelection ? Scale(InfoColor, .65f, 1f) : Scale(InfoColor, .38f, 1f);
-        var barHeight = (ImGui.GetFrameHeightWithSpacing() * selectionBarLines) + 10f;
-        ImGui.PushStyleColor(ImGuiCol.ChildBg, background);
-        ImGui.PushStyleColor(ImGuiCol.Border, border);
-        ImGui.PushStyleVar(ImGuiStyleVar.ChildRounding, 2f);
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new Vector2(8f, 5f));
-        if (ImGui.BeginChild($"{surfaceId}.selection-bar", new Vector2(0f, barHeight), true,
-                ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse))
-        {
-            var top = ImGui.GetCursorPosY();
-            ImGui.AlignTextToFramePadding();
-            ImGui.TextColored(
-                hasSelection ? InfoColor : ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled],
-                hasSelection ? $"{count:N0} item{(count == 1 ? string.Empty : "s")} selected" : "No items selected");
-            DrawSelectionActions(allRows, visibleRows, columns, hasSelection);
-            var lines = (int)MathF.Round((ImGui.GetCursorPosY() - top) / ImGui.GetFrameHeightWithSpacing());
-            selectionBarLines = Math.Max(1, lines);
-        }
-        ImGui.EndChild();
-        ImGui.PopStyleVar(2);
-        ImGui.PopStyleColor(2);
-    }
+        IReadOnlyList<PlacementMatrixColumn> columns) =>
+        selectionBar.Draw(selected.Count, InfoColor, hasSelection => DrawSelectionActions(allRows, visibleRows, columns, hasSelection));
 
     private void DrawSelectionActions(
         IReadOnlyList<PlacementMatrixRow<TKey>> allRows,
@@ -292,7 +238,7 @@ internal sealed class PlacementMatrix<TKey>
         IReadOnlyList<PlacementMatrixColumn> columns,
         bool hasSelection)
     {
-        UiLayout.SameLineIfFits("Select visible");
+        DalamudUiLayout.SameLineIfFits("Select visible");
         ImGui.BeginDisabled(visibleRows.Count == 0);
         if (ImGui.Button($"Select visible##{surfaceId}"))
             SelectVisible(visibleRows);
@@ -309,12 +255,7 @@ internal sealed class PlacementMatrix<TKey>
         DrawRankedActions(allRows, hasSelection, TargetName(columns, target));
 
         const string clearLabel = "Clear row selection";
-        var clearWidth = ImGui.CalcTextSize(clearLabel).X + (ImGui.GetStyle().FramePadding.X * 2f);
-        ImGui.SameLine();
-        if (ImGui.GetContentRegionAvail().X < clearWidth)
-            ImGui.NewLine();
-        else
-            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - clearWidth);
+        DalamudUiLayout.SameLineRight(DalamudUiLayout.ButtonWidth(clearLabel));
         ImGui.BeginDisabled(!hasSelection);
         if (ImGui.Button($"{clearLabel}##{surfaceId}"))
             ClearSelection();
@@ -372,7 +313,7 @@ internal sealed class PlacementMatrix<TKey>
     /// <summary>A selection-bar button and its bridge action; <paramref name="run"/> returns rows changed, or -1 when refused.</summary>
     private void SelectionButton(string id, string label, bool primary, bool hasSelection, string description, Func<int> run)
     {
-        UiLayout.SameLineIfFits(label);
+        DalamudUiLayout.SameLineIfFits(label);
         ImGui.BeginDisabled(!hasSelection);
         if (primary)
             UiLayout.PushPrimary();
@@ -411,7 +352,7 @@ internal sealed class PlacementMatrix<TKey>
 
     private void DrawTargetCombo(IReadOnlyList<PlacementMatrixColumn> columns)
     {
-        UiLayout.SameLineIfFits(new string('x', 18));
+        DalamudUiLayout.SameLineIfFits(new string('x', 18));
         ImGui.SetNextItemWidth(150f * ImGuiHelpers.GlobalScale);
         if (ImGui.BeginCombo($"##{surfaceId}.target", TargetName(columns, target)))
         {
@@ -540,7 +481,7 @@ internal sealed class PlacementMatrix<TKey>
         ImGui.TextUnformatted("Item");
         ImGui.TableSetColumnIndex(1);
         ImGui.SetCursorPosY(ImGui.GetCursorPosY() + labelOffset);
-        RightAligned(quantityHeader, null);
+        DalamudUiLayout.DrawRightAligned(quantityHeader, null);
         if (fromHeader is not null)
         {
             ImGui.TableSetColumnIndex(2);
@@ -562,7 +503,7 @@ internal sealed class PlacementMatrix<TKey>
             var pivot = new Vector2(cell.X + (width / 2f) - (4f * ImGuiHelpers.GlobalScale), rowTop + headerHeight - (6f * ImGuiHelpers.GlobalScale));
             var drawList = ImGui.GetWindowDrawList();
             drawList.PushClipRect(clipMin, clipMax, false);
-            AddRotatedText(drawList, pivot, -HeaderAngle, color, name, lineHeight);
+            DalamudDrawListPrimitives.AddRotatedText(drawList, pivot, -HeaderAngle, color, name, lineHeight);
             drawList.PopClipRect();
             ImGui.Dummy(new Vector2(width, headerHeight - (style.CellPadding.Y * 2f)));
             if (ImGui.IsItemHovered())
@@ -582,16 +523,16 @@ internal sealed class PlacementMatrix<TKey>
         // With a From column the label sits beside the counts instead of under the item names.
         if (fromHeader is not null)
             ImGui.TableSetColumnIndex(FrozenColumns - 1);
-        RightAligned("Free slots", disabled);
+        DalamudUiLayout.DrawRightAligned("Free slots", disabled);
         for (var index = 0; index < columns.Count; index++)
         {
             ImGui.TableSetColumnIndex(FrozenColumns + index);
             var free = columns[index].FreeSlots;
-            RightAligned(free?.ToString("N0") ?? "—", free == 0 ? AmberColor : disabled);
+            DalamudUiLayout.DrawRightAligned(free?.ToString("N0") ?? "—", free == 0 ? AmberColor : disabled);
         }
         ImGui.TableSetColumnIndex(FrozenColumns + columns.Count);
         DrawAnySeparator(rowTop, ImGui.GetTextLineHeight() + (style.CellPadding.Y * 2f));
-        RightAligned(columns.Sum(column => column.FreeSlots ?? 0).ToString("N0"), disabled);
+        DalamudUiLayout.DrawRightAligned(columns.Sum(column => column.FreeSlots ?? 0).ToString("N0"), disabled);
     }
 
     private void DrawRow(
@@ -649,7 +590,7 @@ internal sealed class PlacementMatrix<TKey>
 
         ImGui.TableSetColumnIndex(1);
         ImGui.AlignTextToFramePadding();
-        RightAligned(row.Quantity, null);
+        DalamudUiLayout.DrawRightAligned(row.Quantity, null);
 
         if (fromHeader is not null)
         {
@@ -820,11 +761,6 @@ internal sealed class PlacementMatrix<TKey>
             ImGui.GetColorU32(AnySeparatorColor), 2f * ImGuiHelpers.GlobalScale);
     }
 
-    private static void RightAligned(string text, Vector4? color) => PlacementMatrixDrawing.RightAligned(text, color);
-
-    private static void AddRotatedText(ImDrawListPtr drawList, Vector2 pivot, float radians, uint color, string text, float lineHeight) =>
-        PlacementMatrixDrawing.AddRotatedText(drawList, pivot, radians, color, text, lineHeight);
-
     private void RegisterAction(
         string id,
         string label,
@@ -852,7 +788,4 @@ internal sealed class PlacementMatrix<TKey>
         retainerId == PlacementEdits.AnySpace
             ? TransferPresentation.AnySpaceLabel
             : columns.FirstOrDefault(column => column.RetainerId == retainerId)?.Name ?? $"Retainer {retainerId}";
-
-    private static Vector4 Scale(Vector4 color, float scale, float alpha) =>
-        new(color.X * scale, color.Y * scale, color.Z * scale, alpha);
 }

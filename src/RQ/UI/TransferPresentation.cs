@@ -18,6 +18,16 @@ internal static class TransferPresentation
     /// <summary>Courier sends: units leaving for another character.</summary>
     public static readonly Vector4 SendColor = new(.78f, .68f, .94f, 1f);
 
+    /// <summary>"NQ"/"HQ" for a restricted quality, <paramref name="anyLabel"/> otherwise.</summary>
+    /// <param name="anyLabel">Text for <see cref="ItemQualityPolicy.Any"/>.</param>
+    /// <param name="restrictedSuffix">Appended to NQ and HQ, e.g. " only" for a quality picker.</param>
+    public static string QualityLabel(ItemQualityPolicy quality, string anyLabel = "Any", string restrictedSuffix = "") => quality switch
+    {
+        ItemQualityPolicy.NqOnly => "NQ" + restrictedSuffix,
+        ItemQualityPolicy.HqOnly => "HQ" + restrictedSuffix,
+        _ => anyLabel,
+    };
+
     public static string SignedQuantity(int quantity) =>
         quantity > 0
             ? $"+{quantity:N0}"

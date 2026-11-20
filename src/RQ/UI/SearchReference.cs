@@ -70,13 +70,8 @@ internal static class SearchReference
             var width = Math.Min(540f, Math.Max(200f, ImGui.GetWindowSize().X));
             ImGui.SetNextWindowPos(new Vector2(Math.Max(windowPos.X, anchor.X - width), anchor.Y));
             ImGui.SetNextWindowSizeConstraints(new Vector2(width, 0), new Vector2(width, float.MaxValue));
-            ImGui.SetNextWindowBgAlpha(0.98f);
             tableWidth = width - (ImGui.GetStyle().WindowPadding.X * 2f);
-            var owner = DalamudOwnedWindowSurface.Capture();
-            owner.ApplyToNextWindow();
-            if (!ImGui.BeginPopup(id)) return false;
-            owner.KeepCurrentWindowAboveOwner();
-            return true;
+            return DalamudOwnedPopup.BeginOpaquePopup(id, backgroundAlpha: 0.98f);
         }
 
         public string? DrawStock<T>(FilterContext<T> context)

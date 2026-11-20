@@ -11,11 +11,10 @@ namespace RQ.UI;
 internal sealed class VendorProcurementReviewDialog
 {
     private readonly TransferVendorProcurementService vendorProcurement;
-    private readonly AgentBridgeUiReviewRegistry reviewRegistry;
     private readonly Action onStartSucceeded;
     private readonly DalamudTableProjection<TransferVendorProcurementLine> table = CreateTable();
+    private readonly ReviewModal modal;
     private TransferVendorProcurementReview? review;
-    private bool openRequested;
     private string status = string.Empty;
 
     public VendorProcurementReviewDialog(
@@ -24,25 +23,25 @@ internal sealed class VendorProcurementReviewDialog
         Action onStartSucceeded)
     {
         this.vendorProcurement = vendorProcurement ?? throw new ArgumentNullException(nameof(vendorProcurement));
-        this.reviewRegistry = reviewRegistry ?? throw new ArgumentNullException(nameof(reviewRegistry));
         this.onStartSucceeded = onStartSucceeded ?? throw new ArgumentNullException(nameof(onStartSucceeded));
+        modal = new(reviewRegistry ?? throw new ArgumentNullException(nameof(reviewRegistry)), 900, Clear);
     }
 
     public void Request(TransferVendorProcurementReview requestedReview)
     {
         review = requestedReview ?? throw new ArgumentNullException(nameof(requestedReview));
-        openRequested = true;
+        modal.OpenRequested = true;
         status = string.Empty;
     }
 
     public void Clear()
     {
         review = null;
-        openRequested = false;
+        modal.OpenRequested = false;
         status = string.Empty;
     }
 
-    public VendorProcurementReviewDialogState CaptureState() => new(review, openRequested, status);
+    public VendorProcurementReviewDialogState CaptureState() => new(review, modal.OpenRequested, status);
 
     public string? CaptureWindowName => review is { } current
         ? $"Buy vendor shortfalls for {current.PlanName}##RQVendorReview"
@@ -51,7 +50,7 @@ internal sealed class VendorProcurementReviewDialog
     public void RestoreState(VendorProcurementReviewDialogState state)
     {
         review = state.Review;
-        openRequested = state.OpenRequested;
+        modal.OpenRequested = state.OpenRequested;
         status = state.Status;
     }
 
@@ -60,24 +59,20 @@ internal sealed class VendorProcurementReviewDialog
         if (review is not { } currentReview)
             return;
 
-        var popup = CaptureWindowName!;
-        if (openRequested)
-        {
-            ImGui.SetNextWindowSize(
-                new Vector2(Math.Min(900, ImGui.GetMainViewport().WorkSize.X - 80), 520),
-                ImGuiCond.Appearing);
-            ImGui.OpenPopup(popup);
-            openRequested = false;
-        }
-
-        var open = true;
-        if (!ImGui.BeginPopupModal(popup, ref open, ImGuiWindowFlags.NoScrollbar))
-        {
-            if (!open)
-                Clear();
+        if (!modal.Begin(CaptureWindowName!))
             return;
+        try
+        {
+            DrawBody(currentReview);
         }
+        finally
+        {
+            modal.End();
+        }
+    }
 
+    private void DrawBody(TransferVendorProcurementReview currentReview)
+    {
         ImGui.TextUnformatted($"{currentReview.ApprovedQuantity:N0} units · {currentReview.Stops.Count:N0} vendor stops · maximum {currentReview.MaximumGil:N0} gil");
         ImGui.TextDisabled("Only the shortage left after accessible retainer stock is approved. Live inventory, gil, capacity, shop identity, and price are checked again before purchase.");
         ImGui.Separator();
@@ -100,33 +95,25 @@ internal sealed class VendorProcurementReviewDialog
             ImGui.TextWrapped(status);
             ImGui.PopStyleColor();
         }
-        if (ImGui.Button("Back##RQVendorReview"))
-        {
-            Clear();
-            ImGui.CloseCurrentPopup();
-        }
+        modal.DrawBack(
+            "Back##RQVendorReview",
+            "quartermaster.vendor.back",
+            "Return to the Transfer Plan without buying",
+            "No purchase");
         var canStart = currentReview.CanStart && !vendorProcurement.HasActiveRun;
-        ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetContentRegionMax().X - 150));
-        if (!canStart)
-            ImGui.BeginDisabled();
-        if (ImGui.Button("Start vendor buy") && TryStart(currentReview))
+        if (modal.DrawPrimary(
+                "Start vendor buy",
+                canStart,
+                "quartermaster.vendor.start",
+                "Start the reviewed ordinary-gil vendor purchase",
+                () =>
+                {
+                    if (review is { } pendingReview)
+                        TryStart(pendingReview);
+                },
+                canStart ? $"Maximum {currentReview.MaximumGil:N0} gil" : "No startable reviewed purchase") &&
+            TryStart(currentReview))
             ImGui.CloseCurrentPopup();
-        if (!canStart)
-            ImGui.EndDisabled();
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.vendor.start",
-            "Start the reviewed ordinary-gil vendor purchase",
-            canStart,
-            () =>
-            {
-                if (review is { } pendingReview)
-                    TryStart(pendingReview);
-            },
-            canStart ? $"Maximum {currentReview.MaximumGil:N0} gil" : "No startable reviewed purchase");
-
-        ImGui.EndPopup();
-        if (!open)
-            Clear();
     }
 
     private bool TryStart(TransferVendorProcurementReview currentReview)
@@ -147,14 +134,14 @@ internal sealed class VendorProcurementReviewDialog
         new(
             "Item",
             1.3f,
-            line => $"{line.ItemName} {QualityLabel(line.Quality)}",
+            line => $"{line.ItemName} {TransferPresentation.QualityLabel(line.Quality)}",
             line => line.ItemName,
             ImGuiTableColumnFlags.WidthStretch,
             Draw: line =>
             {
                 ImGui.TextUnformatted(line.ItemName);
                 ImGui.SameLine();
-                ImGui.TextDisabled(QualityLabel(line.Quality));
+                ImGui.TextDisabled(TransferPresentation.QualityLabel(line.Quality));
             }),
         new("Buy", 64, line => line.ApprovedQuantity.ToString("N0"), line => line.ApprovedQuantity),
         new(
@@ -180,12 +167,6 @@ internal sealed class VendorProcurementReviewDialog
                 : new Vector4(1f, .55f, .35f, 1f)),
     ]);
 
-    private static string QualityLabel(ItemQualityPolicy quality) => quality switch
-    {
-        ItemQualityPolicy.NqOnly => "NQ",
-        ItemQualityPolicy.HqOnly => "HQ",
-        _ => "Any",
-    };
 }
 
 internal sealed record VendorProcurementReviewDialogState(

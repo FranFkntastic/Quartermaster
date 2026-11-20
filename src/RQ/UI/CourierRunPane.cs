@@ -1,6 +1,7 @@
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Franthropy.Dalamud.AgentBridge;
+using Franthropy.Dalamud.UI.Drawing;
 using RQ.Courier;
 using RQ.Runtime;
 
@@ -92,7 +93,7 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
         if (total > 0)
         {
             var barTop = top + line + 4;
-            draw.AddRectFilled(new Vector2(origin.X, barTop), new Vector2(origin.X + width, barTop + 6), ImGui.GetColorU32(SegmentBar.Empty));
+            draw.AddRectFilled(new Vector2(origin.X, barTop), new Vector2(origin.X + width, barTop + 6), ImGui.GetColorU32(DalamudSegmentBarStyle.Default.Empty));
             var fraction = Math.Clamp((float)moved / total, 0, 1);
             if (fraction > 0)
                 draw.AddRectFilled(new Vector2(origin.X, barTop), new Vector2(origin.X + (width * fraction), barTop + 6),
@@ -131,7 +132,7 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
         ImGui.BeginGroup();
         var top = ImGui.GetCursorPosY();
         ImGui.SetCursorPosY(top + Math.Max(0, (height - (ImGui.GetTextLineHeight() * 2) - ImGui.GetStyle().ItemSpacing.Y) / 2));
-        var amber = ListingWorkspace.Color(ListingStateTone.Amber);
+        var amber = QuartermasterPalette.Amber;
         if (!run.CanResume && !run.CanClear && run.Unverified is { } step)
         {
             ImGui.TextColored(amber, CourierSession.UnverifiedLabel(step));
@@ -157,8 +158,8 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
         ImGui.SameLine();
         var returnWarning=run.State=="Completed" && run.Code!="Succeeded";
         var color = run.State == "Completed" && !returnWarning
-            ? ListingWorkspace.Color(ListingStateTone.Green)
-            : ListingWorkspace.Color(ListingStateTone.Amber);
+            ? QuartermasterPalette.Green
+            : QuartermasterPalette.Amber;
         ImGui.TextColored(color, returnWarning?"Completed · return warning":run.State == "Completed" ? "Completed" : $"{StateLabel(run.State)} · {CourierSession.OutcomeLabel(run.Code, carrier)}");
         if (!ImGui.IsItemHovered())
             return;
@@ -254,7 +255,7 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
         var units = view.Custody.Sum(shipment => shipment.Units);
         var state = view.Unconfirmed ? "Hand-off unconfirmed" : view.Paused ? "Paused" : null;
         if (state is not null)
-            ImGui.TextColored(ListingWorkspace.Color(ListingStateTone.Amber), units > 0 ? $"{state} · holding {units:N0}" : state);
+            ImGui.TextColored(QuartermasterPalette.Amber, units > 0 ? $"{state} · holding {units:N0}" : state);
         else
             ImGui.TextDisabled(units > 0 ? $"Holding {units:N0}" : "Holding nothing");
         ImGui.EndGroup();

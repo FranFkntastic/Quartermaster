@@ -1,6 +1,7 @@
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Franthropy.Dalamud.AgentBridge;
+using Franthropy.Dalamud.UI.Layout;
 using Franthropy.Dalamud.UI.Tables;
 using RQ.Domain;
 using RQ.Inventory;
@@ -192,7 +193,7 @@ internal sealed class CatalogPicker
             levelMax = Math.Clamp(levelMax, Math.Clamp(levelMin, floor, ceiling), ceiling);
 
         var label = allExpanded ? "Collapse all###RQCatalogExpand" : "Expand all###RQCatalogExpand";
-        var width = ImGui.CalcTextSize(allExpanded ? "Collapse all" : "Expand all").X + (ImGui.GetStyle().FramePadding.X * 2f);
+        var width = DalamudUiLayout.ButtonWidth(label);
         ImGui.SameLine(Math.Max(ImGui.GetCursorPosX(), ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - width));
         if (ImGui.Button(label))
             SetAllExpanded(!allExpanded);
@@ -433,18 +434,12 @@ internal sealed class CatalogPicker
     private static void RightAligned(string text)
     {
         ImGui.AlignTextToFramePadding();
-        var offset = ImGui.GetContentRegionAvail().X - ImGui.CalcTextSize(text).X;
-        if (offset > 0)
-            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + offset);
-        ImGui.TextUnformatted(text);
+        DalamudUiLayout.DrawRightAligned(text);
     }
 
     private static void RightAlignedDisabled(string text)
     {
         ImGui.AlignTextToFramePadding();
-        var offset = ImGui.GetContentRegionAvail().X - ImGui.CalcTextSize(text).X;
-        if (offset > 0)
-            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + offset);
-        ImGui.TextDisabled(text);
+        DalamudUiLayout.DrawRightAligned(text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
     }
 }

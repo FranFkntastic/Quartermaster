@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Dalamud.Bindings.ImGui;
+using Franthropy.Dalamud.UI.Windows;
 using RQ.Domain;
 using RQ.Operations;
 
@@ -46,7 +47,7 @@ internal sealed class OperationHistoryDialog(OperationJournal journal)
             }
             openRequested = false;
         }
-        if (!ImGui.BeginPopup(popup))
+        if (!DalamudOwnedPopup.BeginOpaquePopup(popup))
         {
             CaptureWindowName = null;
             closeRequested = false;
