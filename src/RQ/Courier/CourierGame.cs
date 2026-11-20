@@ -36,7 +36,9 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     internal static readonly AsyncLocal<Guid> Step = new();
     internal static readonly AsyncLocal<Func<bool>?> CanContinue = new();
     private readonly CourierStore<Dictionary<string,Guid>> submissions = new(Path.Combine(directory,"courier-travel.json"));
-    internal async Task<Result<T>> Poll<T>(Deadline d, Func<Result<T>?> tick, bool primitiveDeadline = false)
+    // Trade operations step through several UI states per slot; a coarse poll would add its full interval to each one.
+    internal const int TradePollMilliseconds = 16;
+    internal async Task<Result<T>> Poll<T>(Deadline d, Func<Result<T>?> tick, bool primitiveDeadline = false, int pollMilliseconds = 100)
     {
         var token = unload.Token;
         while (!token.IsCancellationRequested)
@@ -49,7 +51,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                     ? new(CourierOutcome.Indeterminate,d.Name+"Deadline",d.Expires.ToString("O")) : tick();
             }, token).WaitAsync(token).ConfigureAwait(false);
             if (value != null) return value;
-            await Task.Delay(100, token).ConfigureAwait(false);
+            await Task.Delay(pollMilliseconds, token).ConfigureAwait(false);
         }
         throw new OperationCanceledException(token);
     }
@@ -329,7 +331,8 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 // Do not race it with our own path, or attest arrival while it owns movement.
                 if(wardSubmitted && busy)wardWasBusy=true;
                 if(busy || !IdleCharacter()){wardIdle=new();return null;}
-                if(current!=(ward,subdivision))
+                // A recorded shard hop below crosses into the subdivision itself, so only the ward number must match.
+                if(current is not {} at || at.Number!=ward || at.Subdivision!=subdivision && !recorded)
                 {
                     if(wardSubmitted && !wardIdle.Ready(this))return null;
                     if(wardWasBusy && current.HasValue)
@@ -337,7 +340,13 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                     var gate=pi.GetIpcSubscriber<(string,int,int,int,int,int,int,bool,bool,string),object>("Lifestream.GoToHousingAddress");
                     if(!gate.HasAction)return WardFailure("WardTravelUnavailable","GoToHousingAddress is not registered");
                     wardMarker.Save!();
-                    try { gate.InvokeAction(("",checked((int)p.World),city,ward,0,subdivision?31:1,1,false,false,"")); }
+                    // Lifestream 2.6 address tuple: (Name, World, City, Ward 1-30, PropertyType 0=House/1=Apartment,
+                    // Plot 1-60, Apartment, ApartmentSubdivision, AliasEnabled, Alias). For a house it enters the ward,
+                    // then hops to the shard serving plot Plot-1 and walks to that plot; an out-of-range Plot (0) stops
+                    // at ward entry. A recorded bell hops straight to its own shard, so it must not take a plot detour.
+                    // Without one, plot 31 is the only way across into the subdivision.
+                    var plot=recorded || !subdivision ? 0 : 31;
+                    try { gate.InvokeAction(("",checked((int)p.World),city,ward,0,plot,1,false,false,"")); }
                     catch(Exception e){return WardFailure("WardTravelSubmissionFailed",e.Message);}
                     wardSubmitted=wardOwned=true;wardIdle=new();return null;
                 }
