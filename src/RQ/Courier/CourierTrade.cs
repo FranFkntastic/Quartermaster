@@ -32,6 +32,8 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
         public void Save()=>store.Save(current);
     }
     private readonly CourierStore<TradeCheckpoint> store=new(Path.Combine(directory,"courier-trade.json"));
+    // Paces UI actions only; every slot and the final batch are still verified against the trade window and bags.
+    private static TradeTimingOptions Timing => new(){ActionDelayMilliseconds=80};
     private TradeRunner? sender;
     private TradeReceiveOperation? receiver;
     private IDisposable? prompts;
@@ -121,7 +123,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                     store.Save(state);stopped=locked=false;
                     SuppressTradeAutoConfirm();
                     if(!receive){
-                        sender=new(new Intent(store,state),new(),io,this,log);
+                        sender=new(new Intent(store,state),Timing,io,this,log);
                         sender.BatchLocking+=(_,_)=>locked=true;
                         sender.BatchVerified+=(_,_)=>locked=false;
                         state.DispatchAuthorized=true;store.Save(state);
@@ -174,7 +176,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                 return End(result.Status switch { OperationStatus.Succeeded=>CourierOutcome.Succeeded,OperationStatus.Cancelled=>CourierOutcome.Cancelled,
                     OperationStatus.Indeterminate=>CourierOutcome.Indeterminate,_=>CourierOutcome.Failed },result.Code,result.Message);
             }catch(Exception e){return End(CourierOutcome.Indeterminate,"TradeAdapterFault",e.Message);}
-        },true);
+        },true,CourierGame.TradePollMilliseconds);
     }
     // Called only after the run owner has checked both clients' complete fresh deltas.
     public Task<Result<bool>> Settle(Guid step,OwnerScope partner,TradeEvidence peer,Deadline d)=>game.Poll<bool>(d,()=>{
@@ -185,7 +187,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
             return CourierReceiveRecovery.Settle(state,step,partner,fresh,peer,()=>store.Save(state));
         }
         if(state.Recovery.AwaitingVerification!=null){
-            using var runner=new TradeRunner(new Intent(store,state),new(),io,this,log);
+            using var runner=new TradeRunner(new Intent(store,state),Timing,io,this,log);
             if(runner.IsActive)runner.Tick(); // Observe persisted closure on a now-closed window.
             if(runner.IsActive || runner.ObserveSettlement() is not {} decision)
                 return new(CourierOutcome.Indeterminate,"TradeSettlementUnproven",step.ToString());
