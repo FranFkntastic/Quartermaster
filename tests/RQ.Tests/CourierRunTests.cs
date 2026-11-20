@@ -318,21 +318,44 @@ public sealed class CourierRunTests : IDisposable
         Assert.Equal(7, owner.Deposited); Assert.Equal(10, mule.Units);
     }
 
-    // An unverified consolidation stops the run resumable; resuming re-plans and runs it again.
+    // A pre-journal consolidation interruption (nothing recorded, bags unchanged) retries cleanly on resume.
     [Fact]
-    public async Task UnverifiedConsolidationResumesByRunningItAgain()
+    public async Task PreJournalConsolidationInterruptionRetriesOnResume()
     {
         line.Routing.Consolidate = true;
+        owner.SkipConsolidationRecord = true;
         owner.ConsolidationResult = new Result<bool>(CourierOutcome.Indeterminate, "ConsolidationUnverified", "fixture");
         var interrupted = await engine.StartAsync(Plan(), cfg);
         Assert.Equal("Indeterminate", interrupted.State);
         Assert.True(interrupted.CanResume);
+        owner.SkipConsolidationRecord = false;
         owner.ConsolidationResult = null;
         engine = Conductor();
         var resumed = await engine.StartAsync(Plan(), cfg);
         Assert.True(resumed.State == "Completed", resumed.Code + ":" + resumed.Detail);
         Assert.Equal(2, owner.Consolidations.Count);
         Assert.Equal(7, owner.Deposited); Assert.Equal(10, mule.Units);
+    }
+
+    // An unsettled journaled consolidation (or one that left retrieved units in destination bags)
+    // must not silently start a fresh moves-only pass that strands items in bags.
+    [Theory]
+    [InlineData(OperationStatuses.Indeterminate, 0, "ConsolidationUnsettled")]
+    [InlineData(OperationStatuses.Succeeded, 2, "ConsolidationUnsettled")]
+    [InlineData(OperationStatuses.Succeeded, 0, "Succeeded")]
+    public async Task PendingJournaledConsolidationReconcilesJournalAndBagsBeforeResuming(string journalStatus, int bagDelta, string expectedCode)
+    {
+        line.Routing.Consolidate = true;
+        owner.ConsolidationJournalStatus = journalStatus;
+        owner.ConsolidationResult = new Result<bool>(CourierOutcome.Indeterminate, "ConsolidationUnverified", "fixture");
+        var interrupted = await engine.StartAsync(Plan(), cfg);
+        Assert.Equal("Indeterminate", interrupted.State);
+        if (bagDelta != 0) owner.Quantities[destination] = owner.Quantities.GetValueOrDefault(destination) + bagDelta;
+        owner.ConsolidationResult = null;
+        engine = Conductor();
+        var resumed = await engine.StartAsync(Plan(), cfg);
+        Assert.Equal(expectedCode, resumed.Code);
+        Assert.Single(owner.Consolidations);
     }
 
     [Fact]
@@ -483,11 +506,14 @@ public sealed class CourierRunTests : IDisposable
         }
         public readonly List<(OwnerScope Who, int DepositedBefore, ImmutableArray<CourierConsolidation> Lines)> Consolidations = [];
         public Result<bool>? ConsolidationResult;
+        public bool SkipConsolidationRecord;
+        public string? ConsolidationJournalStatus = OperationStatuses.Indeterminate;
+        public string? OperationStatus(string id, OwnerScope owner) => ConsolidationJournalStatus;
         public Task<Result<bool>> ConsolidateAsync(StowagePlan plan, ImmutableArray<CourierConsolidation> lines, IDisposable lease, Func<bool> auth, Deadline d, Action<string> recordOperation)
         {
             Assert.True(auth()); Assert.Equal(plan.Owner, who);
             Assert.All(lines, l => Assert.True(l.Destination.Matches(who)));
-            recordOperation(Guid.NewGuid().ToString());
+            if (!SkipConsolidationRecord) recordOperation(Guid.NewGuid().ToString());
             Consolidations.Add((who, Deposited, lines));
             return Task.FromResult(ConsolidationResult ?? Result<bool>.Ok(true));
         }

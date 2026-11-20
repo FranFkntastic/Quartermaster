@@ -9,6 +9,7 @@ public interface ICourierPlacementPort
 {
     Task<Result<int>> RetainerUnits(OwnerScope owner,Shipment shipment,bool deposit,Deadline deadline);
     int? JournalUnits(string operationId,OwnerScope owner,Shipment shipment);
+    string? OperationStatus(string operationId, OwnerScope owner);
     Task<Result<bool>> MoveAsync(StowagePlan plan, Shipment shipment, bool deposit, IDisposable lease,
         Func<bool> authorized, Deadline deadline, Action<string> recordOperation);
     /// <summary>
@@ -42,6 +43,8 @@ public sealed partial class TransferCoordinator : ICourierPlacementPort
     int? ICourierPlacementPort.JournalUnits(string id,OwnerScope owner,Shipment s) =>
         journal.Get(id) is {} record && CourierPlanner.Exact(record.Owner,owner) && record.Lines.All(l=>l.SourceRuleId==s.Line && l.ItemId==s.Item) ?
         record.Lines.Sum(l=>l.TransferredQuantity):null;
+    string? ICourierPlacementPort.OperationStatus(string id, OwnerScope owner) =>
+        journal.Get(id) is { } record && CourierPlanner.Exact(record.Owner, owner) ? record.Status : null;
     async Task<Result<bool>> ICourierPlacementPort.MoveAsync(StowagePlan plan, Shipment s, bool deposit,
         IDisposable lease, Func<bool> authorized, Deadline deadline, Action<string> recordOperation)
     {

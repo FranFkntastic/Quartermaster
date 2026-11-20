@@ -371,10 +371,43 @@ public sealed class CourierConductor
                     else r.Schedule=r.Schedule.SetItem(r.Cursor,move.Action with {Batch=[s with {Units=s.Units-delta}]});
                     r.OwnerCheckpoint=owner;r.CarrierCheckpoint=carrier;r.Pending=null;store.Save(r);
                 }
-                // Consolidation re-plans its moves from fresh retainer stock and journals its own legs,
-                // so an interrupted one is simply run again, like travel.
+                if (r.Pending is { Action.Phase: CourierPhase.Consolidate } con)
+                {
+                    if (!CourierPlanner.Exact(owner.Character, con.OwnerBefore.Character) || !Agrees(con.CarrierBefore, carrier, r) ||
+                        !Custody.Covers(status.Custody, r.Custody) || !Custody.Covers(r.Custody, status.Custody))
+                        throw Fault("PlacementSettlementIdentity", "Consolidation owner, carrier or custody changed.");
+                    var conLines = r.Plan.Consolidations.Where(c => CourierPlanner.Exact(c.Destination, owner.Character)).ToArray();
+                    var bagsUnchanged = conLines.All(c =>
+                        (c.Quality == ItemQualityPolicy.HqOnly || owner.Count(c.Item, false) == con.OwnerBefore.Count(c.Item, false)) &&
+                        (c.Quality == ItemQualityPolicy.NqOnly || owner.Count(c.Item, true) == con.OwnerBefore.Count(c.Item, true)));
+                    if (!bagsUnchanged)
+                        throw Fault("ConsolidationUnsettled", $"Destination bags changed during interrupted consolidation {con.PlacementOperation ?? "(unrecorded)"}; settle in-transit units before retrying.");
+                    if (con.PlacementOperation is null)
+                    {
+                        r.OwnerCheckpoint = owner; r.CarrierCheckpoint = carrier; r.Pending = null; store.Save(r);
+                    }
+                    else
+                    {
+                        var opStatus = placement.OperationStatus(con.PlacementOperation, owner.Character);
+                        if (opStatus == OperationStatuses.Succeeded)
+                        {
+                            r.Cursor++; r.OwnerCheckpoint = owner; r.CarrierCheckpoint = carrier; r.Pending = null; store.Save(r);
+                        }
+                        else if (opStatus == OperationStatuses.Failed)
+                        {
+                            var prefix = $"{owner.Character.CharacterName}: ";
+                            r.ConsolidationLimits.RemoveAll(limit => limit.StartsWith(prefix, StringComparison.Ordinal));
+                            r.ConsolidationLimits.Add(prefix + $"ConsolidationLimited: {con.PlacementOperation}");
+                            r.Cursor++; r.OwnerCheckpoint = owner; r.CarrierCheckpoint = carrier; r.Pending = null; store.Save(r);
+                        }
+                        else
+                        {
+                            throw Fault("ConsolidationUnsettled", $"Previous consolidation {con.PlacementOperation} did not settle ({opStatus ?? "unknown"}); verify retainers and bags before retrying.");
+                        }
+                    }
+                }
                 var travel=r.Pending?.Action.Phase is CourierPhase.EnsureSource or CourierPhase.SwitchToDestination or CourierPhase.ReturnOwner
-                    or CourierPhase.ReturnCarrier or CourierPhase.CarrierToSource or CourierPhase.CarrierToDestination or CourierPhase.Consolidate;
+                    or CourierPhase.ReturnCarrier or CourierPhase.CarrierToSource or CourierPhase.CarrierToDestination;
                 var unstartedTrade=r.Pending==null && r.Schedule.Skip(r.Cursor).FirstOrDefault()?.Phase is CourierPhase.HandIn or CourierPhase.HandOut;
                 if (r.Pending != null && !travel || status.Unconfirmed != null || !Custody.Covers(status.Custody, r.Custody) || !Custody.Covers(r.Custody, status.Custody)
                     || (!travel && !unstartedTrade && r.Cursor != 0 && (!Agrees(r.OwnerCheckpoint, owner, r) || !Agrees(r.CarrierCheckpoint, carrier, r))))
