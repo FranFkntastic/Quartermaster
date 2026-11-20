@@ -560,21 +560,25 @@ public sealed class BrowserQueryController
     public int ListingCompilationCount => listings.CompilationCount;
     public int ListingEvaluationCount => listings.EvaluationCount;
 
-    public FilterContext<StockGroup> EnsureItemContext(IReadOnlyList<StockGroup> source, OwnerScope owner, string? scopeKey = null, bool isEditing = false, long revision = 0)
+    /// <param name="account">
+    /// The account view's merged stock, so <c>char:</c> matches each item's actual holders instead
+    /// of the logged-in character alone.
+    /// </param>
+    public FilterContext<StockGroup> EnsureItemContext(IReadOnlyList<StockGroup> source, OwnerScope owner, string? scopeKey = null, bool isEditing = false, long revision = 0, AccountStockProjection? account = null)
     {
         var scopeIdentity = ScopeIdentity(owner, scopeKey);
         var identity = $"{revision.ToString(CultureInfo.InvariantCulture)}:{scopeIdentity}";
-        return items.EnsureContext(identity, scopeIdentity, isEditing, () => CreateItemContext(source, owner));
+        return items.EnsureContext(identity, scopeIdentity, isEditing, () => CreateItemContext(source, owner, account));
     }
 
     // A caller with an already-scoped source must still supply its actual scope key
     // so both the query and autocomplete cache invalidate on scope changes.
-    public ItemQueryResult QueryItems(BrowserProjection projection, string? expression, string? scopeKey = null, bool isEditing = false, long revision = 0, IReadOnlyList<StockGroup>? sourceItems = null)
+    public ItemQueryResult QueryItems(BrowserProjection projection, string? expression, string? scopeKey = null, bool isEditing = false, long revision = 0, IReadOnlyList<StockGroup>? sourceItems = null, AccountStockProjection? account = null)
     {
         var source = sourceItems ?? projection.GetItems(scopeKey);
         var scopeIdentity = ScopeIdentity(projection, scopeKey);
         var identity = $"{revision.ToString(CultureInfo.InvariantCulture)}:{scopeIdentity}";
-        var context = EnsureItemContext(source, projection.Owner, scopeKey, isEditing, revision);
+        var context = EnsureItemContext(source, projection.Owner, scopeKey, isEditing, revision, account);
         var result = items.Query(
             source,
             identity,
@@ -609,9 +613,9 @@ public sealed class BrowserQueryController
     private static string ScopeIdentity(OwnerScope owner, string? scopeKey) =>
         $"{owner.LocalContentId}:{owner.HomeWorldId}:{scopeKey ?? BrowserScope.AllKey}";
 
-    public static FilterContext<StockGroup> CreateItemContext(IReadOnlyList<StockGroup> source, OwnerScope owner)
+    public static FilterContext<StockGroup> CreateItemContext(IReadOnlyList<StockGroup> source, OwnerScope owner, AccountStockProjection? account = null)
     {
-        var catalog = CreateCatalog(source.Select(item => (item.ItemId, item.ItemName)), source.SelectMany(item => item.Stacks).Where(stack => stack.RetainerId is not null).Select(stack => (stack.RetainerId!.Value, stack.OwnerName)), source.Select(item => item.Definition), owner);
+        var catalog = CreateCatalog(source.Select(item => (item.ItemId, item.ItemName)), source.SelectMany(item => item.Stacks).Where(stack => stack.RetainerId is not null).Select(stack => (stack.RetainerId!.Value, stack.OwnerName)), source.Select(item => item.Definition), owner, account?.Characters);
         var builder = new FilterContextBuilder<StockGroup>(catalog.Catalog)
             .Bind(catalog.ItemName, item => Evidence.Known(new FfxivItemKey(item.ItemId)))
             .Bind(catalog.ItemLevel, item => Value(item.Definition?.ItemLevel, "Item-level metadata is unavailable."))
@@ -626,7 +630,20 @@ public sealed class BrowserQueryController
             .Bind(catalog.OwnershipQuantity, item => Evidence.Known((long)item.TotalQuantity))
             .BindSet(catalog.OwnershipRetainers, item => Evidence.Known(item.Retainers))
             .UseDefaultText(catalog.ItemName, item => Evidence.Known(item.ItemName));
-        if (owner.LocalContentId is > 0)
+        if (account is not null)
+        {
+            // Every character holding the item, so char: works across the account view.
+            var holders = new Dictionary<uint, IReadOnlyCollection<FfxivCharacterKey>>(account.ById.Count);
+            foreach (var (itemId, entry) in account.ById)
+                holders[itemId] = entry.Locations
+                    .Where(location => location.Character.LocalContentId is > 0)
+                    .Select(location => new FfxivCharacterKey(location.Character.LocalContentId!.Value))
+                    .Distinct()
+                    .ToArray();
+            IReadOnlyCollection<FfxivCharacterKey> none = [];
+            builder.BindSet(catalog.OwnershipCharacters, item => Evidence.Known(holders.GetValueOrDefault(item.ItemId) ?? none));
+        }
+        else if (owner.LocalContentId is > 0)
             builder.BindSet(catalog.OwnershipCharacters, _ => Evidence.Known<IReadOnlyCollection<FfxivCharacterKey>>([new(owner.LocalContentId.Value)]));
         return builder.Build("quartermaster-items", "2");
     }
@@ -662,7 +679,8 @@ public sealed class BrowserQueryController
         IEnumerable<(uint Id, string Name)> itemRows,
         IEnumerable<(ulong Id, string Name)> retainerRows,
         IEnumerable<ItemMetadata?> definitions,
-        OwnerScope owner)
+        OwnerScope owner,
+        IEnumerable<OwnerScope>? characters = null)
     {
         var itemValues = itemRows.GroupBy(row => row.Id).Select(group => new FilterLiteralCandidate<FfxivItemKey>(new(group.Key), group.First().Name)).ToArray();
         var retainerValues = retainerRows.GroupBy(row => row.Id).Select(group => new FilterLiteralCandidate<FfxivRetainerKey>(new(group.Key), group.First().Name)).ToArray();
@@ -677,9 +695,11 @@ public sealed class BrowserQueryController
             .GroupBy(definition => definition.UiCategory!.Value)
             .Select(group => new FilterLiteralCandidate<FfxivUiCategoryKey>(group.Key, group.First().UiCategoryName!))
             .ToArray();
-        var characterValues = owner.LocalContentId is > 0
-            ? new[] { new FilterLiteralCandidate<FfxivCharacterKey>(new(owner.LocalContentId.Value), $"{owner.CharacterName}@{owner.HomeWorldName}") }
-            : [];
+        var characterValues = (characters ?? [owner])
+            .Where(character => character.LocalContentId is > 0)
+            .DistinctBy(character => character.LocalContentId)
+            .Select(character => new FilterLiteralCandidate<FfxivCharacterKey>(new(character.LocalContentId!.Value), $"{character.CharacterName}@{character.HomeWorldName}"))
+            .ToArray();
         return FfxivFilterCatalog.Create(new FfxivFilterResolvers(
             new FilterNamedValueCatalog<FfxivItemKey>(itemValues),
             new FilterNamedValueCatalog<FfxivJobKey>(jobValues),

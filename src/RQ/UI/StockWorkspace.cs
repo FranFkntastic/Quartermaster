@@ -1,6 +1,9 @@
 using System.Diagnostics;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface;
+using Dalamud.Interface.Components;
+using Dalamud.Interface.Utility;
 using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.UI.Filtering;
 using Franthropy.Dalamud.UI.Layout;
@@ -76,8 +79,18 @@ internal sealed class StockWorkspace
     /// <summary>Another character whose cached stock the browser shows instead of the logged-in one's.</summary>
     private OwnerScope? viewedCharacter;
     private (IReadOnlyList<StockGroup> QueryItems, AccountStockProjection Account, StockWorkbenchRow[] Rows)? viewedRows;
+    /// <summary>The viewed character's container: <see cref="BrowserScope.AllKey"/>, its bags or one of its retainers.</summary>
+    private string viewedScopeKey = BrowserScope.AllKey;
+    private (BrowserProjection Stock, string ScopeKey, IReadOnlyList<StockGroup> Items, Dictionary<uint, StockGroup> ById)? viewedItems;
 
-    private const string AccountScopeLabel = "All accessible stock";
+    // ---- Scope rail ----
+    private bool railOpen = true;
+    /// <summary>Character nodes the user opened or closed, by content ID; the logged-in one starts open.</summary>
+    private readonly Dictionary<ulong, bool> railExpanded = [];
+    private RailCounts? railCounts;
+    private const string RailCatalogLabel = "Item Catalog";
+
+    private const string AccountScopeLabel = "All accessible";
     /// <summary>Query identity for the account view; never a <see cref="BrowserScope"/> key.</summary>
     private const string AccountQueryScope = "account";
     /// <summary>The account-wide view (every observed character) rather than one of the logged-in character's scopes.</summary>
@@ -308,11 +321,34 @@ internal sealed class StockWorkspace
         var drawStarted = Stopwatch.GetTimestamp();
         ClearSelectionOnOwnerChange(runtime.Owner);
         PruneSelection(runtime);
+        // The workspace always draws inside its own child, so the table keeps one ID (and saved
+        // layout) whether the rail is open or not.
+        if (railOpen)
+        {
+            timings.Section("stock rail");
+            var railWidth = RailWidth * ImGuiHelpers.GlobalScale;
+            if (ImGui.BeginChild("##RQStockRail", new Vector2(railWidth, 0), false))
+                DrawScopeRail(runtime);
+            ImGui.EndChild();
+            ImGui.SameLine();
+            var min = ImGui.GetItemRectMin();
+            var max = ImGui.GetItemRectMax();
+            var x = max.X + (ImGui.GetStyle().ItemSpacing.X / 2f);
+            ImGui.GetWindowDrawList().AddLine(new Vector2(x, min.Y), new Vector2(x, max.Y), ImGui.GetColorU32(ImGuiCol.Separator), 1);
+        }
+        if (ImGui.BeginChild("##RQStockMain", Vector2.Zero, false))
+            DrawWorkspace(runtime, timings);
+        ImGui.EndChild();
+        drawingRows = null;
+        stockDrawMilliseconds = Stopwatch.GetElapsedTime(drawStarted).TotalMilliseconds;
+    }
+
+    private void DrawWorkspace(QuartermasterRuntimeSnapshot runtime, FrameTimings timings)
+    {
         if (catalogMode)
         {
             timings.Section("stock catalog");
             DrawCatalog(runtime);
-            stockDrawMilliseconds = Stopwatch.GetElapsedTime(drawStarted).TotalMilliseconds;
             return;
         }
         timings.Section("stock filter");
@@ -321,24 +357,23 @@ internal sealed class StockWorkspace
         PruneExpansion(account);
         var accountMode = IsAccountMode;
         var projection = viewed ?? runtime.Browser;
-        var availableItems = viewed?.Items ?? (accountMode
+        var availableItems = viewed is not null ? ViewedItems(viewed).Items : accountMode
             ? GetAccountItemsWithListingDemand(runtime, account)
-            : GetStockItemsWithListingDemand(runtime, workbench.ScopeKey));
+            : GetStockItemsWithListingDemand(runtime, workbench.ScopeKey);
         // The toolbar runs first and updates IsInputActive. Use the same editing
         // snapshot for both cache lookups so a focus transition cannot rebuild twice.
         var isEditing = workbench.ItemFilterState.IsInputActive;
-        var scopeKey = viewed is not null ? BrowserScope.AllKey : accountMode ? AccountQueryScope : workbench.ScopeKey;
-        var characterBeforeToolbar = viewedCharacter;
-        DrawStockToolbar(runtime, availableItems, scopeKey, isEditing);
-        if (characterBeforeToolbar != viewedCharacter || accountMode != IsAccountMode)
-            return; // The stock projection belongs to the previous character or view.
+        var scopeKey = viewed is not null ? viewedScopeKey : accountMode ? AccountQueryScope : workbench.ScopeKey;
+        var queryAccount = accountMode ? account : null;
+        DrawStockToolbar(runtime, availableItems, scopeKey, isEditing, queryAccount);
         var result = queries.QueryItems(
             projection,
             workbench.ItemFilterState.Expression,
             scopeKey,
             isEditing,
             runtime.PlanningRevision,
-            availableItems);
+            availableItems,
+            queryAccount);
         if (!ReferenceEquals(focusedStockSource, result.Items) || focusedStockItemId != workbench.FocusedStockItemId)
         {
             focusedStockSource = result.Items;
@@ -391,8 +426,6 @@ internal sealed class StockWorkspace
             DalamudTableSelectionRenderer.EndRows(stockSelection);
             table.End();
         }
-        drawingRows = null;
-        stockDrawMilliseconds = Stopwatch.GetElapsedTime(drawStarted).TotalMilliseconds;
     }
 
     /// <summary>
@@ -563,7 +596,8 @@ internal sealed class StockWorkspace
 
     /// <summary>
     /// The expanded breakdown: the logged-in character first (bags, saddlebag, retainers in game
-    /// order), then other characters by name, each row with the actions that start from it.
+    /// order), then other characters by name. Each row is one hit target whose right-click menu
+    /// holds the actions that start from that container.
     /// </summary>
     private void DrawLocations(QuartermasterRuntimeSnapshot runtime, StockWorkbenchRow row)
     {
@@ -573,17 +607,14 @@ internal sealed class StockWorkspace
             ImGui.TextDisabled("No observed stock.");
             return;
         }
-        var showCharacter = IsAccountMode;
-        if (!ImGui.BeginTable("##stock-locations", showCharacter ? 5 : 4, DalamudNestedTableFlags.Child))
+        if (!ImGui.BeginTable("##stock-locations", 4, DalamudNestedTableFlags.Child))
             return;
         try
         {
-            if (showCharacter)
-                ImGui.TableSetupColumn("Character", ImGuiTableColumnFlags.WidthFixed);
+            ImGui.TableSetupColumn("Character", ImGuiTableColumnFlags.WidthFixed);
             ImGui.TableSetupColumn("Location", ImGuiTableColumnFlags.WidthFixed);
             ImGui.TableSetupColumn("Quality", ImGuiTableColumnFlags.WidthFixed);
             ImGui.TableSetupColumn("Qty", ImGuiTableColumnFlags.WidthFixed);
-            ImGui.TableSetupColumn("##actions", ImGuiTableColumnFlags.WidthFixed);
             ImGui.TableHeadersRow();
             var previousCharacter = -1;
             foreach (var location in locations)
@@ -592,21 +623,19 @@ internal sealed class StockWorkspace
                 ImGui.PushID(LocationToken(location));
                 try
                 {
-                    if (showCharacter)
-                    {
-                        ImGui.TableNextColumn();
-                        // Each character is named once, on its first location.
-                        if (location.CharacterOrder != previousCharacter)
-                        {
-                            if (location.IsCurrent)
-                                ImGui.TextColored(QuartermasterPalette.Info, location.Character.CharacterName);
-                            else
-                                ImGui.TextUnformatted(location.Character.CharacterName);
-                            if (location.IsCurrent && ImGui.IsItemHovered())
-                                ImGui.SetTooltip("Logged in here");
-                        }
-                        previousCharacter = location.CharacterOrder;
-                    }
+                    ImGui.TableNextColumn();
+                    // Each character is named once, on its first location; the row target spans every column.
+                    var named = location.CharacterOrder != previousCharacter;
+                    previousCharacter = location.CharacterOrder;
+                    if (named && location.IsCurrent)
+                        ImGui.PushStyleColor(ImGuiCol.Text, QuartermasterPalette.Info);
+                    ImGui.Selectable(named ? location.Character.CharacterName : string.Empty, false,
+                        ImGuiSelectableFlags.SpanAllColumns);
+                    if (named && location.IsCurrent)
+                        ImGui.PopStyleColor();
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip(named && location.IsCurrent ? "Logged in here. Right-click for actions." : "Right-click for actions.");
+                    DrawLocationMenu(runtime, row, location);
                     ImGui.TableNextColumn();
                     ImGui.TextUnformatted(location.Container);
                     ImGui.TableNextColumn();
@@ -616,8 +645,6 @@ internal sealed class StockWorkspace
                     var quantity = location.Quantity.ToString("N0");
                     ImGui.SetCursorPosX(ImGui.GetCursorPosX() + Math.Max(0, ImGui.GetContentRegionAvail().X - ImGui.CalcTextSize(quantity).X));
                     ImGui.TextUnformatted(quantity);
-                    ImGui.TableNextColumn();
-                    DrawLocationActions(runtime, row, location);
                 }
                 finally { ImGui.PopID(); }
             }
@@ -636,77 +663,88 @@ internal sealed class StockWorkspace
         return $"{location.Character.LocalContentId ?? 0}.{container}";
     }
 
-    private void DrawLocationActions(QuartermasterRuntimeSnapshot runtime, StockWorkbenchRow row, StockLocation location)
+    /// <summary>
+    /// A location row's right-click menu: send from exactly that container, and for the logged-in
+    /// character, stow from its bags or add its storage to the plan.
+    /// </summary>
+    private void DrawLocationMenu(QuartermasterRuntimeSnapshot runtime, StockWorkbenchRow row, StockLocation location)
     {
         var itemId = row.Item.ItemId;
         var control = $"quartermaster.stock.location.{itemId}.{LocationToken(location)}";
-        var first = true;
-        void Gap()
-        {
-            if (!first) ImGui.SameLine();
-            first = false;
-        }
-
+        var identified = runtime.Owner.HasStableIdentity;
         // Courier lines move bags and retainer stock; the saddlebag is not a courier source.
-        if (location.Kind is BrowserScopeKind.Player or BrowserScopeKind.Retainer &&
-            transferPlans.HasCourierDestinations(runtime, location.Character))
+        var canSend = location.Kind is BrowserScopeKind.Player or BrowserScopeKind.Retainer &&
+                      transferPlans.HasCourierDestinations(runtime, location.Character);
+        var current = location.IsCurrent && identified ? runtime.Browser.FindItem(itemId) : null;
+        var canStow = location.Kind == BrowserScopeKind.Player && current is { PlayerQuantity: > 0 };
+        var canPlan = location.Kind is BrowserScopeKind.Saddlebag or BrowserScopeKind.Retainer && current is not null;
+
+        reviewRegistry.RegisterLastButton($"{control}.menu", $"Open actions for {row.Item.ItemName} in {location.Label}", true,
+            () => pendingLocationPopup = $"menu:{control}", "Available");
+        if (canSend)
+            reviewRegistry.RegisterLastButton($"{control}.send", $"Send {row.Item.ItemName} from {location.Label}", identified,
+                () => pendingLocationPopup = $"send:{control}", identified ? "Available" : "Log in to plan courier lines");
+        if (canStow)
+            reviewRegistry.RegisterLastButton($"{control}.stow", $"Stow carried {row.Item.ItemName}", true,
+                () => pendingLocationPopup = $"stow:{control}", "Available");
+        if (canPlan)
+            reviewRegistry.RegisterLastButton($"{control}.add-to-plan", $"Add {row.Item.ItemName} to the current Transfer Plan", true,
+                () => UpsertSelectedStockRules(runtimeSnapshots.Current, [current!], stowCarried: false), "Available");
+
+        if (pendingLocationPopup is { } pending && pending.Length == control.Length + 5 && pending.EndsWith(control, StringComparison.Ordinal))
         {
-            var canSend = runtime.Owner.HasStableIdentity;
-            var popup = $"send:{control}";
-            Gap();
-            ImGui.BeginDisabled(!canSend);
-            if (ImGui.SmallButton("Send to…"))
-                ImGui.OpenPopup("##location-send");
-            ImGui.EndDisabled();
-            if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-                ImGui.SetTooltip(canSend ? $"Send {location.Quantity:N0} from {location.Label}" : "Log in to plan courier lines");
-            reviewRegistry.RegisterLastButton($"{control}.send", $"Send {row.Item.ItemName} from {location.Label}", canSend,
-                () => pendingLocationPopup = popup, "Available");
-            if (pendingLocationPopup == popup)
-            {
-                ImGui.OpenPopup("##location-send");
-                pendingLocationPopup = null;
-            }
-            if (DalamudOwnedPopup.BeginOpaquePopup("##location-send"))
-            {
-                ImGui.TextDisabled($"From {location.Label}");
-                if (LocationItem(runtime, itemId, location) is { } source)
-                    DrawSendDestinations(runtime, [source], location.Character, $"{control}.send");
-                ImGui.EndPopup();
-            }
+            var popup = pending.StartsWith("menu:", StringComparison.Ordinal) ? "##location-menu"
+                : pending.StartsWith("send:", StringComparison.Ordinal) ? "##location-send"
+                : "##location-stow";
+            ImGui.OpenPopup(popup);
+            pendingLocationPopup = null;
         }
 
-        if (!location.IsCurrent || !runtime.Owner.HasStableIdentity || runtime.Browser.FindItem(itemId) is not { } current)
-            return;
-        if (location.Kind == BrowserScopeKind.Player)
+        if (ImGui.BeginPopupContextItem("##location-menu"))
         {
-            if (current.PlayerQuantity == 0)
-                return;
-            var popup = $"stow:{control}";
-            Gap();
-            if (ImGui.SmallButton("Stow…"))
-                ImGui.OpenPopup("##location-stow");
-            reviewRegistry.RegisterLastButton($"{control}.stow", $"Stow carried {row.Item.ItemName}", true,
-                () => pendingLocationPopup = popup, "Available");
-            if (pendingLocationPopup == popup)
+            ImGui.TextDisabled($"{location.Character.CharacterName} · {location.Container}");
+            ImGui.Separator();
+            if (canSend)
             {
-                ImGui.OpenPopup("##location-stow");
-                pendingLocationPopup = null;
+                if (ImGui.BeginMenu("Send to", identified))
+                {
+                    if (LocationItem(runtime, itemId, location) is { } source)
+                        DrawSendDestinations(runtime, [source], location.Character, $"{control}.send");
+                    ImGui.EndMenu();
+                }
+                if (!identified && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                    ImGui.SetTooltip("Log in to plan courier lines");
             }
-            if (DalamudOwnedPopup.BeginOpaquePopup("##location-stow"))
+            if (canStow && ImGui.BeginMenu("Stow carried"))
             {
-                DrawStowDestinations(runtime, [current]);
-                ImGui.EndPopup();
+                DrawStowDestinations(runtime, [current!]);
+                ImGui.EndMenu();
             }
-            return;
+            if (canPlan)
+            {
+                if (ImGui.MenuItem("Add to plan"))
+                    UpsertSelectedStockRules(runtime, [current!], stowCarried: false);
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("Add to the open Transfer plan, then set a target to retrieve");
+            }
+            if (!canSend && !canStow && !canPlan)
+                ImGui.TextDisabled("Nothing to do from here");
+            ImGui.EndPopup();
         }
-        Gap();
-        if (ImGui.SmallButton("Add to plan"))
-            UpsertSelectedStockRules(runtime, [current], stowCarried: false);
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Add to the open Transfer plan, then set a target to retrieve");
-        reviewRegistry.RegisterLastButton($"{control}.add-to-plan", $"Add {row.Item.ItemName} to the current Transfer Plan", true,
-            () => UpsertSelectedStockRules(runtimeSnapshots.Current, [current], stowCarried: false), "Available");
+
+        // The agent bridge cannot hover a submenu open, so its send and stow open these instead.
+        if (canSend && DalamudOwnedPopup.BeginOpaquePopup("##location-send"))
+        {
+            ImGui.TextDisabled($"From {location.Label}");
+            if (LocationItem(runtime, itemId, location) is { } source)
+                DrawSendDestinations(runtime, [source], location.Character, $"{control}.send");
+            ImGui.EndPopup();
+        }
+        if (canStow && DalamudOwnedPopup.BeginOpaquePopup("##location-stow"))
+        {
+            DrawStowDestinations(runtime, [current!]);
+            ImGui.EndPopup();
+        }
     }
 
     /// <summary>A character's own stock group for an item: the logged-in projection or that character's cached one.</summary>
@@ -784,9 +822,27 @@ internal sealed class StockWorkspace
             return null;
         if (!character.Matches(runtime.Owner) && !CourierSession.IsCarrier(runtime, character) &&
             courier.Stock(runtime, character) is { } stock)
+        {
+            // A retainer that left the character takes its scope with it.
+            if (viewedScopeKey != BrowserScope.AllKey && !stock.Scopes.Any(scope => scope.Key == viewedScopeKey))
+                viewedScopeKey = BrowserScope.AllKey;
             return stock;
+        }
         SetViewedCharacter(null);
         return null;
+    }
+
+    /// <summary>The viewed character's items in its chosen container, cached per projection and container.</summary>
+    private (BrowserProjection Stock, string ScopeKey, IReadOnlyList<StockGroup> Items, Dictionary<uint, StockGroup> ById) ViewedItems(BrowserProjection stock)
+    {
+        if (viewedItems is { } cached && ReferenceEquals(cached.Stock, stock) && cached.ScopeKey == viewedScopeKey)
+            return cached;
+        var items = stock.GetItems(viewedScopeKey);
+        var byId = new Dictionary<uint, StockGroup>(items.Count);
+        foreach (var item in items)
+            byId.TryAdd(item.ItemId, item);
+        viewedItems = (stock, viewedScopeKey, items, byId);
+        return viewedItems.Value;
     }
 
     private void SetViewedCharacter(OwnerScope? character)
@@ -795,11 +851,14 @@ internal sealed class StockWorkspace
             return;
         ClearStockSelection();
         viewedCharacter = character;
+        viewedScopeKey = BrowserScope.AllKey;
     }
 
-    private void ViewCharacter(OwnerScope character)
+    /// <summary>Another character's stock: all of it, or one container (its bags or one retainer).</summary>
+    private void ViewCharacter(OwnerScope character, string scopeKey = BrowserScope.AllKey)
     {
         SetViewedCharacter(character);
+        viewedScopeKey = scopeKey;
         workbench.FocusedStockItemId = null;
         LeaveCatalog();
     }
@@ -969,24 +1028,23 @@ internal sealed class StockWorkspace
         return stockListingEvaluation;
     }
 
-    private void DrawStockToolbar(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> sourceItems, string scopeKey, bool isEditing)
+    private void DrawStockToolbar(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> sourceItems, string scopeKey, bool isEditing, AccountStockProjection? account = null)
     {
         var projection = runtime.Browser;
+        DrawRailToggle();
+        ImGui.SameLine();
         if (catalogMode)
         {
-            catalogPicker.DrawSearch(Math.Max(100, ImGui.GetContentRegionAvail().X - ScopeComboWidth() - ImGui.GetStyle().ItemSpacing.X));
-            ImGui.SameLine();
-            DrawScopeCombo(runtime);
+            catalogPicker.DrawSearch(Math.Max(100, ImGui.GetContentRegionAvail().X));
             return;
         }
-        var context = queries.EnsureItemContext(sourceItems, viewedCharacter ?? projection.Owner, scopeKey, isEditing, runtime.PlanningRevision);
+        var context = queries.EnsureItemContext(sourceItems, viewedCharacter ?? projection.Owner, scopeKey, isEditing, runtime.PlanningRevision, account);
         var spacing = ImGui.GetStyle().ItemSpacing.X;
-        var trailingWidth = SearchReference.ButtonWidth + spacing + ScopeComboWidth() + spacing +
-            DalamudUiLayout.ButtonWidth("…") + spacing;
+        var trailingWidth = SearchReference.ButtonWidth + spacing + DalamudUiLayout.ButtonWidth("…") + spacing;
         var filterBeforeDraw = workbench.ItemFilterState.Expression;
         DalamudFilterAutocompleteRenderer.Draw(
             "RQStockWorkbench",
-            "Search stock — try ilvl>=690 job:WHM slot:body",
+            SearchHint(runtime),
             context,
             workbench.ItemFilterState,
             Math.Max(100, ImGui.GetContentRegionAvail().X - trailingWidth));
@@ -1020,8 +1078,6 @@ internal sealed class StockWorkspace
             workbench.ItemFilterState.RequestFocus();
             workbench.FocusedStockItemId = null;
         }
-        ImGui.SameLine();
-        DrawScopeCombo(runtime);
 
         ImGui.SameLine();
         var openOptions = ImGui.SmallButton("…##RQStockOptions");
@@ -1099,98 +1155,319 @@ internal sealed class StockWorkspace
         }
     }
 
-    private static float ScopeComboWidth() =>
-        Math.Max(150, ImGui.CalcTextSize(CatalogPicker.ScopeLabel).X + ImGui.GetFrameHeight() + (ImGui.GetStyle().FramePadding.X * 2f));
+    // ---- Scope rail ----------------------------------------------------------------------------
+
+    private const float RailWidth = 192f;
 
     /// <summary>"Wei Ning", or a neutral name while the logged-in character is not identified.</summary>
     private static string HereName(QuartermasterRuntimeSnapshot runtime) =>
         string.IsNullOrWhiteSpace(runtime.Owner.CharacterName) ? "This character" : runtime.Owner.CharacterName;
 
-    /// <summary>A logged-in character scope as the dropdown lists it: "Wei Ning (all)", "Player", "Grungel".</summary>
-    private static string HereScopeLabel(QuartermasterRuntimeSnapshot runtime, BrowserScope scope) =>
-        scope.Kind == BrowserScopeKind.All ? $"{HereName(runtime)} (all)" : scope.Label;
+    /// <summary>A character's container as the rail names it: "Bags", "Saddlebag" or the retainer's name.</summary>
+    private static string ContainerName(BrowserScope scope) => scope.Kind switch
+    {
+        BrowserScopeKind.Player => "Bags",
+        BrowserScopeKind.Saddlebag => "Saddlebag",
+        _ => scope.Label,
+    };
+
+    /// <summary>"All accessible", "Wei Ning", "Wei Ning · Saddlebag", "Dredgen Hope · Vesper" or the catalog.</summary>
+    private string ActiveScopeLabel(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (catalogMode)
+            return RailCatalogLabel;
+        if (viewedCharacter is { } viewed)
+            return viewedScopeKey != BrowserScope.AllKey &&
+                   courier.Stock(runtime, viewed)?.Scopes.FirstOrDefault(scope => scope.Key == viewedScopeKey) is { } container
+                ? $"{CourierSession.CharacterLabel(viewed)} · {ContainerName(container)}"
+                : CourierSession.CharacterLabel(viewed);
+        if (accountWide)
+            return AccountScopeLabel;
+        var selected = runtime.Browser.Scopes.FirstOrDefault(scope => scope.Key == workbench.ScopeKey);
+        return selected is null || selected.Kind == BrowserScopeKind.All
+            ? HereName(runtime)
+            : $"{HereName(runtime)} · {ContainerName(selected)}";
+    }
+
+    private string? searchHintScope;
+    private string searchHint = string.Empty;
+
+    /// <summary>The search box names the active scope, so it stays obvious with the rail closed.</summary>
+    private string SearchHint(QuartermasterRuntimeSnapshot runtime)
+    {
+        var scope = ActiveScopeLabel(runtime);
+        if (!string.Equals(scope, searchHintScope, StringComparison.Ordinal))
+        {
+            searchHintScope = scope;
+            searchHint = $"Search in {scope}…";
+        }
+        return searchHint;
+    }
+
+    private void ToggleRail() => railOpen = !railOpen;
+
+    private void DrawRailToggle()
+    {
+        if (ImGuiComponents.IconButton("RQStockRailToggle", railOpen ? FontAwesomeIcon.ChevronLeft : FontAwesomeIcon.ChevronRight))
+            ToggleRail();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(railOpen ? "Hide scopes" : "Show scopes");
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.stock.rail.toggle",
+            railOpen ? "Hide the stock scope rail" : "Show the stock scope rail",
+            true,
+            ToggleRail,
+            railOpen ? "Open" : "Closed");
+    }
+
+    private bool RailExpanded(OwnerScope character, bool byDefault) =>
+        railExpanded.TryGetValue(character.LocalContentId ?? 0, out var open) ? open : byDefault;
+
+    private void ToggleRailExpanded(OwnerScope character, bool byDefault) =>
+        railExpanded[character.LocalContentId ?? 0] = !RailExpanded(character, byDefault);
 
     /// <summary>
-    /// The scope dropdown: the account view, then the logged-in character's scopes, then other
-    /// observed characters, then the catalog, each section under its own header.
+    /// The scope tree: the account view, the logged-in character and its containers, each other
+    /// observed character and its containers, then the catalog. Clicking any node scopes to it.
     /// </summary>
-    private void DrawScopeCombo(QuartermasterRuntimeSnapshot runtime)
+    private void DrawScopeRail(QuartermasterRuntimeSnapshot runtime)
     {
-        var projection = runtime.Browser;
-        var characters = courier.Browsable(runtime).ToArray();
-        ImGui.SetNextItemWidth(ScopeComboWidth());
-        var selectedScope = projection.Scopes.FirstOrDefault(scope => scope.Key == workbench.ScopeKey) ?? projection.Scopes[0];
-        var selectedLabel = catalogMode ? CatalogPicker.ScopeLabel
-            : viewedCharacter is { } viewed ? CourierSession.CharacterLabel(viewed)
-            : accountWide ? AccountScopeLabel
-            : selectedScope.Kind == BrowserScopeKind.All ? HereScopeLabel(runtime, selectedScope)
-            : $"{HereName(runtime)} · {selectedScope.Label}";
-        if (ImGui.BeginCombo("##RQStockScope", selectedLabel, ImGuiComboFlags.HeightLarge))
-        {
-            if (ImGui.Selectable($"{AccountScopeLabel}##stock-scope:account", IsAccountMode))
-                ViewAccount();
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip(string.Join("\n", courier.AccountStock(runtime).Characters
-                    .Select(character => character.Matches(runtime.Owner) ? $"{HereName(runtime)} (logged in)" : character.CharacterName)
-                    .Prepend("Every observed character:")));
+        var account = courier.AccountStock(runtime);
+        var counts = ResolveRailCounts(account);
 
-            ImGui.Separator();
-            ImGui.TextDisabled(HereName(runtime));
-            ImGui.Indent();
-            foreach (var scope in projection.Scopes)
-                if (ImGui.Selectable($"{HereScopeLabel(runtime, scope)}##stock-scope:{scope.Key}",
-                        !catalogMode && viewedCharacter is null && !accountWide && scope.Key == workbench.ScopeKey))
-                    ViewHereScope(scope.Key);
-            ImGui.Unindent();
-
-            if (characters.Length > 0)
-            {
-                ImGui.Separator();
-                ImGui.TextDisabled("Other characters");
-                ImGui.Indent();
-                foreach (var character in characters)
-                    if (ImGui.Selectable($"{CourierSession.CharacterLabel(character)}##stock-scope:character:{character.LocalContentId}",
-                            !catalogMode && viewedCharacter?.Matches(character) == true))
-                        ViewCharacter(character);
-                ImGui.Unindent();
-            }
-
-            ImGui.Separator();
-            if (ImGui.Selectable($"{CatalogPicker.ScopeLabel}##stock-scope:catalog", catalogMode))
-                EnterCatalog();
-            ImGui.EndCombo();
-        }
-        reviewRegistry.RegisterLastButton(
-            "quartermaster.stock.scope.catalog",
-            $"Browse {CatalogPicker.ScopeLabel.ToLowerInvariant()}",
-            true,
-            EnterCatalog,
-            catalogMode ? "Selected" : "Available");
+        if (RailNode(AccountScopeLabel, counts.AccountText, IsAccountMode, null, out _))
+            ViewAccount();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(string.Join("\n", account.Characters
+                .Select(character => character.Matches(runtime.Owner) ? $"{HereName(runtime)} (logged in)" : character.CharacterName)
+                .Prepend("Every observed character:")));
         reviewRegistry.RegisterLastButton(
             "quartermaster.stock.scope.account",
             "Browse every observed character's stock",
             true,
             ViewAccount,
             IsAccountMode ? "Selected" : "Available");
-        foreach (var scope in projection.Scopes)
+
+        DrawHereNode(runtime, counts);
+
+        // Account characters after the first are the other observed characters, by name.
+        for (var index = 1; index < account.Characters.Count; index++)
         {
-            var key = scope.Key;
-            reviewRegistry.RegisterLastButton(
-                $"quartermaster.stock.scope.here.{key.Replace(':', '.')}",
-                $"Browse {HereScopeLabel(runtime, scope)}",
-                true,
-                () => ViewHereScope(key),
-                !catalogMode && viewedCharacter is null && !accountWide && key == workbench.ScopeKey ? "Selected" : "Available");
+            var character = account.Characters[index];
+            if (courier.Stock(runtime, character) is not { } stock)
+                continue;
+            ImGui.PushID(index);
+            try { DrawCharacterNode(character, stock, index, counts); }
+            finally { ImGui.PopID(); }
         }
-        foreach (var character in characters)
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+        if (RailNode(RailCatalogLabel, counts.CatalogText(gameCatalog), catalogMode, null, out _))
+            EnterCatalog();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(CatalogPicker.ScopeLabel);
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.stock.scope.catalog",
+            $"Browse {CatalogPicker.ScopeLabel.ToLowerInvariant()}",
+            true,
+            EnterCatalog,
+            catalogMode ? "Selected" : "Available");
+    }
+
+    /// <summary>The logged-in character: open by default, with its bags, saddlebag and retainers in game order.</summary>
+    private void DrawHereNode(QuartermasterRuntimeSnapshot runtime, RailCounts counts)
+    {
+        var owner = runtime.Owner;
+        var inHere = !catalogMode && viewedCharacter is null && !accountWide;
+        var open = RailExpanded(owner, true);
+        ImGui.PushID("here");
+        try
         {
-            var target = character;
+            var allSelected = inHere && workbench.ScopeKey == BrowserScope.AllKey;
+            if (RailNode(HereName(runtime), counts.Text(0, BrowserScope.AllKey), allSelected, open, out var toggled, QuartermasterPalette.Info))
+                ViewHereScope(BrowserScope.AllKey);
+            if (toggled)
+                ToggleRailExpanded(owner, true);
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Logged in here");
             reviewRegistry.RegisterLastButton(
-                $"quartermaster.stock.scope.character.{character.LocalContentId}",
-                $"Browse {character.CharacterName}'s stock",
+                "quartermaster.stock.scope.here.all",
+                $"Browse all of {HereName(runtime)}'s stock",
                 true,
-                () => ViewCharacter(target),
-                !catalogMode && viewedCharacter?.Matches(character) == true ? "Selected" : "Available");
+                () => ViewHereScope(BrowserScope.AllKey),
+                allSelected ? "Selected" : "Available");
+            reviewRegistry.RegisterLastButton(
+                "quartermaster.stock.rail.here.expand",
+                $"{(open ? "Collapse" : "Expand")} {HereName(runtime)}'s containers",
+                true,
+                () => ToggleRailExpanded(runtimeSnapshots.Current.Owner, true),
+                open ? "Expanded" : "Collapsed");
+            if (!open)
+                return;
+            ImGui.Indent();
+            foreach (var scope in runtime.Browser.Scopes)
+            {
+                if (scope.Kind == BrowserScopeKind.All)
+                    continue;
+                var key = scope.Key;
+                var selected = inHere && key == workbench.ScopeKey;
+                if (RailNode(ContainerName(scope), counts.Text(0, key), selected, null, out _))
+                    ViewHereScope(key);
+                reviewRegistry.RegisterLastButton(
+                    $"quartermaster.stock.scope.here.{key.Replace(':', '.')}",
+                    $"Browse {HereName(runtime)} · {ContainerName(scope)}",
+                    true,
+                    () => ViewHereScope(key),
+                    selected ? "Selected" : "Available");
+            }
+            ImGui.Unindent();
+        }
+        finally { ImGui.PopID(); }
+    }
+
+    /// <summary>Another observed character: closed by default, with its bags and observed retainers.</summary>
+    private void DrawCharacterNode(OwnerScope character, BrowserProjection stock, int index, RailCounts counts)
+    {
+        var viewing = !catalogMode && viewedCharacter?.Matches(character) == true;
+        var open = RailExpanded(character, false);
+        var control = $"quartermaster.stock.scope.character.{character.LocalContentId}";
+        var allSelected = viewing && viewedScopeKey == BrowserScope.AllKey;
+        if (RailNode(CourierSession.CharacterLabel(character), counts.Text(index, BrowserScope.AllKey), allSelected, open, out var toggled))
+            ViewCharacter(character);
+        if (toggled)
+            ToggleRailExpanded(character, false);
+        reviewRegistry.RegisterLastButton(
+            control,
+            $"Browse {character.CharacterName}'s stock",
+            true,
+            () => ViewCharacter(character),
+            allSelected ? "Selected" : "Available");
+        reviewRegistry.RegisterLastButton(
+            $"quartermaster.stock.rail.character.{character.LocalContentId}.expand",
+            $"{(open ? "Collapse" : "Expand")} {character.CharacterName}'s containers",
+            true,
+            () => ToggleRailExpanded(character, false),
+            open ? "Expanded" : "Collapsed");
+        if (!open)
+            return;
+        ImGui.Indent();
+        foreach (var scope in stock.Scopes)
+        {
+            // Another character's saddlebag is never observed here.
+            if (scope.Kind is not (BrowserScopeKind.Player or BrowserScopeKind.Retainer))
+                continue;
+            var key = scope.Key;
+            var selected = viewing && key == viewedScopeKey;
+            if (RailNode(ContainerName(scope), counts.Text(index, key), selected, null, out _))
+                ViewCharacter(character, key);
+            reviewRegistry.RegisterLastButton(
+                $"{control}.{key.Replace(':', '.')}",
+                $"Browse {character.CharacterName} · {ContainerName(scope)}",
+                true,
+                () => ViewCharacter(character, key),
+                selected ? "Selected" : "Available");
+        }
+        ImGui.Unindent();
+    }
+
+    /// <summary>
+    /// One rail row: a tree node (a leaf when <paramref name="open"/> is null) with its count drawn
+    /// right-aligned in muted text. The count is not an item, so the node stays the last item for
+    /// hover checks and review registration. Returns whether the label (not the chevron) was clicked.
+    /// </summary>
+    private static bool RailNode(string label, string? count, bool selected, bool? open, out bool toggled, Vector4? color = null)
+    {
+        var flags = ImGuiTreeNodeFlags.SpanAvailWidth | ImGuiTreeNodeFlags.NoTreePushOnOpen;
+        if (selected)
+            flags |= ImGuiTreeNodeFlags.Selected;
+        if (open is { } expanded)
+        {
+            flags |= ImGuiTreeNodeFlags.OpenOnArrow;
+            ImGui.SetNextItemOpen(expanded, ImGuiCond.Always);
+        }
+        else
+            flags |= ImGuiTreeNodeFlags.Leaf;
+        if (color is { } text)
+            ImGui.PushStyleColor(ImGuiCol.Text, text);
+        ImGui.TreeNodeEx(label, flags);
+        if (color is not null)
+            ImGui.PopStyleColor();
+        toggled = open is not null && ImGui.IsItemToggledOpen();
+        var clicked = ImGui.IsItemClicked(ImGuiMouseButton.Left) && !toggled;
+        if (!string.IsNullOrEmpty(count))
+        {
+            var min = ImGui.GetItemRectMin();
+            var max = ImGui.GetItemRectMax();
+            var size = ImGui.CalcTextSize(count);
+            ImGui.GetWindowDrawList().AddText(
+                new Vector2(max.X - size.X - ImGui.GetStyle().FramePadding.X, min.Y + ((max.Y - min.Y - size.Y) / 2f)),
+                ImGui.GetColorU32(ImGuiCol.TextDisabled),
+                count);
+        }
+        return clicked;
+    }
+
+    private RailCounts ResolveRailCounts(AccountStockProjection account)
+    {
+        if (railCounts is { } cached && ReferenceEquals(cached.Account, account))
+            return cached;
+        return railCounts = RailCounts.Build(account);
+    }
+
+    /// <summary>Distinct items per rail node, built once per account projection.</summary>
+    private sealed class RailCounts
+    {
+        private readonly Dictionary<(int Character, string ScopeKey), string> text;
+        private string? catalogText;
+
+        private RailCounts(AccountStockProjection account, string accountText, Dictionary<(int Character, string ScopeKey), string> text)
+        {
+            Account = account;
+            AccountText = accountText;
+            this.text = text;
+        }
+
+        public AccountStockProjection Account { get; }
+        public string AccountText { get; }
+
+        /// <summary>A character's count (by its index in the account) for one of its scopes, or "0".</summary>
+        public string Text(int character, string scopeKey) => text.GetValueOrDefault((character, scopeKey)) ?? "0";
+
+        /// <summary>The catalog's size once it has loaded.</summary>
+        public string? CatalogText(GameItemCatalog catalog) =>
+            catalogText ??= catalog.TryGet()?.Items.Count.ToString("N0");
+
+        public static RailCounts Build(AccountStockProjection account)
+        {
+            var counts = new Dictionary<(int Character, string ScopeKey), int>();
+            foreach (var entry in account.ById.Values)
+            {
+                var previous = -1;
+                // Locations are grouped by character, one per container.
+                foreach (var location in entry.Locations)
+                {
+                    if (location.CharacterOrder != previous)
+                    {
+                        previous = location.CharacterOrder;
+                        Increment(counts, (previous, BrowserScope.AllKey));
+                    }
+                    var scopeKey = location.Kind switch
+                    {
+                        BrowserScopeKind.Player => BrowserScope.PlayerKey,
+                        BrowserScopeKind.Saddlebag => BrowserScope.SaddlebagKey,
+                        _ => location.RetainerId is { } retainer ? BrowserScope.RetainerKey(retainer) : null,
+                    };
+                    if (scopeKey is not null)
+                        Increment(counts, (location.CharacterOrder, scopeKey));
+                }
+            }
+            return new RailCounts(account, account.Items.Count.ToString("N0"),
+                counts.ToDictionary(entry => entry.Key, entry => entry.Value.ToString("N0")));
+
+            static void Increment(Dictionary<(int Character, string ScopeKey), int> counts, (int Character, string ScopeKey) key) =>
+                counts[key] = counts.GetValueOrDefault(key) + 1;
         }
     }
 
@@ -1501,10 +1778,12 @@ internal sealed class StockWorkspace
 
     private bool TryResolveStock(QuartermasterRuntimeSnapshot runtime, uint itemId, out StockGroup item, out bool carried)
     {
-        // Another character's scope resolves only against that character's stock.
+        // Another character's scope resolves only against that character's stock: its chosen
+        // container first, as the logged-in character's scopes do, then all of it.
         if (!catalogMode && viewedCharacter is { } viewed)
         {
-            item = courier.Stock(runtime, viewed)?.FindItem(itemId)!;
+            var stock = courier.Stock(runtime, viewed);
+            item = (stock is null ? null : ViewedItems(stock).ById.GetValueOrDefault(itemId) ?? stock.FindItem(itemId))!;
             carried = item?.PlayerQuantity > 0;
             return item is not null;
         }
