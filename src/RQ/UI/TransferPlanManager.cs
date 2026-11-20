@@ -357,7 +357,7 @@ internal sealed class TransferPlanManager
         ImGui.TextUnformatted(rule.TargetQuantity.ToString("N0"));
         ImGui.TableNextColumn();
         var destination = rule.Courier is { } route
-            ? $"{CourierSession.Side(runtime, route.SourceCharacter ?? row.Owner, route.SourceRetainerId, includeOwner: true)} → {CourierSession.Side(runtime, route.Character, route.RetainerId, includeOwner: true)}"
+            ? $"{CourierSession.Side(runtime, route.SourceCharacter ?? row.Owner, route.SourceRetainerId, includeOwner: true)} → {CourierSession.Destination(runtime, route.Character, rule.Routing, includeOwner: true)}"
             : StowTo(runtime, rule.Routing);
         var shown = Fit(destination, ImGui.GetContentRegionAvail().X);
         ImGui.TextUnformatted(shown);

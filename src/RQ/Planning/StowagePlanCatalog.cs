@@ -315,18 +315,21 @@ public static class StowagePlanCatalog
         (rule.Courier is not null) == (kind == StowagePlanKind.Courier);
 
     /// <summary>
-    /// A plan holds one ordinary line per item and quality, plus one courier line per distinct route
-    /// (source container and destination) for that item and quality.
+    /// A plan holds one ordinary line per item and quality, plus one courier line per source container
+    /// and destination character for that item and quality. Where a courier line lands on its
+    /// destination is the line's ranked Routing, as for an ordinary line, not part of its identity.
     /// </summary>
-    public static (uint ItemId, ItemQualityPolicy Quality, ulong? To, ulong? ToRetainer, ulong? From, ulong? FromRetainer, bool Courier) LineKey(TargetPlanItem rule) =>
+    public static (uint ItemId, ItemQualityPolicy Quality, ulong? To, ulong? From, ulong? FromRetainer, bool Courier) LineKey(TargetPlanItem rule) =>
         rule.Courier is { } route
-            ? (rule.ItemId, rule.Quality, route.Character.LocalContentId, route.RetainerId, route.SourceCharacter?.LocalContentId, route.SourceRetainerId, true)
-            : (rule.ItemId, rule.Quality, (ulong?)null, (ulong?)null, (ulong?)null, (ulong?)null, false);
+            ? (rule.ItemId, rule.Quality, route.Character.LocalContentId, route.SourceCharacter?.LocalContentId, route.SourceRetainerId, true)
+            : (rule.ItemId, rule.Quality, (ulong?)null, (ulong?)null, (ulong?)null, false);
 
     /// <summary>
     /// Collapses courier lines that share a <see cref="LineKey"/> into the first of them, the way
-    /// adding an item already on the route does: quantities sum (saturating at int.MaxValue) and
-    /// the merged line is enabled when any of them was. Non-courier lines are left alone.
+    /// adding an item already on the route does: quantities sum (saturating at int.MaxValue), the
+    /// merged line is enabled when any of them was, and its destinations are the first line's ranked
+    /// retainers followed by the others' not already listed, with Any space and Consolidate kept when
+    /// any line had them (Consolidate only while a rank 1 exists). Non-courier lines are left alone.
     /// </summary>
     public static void MergeCourierDuplicates(List<TargetPlanItem> rules)
     {
@@ -338,11 +341,27 @@ public static class StowagePlanCatalog
                 total += Math.Max(0, rule.TargetQuantity);
             survivor.TargetQuantity = (int)Math.Min(int.MaxValue, total);
             survivor.Enabled = group.Any(rule => rule.Enabled);
+            survivor.Routing = group.Skip(1).Aggregate(survivor.Routing, (routing, rule) => UnionRouting(routing, rule.Routing));
             if (string.IsNullOrWhiteSpace(survivor.Notes))
                 survivor.Notes = group.Select(rule => rule.Notes).FirstOrDefault(notes => !string.IsNullOrWhiteSpace(notes)) ?? survivor.Notes;
             var redundant = group.Skip(1).ToHashSet();
             rules.RemoveAll(redundant.Contains);
         }
+    }
+
+    /// <summary>
+    /// The destinations of two merged lines: the first's ranked retainers, then the second's not
+    /// already listed; Any space and Consolidate when either had them, Consolidate only with a rank 1.
+    /// </summary>
+    public static StowageRoutingPolicy UnionRouting(StowageRoutingPolicy? first, StowageRoutingPolicy? second)
+    {
+        var routing = StowageRoutingPolicy.CopyOf(first);
+        foreach (var id in second?.PreferredRetainerIds ?? [])
+            if (!routing.PreferredRetainerIds.Contains(id))
+                routing.PreferredRetainerIds.Add(id);
+        routing.AnySpace |= second?.AnySpace == true;
+        routing.Consolidate = (routing.Consolidate || second?.Consolidate == true) && routing.PreferredRetainerIds.Count > 0;
+        return routing;
     }
 
     public static void ClearStaleRecovery(QuartermasterState state)

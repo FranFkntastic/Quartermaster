@@ -5,9 +5,20 @@ using RQ.Inventory;
 
 namespace RQ.Courier;
 
-// Null retainer means bags; zero is not a retainer. A null SourceCharacter means the plan owner.
-public sealed record CourierRoute(OwnerScope Character, ulong? RetainerId, ulong? SourceRetainerId,
-    OwnerScope? SourceCharacter = null);
+// Null source retainer means bags; zero is not a retainer. A null SourceCharacter means the plan owner.
+// Where the units land on Character lives in the line's Routing, as in Transfer Placement: no
+// destinations keeps them in its bags, else its ranked retainers, then Any space.
+public sealed record CourierRoute(OwnerScope Character, ulong? SourceRetainerId, OwnerScope? SourceCharacter = null)
+{
+    /// <summary>
+    /// The single destination retainer of routes written before courier lines carried a Routing.
+    /// Read from older state and moved into the line's Routing on load (see
+    /// <c>StowagePlanMigration.MoveCourierRetainersToRouting</c>); never written once migrated.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [System.ComponentModel.EditorBrowsable(System.ComponentModel.EditorBrowsableState.Never)]
+    public ulong? RetainerId { get; init; }
+}
 public readonly record struct WardPoint(float X,float Y,float Z)
 {
     internal System.Numerics.Vector3 Position => new(X,Y,Z);
@@ -46,7 +57,17 @@ public sealed record Shipment(Guid Line, uint Item, string Name, bool Hq, int Un
 public sealed record CourierTrip(OwnerScope Source, OwnerScope Destination, MeetingBell Pickup, MeetingBell Dropoff,
     ImmutableArray<Shipment> Manifest);
 public sealed record Refusal(Guid Line, string Name, string Code, string? Source=null, string? Destination=null);
-public sealed record CourierPlan(Guid PlanId, long Revision, ImmutableArray<CourierTrip> Trips, ImmutableArray<Refusal> Refusals);
+/// <summary>
+/// Destination-side consolidation for one line: once its units are delivered, gather the item's
+/// stray stacks on Destination's other retainers into Retainer (the line's rank 1).
+/// </summary>
+public sealed record CourierConsolidation(OwnerScope Destination, Guid Line, uint Item, string Name,
+    ItemQualityPolicy Quality, ulong Retainer, int StackSize);
+public sealed record CourierPlan(Guid PlanId, long Revision, ImmutableArray<CourierTrip> Trips, ImmutableArray<Refusal> Refusals)
+{
+    /// <summary>Absent in journals written before destination consolidation, which read as none.</summary>
+    public ImmutableArray<CourierConsolidation> Consolidations { get; init; } = [];
+}
 
 public static class CourierPlanner
 {
@@ -61,6 +82,7 @@ public static class CourierPlanner
     {
         var trips = ImmutableArray.CreateBuilder<CourierTrip>();
         var refusals = ImmutableArray.CreateBuilder<Refusal>();
+        var consolidations = ImmutableArray.CreateBuilder<CourierConsolidation>();
         var uniqueDestinations=new HashSet<(ulong?,uint)>();
         var stock = locations.ToDictionary(x => (x.Character.LocalContentId, x.Retainer), x => x.Inventory.Stock.ToList());
         var space = locations.ToDictionary(x => (x.Character.LocalContentId, x.Retainer), x => x.Inventory.FreeSlots);
@@ -72,6 +94,9 @@ public static class CourierPlanner
                 Exact(x.Character, who) && Exact(x.Inventory.Character, who) && x.Retainer == ret);
             var sourceBags = At(src, null);
             var destBags = At(dst, null);
+            // The destination's observed retainers in display order: Any space fills them in this order.
+            var destRetainers = locations.Where(x => x.Retainer != null && Exact(x.Character, dst) && Exact(x.Inventory.Character, dst))
+                .Select(x => x.Retainer!.Value).Distinct().ToArray();
             var pickup = settings.Bells.GetValueOrDefault(src.LocalContentId ?? 0);
             var drop = settings.Bells.GetValueOrDefault(dst.LocalContentId ?? 0);
             var tripUnique=new HashSet<uint>();
@@ -81,19 +106,18 @@ public static class CourierPlanner
                 var route = r.Courier!;
                 var meta = metadata(r.ItemId);
                 var source = At(src, route.SourceRetainerId);
-                var target = At(dst, route.RetainerId);
+                var targets = Destinations(r.Routing, destRetainers);
                 string? code = settings.Carrier is not { HasStableIdentity: true } ? "CarrierNotConfigured"
                     : !Exact(carrier?.Character, settings.Carrier) ? "CarrierUnreachable"
                     : !settings.LocalRoster.Any(o=>Exact(o,src)) || !settings.LocalRoster.Any(o=>Exact(o,dst)) ? "OutsideClientRoster"
                     : sourceBags == null || destBags == null || Exact(src, dst) || Exact(src, settings.Carrier) || Exact(dst, settings.Carrier) ? "CharacterNotKnown"
                     : pickup?.World != src.HomeWorldId || drop?.World != dst.HomeWorldId || pickup == null || drop == null ? "MeetingBellMissing"
                     : meta.IsTradable != true ? "ItemNotTradeable"
-                    : source == null ? "SourceUnknown" : target == null ? "DestinationUnknown"
+                    : source == null ? "SourceUnknown" : targets.Count == 0 ? "DestinationUnknown"
                     : meta.MaxStackSize is not (> 0 and <= int.MaxValue) || meta.IsUnique == null ? "ItemMetadataUnknown"
                     : r.TargetQuantity <= 0 ? "InvalidQuantity" : null;
                 void Refuse(string reason) => refusals.Add(new(r.Id, r.ItemName, reason,src.CharacterName,dst.CharacterName));
                 if (code != null) { Refuse(code); continue; }
-                var targetKey = (dst.LocalContentId, route.RetainerId);
                 if (meta.IsUnique == true && (r.TargetQuantity != 1 || tripUnique.Contains(r.ItemId) || uniqueDestinations.Contains((dst.LocalContentId,r.ItemId)) || carrier!.Stock.Any(s => s.ItemId == r.ItemId && s.Units > 0)
                     || locations.Where(l => Exact(l.Character, dst)).Any(l => stock[(dst.LocalContentId, l.Retainer)].Any(s => s.ItemId == r.ItemId && s.Units > 0))))
                 { Refuse("UniqueConflict"); continue; }
@@ -106,37 +130,72 @@ public static class CourierPlanner
                     var supply = inventory.Where(s => s.ItemId == r.ItemId && s.Hq == hq).Sum(s => s.Units);
                     var units = Math.Min(supply, remaining);
                     if (units == 0) continue;
-                    var dest = stock[targetKey];
-                    var partial = dest.Where(s => s.ItemId == r.ItemId && s.Hq == hq && s.Units > 0).Sum(s => (size - s.Units % size) % size);
-                    var slots = (int)((Math.Max(0L, (long)units - partial) + size - 1) / size);
-                    if (space[targetKey] < slots) { Refuse("DestinationFull"); break; }
-                    space[targetKey] -= slots;
-                    // Preserve physical stack boundaries when consuming partial-stack room.
-                    var add = units;
-                    for (var i = 0; i < dest.Count && add > 0; i++)
-                        if (dest[i].ItemId == r.ItemId && dest[i].Hq == hq && dest[i].Units > 0)
+                    int Partial(List<BagStock> dest) =>
+                        dest.Where(s => s.ItemId == r.ItemId && s.Hq == hq && s.Units > 0).Sum(s => (size - s.Units % size) % size);
+                    long Room(ulong? to) =>
+                        Partial(stock[(dst.LocalContentId, to)]) + (long)Math.Max(0, space[(dst.LocalContentId, to)]) * size;
+                    // Rank 1 first, spilling to rank 2, ... then Any space; refuse only when the whole chain is short.
+                    if (targets.Sum(Room) < units) { Refuse("DestinationFull"); break; }
+                    var left = units;
+                    foreach (var to in targets)
+                    {
+                        if (left == 0) break;
+                        var placed = (int)Math.Min(left, Room(to));
+                        if (placed == 0) continue;
+                        var key = (dst.LocalContentId, to);
+                        var dest = stock[key];
+                        space[key] -= (int)((Math.Max(0L, (long)placed - Partial(dest)) + size - 1) / size);
+                        // Preserve physical stack boundaries when consuming partial-stack room.
+                        var add = placed;
+                        for (var i = 0; i < dest.Count && add > 0; i++)
+                            if (dest[i].ItemId == r.ItemId && dest[i].Hq == hq && dest[i].Units > 0)
+                            {
+                                var n = Math.Min(add, (size - dest[i].Units % size) % size);
+                                dest[i] = dest[i] with { Units = dest[i].Units + n }; add -= n;
+                            }
+                        if (add > 0) dest.Add(new(r.ItemId, hq, add));
+                        for (var slice = placed; slice > 0;)
                         {
-                            var n = Math.Min(add, (size - dest[i].Units % size) % size);
-                            dest[i] = dest[i] with { Units = dest[i].Units + n }; add -= n;
+                            var n = Math.Min(size, slice);
+                            stacks.Add(new(r.Id, r.ItemId, r.ItemName, hq, n, size, route.SourceRetainerId, to, src, dst)); slice -= n;
                         }
-                    if (add > 0) dest.Add(new(r.ItemId, hq, add));
+                        left -= placed;
+                    }
                     inventory.RemoveAll(s => s.ItemId == r.ItemId && s.Hq == hq);
                     inventory.Add(new(r.ItemId, hq, supply - units));
-                    for (var left = units; left > 0;)
-                    {
-                        var n = Math.Min(size, left);
-                        stacks.Add(new(r.Id, r.ItemId, r.ItemName, hq, n, size, route.SourceRetainerId, route.RetainerId, src, dst)); left -= n;
-                    }
                     if(meta.IsUnique==true){tripUnique.Add(r.ItemId);uniqueDestinations.Add((dst.LocalContentId,r.ItemId));}
                     remaining -= units;
                 }
                 if (remaining > 0 && refusals.All(f => f.Line != r.Id)) Refuse("SourceShort");
+                if (r.Routing.Consolidate && r.Routing.PreferredRetainerIds.Count > 0)
+                    consolidations.Add(new(dst, r.Id, r.ItemId, r.ItemName, r.Quality, r.Routing.PreferredRetainerIds[0], size));
             }
             var cap = Math.Min(testSlotCap ?? int.MaxValue, Math.Min(carrier?.FreeSlots ?? 0,
                 Math.Min(sourceBags?.Inventory.FreeSlots ?? 0, destBags?.Inventory.FreeSlots ?? 0)));
             if (cap <= 0) foreach (var s in stacks.DistinctBy(s => s.Line)) refusals.Add(new(s.Line, s.Name, "BagSlotLimit",src.CharacterName,dst.CharacterName));
             else foreach (var batch in stacks.Chunk(cap)) trips.Add(new(src, dst, pickup!, drop!, [.. batch]));
         }
-        return new(plan.Id, plan.Revision, trips.ToImmutable(), refusals.ToImmutable());
+        // A refused line delivers nothing, so there is nothing of it to gather.
+        var refused = refusals.Select(f => f.Line).ToHashSet();
+        return new(plan.Id, plan.Revision, trips.ToImmutable(), refusals.ToImmutable())
+        {
+            Consolidations = [.. consolidations.Where(c => !refused.Contains(c.Line))],
+        };
+    }
+
+    /// <summary>
+    /// The containers a line's units may land in on its destination, in fill order. No destinations
+    /// is the destination's bags (null), as in Transfer Placement; otherwise its listed retainers that
+    /// are observed, then, with Any space, every other observed retainer in display order. Empty when
+    /// nothing the line lists is observed.
+    /// </summary>
+    internal static IReadOnlyList<ulong?> Destinations(StowageRoutingPolicy routing, IReadOnlyList<ulong> observed)
+    {
+        if (routing.PreferredRetainerIds.Count == 0 && !routing.AnySpace)
+            return [null];
+        var listed = routing.PreferredRetainerIds.Distinct().Where(observed.Contains).ToList();
+        if (routing.AnySpace)
+            listed.AddRange(observed.Where(id => !listed.Contains(id)));
+        return [.. listed.Select(id => (ulong?)id)];
     }
 }

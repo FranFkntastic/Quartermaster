@@ -125,6 +125,42 @@ public static class StowagePlanMigration
     }
 
     /// <summary>
+    /// Moves the single destination retainer of courier lines written before courier lines carried a
+    /// Routing (<see cref="Courier.CourierRoute.RetainerId"/>) into the line's Routing as its rank 1,
+    /// and clears it. Lines of one plan that now share a <see cref="StowagePlanCatalog.LineKey"/>
+    /// (the same item and quality from one source container to one character, formerly to different
+    /// containers) merge as <see cref="StowagePlanCatalog.MergeCourierDuplicates"/> does: quantities
+    /// add up and the destinations rank in line order. Returns whether anything changed; running it
+    /// again changes nothing.
+    /// </summary>
+    public static bool MoveCourierRetainersToRouting(QuartermasterState state)
+    {
+        var plans = new HashSet<Guid>();
+        foreach (var rule in state.PlanItems)
+        {
+            if (rule.Courier is not { RetainerId: { } legacy } route)
+                continue;
+            rule.Routing = StowageRoutingPolicy.CopyOf(rule.Routing);
+            if (!rule.Routing.PreferredRetainerIds.Contains(legacy))
+                rule.Routing.PreferredRetainerIds.Insert(0, legacy);
+            rule.Courier = route with { RetainerId = null };
+            plans.Add(rule.StowagePlanId);
+        }
+        foreach (var planId in plans)
+        {
+            var lines = state.PlanItems.Where(rule => rule.StowagePlanId == planId).ToList();
+            StowagePlanCatalog.MergeCourierDuplicates(lines);
+            var kept = lines.ToHashSet();
+            state.PlanItems.RemoveAll(rule => rule.StowagePlanId == planId && !kept.Contains(rule));
+            if (state.StowagePlans.FirstOrDefault(plan => plan.Id == planId) is { } changed)
+                changed.Revision = checked(changed.Revision + 1);
+        }
+        if (plans.Count > 0)
+            StowagePlanCatalog.ClearStaleRecovery(state);
+        return plans.Count > 0;
+    }
+
+    /// <summary>
     /// Separates courier lines from Transfer plans written before plans had a kind, losslessly:
     /// an unsaved plan's courier lines move to its owner's unsaved Courier plan; a saved plan holding
     /// only courier lines becomes a Courier plan; a saved plan holding both keeps its ordinary lines
@@ -190,6 +226,7 @@ public static class StowagePlanMigration
                 }
                 same.TargetQuantity = (int)Math.Min(int.MaxValue, (long)same.TargetQuantity + Math.Max(0, line.TargetQuantity));
                 same.Enabled |= line.Enabled;
+                same.Routing = StowagePlanCatalog.UnionRouting(same.Routing, line.Routing);
                 state.PlanItems.Remove(line);
             }
             plan.Revision = checked(plan.Revision + 1);

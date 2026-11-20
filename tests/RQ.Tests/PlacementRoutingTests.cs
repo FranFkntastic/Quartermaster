@@ -77,36 +77,6 @@ public sealed class PlacementRoutingTests
         Assert.Equal(new ulong[] { 12, 10, 11 }, withAnySpace.Allocations.Select(allocation => allocation.RetainerId));
     }
 
-    // Courier Placement shares the matrix: bags are a column of their own that round-trips to a
-    // null route retainer, and "Use current holders" picks the biggest holder among the shown
-    // retainers, never bags, and leaves the row put when nobody holds it.
-    [Fact]
-    public void CourierPlacementColumns_RoundTripBags_AndCurrentHolderPicksTheBiggestShownRetainer()
-    {
-        Assert.NotEqual(PlacementEdits.AnySpace, PlacementEdits.PlayerBags);
-        Assert.Equal(PlacementEdits.PlayerBags, PlacementEdits.CourierColumn(null));
-        Assert.Equal(42UL, PlacementEdits.CourierColumn(42));
-        Assert.Null(PlacementEdits.CourierRetainer(PlacementEdits.PlayerBags));
-        Assert.Equal(42UL, PlacementEdits.CourierRetainer(42));
-
-        var holdings = new Dictionary<ulong, int>
-        {
-            [PlacementEdits.PlayerBags] = 500,
-            [10] = 20,
-            [11] = 30,
-            [12] = 30,
-            [99] = 900,
-        };
-        var shown = new ulong[] { PlacementEdits.PlayerBags, 10, 11, 12 };
-        Assert.Equal(11UL, PlacementEdits.CurrentHolder(holdings, shown));
-        Assert.Equal(99UL, PlacementEdits.CurrentHolder(holdings));
-        Assert.Null(PlacementEdits.CurrentHolder(new Dictionary<ulong, int> { [PlacementEdits.PlayerBags] = 5, [10] = 0 }, shown));
-
-        // Ranked "Use current holders" never ranks the bags column as a retainer.
-        var ranked = PlacementEdits.WhereItLives(new StowageRoutingPolicy(), holdings);
-        Assert.DoesNotContain(PlacementEdits.PlayerBags, ranked.PreferredRetainerIds);
-    }
-
     private static void Expect(StowageRoutingPolicy routing, bool anySpace, params ulong[] retainers)
     {
         Assert.Equal(retainers, routing.PreferredRetainerIds);

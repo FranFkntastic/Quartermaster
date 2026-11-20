@@ -67,10 +67,15 @@ public sealed partial class TransferCoordinator
     private bool SamePlacementOwner(OwnerScope owner) =>
         currentOwner() is { HasStableIdentity: true } current && owner.HasStableIdentity && owner.Matches(current);
 
+    /// <param name="movesOnly">Skip the bag retrieval and stow phases and only gather each consolidating
+    /// rule's stray stacks into its rank 1 (courier destination consolidation).</param>
+    /// <param name="started">Receives the parent placement operation id as soon as it is journaled.</param>
     private async Task<TransferExecutionResult> RunPlacementAsync(OwnerScope owner, StowagePlan plan,
-        IReadOnlyList<TargetPlanItem> rules, Func<uint, int> sizeOf, IDisposable lease, Func<bool> authorized, CancellationToken token)
+        IReadOnlyList<TargetPlanItem> rules, Func<uint, int> sizeOf, IDisposable lease, Func<bool> authorized, CancellationToken token,
+        bool movesOnly = false, Action<string>? started = null)
     {
         var parent = journal.CreatePlacement(owner, plan, rules).OperationId;
+        started?.Invoke(parent);
         var phase = "retrieval";
         var detail = "";
         var problems = new List<(string Code, string Message)>();
@@ -152,7 +157,7 @@ public sealed partial class TransferCoordinator
         try
         {
             var needs = new List<(TargetPlanItem Rule, int Held)>();
-            foreach (var rule in rules)
+            foreach (var rule in movesOnly ? [] : rules)
             {
                 detail = rule.ItemName;
                 var (held, _) = await Read(rule, rule.Quality).ConfigureAwait(false);
@@ -183,7 +188,7 @@ public sealed partial class TransferCoordinator
             phase = "stow";
             var projected = Cache().ToDictionary(p => p.Key, p => StowageRouter.Copy(p.Value));
             var deposits = new List<(TargetPlanItem Rule, StowageDepositRequest Request, StowageAllocation Destination)>();
-            foreach (var rule in rules)
+            foreach (var rule in movesOnly ? [] : rules)
             {
                 detail = rule.ItemName;
                 var (held, _) = await Read(rule, rule.Quality).ConfigureAwait(false);

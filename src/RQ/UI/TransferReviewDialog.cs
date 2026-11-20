@@ -220,7 +220,7 @@ internal sealed class TransferReviewDialog
         ImGui.TextColored(TransferPresentation.SendColor, $"Send {units:N0}");
         ImGui.Separator();
 
-        DrawCourierRows(courierPlan, rows);
+        DrawCourierRows(runtime, courierPlan, rows);
 
         if (ImGui.Button("Back"))
         {
@@ -270,12 +270,13 @@ internal sealed class TransferReviewDialog
     private static TransferWorkbenchRow[] CourierRows(TransferWorkbenchProjection projection) =>
         projection.Rows.Where(row => row.Rule.Courier is not null && row.Rule.Enabled).ToArray();
 
-    private void DrawCourierRows(CourierPlan? plan, IReadOnlyList<TransferWorkbenchRow> rows)
+    private void DrawCourierRows(QuartermasterRuntimeSnapshot runtime, CourierPlan? plan, IReadOnlyList<TransferWorkbenchRow> rows)
     {
+        var gathers = ConsolidationPreview(runtime, plan, rows);
         if (plan is { Trips.IsEmpty: false })
         {
             var lineHeight = ImGui.GetTextLineHeightWithSpacing();
-            var height = Math.Min(plan.Trips.Length * lineHeight + ImGui.GetStyle().ScrollbarSize,
+            var height = Math.Min((plan.Trips.Length + gathers.Count) * lineHeight + ImGui.GetStyle().ScrollbarSize,
                 Math.Max(lineHeight, (ImGui.GetContentRegionAvail().Y - 48) * .4f));
             if (ImGui.BeginChild("RQCourierReviewTrips", new Vector2(0, height), false, ImGuiWindowFlags.HorizontalScrollbar))
             {
@@ -285,6 +286,13 @@ internal sealed class TransferReviewDialog
                     var stacks = trip.Manifest.Length;
                     ImGui.TextDisabled($"Trip {i + 1} · {CourierSession.CharacterLabel(trip.Source)} at {trip.Pickup.Label} → " +
                         $"{CourierSession.CharacterLabel(trip.Destination)} at {trip.Dropoff.Label} · {stacks:N0} stack{(stacks == 1 ? string.Empty : "s")}");
+                }
+                foreach (var (text, limited) in gathers)
+                {
+                    if (limited)
+                        ImGui.TextColored(new Vector4(1f, .7f, .3f, 1f), text);
+                    else
+                        ImGui.TextColored(TransferPresentation.SendColor, text);
                 }
             }
             ImGui.EndChild();
@@ -298,6 +306,38 @@ internal sealed class TransferReviewDialog
             return;
         courierTable.DrawClippedRows(rows, (row, _) => courierTable.DrawRow(row, id: $"courier-review:{row.Rule.Id}"));
         courierTable.End();
+    }
+
+    /// <summary>
+    /// The consolidation each delivering destination runs after its last drop-off, as planned from
+    /// today's stock: the moves into each line's rank 1, then anything that limits them. The run
+    /// plans the moves again after its deposits, so the delivered units are gathered as well.
+    /// </summary>
+    private List<(string Text, bool Limited)> ConsolidationPreview(
+        QuartermasterRuntimeSnapshot runtime,
+        CourierPlan? plan,
+        IReadOnlyList<TransferWorkbenchRow> rows)
+    {
+        var preview = new List<(string, bool)>();
+        if (plan is null)
+            return preview;
+        foreach (var line in plan.Consolidations)
+        {
+            var rule = rows.FirstOrDefault(row => row.Rule.Id == line.Line)?.Rule;
+            if (rule is null)
+                continue;
+            var into = $"{CourierSession.CharacterLabel(line.Destination)} · {CourierSession.ContainerLabel(runtime, line.Retainer)}";
+            var gather = courier.Gather(runtime, rule);
+            var moves = gather?.Moves
+                .GroupBy(move => move.SourceRetainerId)
+                .Select(group => $"{group.Sum(move => move.Quantity):N0} from {CourierSession.ContainerLabel(runtime, group.Key)}")
+                .ToArray() ?? [];
+            preview.Add(($"Consolidate {line.Name} into {into}" +
+                (moves.Length > 0 ? $" · {string.Join(", ", moves)}" : " · delivered units only"), false));
+            foreach (var limit in gather?.Limits ?? [])
+                preview.Add(($"  {limit.Message}", true));
+        }
+        return preview;
     }
 
     private static DalamudTableProjection<TransferWorkbenchRow> CreateCourierTable() => new(
@@ -316,7 +356,7 @@ internal sealed class TransferReviewDialog
         new(
             "To",
             1f,
-            row => CourierSession.Side(row.Runtime, row.Rule.Courier!.Character, row.Rule.Courier.RetainerId, includeOwner: true),
+            row => CourierSession.Destination(row.Runtime, row.Rule.Courier!.Character, row.Rule.Routing, includeOwner: true),
             Flags: ImGuiTableColumnFlags.WidthStretch),
         new(
             "Send",

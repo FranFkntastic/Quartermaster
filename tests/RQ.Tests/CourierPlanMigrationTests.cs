@@ -22,8 +22,8 @@ public sealed class CourierPlanMigrationTests
         var plan = Plan("Weekly", ephemeral: false, enabled: true);
         state.StowagePlans.Add(plan);
         var ordinary = Line(plan.Id, 100, 12);
-        var toAlt = Line(plan.Id, 200, 5, new CourierRoute(Alt, 77, null));
-        var toAltBags = Line(plan.Id, 300, 3, new CourierRoute(Alt, null, 55), enabled: false);
+        var toAlt = Line(plan.Id, 200, 5, new CourierRoute(Alt, null), to: [77]);
+        var toAltBags = Line(plan.Id, 300, 3, new CourierRoute(Alt, 55), enabled: false);
         state.PlanItems.AddRange([ordinary, toAlt, toAltBags]);
 
         Assert.True(StowagePlanMigration.SeparateCourierLines(state));
@@ -41,7 +41,8 @@ public sealed class CourierPlanMigrationTests
         var moved = state.PlanItems.Where(rule => rule.StowagePlanId == sibling.Id).OrderBy(rule => rule.ItemId).ToArray();
         Assert.Equal([toAlt.Id, toAltBags.Id], moved.Select(rule => rule.Id));
         Assert.Equal([5, 3], moved.Select(rule => rule.TargetQuantity));
-        Assert.Equal(new CourierRoute(Alt, 77, null), moved[0].Courier);
+        Assert.Equal(new CourierRoute(Alt, null), moved[0].Courier);
+        Assert.Equal([77ul], moved[0].Routing.PreferredRetainerIds);
         Assert.False(moved[1].Enabled);
         Assert.All(state.StowagePlans, candidate =>
             Assert.All(state.PlanItems.Where(rule => rule.StowagePlanId == candidate.Id),
@@ -54,7 +55,7 @@ public sealed class CourierPlanMigrationTests
         var state = new QuartermasterState();
         var plan = Plan("Alt supplies", ephemeral: false, enabled: true);
         state.StowagePlans.Add(plan);
-        var line = Line(plan.Id, 200, 5, new CourierRoute(Alt, null, null));
+        var line = Line(plan.Id, 200, 5, new CourierRoute(Alt, null));
         state.PlanItems.Add(line);
         var revision = plan.Revision;
 
@@ -76,7 +77,7 @@ public sealed class CourierPlanMigrationTests
         var scratch = Plan(StowagePlanCatalog.ScratchName(StowagePlanKind.Transfer), ephemeral: true, enabled: false);
         state.StowagePlans.Add(scratch);
         var ordinary = Line(scratch.Id, 100, 4);
-        var courierLine = Line(scratch.Id, 200, 6, new CourierRoute(Alt, 77, null));
+        var courierLine = Line(scratch.Id, 200, 6, new CourierRoute(Alt, null), to: [77]);
         state.PlanItems.AddRange([ordinary, courierLine]);
 
         Assert.True(StowagePlanMigration.SeparateCourierLines(state));
@@ -99,7 +100,7 @@ public sealed class CourierPlanMigrationTests
         var courierScratch = Plan(StowagePlanCatalog.ScratchName(StowagePlanKind.Courier), ephemeral: true, enabled: false);
         courierScratch.Kind = StowagePlanKind.Courier;
         state.StowagePlans.AddRange([scratch, courierScratch]);
-        var route = new CourierRoute(Alt, 77, null);
+        var route = new CourierRoute(Alt, null);
         var existing = Line(courierScratch.Id, 200, 2, route);
         state.PlanItems.AddRange([existing, Line(scratch.Id, 200, 6, route)]);
 
@@ -121,8 +122,8 @@ public sealed class CourierPlanMigrationTests
         state.StowagePlans.AddRange([saved, scratch]);
         state.PlanItems.AddRange([
             Line(saved.Id, 100, 1),
-            Line(saved.Id, 200, 2, new CourierRoute(Alt, null, null)),
-            Line(scratch.Id, 300, 3, new CourierRoute(Alt, 77, null)),
+            Line(saved.Id, 200, 2, new CourierRoute(Alt, null)),
+            Line(scratch.Id, 300, 3, new CourierRoute(Alt, null), to: [77]),
         ]);
         Assert.True(StowagePlanMigration.SeparateCourierLines(state));
         var plans = state.StowagePlans.Select(plan => (plan.Id, plan.Kind, plan.Revision)).ToArray();
@@ -143,7 +144,8 @@ public sealed class CourierPlanMigrationTests
         var state = new QuartermasterState();
         var plan = Plan("Weekly", ephemeral: false, enabled: true);
         state.StowagePlans.Add(plan);
-        var courierLine = Line(plan.Id, 200, 5, new CourierRoute(Alt, 77, null));
+        // Written before courier lines carried a Routing: the load also moves its retainer there.
+        var courierLine = Line(plan.Id, 200, 5, new CourierRoute(Alt, null) { RetainerId = 77 });
         state.PlanItems.AddRange([Line(plan.Id, 100, 12), courierLine]);
         store.Save(state);
 
@@ -151,7 +153,10 @@ public sealed class CourierPlanMigrationTests
 
         var reloaded = new QuartermasterStateStore(path).Load();
         var sibling = Assert.Single(reloaded.StowagePlans, candidate => candidate.Kind == StowagePlanKind.Courier);
-        Assert.Equal(sibling.Id, Assert.Single(reloaded.PlanItems, rule => rule.Id == courierLine.Id).StowagePlanId);
+        var reloadedLine = Assert.Single(reloaded.PlanItems, rule => rule.Id == courierLine.Id);
+        Assert.Equal(sibling.Id, reloadedLine.StowagePlanId);
+        Assert.Null(reloadedLine.Courier!.RetainerId);
+        Assert.Equal([77ul], reloadedLine.Routing.PreferredRetainerIds);
     }
 
     private static StowagePlan Plan(string name, bool ephemeral, bool enabled) => new()
@@ -162,7 +167,7 @@ public sealed class CourierPlanMigrationTests
         Enabled = enabled,
     };
 
-    private static TargetPlanItem Line(Guid planId, uint itemId, int quantity, CourierRoute? route = null, bool enabled = true) => new()
+    private static TargetPlanItem Line(Guid planId, uint itemId, int quantity, CourierRoute? route = null, bool enabled = true, ulong[]? to = null) => new()
     {
         StowagePlanId = planId,
         ItemId = itemId,
@@ -170,5 +175,6 @@ public sealed class CourierPlanMigrationTests
         TargetQuantity = quantity,
         Courier = route,
         Enabled = enabled,
+        Routing = new() { PreferredRetainerIds = [.. to ?? []] },
     };
 }

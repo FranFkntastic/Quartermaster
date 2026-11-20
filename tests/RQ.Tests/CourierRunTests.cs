@@ -33,7 +33,8 @@ public sealed class CourierRunTests : IDisposable
             ItemName = "Titanium Ore",
             TargetQuantity = 7,
             Quality = ItemQualityPolicy.NqOnly,
-            Courier = new(destination, 22, 11)
+            Courier = new(destination, 11),
+            Routing = new() { PreferredRetainerIds = [22] },
         };
         mule.Quantities[carrier] = 10; // Private carrier stock must survive.
         follower = Follower(); wire.Handler = m => follower.HandleAsync(source, m, Deadline.After("Fixture", 30),started:wire.Started);
@@ -278,6 +279,62 @@ public sealed class CourierRunTests : IDisposable
     }
     public void Dispose() { follower.Dispose(); Directory.Delete(dir, true); }
 
+    // Destination consolidation runs once per destination, after that destination's final deposit,
+    // as the destination character, under the run's lease.
+    [Fact]
+    public async Task ConsolidatingLineGathersOnceAfterTheFinalDeposit()
+    {
+        line.Routing.Consolidate = true;
+        var p = Plan();
+        Assert.Equal(3, p.Trips.Length);
+        var gather = Assert.Single(p.Consolidations);
+        Assert.Equal(22ul, gather.Retainer);
+        var result = await engine.StartAsync(p, cfg);
+        Assert.True(result.State == "Completed", result.Code + ":" + result.Detail);
+        var call = Assert.Single(owner.Consolidations);
+        Assert.True(call.Who.Matches(destination));
+        Assert.Equal(7, call.DepositedBefore);
+        Assert.Equal(line.Id, Assert.Single(call.Lines).Line);
+    }
+
+    [Fact]
+    public async Task UnconsolidatedPlanNeverCallsConsolidation()
+    {
+        var result = await engine.StartAsync(Plan(), cfg);
+        Assert.True(result.State == "Completed", result.Code + ":" + result.Detail);
+        Assert.Empty(owner.Consolidations);
+    }
+
+    // A settled consolidation shortfall leaves the delivery standing: the run completes and says so.
+    [Fact]
+    public async Task ConsolidationShortfallCompletesAsConsolidationLimited()
+    {
+        line.Routing.Consolidate = true;
+        owner.ConsolidationResult = Result<bool>.Fail("ConsolidationLimited", "Grungel is full");
+        var result = await engine.StartAsync(Plan(), cfg);
+        Assert.Equal("Completed", result.State);
+        Assert.Equal("ConsolidationLimited", result.Code);
+        Assert.Contains("Grungel is full", result.Detail);
+        Assert.Equal(7, owner.Deposited); Assert.Equal(10, mule.Units);
+    }
+
+    // An unverified consolidation stops the run resumable; resuming re-plans and runs it again.
+    [Fact]
+    public async Task UnverifiedConsolidationResumesByRunningItAgain()
+    {
+        line.Routing.Consolidate = true;
+        owner.ConsolidationResult = new Result<bool>(CourierOutcome.Indeterminate, "ConsolidationUnverified", "fixture");
+        var interrupted = await engine.StartAsync(Plan(), cfg);
+        Assert.Equal("Indeterminate", interrupted.State);
+        Assert.True(interrupted.CanResume);
+        owner.ConsolidationResult = null;
+        engine = Conductor();
+        var resumed = await engine.StartAsync(Plan(), cfg);
+        Assert.True(resumed.State == "Completed", resumed.Code + ":" + resumed.Detail);
+        Assert.Equal(2, owner.Consolidations.Count);
+        Assert.Equal(7, owner.Deposited); Assert.Equal(10, mule.Units);
+    }
+
     [Fact]
     public async Task LostReplyAndCarrierRestartCannotReceiveTwiceOrRebindToAnotherEndpoint()
     {
@@ -423,6 +480,16 @@ public sealed class CourierRunTests : IDisposable
             if(fail){FailPlacement=null;Quantities[who]=Units+(deposit?-n:n);if(deposit)Deposited+=n;
                 return Task.FromResult(Result<bool>.Fail("PlacementStopped","fixture"));}
             Quantities[who] = Units + (deposit ? -s.Units : s.Units); if (deposit) Deposited += s.Units; return OK(true);
+        }
+        public readonly List<(OwnerScope Who, int DepositedBefore, ImmutableArray<CourierConsolidation> Lines)> Consolidations = [];
+        public Result<bool>? ConsolidationResult;
+        public Task<Result<bool>> ConsolidateAsync(StowagePlan plan, ImmutableArray<CourierConsolidation> lines, IDisposable lease, Func<bool> auth, Deadline d, Action<string> recordOperation)
+        {
+            Assert.True(auth()); Assert.Equal(plan.Owner, who);
+            Assert.All(lines, l => Assert.True(l.Destination.Matches(who)));
+            recordOperation(Guid.NewGuid().ToString());
+            Consolidations.Add((who, Deposited, lines));
+            return Task.FromResult(ConsolidationResult ?? Result<bool>.Ok(true));
         }
         public Task<Result<InventoryView>> ObserveAsync(Deadline d) => OK(new InventoryView(who, 4, [new(1, false, Units)]));
         public Task<Result<string>> SwitchRefusalAsync(Deadline deadline) => OK("");

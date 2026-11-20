@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using RQ.Courier;
 using RQ.Domain;
 using RQ.Planning;
@@ -9,6 +10,14 @@ public interface ICourierPlacementPort
     Task<Result<int>> RetainerUnits(OwnerScope owner,Shipment shipment,bool deposit,Deadline deadline);
     int? JournalUnits(string operationId,OwnerScope owner,Shipment shipment);
     Task<Result<bool>> MoveAsync(StowagePlan plan, Shipment shipment, bool deposit, IDisposable lease,
+        Func<bool> authorized, Deadline deadline, Action<string> recordOperation);
+    /// <summary>
+    /// Gathers each line's stray stacks on the logged-in plan owner's retainers into the line's
+    /// retainer, as Transfer Placement's Consolidate does. Succeeded: every move landed. Failed: it
+    /// stopped short with every leg settled (nothing unverified in transit). Indeterminate: a leg's
+    /// outcome is unverified. The placement operation id is reported as soon as it is journaled.
+    /// </summary>
+    Task<Result<bool>> ConsolidateAsync(StowagePlan plan, ImmutableArray<CourierConsolidation> lines, IDisposable lease,
         Func<bool> authorized, Deadline deadline, Action<string> recordOperation);
 }
 
@@ -81,5 +90,35 @@ public sealed partial class TransferCoordinator : ICourierPlacementPort
         return result.Started && record?.Status == OperationStatuses.Succeeded &&
             record.Lines.Sum(l => l.TransferredQuantity) == s.Units ? Result<bool>.Ok(true) :
             new(CourierOutcome.Indeterminate, "PlacementNotVerified", $"{s.Name}: {id}: {record?.Message ?? result.Message}");
+    }
+    async Task<Result<bool>> ICourierPlacementPort.ConsolidateAsync(StowagePlan plan, ImmutableArray<CourierConsolidation> lines,
+        IDisposable lease, Func<bool> authorized, Deadline deadline, Action<string> recordOperation)
+    {
+        using var cancel = new CancellationTokenSource(deadline.Expires - DateTimeOffset.UtcNow);
+        bool Allowed() => authorized() && automation.Owns(lease) && SamePlacementOwner(plan.Owner) && !cancel.IsCancellationRequested;
+        if (!Allowed()) return Result<bool>.Fail("PlacementAuthorityLost", "Destination consolidation");
+        if (lines.Any(line => !CourierPlanner.Exact(line.Destination, plan.Owner)))
+            return Result<bool>.Fail("ConsolidationOwnerMismatch", "Consolidation lines belong to another character.");
+        var rules = lines.Select(line => new TargetPlanItem
+        {
+            Id = line.Line,
+            StowagePlanId = plan.Id,
+            ItemId = line.Item,
+            ItemName = line.Name,
+            Quality = line.Quality,
+            Routing = new() { PreferredRetainerIds = [line.Retainer], Consolidate = true },
+        }).ToArray();
+        var sizes = lines.GroupBy(line => line.Item).ToDictionary(group => group.Key, group => Math.Max(1, group.First().StackSize));
+        string? id = null;
+        var result = await RunPlacementAsync(plan.Owner, plan, rules, item => sizes.GetValueOrDefault(item, 1), lease, Allowed, cancel.Token,
+            movesOnly: true, started: operation => { id = operation; recordOperation(operation); });
+        var record = id is null ? null : journal.Get(id);
+        var message = record?.Message ?? result.Message;
+        return record?.Status switch
+        {
+            OperationStatuses.Succeeded => Result<bool>.Ok(true),
+            OperationStatuses.Indeterminate or null => new(CourierOutcome.Indeterminate, "ConsolidationUnverified", $"{id}: {message}"),
+            _ => Result<bool>.Fail("ConsolidationLimited", $"{id}: {message}"),
+        };
     }
 }
