@@ -323,6 +323,28 @@ public static class StowagePlanCatalog
             ? (rule.ItemId, rule.Quality, route.Character.LocalContentId, route.RetainerId, route.SourceCharacter?.LocalContentId, route.SourceRetainerId, true)
             : (rule.ItemId, rule.Quality, (ulong?)null, (ulong?)null, (ulong?)null, (ulong?)null, false);
 
+    /// <summary>
+    /// Collapses courier lines that share a <see cref="LineKey"/> into the first of them, the way
+    /// adding an item already on the route does: quantities sum (saturating at int.MaxValue) and
+    /// the merged line is enabled when any of them was. Non-courier lines are left alone.
+    /// </summary>
+    public static void MergeCourierDuplicates(List<TargetPlanItem> rules)
+    {
+        foreach (var group in rules.Where(rule => rule.Courier is not null).GroupBy(LineKey).Where(group => group.Count() > 1).ToArray())
+        {
+            var survivor = group.First();
+            var total = 0L;
+            foreach (var rule in group)
+                total += Math.Max(0, rule.TargetQuantity);
+            survivor.TargetQuantity = (int)Math.Min(int.MaxValue, total);
+            survivor.Enabled = group.Any(rule => rule.Enabled);
+            if (string.IsNullOrWhiteSpace(survivor.Notes))
+                survivor.Notes = group.Select(rule => rule.Notes).FirstOrDefault(notes => !string.IsNullOrWhiteSpace(notes)) ?? survivor.Notes;
+            var redundant = group.Skip(1).ToHashSet();
+            rules.RemoveAll(redundant.Contains);
+        }
+    }
+
     public static void ClearStaleRecovery(QuartermasterState state)
     {
         if (state.TransferPlanRecovery is not { } recovery)
