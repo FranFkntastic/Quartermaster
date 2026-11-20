@@ -2398,6 +2398,10 @@ internal sealed class TransferPlanWorkspace
                 var draft = StowagePlanCatalog.Draft(document, owner, planId);
                 foreach (var rule in draft.Rules.Where(rule => ruleIds.Contains(rule.Id)))
                     update(rule);
+                // Rerouting a courier line onto another line's route folds them together, as
+                // adding the item again would; a Transfer plan keeps refusing duplicates.
+                if (draft.Kind == StowagePlanKind.Courier)
+                    StowagePlanCatalog.MergeCourierDuplicates(draft.Rules);
                 var duplicate = draft.Rules
                     .GroupBy(StowagePlanCatalog.LineKey)
                     .FirstOrDefault(group => group.Count() > 1);
