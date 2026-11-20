@@ -11,9 +11,9 @@ using RQ.Runtime;
 namespace RQ.UI;
 
 /// <summary>
-/// One item row: its current destinations and the units each column holds today. Ranked
-/// (Transfer) rows read <see cref="Routing"/>; single-destination (Courier) rows read
-/// <see cref="Lands"/>, <see cref="Elsewhere"/> and <see cref="From"/> and leave Routing empty.
+/// One item row: its ranked destinations and the units each retainer column holds today.
+/// Courier rows also carry <see cref="From"/>, and <see cref="Elsewhere"/> while they deliver
+/// to another character than the one shown.
 /// </summary>
 internal sealed record PlacementMatrixRow<TKey>(
     TKey Key,
@@ -24,10 +24,10 @@ internal sealed record PlacementMatrixRow<TKey>(
     IReadOnlyDictionary<ulong, int> Holdings,
     string? Gathering = null)
 {
-    /// <summary>Single-destination: the column the row lands in at the viewed destination; null when it lands elsewhere.</summary>
-    public ulong? Lands { get; init; }
-
-    /// <summary>Single-destination: where the row lands instead; the row is dimmed with this as its tooltip.</summary>
+    /// <summary>
+    /// Where the row delivers instead of the shown character; the row is dimmed with this as its
+    /// tooltip, and an edit to it is the surface's cue to send it to the shown character.
+    /// </summary>
     public string? Elsewhere { get; init; }
 
     /// <summary>The row's source, shown when the matrix has a From column.</summary>
@@ -153,15 +153,9 @@ internal static class PlacementMatrixDrawing
 
 /// <summary>
 /// Placement editor shared by Transfer, Listing and Courier Placement: rows are items, columns
-/// are containers, a cell is that container's place in the row's destination. Two modes share
-/// the selection bar, row selection, table layout and cell rendering:
-/// <list type="bullet">
-/// <item>Ranked (<see cref="Draw"/>): columns are owner retainers then Any space, and a cell is
-/// the retainer's rank in the item's destination order.</item>
-/// <item>Single destination (<see cref="DrawSingleDestination"/>): columns are one character's
-/// bags then retainers, and a row lands in exactly one of them, so a click moves its chit.</item>
-/// </list>
-/// Edits are handed to the owning surface, which routes them through its own draft or mutation path.
+/// are one character's retainers then Any space, and a cell is the retainer's rank in the item's
+/// destination order. No destinations keeps the item in that character's bags. Edits are handed
+/// to the owning surface, which routes them through its own draft or mutation path.
 /// </summary>
 internal sealed class PlacementMatrix<TKey>
     where TKey : notnull
@@ -180,6 +174,7 @@ internal sealed class PlacementMatrix<TKey>
     private readonly string surfaceId;
     private readonly string quantityHeader;
     private readonly string? fromHeader;
+    private readonly string emptyText;
     private readonly AgentBridgeUiReviewRegistry registry;
     private readonly HashSet<TKey> selected = [];
     private TKey? anchor;
@@ -187,24 +182,24 @@ internal sealed class PlacementMatrix<TKey>
     private ulong target = PlacementEdits.AnySpace;
     private int selectionBarLines = 1;
 
-    // Set by the Draw entry point each frame; bridge actions registered this frame use them too.
-    private bool single;
-    private string destination = string.Empty;
+    // Set by Draw each frame; bridge actions registered this frame use it too.
     private Func<IReadOnlyList<(TKey Key, StowageRoutingPolicy Routing)>, bool> applyRouting = _ => false;
-    private Func<IReadOnlyList<(TKey Key, ulong Container)>, bool> assignLanding = _ => false;
 
     /// <param name="fromHeader">Adds a frozen source column after the quantity, filled from <see cref="PlacementMatrixRow{TKey}.From"/>.</param>
+    /// <param name="emptyText">Shown in place of rows when there are none.</param>
     public PlacementMatrix(
         string surfaceId,
         string quantityHeader,
         AgentBridgeUiReviewRegistry registry,
         bool allowConsolidation = false,
-        string? fromHeader = null)
+        string? fromHeader = null,
+        string emptyText = "No matching items.")
     {
         this.allowConsolidation = allowConsolidation;
         this.surfaceId = surfaceId;
         this.quantityHeader = quantityHeader;
         this.fromHeader = fromHeader;
+        this.emptyText = emptyText;
         this.registry = registry;
     }
 
@@ -226,6 +221,7 @@ internal sealed class PlacementMatrix<TKey>
     /// <summary>Ranked placement: each row keeps an ordered list of retainers, then optionally Any space.</summary>
     /// <param name="allRows">Every row of the surface; selection-bar actions apply to selected rows even when filtered out.</param>
     /// <param name="visibleRows">Rows that pass the surface's filter, in display order.</param>
+    /// <param name="columns">The shown character's retainers in display order; Any space follows them.</param>
     /// <param name="apply">Applies changed destinations through the surface's edit path; returns false when refused.</param>
     public void Draw(
         IReadOnlyList<PlacementMatrixRow<TKey>> allRows,
@@ -233,28 +229,7 @@ internal sealed class PlacementMatrix<TKey>
         IReadOnlyList<PlacementMatrixColumn> columns,
         Func<IReadOnlyList<(TKey Key, StowageRoutingPolicy Routing)>, bool> apply)
     {
-        single = false;
         applyRouting = apply;
-        DrawCore(allRows, visibleRows, columns);
-    }
-
-    /// <summary>
-    /// Single-destination placement: every row lands in exactly one column of one character
-    /// (<see cref="PlacementEdits.PlayerBags"/> for bags, else a retainer id).
-    /// </summary>
-    /// <param name="columns">The character's containers in display order, bags included.</param>
-    /// <param name="destinationLabel">The viewed character, for labels and bridge descriptions.</param>
-    /// <param name="assign">Lands each row in a column at this destination; returns false when refused.</param>
-    public void DrawSingleDestination(
-        IReadOnlyList<PlacementMatrixRow<TKey>> allRows,
-        IReadOnlyList<PlacementMatrixRow<TKey>> visibleRows,
-        IReadOnlyList<PlacementMatrixColumn> columns,
-        string destinationLabel,
-        Func<IReadOnlyList<(TKey Key, ulong Container)>, bool> assign)
-    {
-        single = true;
-        destination = destinationLabel;
-        assignLanding = assign;
         DrawCore(allRows, visibleRows, columns);
     }
 
@@ -268,8 +243,8 @@ internal sealed class PlacementMatrix<TKey>
         visibleRows = visibleRows.DistinctBy(row => row.Key).ToArray();
         var keys = allRows.Select(row => row.Key).ToHashSet();
         selected.RemoveWhere(key => !keys.Contains(key));
-        if (columns.All(column => column.RetainerId != target))
-            target = single ? columns.FirstOrDefault()?.RetainerId ?? PlacementEdits.PlayerBags : PlacementEdits.AnySpace;
+        if (target != PlacementEdits.AnySpace && columns.All(column => column.RetainerId != target))
+            target = PlacementEdits.AnySpace;
         if (selected.Count > 0 && ImGui.IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows) &&
             !ImGui.GetIO().WantTextInput && ImGui.IsKeyPressed(ImGuiKey.Escape))
             ClearSelection();
@@ -331,11 +306,7 @@ internal sealed class PlacementMatrix<TKey>
 
         DrawTargetCombo(columns);
 
-        var targetName = TargetName(columns, target);
-        if (single)
-            DrawSingleDestinationActions(allRows, columns, hasSelection, targetName);
-        else
-            DrawRankedActions(allRows, hasSelection, targetName);
+        DrawRankedActions(allRows, hasSelection, TargetName(columns, target));
 
         const string clearLabel = "Clear row selection";
         var clearWidth = ImGui.CalcTextSize(clearLabel).X + (ImGui.GetStyle().FramePadding.X * 2f);
@@ -385,21 +356,6 @@ internal sealed class PlacementMatrix<TKey>
         Action("clear-destinations", "Clear destinations", primary: false, hasSelection, allRows,
             "Clear every destination of the selected rows",
             _ => PlacementEdits.Clear());
-    }
-
-    private void DrawSingleDestinationActions(
-        IReadOnlyList<PlacementMatrixRow<TKey>> allRows,
-        IReadOnlyList<PlacementMatrixColumn> columns,
-        bool hasSelection,
-        string targetName)
-    {
-        SelectionButton("send-here", "Send here", primary: true, hasSelection,
-            $"Land the selected rows in {destination} · {targetName}",
-            () => AssignSelection(allRows, _ => target));
-        var containers = columns.Select(column => column.RetainerId).ToArray();
-        SelectionButton("where-it-lives", "Use current holders", primary: false, hasSelection,
-            $"Land each selected row in the {destination} retainer holding the most units; rows nobody holds stay put",
-            () => AssignSelection(allRows, row => PlacementEdits.CurrentHolder(row.Holdings, containers)));
     }
 
     private void Action(
@@ -453,25 +409,6 @@ internal sealed class PlacementMatrix<TKey>
         return applyRouting(changes) ? changes.Length : -1;
     }
 
-    /// <summary>
-    /// Lands each selected row in the column <paramref name="landing"/> picks (null leaves it put).
-    /// Returns the number of rows changed, or -1 when the surface refused the change.
-    /// </summary>
-    private int AssignSelection(
-        IReadOnlyList<PlacementMatrixRow<TKey>> allRows,
-        Func<PlacementMatrixRow<TKey>, ulong?> landing)
-    {
-        var changes = allRows
-            .Where(row => selected.Contains(row.Key))
-            .Select(row => (Row: row, To: landing(row)))
-            .Where(change => change.To is { } to && change.Row.Lands != to)
-            .Select(change => (change.Row.Key, Container: change.To!.Value))
-            .ToArray();
-        if (changes.Length == 0)
-            return 0;
-        return assignLanding(changes) ? changes.Length : -1;
-    }
-
     private void DrawTargetCombo(IReadOnlyList<PlacementMatrixColumn> columns)
     {
         UiLayout.SameLineIfFits(new string('x', 18));
@@ -481,14 +418,12 @@ internal sealed class PlacementMatrix<TKey>
             foreach (var column in columns)
                 if (ImGui.Selectable($"{column.Name}##target-{column.RetainerId}", column.RetainerId == target))
                     target = column.RetainerId;
-            if (!single && ImGui.Selectable($"{TransferPresentation.AnySpaceLabel}##target-any", target == PlacementEdits.AnySpace))
+            if (ImGui.Selectable($"{TransferPresentation.AnySpaceLabel}##target-any", target == PlacementEdits.AnySpace))
                 target = PlacementEdits.AnySpace;
             ImGui.EndCombo();
         }
 
-        var names = columns.Select(column => column.Name);
-        if (!single)
-            names = names.Append(TransferPresentation.AnySpaceLabel);
+        var names = columns.Select(column => column.Name).Append(TransferPresentation.AnySpaceLabel);
         registry.Register(
             $"{surfaceId}.target",
             "Choose the destination the selection-bar actions target",
@@ -505,7 +440,7 @@ internal sealed class PlacementMatrix<TKey>
             arguments =>
             {
                 var requested = arguments!.Value.GetProperty("target").GetString()?.Trim() ?? string.Empty;
-                if (!single && string.Equals(requested, TransferPresentation.AnySpaceLabel, StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(requested, TransferPresentation.AnySpaceLabel, StringComparison.OrdinalIgnoreCase))
                 {
                     target = PlacementEdits.AnySpace;
                     return AgentBridgeUiActionResult.Ok("Selection-bar actions now target Any space.");
@@ -529,8 +464,8 @@ internal sealed class PlacementMatrix<TKey>
     /// <summary>Item, quantity, then the optional From column.</summary>
     private int FrozenColumns => fromHeader is null ? 2 : 3;
 
-    /// <summary>Container columns, plus Any space in ranked mode.</summary>
-    private int CellColumns(IReadOnlyList<PlacementMatrixColumn> columns) => columns.Count + (single ? 0 : 1);
+    /// <summary>Retainer columns, then Any space.</summary>
+    private static int CellColumns(IReadOnlyList<PlacementMatrixColumn> columns) => columns.Count + 1;
 
     private unsafe void DrawTable(
         IReadOnlyList<PlacementMatrixRow<TKey>> rows,
@@ -545,9 +480,7 @@ internal sealed class PlacementMatrix<TKey>
         var fromWidth = hasFrom ? (wide ? 200f : 150f) * scale : 0f;
         var cellWidth = (wide ? 64f : 50f) * scale;
         var lineHeight = ImGui.GetTextLineHeight();
-        var headers = columns.Select(column => column.Name);
-        if (!single)
-            headers = headers.Append(TransferPresentation.AnySpaceLabel);
+        var headers = columns.Select(column => column.Name).Append(TransferPresentation.AnySpaceLabel);
         var longest = headers.Select(name => ImGui.CalcTextSize(name).X).DefaultIfEmpty(0f).Max();
         var headerHeight = Math.Clamp((longest * MathF.Sin(HeaderAngle)) + lineHeight + (8f * scale), 3f * lineHeight, 140f * scale);
         var spacerWidth = Math.Clamp(longest * MathF.Cos(HeaderAngle), 40f * scale, 140f * scale);
@@ -567,8 +500,7 @@ internal sealed class PlacementMatrix<TKey>
                 ImGui.TableSetupColumn(fromHeader, ImGuiTableColumnFlags.WidthFixed, fromWidth);
             foreach (var column in columns)
                 ImGui.TableSetupColumn($"##retainer-{column.RetainerId}", ImGuiTableColumnFlags.WidthFixed, cellWidth);
-            if (!single)
-                ImGui.TableSetupColumn("##any", ImGuiTableColumnFlags.WidthFixed, cellWidth);
+            ImGui.TableSetupColumn("##any", ImGuiTableColumnFlags.WidthFixed, cellWidth);
             ImGui.TableSetupColumn("##spacer", ImGuiTableColumnFlags.WidthFixed, spacerWidth);
 
             DrawNameHeader(columns, headerHeight, nameWidth + quantityWidth + fromWidth, lineHeight);
@@ -579,7 +511,7 @@ internal sealed class PlacementMatrix<TKey>
                 ImGui.TableNextRow(ImGuiTableRowFlags.None, rowHeight);
                 ImGui.TableSetColumnIndex(0);
                 ImGui.AlignTextToFramePadding();
-                ImGui.TextDisabled(single ? "No lines." : "No matching items.");
+                ImGui.TextDisabled(emptyText);
                 return;
             }
 
@@ -657,8 +589,6 @@ internal sealed class PlacementMatrix<TKey>
             var free = columns[index].FreeSlots;
             RightAligned(free?.ToString("N0") ?? "—", free == 0 ? AmberColor : disabled);
         }
-        if (single)
-            return;
         ImGui.TableSetColumnIndex(FrozenColumns + columns.Count);
         DrawAnySeparator(rowTop, ImGui.GetTextLineHeight() + (style.CellPadding.Y * 2f));
         RightAligned(columns.Sum(column => column.FreeSlots ?? 0).ToString("N0"), disabled);
@@ -758,10 +688,7 @@ internal sealed class PlacementMatrix<TKey>
         var hovered = ImGui.IsItemHovered();
         var min = ImGui.GetItemRectMin();
         var max = ImGui.GetItemRectMax();
-        // Single destination: the one column the row lands in carries the primary chit, as rank 1 does.
-        var rank = single
-            ? row.Lands == retainerId ? 1 : 0
-            : PlacementEdits.Rank(row.Routing, retainerId);
+        var rank = PlacementEdits.Rank(row.Routing, retainerId);
         var held = retainerId == PlacementEdits.AnySpace ? 0 : row.Holdings.GetValueOrDefault(retainerId);
         var name = column?.Name ?? TransferPresentation.AnySpaceLabel;
         RegisterCell(row, retainerId, name, rank, held, min, max);
@@ -771,7 +698,7 @@ internal sealed class PlacementMatrix<TKey>
             drawList.AddRectFilled(new Vector2(min.X - style.CellPadding.X, min.Y - style.CellPadding.Y),
                 new Vector2(max.X + style.CellPadding.X, max.Y + style.CellPadding.Y), ImGui.GetColorU32(HoverCellColor));
 
-        var badgeText = rank > 0 && !single ? rank.ToString() : string.Empty;
+        var badgeText = rank > 0 ? rank.ToString() : string.Empty;
         var holdText = held > 0 ? held.ToString("N0") : string.Empty;
         var smallScale = .85f;
         var badgeDiameter = ImGui.GetTextLineHeight();
@@ -788,18 +715,13 @@ internal sealed class PlacementMatrix<TKey>
             var badgeMin = new Vector2(x, centerY - (badgeDiameter / 2f));
             var badgeMax = new Vector2(x + badgeWidth, centerY + (badgeDiameter / 2f));
             drawList.AddRectFilled(badgeMin, badgeMax, ImGui.GetColorU32(rank == 1 ? FirstRankColor : RankColor), badgeDiameter / 2f);
-            if (allowConsolidation && !single && row.Routing.Consolidate && rank == 1 && column is not null)
+            if (allowConsolidation && row.Routing.Consolidate && rank == 1 && column is not null)
                 drawList.AddCircle((badgeMin + badgeMax) / 2f, badgeDiameter / 2f,
                     ImGui.GetColorU32(new Vector4(.95f, .76f, .25f, 1f)), 0, 1.5f * ImGuiHelpers.GlobalScale);
-            if (single)
-                DrawCheck(drawList, (badgeMin + badgeMax) / 2f, badgeDiameter / 2f);
-            else
-            {
-                var textSize = ImGui.CalcTextSize(badgeText) * smallScale;
-                drawList.AddText(font, fontSize,
-                    new Vector2(x + ((badgeWidth - textSize.X) / 2f), centerY - (textSize.Y / 2f)),
-                    ImGui.GetColorU32(rank == 1 ? new Vector4(1f, 1f, 1f, 1f) : InfoColor), badgeText);
-            }
+            var textSize = ImGui.CalcTextSize(badgeText) * smallScale;
+            drawList.AddText(font, fontSize,
+                new Vector2(x + ((badgeWidth - textSize.X) / 2f), centerY - (textSize.Y / 2f)),
+                ImGui.GetColorU32(rank == 1 ? new Vector4(1f, 1f, 1f, 1f) : InfoColor), badgeText);
             x += badgeWidth + gap;
         }
         if (held > 0)
@@ -810,13 +732,8 @@ internal sealed class PlacementMatrix<TKey>
 
         if (hovered)
             ImGui.SetTooltip(Tooltip(row, retainerId, column, rank, held) +
-                (allowConsolidation && !single && rank == 1 && column is not null && row.Routing.Consolidate ? $" · {row.Gathering}" : ""));
-        if (single)
-        {
-            if (clicked && rank == 0)
-                assignLanding([(row.Key, retainerId)]);
-        }
-        else if (clicked)
+                (allowConsolidation && rank == 1 && column is not null && row.Routing.Consolidate ? $" · {row.Gathering}" : ""));
+        if (clicked)
             applyRouting([(row.Key, PlacementEdits.Toggle(row.Routing, retainerId))]);
         else if (allowConsolidation && column is not null && hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
         {
@@ -830,32 +747,6 @@ internal sealed class PlacementMatrix<TKey>
 
     private void RegisterCell(PlacementMatrixRow<TKey> row, ulong retainerId, string name, int rank, int held, Vector2 min, Vector2 max)
     {
-        if (single)
-        {
-            var landed = rank > 0;
-            var assign = assignLanding;
-            var where = destination;
-            registry.Register(
-                $"{surfaceId}.cell.{row.Slug}.{(retainerId == PlacementEdits.PlayerBags ? "bags" : retainerId.ToString())}",
-                landed ? $"{row.Label} lands in {where} · {name}" : $"Send {row.Label} to {where} · {name}",
-                AgentBridgeUiControlKind.Toggle,
-                min,
-                max,
-                enabled: true,
-                selected: landed,
-                $"holds={held}",
-                arguments: null,
-                surfaceId,
-                mutating: true,
-                completionOperationKind: null,
-                _ => landed
-                    ? AgentBridgeUiActionResult.Ok($"{row.Label} already lands in {name}.")
-                    : assign([(row.Key, retainerId)])
-                        ? AgentBridgeUiActionResult.Ok($"{row.Label} now lands in {where} · {name}.")
-                        : AgentBridgeUiActionResult.Fail("The plan refused the placement change."));
-            return;
-        }
-
         var apply = applyRouting;
         registry.Register(
             $"{surfaceId}.cell.{row.Slug}.{(retainerId == PlacementEdits.AnySpace ? "any" : retainerId.ToString())}",
@@ -875,18 +766,6 @@ internal sealed class PlacementMatrix<TKey>
                 : AgentBridgeUiActionResult.Fail("The surface refused the placement change."));
     }
 
-    /// <summary>A white check mark centred in a chit of the given radius.</summary>
-    private static void DrawCheck(ImDrawListPtr drawList, Vector2 center, float radius)
-    {
-        var color = ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 1f));
-        var thickness = 1.6f * ImGuiHelpers.GlobalScale;
-        var left = center + new Vector2(-radius * .45f, 0f);
-        var bottom = center + new Vector2(-radius * .1f, radius * .38f);
-        var right = center + new Vector2(radius * .48f, -radius * .36f);
-        drawList.AddLine(left, bottom, color, thickness);
-        drawList.AddLine(bottom, right, color, thickness);
-    }
-
     private string Tooltip(PlacementMatrixRow<TKey> row, ulong retainerId, PlacementMatrixColumn? column, int rank, int held)
     {
         if (column is null)
@@ -894,8 +773,6 @@ internal sealed class PlacementMatrix<TKey>
                 ? $"{TransferPresentation.AnySpaceLabel} · #{rank} · remove"
                 : $"{TransferPresentation.AnySpaceLabel} · add as last";
         var free = column.FreeSlots is { } slots ? $"{slots:N0} free slot{(slots == 1 ? string.Empty : "s")}" : "free slots unknown";
-        if (single)
-            return $"{column.Name} · holds {held:N0} · {free} · {(rank > 0 ? "lands here" : "send here")}";
         var action = rank > 0 ? $"#{rank} · remove" : $"add as #{PlacementEdits.RankIfAdded(row.Routing, retainerId)}";
         return $"{column.Name} · holds {held:N0} · {free} · {action}";
     }

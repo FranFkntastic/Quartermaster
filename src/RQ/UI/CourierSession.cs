@@ -193,6 +193,37 @@ public sealed class CourierSession
         return projection;
     }
 
+    private (long Revision, Dictionary<(Guid, ulong, ItemQualityPolicy), PlacementMovePlan?> Plans)? gathers;
+
+    /// <summary>
+    /// What destination consolidation would gather for a courier line on its destination character
+    /// today: the item's stacks on that character's other retainers moved into the line's rank 1.
+    /// Null when the line does not consolidate or its stack size is unknown. Delivery itself is not
+    /// projected; the run plans the moves again from fresh stock after its deposits.
+    /// </summary>
+    internal PlacementMovePlan? Gather(QuartermasterRuntimeSnapshot runtime, TargetPlanItem rule)
+    {
+        if (rule.Courier is not { } route || !rule.Routing.Consolidate || rule.Routing.PreferredRetainerIds.Count == 0)
+            return null;
+        if (gathers is not { } cache || cache.Revision != runtime.Revision)
+            gathers = cache = (runtime.Revision, []);
+        var key = (rule.Id, rule.Routing.PreferredRetainerIds[0], rule.Quality);
+        if (cache.Plans.TryGetValue(key, out var hit))
+            return hit;
+        PlacementMovePlan? plan = null;
+        if (metadata(rule.ItemId).MaxStackSize is > 0 and <= int.MaxValue and var size)
+        {
+            var probe = new TargetPlanItem
+            {
+                Id = rule.Id, ItemId = rule.ItemId, ItemName = rule.ItemName, Quality = rule.Quality,
+                Routing = new() { PreferredRetainerIds = [rule.Routing.PreferredRetainerIds[0]], Consolidate = true },
+            };
+            plan = PlacementMovePlanner.FromCache(probe, Retainers(runtime, route.Character), (int)size);
+        }
+        cache.Plans[key] = plan;
+        return plan;
+    }
+
     /// <summary>Free slots in a character's observed bags; null while its bags have not been observed.</summary>
     internal int? FreeBagSlots(OwnerScope character)
     {
@@ -222,9 +253,45 @@ public sealed class CourierSession
             ? runtime.Retainers.GetValueOrDefault(id)?.RetainerName is { Length: > 0 } name ? name : $"Retainer {id}"
             : "Bags";
 
-    /// <summary>"Eris → Fran · Skrrt": each side names its character only when it is not the logged-in one.</summary>
-    internal static string RouteLabel(QuartermasterRuntimeSnapshot runtime, CourierRoute route) =>
-        $"{Side(runtime, route.SourceCharacter, route.SourceRetainerId)} → {Side(runtime, route.Character, route.RetainerId)}";
+    /// <summary>"Eris → Fran · Skrrt +1": each side names its character only when it is not the logged-in one.</summary>
+    internal static string RouteLabel(QuartermasterRuntimeSnapshot runtime, TargetPlanItem rule) =>
+        rule.Courier is { } route
+            ? $"{Side(runtime, route.SourceCharacter, route.SourceRetainerId)} → {Destination(runtime, route.Character, rule.Routing)}"
+            : string.Empty;
+
+    /// <summary>
+    /// Where a courier line lands, as Transfer Placement reads it: "Bags" with no destinations, else its
+    /// rank-1 retainer and how many fallbacks follow ("Grungel +1"), or "Any space" alone. The character
+    /// is named unless it is the logged-in one and <paramref name="includeOwner"/> is off.
+    /// </summary>
+    internal static string Destination(QuartermasterRuntimeSnapshot runtime, OwnerScope character, StowageRoutingPolicy routing, bool includeOwner = false)
+    {
+        var listed = routing.PreferredRetainerIds.Distinct().ToArray();
+        var container = listed.Length == 0
+            ? routing.AnySpace ? TransferPresentation.AnySpaceLabel : ContainerLabel(runtime, null)
+            : ContainerLabel(runtime, listed[0]) + (listed.Length - 1 + (routing.AnySpace ? 1 : 0) is > 0 and var more ? $" +{more}" : string.Empty);
+        if (!includeOwner && character.Matches(runtime.Owner))
+            return container;
+        return $"{CharacterLabel(character)} · {container}";
+    }
+
+    /// <summary>The full destination order ("Grungel → Eris → Any space", or "Bags"), for tooltips and the review.</summary>
+    internal static string DestinationOrder(QuartermasterRuntimeSnapshot runtime, OwnerScope character, StowageRoutingPolicy routing)
+    {
+        var listed = routing.PreferredRetainerIds.Distinct().Select(id => ContainerLabel(runtime, id)).ToList();
+        if (routing.AnySpace)
+            listed.Add(TransferPresentation.AnySpaceLabel);
+        var order = listed.Count == 0 ? ContainerLabel(runtime, null) : string.Join(" → ", listed);
+        return $"{CharacterLabel(character)} · {order}{(routing.Consolidate && routing.PreferredRetainerIds.Count > 0 ? $" · gathers strays into {ContainerLabel(runtime, routing.PreferredRetainerIds[0])}" : string.Empty)}";
+    }
+
+    /// <summary>
+    /// The container a destination chooser checks for a line: null for bags (no destinations), its
+    /// rank-1 retainer, or <see cref="PlacementEdits.AnySpace"/> (no retainer) for Any space alone.
+    /// </summary>
+    internal static ulong? FirstDestination(StowageRoutingPolicy routing) =>
+        routing.PreferredRetainerIds.Count > 0 ? routing.PreferredRetainerIds[0]
+        : routing.AnySpace ? PlacementEdits.AnySpace : null;
 
     internal static string Side(QuartermasterRuntimeSnapshot runtime, OwnerScope? character, ulong? retainer, bool includeOwner = false)
     {
@@ -369,7 +436,7 @@ public sealed class CourierSession
             "MeetingBellMissing" => $"No meeting bell for {string.Join(" or ", MissingBells(runtime, named).DefaultIfEmpty(source))}",
             "ItemNotTradeable" => $"{refusal.Name} cannot be traded",
             "SourceUnknown" => $"Source container on {source} not observed",
-            "DestinationUnknown" => $"Destination container on {destination} not observed",
+            "DestinationUnknown" => $"Destination retainers on {destination} not observed",
             "ItemMetadataUnknown" => $"No item data for {refusal.Name}",
             "InvalidQuantity" => $"No quantity for {refusal.Name}",
             "UniqueConflict" => $"{refusal.Name} is unique and {destination} or {carrier} already holds one",
@@ -440,8 +507,8 @@ public sealed class CourierSession
             {
                 var rule = draft.Rules.Find(r => r.Id == line.Line && r.Courier is not null);
                 // A line re-routed or re-qualified during the run is a new instruction; what was delivered does not count against it.
-                if (rule is null || line.Moved <= 0 || line.Route is not { } sent || rule.Courier!.RetainerId != sent.To ||
-                    rule.Courier.SourceRetainerId != sent.From || !CourierPlanner.Exact(rule.Courier.Character, sent.Destination) ||
+                if (rule is null || line.Moved <= 0 || line.Route is not { } sent || !StillLandsAt(rule.Routing, sent.To) ||
+                    rule.Courier!.SourceRetainerId != sent.From || !CourierPlanner.Exact(rule.Courier.Character, sent.Destination) ||
                     !CourierPlanner.Exact(rule.Courier.SourceCharacter ?? scratch.Owner, sent.Source) ||
                     rule.Quality != ItemQualityPolicy.Any && (rule.Quality == ItemQualityPolicy.HqOnly ? line.Nq : line.Hq))
                     continue;
@@ -454,6 +521,15 @@ public sealed class CourierSession
             scratch.LastAppliedCourierRun = completed.Run;
         });
     }
+
+    /// <summary>
+    /// Whether a line's destinations still take a delivered shipment's container: bags only when the
+    /// line has none, a retainer when the line lists it or fills Any space.
+    /// </summary>
+    internal static bool StillLandsAt(StowageRoutingPolicy routing, ulong? container) =>
+        container is { } retainer
+            ? routing.AnySpace || routing.PreferredRetainerIds.Contains(retainer)
+            : routing.PreferredRetainerIds.Count == 0 && !routing.AnySpace;
 
     /// <summary>
     /// Whether Start is offered for a courier plan and, when offered but blocked, the short cause.
@@ -612,6 +688,7 @@ public sealed class CourierSession
         return code switch
         {
             "" or "Succeeded" => "Completed",
+            "ConsolidationLimited" => "Delivered; consolidation incomplete",
             "StopRequested" or "StopBeforeBegin" or "StopBeforeTrade" or "StopBeforeLocalTrade" or "CancelledPreLock" => "Stopped",
             "PlanRefused" => "Some lines cannot be sent",
             "AutomationBusy" => "Another automation is running",
@@ -655,6 +732,7 @@ public sealed class CourierSession
         nameof(CourierPhase.CarrierToDestination) => "Waiting for the carrier",
         nameof(CourierPhase.HandIn) => "Receiving from the carrier",
         nameof(CourierPhase.Deposit) => "Depositing",
+        nameof(CourierPhase.Consolidate) => "Consolidating",
         nameof(CourierPhase.ReturnOwner) => "Returning to the start character",
         nameof(CourierPhase.ReturnCarrier) => "Carrier returning",
         nameof(CourierPhase.Finish) => "Finishing",

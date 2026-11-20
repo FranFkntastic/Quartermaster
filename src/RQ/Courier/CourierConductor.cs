@@ -9,7 +9,10 @@ namespace RQ.Courier;
 public enum CourierPhase
 {
     EnsureSource, Retrieve, CarrierToSource, HandOut, SwitchToDestination,
-    CarrierToDestination, HandIn, Deposit, ReturnOwner, ReturnCarrier, Finish
+    CarrierToDestination, HandIn, Deposit, ReturnOwner, ReturnCarrier, Finish,
+    // Journals store phases by number: new phases go last. Consolidate runs inside the trips,
+    // after the last trip's deposits into a destination, while that destination is at its bell.
+    Consolidate
 }
 public sealed record CourierStep(CourierPhase Phase, int Trip, ImmutableArray<Shipment> Batch);
 public sealed record RunIntent(Guid Id, CourierStep Action, InventoryView OwnerBefore, InventoryView CarrierBefore, bool LocalMayHaveStarted=true,int? RetainerBefore=null,string? PlacementOperation=null);
@@ -36,6 +39,11 @@ public sealed class CourierJournal
     public InventoryView? ResumeOwner { get; set; }
     public InventoryView? ResumeCarrier { get; set; }
     public string? ClearAcknowledgement { get; set; }
+    /// <summary>
+    /// Destination consolidations that stopped short ("Name: code: message"), one per destination.
+    /// Delivery still completes; the run then ends as ConsolidationLimited with these in its detail.
+    /// </summary>
+    public List<string> ConsolidationLimits { get; set; } = [];
 }
 public sealed record LineProgress(Guid Line, string Name, int Moved, int Remaining, Shipment? Route = null, bool Nq = false, bool Hq = false);
 public sealed record CourierSnapshot(Guid Run, string State, string OwnerPhase, string CarrierPhase, int Trip, int Trips,
@@ -105,11 +113,16 @@ public sealed class CourierConductor
                 yield return new(CourierPhase.HandIn, i, [.. b]);
                 foreach (var s in b) yield return new(CourierPhase.Deposit, i, [s]);
             }
+            if (r.Plan.Consolidations.Any(c => CourierPlanner.Exact(c.Destination, trip.Destination)) &&
+                !r.Plan.Trips.Skip(i + 1).Any(later => CourierPlanner.Exact(later.Destination, trip.Destination)))
+                yield return new(CourierPhase.Consolidate, i, []);
         }
         if (r.Settings.ReturnOwner) yield return new(CourierPhase.ReturnOwner, 0, []);
         if (r.Settings.ReturnCarrier) yield return new(CourierPhase.ReturnCarrier, 0, []);
         yield return new(CourierPhase.Finish, 0, []);
     }
+    /// <summary>Whether a phase runs inside a trip (before the closing returns), with the owner at a bell.</summary>
+    private static bool InTrip(CourierPhase phase) => phase < CourierPhase.ReturnOwner || phase == CourierPhase.Consolidate;
     public CourierSnapshot Snapshot()=>Project(store.Load());
     private CourierSnapshot Project(CourierJournal r)
     {
@@ -124,7 +137,7 @@ public sealed class CourierConductor
         };
         var step = r.Schedule.Skip(r.Cursor).FirstOrDefault();
         return new(r.Run, r.State, step?.Phase.ToString() ?? r.State, r.State=="Running"?peerPhase:"Idle", r.Plan.Trips.IsEmpty ? 0 :
-            step is null || step.Phase >= CourierPhase.ReturnOwner ? r.Plan.Trips.Length : step.Trip + 1, r.Plan.Trips.Length, r.Code, r.Detail,
+            step is null || !InTrip(step.Phase) ? r.Plan.Trips.Length : step.Trip + 1, r.Plan.Trips.Length, r.Code, r.Detail,
             [..r.Plan.Trips.SelectMany(t=>t.Manifest).GroupBy(s=>s.Line).Select(g=>new LineProgress(g.Key,g.First().Name,
                 r.Delivered.GetValueOrDefault(g.Key),g.Sum(s=>s.Units)-r.Delivered.GetValueOrDefault(g.Key),g.First(),g.Any(s=>!s.Hq),g.Any(s=>s.Hq)))], r.Plan.Refusals,
             connected && attempt && r.State is "Failed" or "Interrupted" or "Indeterminate",
@@ -358,6 +371,41 @@ public sealed class CourierConductor
                     else r.Schedule=r.Schedule.SetItem(r.Cursor,move.Action with {Batch=[s with {Units=s.Units-delta}]});
                     r.OwnerCheckpoint=owner;r.CarrierCheckpoint=carrier;r.Pending=null;store.Save(r);
                 }
+                if (r.Pending is { Action.Phase: CourierPhase.Consolidate } con)
+                {
+                    if (!CourierPlanner.Exact(owner.Character, con.OwnerBefore.Character) || !Agrees(con.CarrierBefore, carrier, r) ||
+                        !Custody.Covers(status.Custody, r.Custody) || !Custody.Covers(r.Custody, status.Custody))
+                        throw Fault("PlacementSettlementIdentity", "Consolidation owner, carrier or custody changed.");
+                    var conLines = r.Plan.Consolidations.Where(c => CourierPlanner.Exact(c.Destination, owner.Character)).ToArray();
+                    var bagsUnchanged = conLines.All(c =>
+                        (c.Quality == ItemQualityPolicy.HqOnly || owner.Count(c.Item, false) == con.OwnerBefore.Count(c.Item, false)) &&
+                        (c.Quality == ItemQualityPolicy.NqOnly || owner.Count(c.Item, true) == con.OwnerBefore.Count(c.Item, true)));
+                    if (!bagsUnchanged)
+                        throw Fault("ConsolidationUnsettled", $"Destination bags changed during interrupted consolidation {con.PlacementOperation ?? "(unrecorded)"}; settle in-transit units before retrying.");
+                    if (con.PlacementOperation is null)
+                    {
+                        r.OwnerCheckpoint = owner; r.CarrierCheckpoint = carrier; r.Pending = null; store.Save(r);
+                    }
+                    else
+                    {
+                        var opStatus = placement.OperationStatus(con.PlacementOperation, owner.Character);
+                        if (opStatus == OperationStatuses.Succeeded)
+                        {
+                            r.Cursor++; r.OwnerCheckpoint = owner; r.CarrierCheckpoint = carrier; r.Pending = null; store.Save(r);
+                        }
+                        else if (opStatus == OperationStatuses.Failed)
+                        {
+                            var prefix = $"{owner.Character.CharacterName}: ";
+                            r.ConsolidationLimits.RemoveAll(limit => limit.StartsWith(prefix, StringComparison.Ordinal));
+                            r.ConsolidationLimits.Add(prefix + $"ConsolidationLimited: {con.PlacementOperation}");
+                            r.Cursor++; r.OwnerCheckpoint = owner; r.CarrierCheckpoint = carrier; r.Pending = null; store.Save(r);
+                        }
+                        else
+                        {
+                            throw Fault("ConsolidationUnsettled", $"Previous consolidation {con.PlacementOperation} did not settle ({opStatus ?? "unknown"}); verify retainers and bags before retrying.");
+                        }
+                    }
+                }
                 var travel=r.Pending?.Action.Phase is CourierPhase.EnsureSource or CourierPhase.SwitchToDestination or CourierPhase.ReturnOwner
                     or CourierPhase.ReturnCarrier or CourierPhase.CarrierToSource or CourierPhase.CarrierToDestination;
                 var unstartedTrade=r.Pending==null && r.Schedule.Skip(r.Cursor).FirstOrDefault()?.Phase is CourierPhase.HandIn or CourierPhase.HandOut;
@@ -377,7 +425,7 @@ public sealed class CourierConductor
                 (trade as ICourierHoldPort)?.CheckHold();
                 if (stop) throw new CourierFault(CourierOutcome.Cancelled, "StopRequested", "Stopped at verified checkpoint.");
                 var s = steps[r.Cursor]; var t = r.Plan.Trips[s.Trip];
-                if (s.Phase<CourierPhase.ReturnOwner || r.Code=="")owner=await Observe();
+                if (InTrip(s.Phase) || r.Code=="")owner=await Observe();
                 status = await Send(r, CourierCommand.Status, r.Start, []);
                 carrier = status.Bags ?? throw Fault("CarrierBagsMissing", "Missing before snapshot");
                 if (s.Phase == CourierPhase.Retrieve && steps[r.Cursor - 1].Phase == CourierPhase.EnsureSource && s.Batch[0]==t.Manifest[0])
@@ -449,7 +497,7 @@ public sealed class CourierConductor
                     throw Fault("CustodyMismatch", "Carrier identity or custody changed.");
                 if (s.Phase is CourierPhase.Retrieve or CourierPhase.CarrierToSource or CourierPhase.HandOut &&
                     !CourierPlanner.Exact(owner.Character, t.Source) ||
-                    s.Phase is CourierPhase.Deposit or CourierPhase.CarrierToDestination or CourierPhase.HandIn &&
+                    s.Phase is CourierPhase.Deposit or CourierPhase.CarrierToDestination or CourierPhase.HandIn or CourierPhase.Consolidate &&
                     !CourierPlanner.Exact(owner.Character, t.Destination)) throw Fault("OwnerIdentityMismatch", owner.Character.CharacterName);
                 if (stop) throw new CourierFault(CourierOutcome.Cancelled,"StopRequested","Stopped before dispatch.");
                 var intent=r.Pending ?? new(Guid.NewGuid(),s,owner,carrier);
@@ -495,6 +543,9 @@ public sealed class CourierConductor
                         await calls.Call("CourierPlacement", 180, d => placement.MoveAsync(new() { Id = r.Plan.PlanId, Revision = r.Plan.Revision, Owner = owner.Character },
                             unit, deposit, lease!, () => !stop && automation.Owns(lease), d,id=>{r.Pending=intent with {PlacementOperation=id};store.Save(r);}));
                         break;
+                    case CourierPhase.Consolidate:
+                        await ConsolidateAsync(r, intent, t.Destination, owner.Character, lease!);
+                        break;
                     case CourierPhase.ReturnOwner:
                     case CourierPhase.ReturnCarrier:
                         try
@@ -528,14 +579,20 @@ public sealed class CourierConductor
                 }
                 else
                 {
-                    if(s.Phase<CourierPhase.ReturnOwner || r.Code=="")r.OwnerCheckpoint = await Observe();
+                    if(InTrip(s.Phase) || r.Code=="")r.OwnerCheckpoint = await Observe();
                     r.CarrierCheckpoint = finished?.Bags ?? (s.Phase == CourierPhase.Finish ? r.CarrierCheckpoint :
                         (await Send(r, CourierCommand.Status, r.Start, [])).Bags);
                 }
                 if(s.Phase==CourierPhase.Deposit){var unit=s.Batch.Single();r.Delivered[unit.Line]=checked(r.Delivered.GetValueOrDefault(unit.Line)+unit.Units);}
                 r.Pending = null; r.Cursor++; store.Save(r);
             }
-            r.State = "Completed"; if(r.Code=="")r.Code="Succeeded"; store.Save(r);
+            r.State = "Completed";
+            if (r.ConsolidationLimits.Count > 0)
+            {
+                r.Detail += (r.Detail.Length == 0 ? "" : "; ") + string.Join("; ", r.ConsolidationLimits);
+                if (r.Code == "") r.Code = "ConsolidationLimited";
+            }
+            if(r.Code=="")r.Code="Succeeded"; store.Save(r);
         }
         catch (Exception e)
         {
@@ -549,6 +606,34 @@ public sealed class CourierConductor
         }
         finally { peer.LinkLost -= Lost; peer.Progress -= Progress; peer.StopRequested -= RemoteStop; calls.WhenSettled(() => { try { ReleaseOwner(); } finally { Volatile.Write(ref releaseOwner,null);gate.Release(); } }); }
         return Snapshot();
+    }
+    /// <summary>
+    /// Gathers the destination's stray stacks of every consolidating line into the line's rank-1
+    /// retainer, while the destination is still at its bell after its last deposit. The placement
+    /// port runs it under this run's lease and authority. A consolidation that stops short with
+    /// nothing unverified is recorded and delivery carries on; an unverified one, or one that ran
+    /// past its deadline, faults the run with the step pending, so a resume runs it again.
+    /// </summary>
+    private async Task ConsolidateAsync(CourierJournal r, RunIntent intent, OwnerScope destination, OwnerScope owner, IDisposable lease)
+    {
+        var lines = r.Plan.Consolidations.Where(c => CourierPlanner.Exact(c.Destination, destination)).ToImmutableArray();
+        if (lines.IsEmpty) return;
+        var prefix = $"{destination.CharacterName}: ";
+        r.ConsolidationLimits.RemoveAll(limit => limit.StartsWith(prefix, StringComparison.Ordinal));
+        try
+        {
+            await calls.Call("DestinationConsolidation", 900, d => placement.ConsolidateAsync(
+                new() { Id = r.Plan.PlanId, Revision = r.Plan.Revision, Owner = owner }, lines, lease,
+                () => !stop && automation.Owns(lease), d, id => { r.Pending = intent with { PlacementOperation = id }; store.Save(r); }));
+        }
+        catch (CourierFault fault) when (fault.Outcome == CourierOutcome.Failed)
+        {
+            // Failed means every leg settled: nothing is in transit, so the step is not pending.
+            r.Pending = null; store.Save(r);
+            if (stop || unloaded) throw new CourierFault(CourierOutcome.Cancelled, "StopRequested", $"Stopped during consolidation: {fault.Message}");
+            r.ConsolidationLimits.Add(prefix + $"{fault.Code}: {fault.Message}");
+            warning($"{r.Run}/{intent.Id} ConsolidationLimited {destination.CharacterName} {fault.Code}: {fault.Message}");
+        }
     }
     private static bool Agrees(InventoryView? checkpoint, InventoryView fresh, CourierJournal r) =>
         checkpoint != null && CourierPlanner.Exact(checkpoint.Character, fresh.Character) &&
