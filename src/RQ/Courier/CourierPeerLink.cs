@@ -26,6 +26,9 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     private DateTimeOffset next;
     private Task refresh=Task.CompletedTask;
     private string published="", projected="";
+    // The character last seen logged in. A carrier mid-run logs out for data-center travel; its presence keeps
+    // naming it (with no bags) so the owner still finds exactly one endpoint for it when it logs back in.
+    private OwnerScope? lastCharacter;
     public MeetingBell? StandingAt {get;private set;}
     public string? BellBlock {get;private set;}
     public bool InWard=>game.InWard;
@@ -35,6 +38,8 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     public void CancelRoute()=>game.CancelRoute();
     public MeetingBell? CaptureHere(ulong character)=>game.CaptureHere(character);
     public IReadOnlyList<CourierPeer> Peers => peers;
+    /// <summary>The logged-in character's bags as last observed by the presence tick; null when logged out.</summary>
+    public InventoryView? LocalBags {get;private set;}
     public event Action<CourierProgress>? Progress;
     public event Action? LinkLost;
     public event Action<Guid>? StopRequested;
@@ -54,9 +59,18 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
         InventoryView? bags=null;
         try{ StandingAt=game.StandingAt();BellBlock=game.BellBlock();bags=game.Bags(); }
         catch(Exception e){ StandingAt=null;BellBlock=null;warn("CourierPresenceObservation: "+e.Message); }
-        var identity=JsonSerializer.SerializeToElement(bags==null?null:new CourierPeer(bags.Character,bags,roster()));
+        LocalBags=bags;
+        if(bags!=null)lastCharacter=bags.Character;
+        else if(lastCharacter!=null && !CarryingRun())lastCharacter=null;
+        var identity=JsonSerializer.SerializeToElement(bags!=null ? new CourierPeer(bags.Character,bags,roster()) :
+            lastCharacter!=null ? new CourierPeer(lastCharacter,null,roster()) : null);
         refresh=Refresh(identity);
         foreach(var p in jobs.Where(e=>e.Value.Task.IsCompleted && e.Value.Expires<now)){ jobs.TryRemove(p.Key,out _); acknowledgements.TryRemove(p.Key,out _); }
+    }
+    private bool CarryingRun()
+    {
+        try { return follower.View().Run != null; }
+        catch (Exception e) { warn("CourierPresenceLedger: " + e.Message); return false; }
     }
     private async Task Refresh(JsonElement identity)
     {

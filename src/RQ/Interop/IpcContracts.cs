@@ -11,6 +11,66 @@ public static class IpcChannels
     public const string SubmitElementalDeposit = "Quartermaster.v1.SubmitElementalDeposit";
     public const string GetOperation = "Quartermaster.v1.GetOperation";
     public const string Changed = "Quartermaster.v1.Changed";
+    public const string GetCourierStatus = "Quartermaster.v1.GetCourierStatus";
+    public const string SubmitCourierTransfer = "Quartermaster.v1.SubmitCourierTransfer";
+    public const string StopCourierRun = "Quartermaster.v1.StopCourierRun";
+    public const string ResumeCourierRun = "Quartermaster.v1.ResumeCourierRun";
+}
+
+/// <summary>A roster character named by an external courier request.</summary>
+public sealed record CourierTransferCharacter
+{
+    public ulong LocalContentId { get; init; }
+    public uint HomeWorldId { get; init; }
+    public string CharacterName { get; init; } = string.Empty;
+    public string HomeWorldName { get; init; } = string.Empty;
+}
+
+public sealed record CourierTransferRequestItem
+{
+    public uint ItemId { get; init; }
+    public string ItemName { get; init; } = string.Empty;
+    public bool IsHq { get; init; }
+    public int Quantity { get; init; }
+}
+
+/// <summary>
+/// <c>gooseworks-quartermaster-courier-transfer/v1</c>: move carried gil and bag-held items from one roster
+/// character to another through the carrier. RequestId is the idempotency key.
+/// </summary>
+public sealed record CourierTransferRequest
+{
+    public string Schema { get; init; } = string.Empty;
+    public string ProviderInstanceId { get; init; } = string.Empty;
+    public string RequestId { get; init; } = string.Empty;
+    public CourierTransferCharacter? Source { get; init; }
+    public CourierTransferCharacter? Destination { get; init; }
+    public int GilAmount { get; init; }
+    public IReadOnlyList<CourierTransferRequestItem>? Items { get; init; }
+    public bool ReturnOwner { get; init; }
+    public bool ReturnDestinationHome { get; init; }
+    public bool ReturnCarrier { get; init; }
+}
+
+/// <summary>Stop or resume a courier run; an empty RunId means the current run.</summary>
+public sealed record CourierRunRequest
+{
+    public string? RunId { get; init; }
+}
+
+/// <summary>
+/// <c>gooseworks-quartermaster-courier-transfer-ack/v1</c>. Status: accepted, already_running,
+/// already_completed, stopping, idle or rejected (ErrorCode then names why).
+/// </summary>
+public sealed record CourierTransferAcknowledgement
+{
+    public string Schema { get; init; } = "gooseworks-quartermaster-courier-transfer-ack/v1";
+    public string ProviderInstanceId { get; init; } = string.Empty;
+    public string RequestId { get; init; } = string.Empty;
+    public string? RunId { get; init; }
+    public string Status { get; init; } = string.Empty;
+    public string? ErrorCode { get; init; }
+    public string Message { get; init; } = string.Empty;
 }
 
 public sealed record ElementalDepositRequest

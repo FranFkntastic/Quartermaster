@@ -24,7 +24,7 @@ internal static class CourierReceiveRecovery
 
         var delta = new List<(TradeItem Item,int Units)>();
         var keys = arm.Before.Stock.Concat(fresh.Stock).Concat(sender.Before.Stock).Concat(sender.After.Stock)
-            .Concat(state.Original).Select(x=>(x.ItemId,x.Hq)).Distinct();
+            .Concat(state.Original).Select(x=>(x.ItemId,x.Hq)).Append((ItemId: Custody.GilKey.Item, Hq: Custody.GilKey.Hq)).Distinct();
         foreach (var (id,hq) in keys)
         {
             var item = state.Items.SingleOrDefault(i=>i.ItemId==id && i.IsHighQuality==hq);

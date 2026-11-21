@@ -61,8 +61,44 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         var bags = scanner.CapturePlayerStorage();
         if (!CourierSession.PlayerBags.All(b => bags.ObservedSources.Contains(b))) return null;
         var slots = bags.Bags.Where(b => CourierSession.PlayerBags.Contains(b.BagName)).SelectMany(b => b.Items).ToArray();
-        return new(owner(), 140-slots.Length, [..slots.Select(s => new BagStock(s.ItemId,s.IsHq,checked((int)s.Quantity)))]);
+        // Carried gil is counted apart from the stacks: it takes no bag slot and is never a BagStock.
+        return new(owner(), 140-slots.Length, [..slots.Select(s => new BagStock(s.ItemId,s.IsHq,checked((int)s.Quantity)))], CarriedGil());
     }
+    private static unsafe int CarriedGil()
+    {
+        var inventory = InventoryManager.Instance();
+        return inventory == null ? 0 : checked((int)inventory->GetInventoryItemCount(TradePlanner.GilItemId, false, true, true, 0));
+    }
+    private const string BridgeWorld = "Ravana", BridgeShard = "Sapphire Avenue Exchange";
+    private (bool Resolved, MeetingBell? Bell) bridge;
+    /// <summary>
+    /// The cross-region rendezvous: Ul'dah's main aetheryte plaza on Ravana (Materia, Oceania), which
+    /// every region can reach by data-center travel. Resolved from the game data: the Ul'dah aetheryte is
+    /// the one sharing an aethernet group with the Sapphire Avenue Exchange shard. Null when unresolved.
+    /// </summary>
+    internal MeetingBell? Bridge()
+    {
+        if (bridge.Resolved) return bridge.Bell;
+        MeetingBell? found = null;
+        try
+        {
+            var world = data.GetExcelSheet<World>().FirstOrDefault(w => w.IsPublic && w.Name.ToString() == BridgeWorld);
+            var aetherytes = data.GetExcelSheet<Aetheryte>(Dalamud.Game.ClientLanguage.English);
+            var shard = aetherytes.FirstOrDefault(a => !a.IsAetheryte && a.AethernetGroup != 0 &&
+                a.AethernetName.ValueNullable?.Name.ToString() == BridgeShard);
+            var plaza = shard.RowId == 0 ? default : aetherytes.FirstOrDefault(a => a.IsAetheryte && a.AethernetGroup == shard.AethernetGroup);
+            if (world.RowId != 0 && plaza.RowId != 0 && plaza.Territory.RowId != 0)
+                found = new MeetingBell(plaza.Territory.RowId, world.RowId, 0, 0, 0, 0, "Ravana — Ul'dah");
+            else warn($"CourierBridgeUnresolved: world {world.RowId}, shard {shard.RowId}, plaza {plaza.RowId}");
+        }
+        catch (Exception e) { warn("CourierBridgeUnresolved: " + e.Message); }
+        bridge = (true, found);
+        return found;
+    }
+    /// <summary>The main aetheryte (not an aethernet shard) serving a territory; null when it has none.</summary>
+    private uint? MainAetheryte(uint territory) =>
+        data.GetExcelSheet<Aetheryte>().FirstOrDefault(a => a.IsAetheryte && a.Territory.RowId == territory) is { RowId: > 0 } a ? a.RowId : null;
+    internal uint DataCenter(uint world) => data.GetExcelSheet<World>().GetRowOrDefault(world)?.DataCenter.RowId ?? 0;
     public Task<Result<InventoryView>> ObserveAsync(Deadline d) => Poll<InventoryView>(d, () => Bags() is {} b ? Result<InventoryView>.Ok(b) : null);
     private CourierPosition? Position() => objects.LocalPlayer is {} p && player.IsLoaded && client.IsLoggedIn
         ? new(player.CurrentWorld.RowId,client.TerritoryType,p.Position.X,p.Position.Y,p.Position.Z) : null;
@@ -267,7 +303,61 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         }
     }
     public Task<Result<bool>> ReturnToAsync(CourierPosition p, Deadline d) => Navigate(p,null,d);
-    public Task<Result<bool>> GoInRangeAsync(MeetingBell b, Deadline d) => Navigate(new(b.World,b.Territory,b.X,b.Y,b.Z),b,d);
+    public Task<Result<bool>> GoInRangeAsync(MeetingBell b, Deadline d) =>
+        b.IsPlaza ? NavigatePlaza(b,d) : Navigate(new(b.World,b.Territory,b.X,b.Y,b.Z),b,d);
+    private const float PlazaArrivalRange = 12f, PlazaWalkRange = 8f;
+    /// <summary>
+    /// Reaches a plaza rendezvous: teleports to its territory's attuned main aetheryte, then walks to within
+    /// a few yalms of the live crystal. The partner observation then closes the last few yalms to trade range.
+    /// </summary>
+    private async Task<Result<bool>> NavigatePlaza(MeetingBell bell, Deadline d)
+    {
+        var teleportMarker=Marker("Teleport",Step.Value);var pathMarker=Marker("Approach",Step.Value);
+        bool teleported=teleportMarker.Already, moving=pathMarker.Already, arrived=false;
+        var idle=new IdleWindow();var watch=new WalkWatch();var walkTarget=default(Vector3);
+        var allowed=CanContinue.Value;
+        var crystal=MainAetheryte(bell.Territory);
+        Result<bool> Failure(string code,string detail){warn($"{code}: {bell.Label} on world {bell.World}: {detail}");return Result<bool>.Fail(code,detail);}
+        try { var outcome=await Poll<bool>(d, () =>
+        {
+            if(allowed?.Invoke()==false)return new(CourierOutcome.Cancelled,"RouteStopped",d.Name);
+            if (Position() is not {} here) return null;
+            var at=new Vector3(here.X,here.Y,here.Z);
+            if(ownsPath && watch.Stalled(this,at,walkTarget) is {} stalled)
+            {
+                nav.TryStop();ownsPath=moving=false;
+                return Failure("NavigationStalled",stalled);
+            }
+            if ((teleported || moving) && idle.Ready(this,moving))
+            {if(moving)ownsPath=false;teleported=moving=false;}
+            if (here.World != bell.World) return Result<bool>.Fail("WrongRendezvousWorld",d.Name);
+            if (crystal is not {} aetheryte) return Failure("PlazaAetheryteUnknown",$"Territory {bell.Territory} has no main aetheryte.");
+            if (here.Territory != bell.Territory)
+            {
+                if (teleported) return null;
+                if (!attuned.Any(a => a.AetheryteId == aetheryte)) return Result<bool>.Fail("NoAttunedAetheryte",bell.Territory.ToString());
+                teleportMarker.Save();
+                var result=teleport.TrySubmit(aetheryte);
+                teleported=result.Submitted;
+                return teleported || result.Retryable ? null : Result<bool>.Fail(result.Code,result.Message);
+            }
+            // The crystal streams in shortly after the zone loads; until then there is nothing to walk to.
+            if (objects.FirstOrDefault(o => o.ObjectKind == ObjectKind.Aetheryte && o.BaseId == aetheryte) is not {} live) return null;
+            if (Vector3.Distance(at,live.Position) <= PlazaArrivalRange) return Result<bool>.Ok(true);
+            if (moving || !IdleCharacter()) return null;
+            if (Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.Nav.PathfindInProgress")) return null;
+            pathMarker.Save();walkTarget=live.Position;
+            var path=nav.TryMoveCloseTo(walkTarget,PlazaWalkRange);
+            ownsPath=moving=path.Submitted;
+            if(moving)watch=new();
+            return moving || path.Retryable ? null : Result<bool>.Fail(path.Code,path.Message);
+        }); arrived=outcome.Outcome==CourierOutcome.Succeeded; if(!arrived)warn($"{outcome.Code}: {outcome.Detail}");return outcome; }
+        catch(Dalamud.Plugin.Ipc.Exceptions.IpcError e){return Failure("NavigationIpcUnavailable",e.Message);}
+        finally
+        {
+            if (ownsPath && !unload.IsCancellationRequested) await dispatch(()=>{ if(ownsPath)nav.TryStop(); ownsPath=false; },unload.Token);
+        }
+    }
     private sealed class IdleWindow
     {
         CourierPosition? last;
@@ -504,14 +594,47 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     }
     public Task<Result<bool>> EnsureWorldAsync(uint world, Deadline d) => Visit(world,d);
     public Task<Result<bool>> ReturnHomeAsync(Deadline d) => Visit(null,d);
+    /// <summary>
+    /// Whether a visit must return home first: world travel cannot hop straight from one visited data
+    /// center to a third one, so a character visiting another data center goes home before moving on.
+    /// </summary>
+    private bool HomeFirst(uint here, uint destination, uint home) =>
+        here != home && destination != home && DataCenter(here) != DataCenter(home) && DataCenter(here) != DataCenter(destination);
+    // Each leg keeps its own durable submission marker: a step that returns home and then visits a world
+    // (or returns one character home and visits with the next) must not read one leg's submission as the other's.
     private Task<Result<bool>> Visit(uint? world,Deadline d)
     {
-        WorldVisitOperation? op=null;var idle=new IdleWindow();var marker=Marker("Visit",Step.Value);bool submitted=marker.Already;
+        WorldVisitOperation? op=null;var idle=new IdleWindow();var marker=Marker(world==null?"VisitHome":"Visit",Step.Value);bool submitted=marker.Already;
         void Save(){marker.Save();submitted=true;}
+        var homeMarker=Marker("VisitReturnHome",Step.Value);bool homeSubmitted=homeMarker.Already;
+        void SaveHome(){homeMarker.Save();homeSubmitted=true;}
+        WorldVisitOperation? homeOp=null;var homeIdle=new IdleWindow();bool homeChecked=world==null,homeFirst=false;
         var allowed=CanContinue.Value;
         return Poll<bool>(d,()=>
         {
             if(allowed?.Invoke()==false)return new(CourierOutcome.Cancelled,"VisitStopped",d.Name);
+            if(!homeChecked)
+            {
+                if(Position() is not {} start)return null; // The home-first check needs a position.
+                homeChecked=true;
+                homeFirst=HomeFirst(start.World,world!.Value,player.HomeWorld.RowId);
+                if(homeFirst)warn($"VisitReturnHome: world {start.World} is on another data center than home {player.HomeWorld.RowId} and destination {world}; returning home first.");
+            }
+            if(homeFirst)
+            {
+                var homeRetry=Position() is {} away && away.World!=player.HomeWorld.RowId && homeSubmitted && homeIdle.Ready(this);
+                if(homeOp==null || homeRetry)
+                    homeOp=WorldVisitOperation.ReturnHome(worlds,player,commands,client,conditions,d.Expires,warn,SaveHome,homeSubmitted && !homeRetry);
+                var home=homeOp.Tick(DateTimeOffset.UtcNow);
+                if(!home.IsTerminal)return null;
+                if(home.Status!=OperationStatus.Succeeded)
+                {
+                    if(home.Status==OperationStatus.Indeterminate)WatchLate(d.Name,()=>{homeOp.Tick(DateTimeOffset.UtcNow);return homeOp.LateArrivalObserved;});
+                    return Translate(home,()=>true);
+                }
+                homeFirst=false;
+                return null;
+            }
             var retry=Position() is {} here && here.World!=(world??player.HomeWorld.RowId) && submitted && idle.Ready(this);
             if(op==null || retry){
                 op=world is {} id ? new(worlds,data.GetExcelSheet<World>().GetRow(id).Name.ToString(),player,commands,client,conditions,d.Expires,player.ContentId,warn,Save,submitted && !retry) :

@@ -186,8 +186,8 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
             return;
         ImGui.TableSetupScrollFreeze(0, 1);
         ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1f);
-        ImGui.TableSetupColumn("Moved", ImGuiTableColumnFlags.WidthFixed, 72);
-        ImGui.TableSetupColumn("Remaining", ImGuiTableColumnFlags.WidthFixed, 84);
+        ImGui.TableSetupColumn("Moved", ImGuiTableColumnFlags.WidthFixed, 96);
+        ImGui.TableSetupColumn("Remaining", ImGuiTableColumnFlags.WidthFixed, 96);
         ImGui.TableHeadersRow();
         foreach (var progress in run.Lines)
         {
@@ -217,7 +217,7 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
         ImGui.TableSetupScrollFreeze(0, 1);
         ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1f);
         ImGui.TableSetupColumn("Quality", ImGuiTableColumnFlags.WidthFixed, 56);
-        ImGui.TableSetupColumn("Quantity", ImGuiTableColumnFlags.WidthFixed, 72);
+        ImGui.TableSetupColumn("Quantity", ImGuiTableColumnFlags.WidthFixed, 96);
         ImGui.TableSetupColumn("Holder", ImGuiTableColumnFlags.WidthStretch, .6f);
         ImGui.TableHeadersRow();
         foreach (var row in custody.OrderBy(row => row.Item, StringComparer.OrdinalIgnoreCase).ThenBy(row => row.Quality, StringComparer.Ordinal))
@@ -254,23 +254,32 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
         var top = ImGui.GetCursorPosY();
         ImGui.SetCursorPosY(top + Math.Max(0, (height - (ImGui.GetTextLineHeight() * 2) - ImGui.GetStyle().ItemSpacing.Y) / 2));
         ImGui.TextUnformatted(view.Active is { } command ? $"Carrier: {CourierSession.PhaseLabel(command.ToString())}" : "Carrier");
-        var units = view.Custody.Sum(shipment => shipment.Units);
+        var holding = HoldingSummary(view.Custody);
         var state = view.Unconfirmed ? "Hand-off unconfirmed" : view.Paused ? "Paused" : null;
         if (state is not null)
-            ImGui.TextColored(QuartermasterPalette.Amber, units > 0 ? $"{state} · holding {units:N0}" : state);
+            ImGui.TextColored(QuartermasterPalette.Amber, holding is not null ? $"{state} · holding {holding}" : state);
         else
-            ImGui.TextDisabled(units > 0 ? $"Holding {units:N0}" : "Holding nothing");
+            ImGui.TextDisabled(holding is not null ? $"Holding {holding}" : "Holding nothing");
         ImGui.EndGroup();
         if (!view.Custody.IsEmpty)
             DrawCustody(view);
         return true;
     }
 
+    /// <summary>"12 items · 3,000,000 gil"; gil is counted apart from item units. Null when nothing is held.</summary>
+    private static string? HoldingSummary(IEnumerable<Shipment> custody)
+    {
+        var items = custody.Where(shipment => !shipment.IsGil).Sum(shipment => (long)shipment.Units);
+        var gil = custody.Where(shipment => shipment.IsGil).Sum(shipment => (long)shipment.Units);
+        string[] parts = [.. new[] { items > 0 ? $"{items:N0} item{(items == 1 ? "" : "s")}" : null, gil > 0 ? $"{gil:N0} gil" : null }.OfType<string>()];
+        return parts.Length == 0 ? null : string.Join(" · ", parts);
+    }
+
     private static void DrawCustody(CarrierView view)
     {
         var rows = view.Custody
             .GroupBy(shipment => (shipment.Item, shipment.Hq))
-            .Select(group => (group.First().Name, group.Key.Hq, Units: group.Sum(shipment => shipment.Units)))
+            .Select(group => (group.First().Name, Hq: group.Key.Hq && !group.First().IsGil, Units: group.Sum(shipment => (long)shipment.Units)))
             .OrderBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
             .ToArray();
         var height = (Math.Min(rows.Length, 6) + 1) * ImGui.GetFrameHeight();
@@ -280,7 +289,7 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
             return;
         ImGui.TableSetupScrollFreeze(0, 1);
         ImGui.TableSetupColumn("Holding", ImGuiTableColumnFlags.WidthStretch, 1f);
-        ImGui.TableSetupColumn("Units", ImGuiTableColumnFlags.WidthFixed, 72);
+        ImGui.TableSetupColumn("Units", ImGuiTableColumnFlags.WidthFixed, 96);
         ImGui.TableHeadersRow();
         foreach (var (name, hq, units) in rows)
         {
