@@ -182,8 +182,15 @@ public sealed record InventoryView(OwnerScope Character, int FreeSlots, Immutabl
 public sealed record CourierLocation(OwnerScope Character, ulong? Retainer, InventoryView Inventory);
 public sealed record Shipment(Guid Line, uint Item, string Name, bool Hq, int Units, int StackSize,
     ulong? From, ulong? To, OwnerScope Source, OwnerScope Destination);
+/// <summary>
+/// One carrier round from Source to Destination. A Local trip moves between containers of one character:
+/// the owner withdraws and deposits at its own bell with no carrier and no trade.
+/// </summary>
 public sealed record CourierTrip(OwnerScope Source, OwnerScope Destination, MeetingBell Pickup, MeetingBell Dropoff,
-    ImmutableArray<Shipment> Manifest);
+    ImmutableArray<Shipment> Manifest)
+{
+    internal bool Local => CourierPlanner.Exact(Source, Destination);
+}
 public sealed record Refusal(Guid Line, string Name, string Code, string? Source=null, string? Destination=null);
 /// <summary>
 /// Destination-side consolidation for one line: once its units are delivered, gather the item's
@@ -281,6 +288,8 @@ public static class CourierPlanner
                 var to = allocation.Places[flow.To];
                 var src = from.Character;
                 var dst = to.Character;
+                // Between containers of one character the owner withdraws and deposits itself: nothing is traded.
+                var local = Exact(src, dst);
                 (srcName, dstName) = (src.CharacterName, dst.CharacterName);
                 var pickup = settings.Bells.GetValueOrDefault(src.LocalContentId ?? 0);
                 var drop = settings.Bells.GetValueOrDefault(dst.LocalContentId ?? 0);
@@ -288,13 +297,13 @@ public static class CourierPlanner
                     : !Exact(carrier?.Character, settings.Carrier) ? "CarrierUnreachable"
                     : !settings.LocalRoster.Any(o => Exact(o, src)) || !settings.LocalRoster.Any(o => Exact(o, dst)) ? "OutsideClientRoster"
                     : !Reachable(src) || !Reachable(dst) ? "RegionUnreachable"
-                    : At(src, null) == null || At(dst, null) == null || Exact(src, dst) || Exact(src, settings.Carrier) || Exact(dst, settings.Carrier) ? "CharacterNotKnown"
+                    : At(src, null) == null || At(dst, null) == null || !local && src.Matches(dst) || Exact(src, settings.Carrier) || Exact(dst, settings.Carrier) ? "CharacterNotKnown"
                     : pickup?.World != src.HomeWorldId || drop?.World != dst.HomeWorldId || pickup == null || drop == null ? "MeetingBellMissing"
-                    : meta.IsTradable != true ? "ItemNotTradeable"
+                    : !local && meta.IsTradable != true ? "ItemNotTradeable"
                     : At(src, from.Retainer) == null ? "SourceUnknown" : At(dst, to.Retainer) == null ? "DestinationUnknown"
                     : meta.MaxStackSize is not (> 0 and <= int.MaxValue) || meta.IsUnique == null ? "ItemMetadataUnknown" : null;
                 if (code != null) break;
-                if (meta.IsUnique == true && (flow.Units != 1 || uniqueDestinations.Contains((dst.LocalContentId, r.ItemId)) || lineUnique.Contains((dst.LocalContentId, r.ItemId))
+                if (!local && meta.IsUnique == true && (flow.Units != 1 || uniqueDestinations.Contains((dst.LocalContentId, r.ItemId)) || lineUnique.Contains((dst.LocalContentId, r.ItemId))
                     || carrier!.Stock.Any(s => s.ItemId == r.ItemId && s.Units > 0)
                     || locations.Where(l => Exact(l.Character, dst)).Any(l => stock[(dst.LocalContentId, l.Retainer)].Any(s => s.ItemId == r.ItemId && s.Units > 0))))
                 { code = "UniqueConflict"; break; }
@@ -335,7 +344,7 @@ public static class CourierPlanner
                     remaining -= units;
                 }
                 if (code == null && remaining > 0) code = "SourceShort";
-                if (meta.IsUnique == true) lineUnique.Add((dst.LocalContentId, r.ItemId));
+                if (!local && meta.IsUnique == true) lineUnique.Add((dst.LocalContentId, r.ItemId));
             }
             if (code != null)
             {
@@ -357,21 +366,53 @@ public static class CourierPlanner
         // Stacks already in the source's bags take no source slot; only retainer-sourced ones are retrieved into it.
         int CarrierCap(OwnerScope dst) => (At(dst, null)?.Inventory.FreeSlots ?? 0) <= 0 ? 0 : Math.Min(testSlotCap ?? int.MaxValue, carrier?.FreeSlots ?? 0);
         int SourceCap(OwnerScope src) => At(src, null)?.Inventory.FreeSlots ?? 0;
+        // A same-character group has no carrier: retainer stacks bound for the bags keep their slots, and
+        // stacks passing from one retainer to another need one free slot, which they hand back before
+        // any bag-bound stack is retrieved (they run first).
+        static bool Stays(Shipment s) => s.From != null && s.To == null;
+        static bool Passes(Shipment s) => s.From != null && s.To != null;
         foreach (var (src, dst, stacks) in groups)
         {
             var carrierCap = CarrierCap(dst);
             var sourceCap = SourceCap(src);
-            foreach (var s in stacks.Where(s => carrierCap <= 0 || s.From != null && sourceCap <= 0).DistinctBy(s => s.Line))
+            var full = Exact(src, dst)
+                ? stacks.Count(Stays) > sourceCap || stacks.Any(Passes) && sourceCap <= 0
+                    ? stacks.Where(s => s.From != null) : []
+                : stacks.Where(s => carrierCap <= 0 || s.From != null && sourceCap <= 0);
+            foreach (var s in full.DistinctBy(s => s.Line))
                 if (refusals.All(f => f.Line != s.Line))
                     refusals.Add(new(s.Line, s.Name, "BagSlotLimit", src.CharacterName, dst.CharacterName));
         }
         var refused = refusals.Select(f => f.Line).ToHashSet();
+        var locals = new List<(OwnerScope Who, List<CourierTrip> Trips)>();
         foreach (var (src, dst, stacks) in groups)
         {
             var pickup = settings.Bells[src.LocalContentId ?? 0];
             var drop = settings.Bells[dst.LocalContentId ?? 0];
-            foreach (var batch in Pack(stacks.Where(s => !refused.Contains(s.Line)).ToList(), CarrierCap(dst), SourceCap(src)))
-                trips.Add(new(src, dst, pickup, drop, batch));
+            var live = stacks.Where(s => !refused.Contains(s.Line)).ToList();
+            if (!Exact(src, dst))
+            {
+                foreach (var batch in Pack(live, CarrierCap(dst), SourceCap(src)))
+                    trips.Add(new(src, dst, pickup, drop, batch));
+                continue;
+            }
+            // Stacks passing between retainers go first, while the most bag slots are free.
+            live = [.. live.Where(Passes), .. live.Where(Stays), .. live.Where(s => s.From == null)];
+            locals.Add((src, [.. Pack(live, int.MaxValue, SourceCap(src)).Select(batch => new CourierTrip(src, dst, pickup, drop, batch))]));
+        }
+        // A character's own moves run while the owner is already there: right after the last hand-in it
+        // receives (once that custody is stowed), else right before the first hand-out it gives, else after
+        // every trip. They never run inside a trade, so its own moves and a trade's stacks never share its bags.
+        foreach (var (who, own) in locals)
+        {
+            int received = -1, given = -1;
+            for (var i = 0; i < trips.Count; i++)
+            {
+                if (trips[i].Local) continue;
+                if (Exact(trips[i].Destination, who)) received = i;
+                if (given < 0 && Exact(trips[i].Source, who)) given = i;
+            }
+            trips.InsertRange(received >= 0 ? received + 1 : given >= 0 ? given : trips.Count, own);
         }
         return new(plan.Id, plan.Revision, trips.ToImmutable(), refusals.ToImmutable());
     }

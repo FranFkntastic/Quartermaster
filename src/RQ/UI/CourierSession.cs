@@ -621,7 +621,6 @@ public sealed class CourierSession
     {
         CourierProblem.NoSource => "No source",
         CourierProblem.NoDestination => "No destination",
-        CourierProblem.SameCharacter => "Same character",
         CourierProblem.Short => $"Short {allocation.Short:N0}",
         CourierProblem.Unplaced => $"{allocation.Stuck:N0} · no destination",
         _ => string.Empty,
@@ -730,7 +729,6 @@ public sealed class CourierSession
             "CarrierUnreachable" => $"{carrier} is not running",
             "OutsideClientRoster" => $"{string.Join(" and ", named.Where(name => !settings.LocalRoster.Any(owner => Same(owner.CharacterName, name))).DefaultIfEmpty(source))} not on this account",
             "RegionUnreachable" => $"{string.Join(" or ", named.DefaultIfEmpty(destination))} is in another region that {carrier} cannot travel to",
-            "CharacterNotKnown" when Same(source, destination) => $"{refusal.Name} would go from {source} to {source}",
             "CharacterNotKnown" when named.FirstOrDefault(name => Same(name, settings.Carrier?.CharacterName)) is { } isCarrier => $"{isCarrier} is the carrier",
             "CharacterNotKnown" => $"Bags of {source} or {destination} not observed",
             "MeetingBellMissing" => $"No meeting bell for {string.Join(" or ", MissingBells(runtime, named).DefaultIfEmpty(source))}",
@@ -742,6 +740,7 @@ public sealed class CourierSession
             "UniqueConflict" => $"{refusal.Name} is unique and {destination} or {carrier} already holds one",
             "DestinationFull" => $"No room for {refusal.Name} on {destination}",
             "SourceShort" => $"Not enough {refusal.Name} on {source}",
+            "BagSlotLimit" when Same(source, destination) => $"No free bag slot on {source}",
             "BagSlotLimit" => $"No free bag slot on {source}, {destination} or {carrier}",
             "PlanningFailed" => $"Courier plan failed for {refusal.Name}",
             _ => $"{refusal.Name}: {RefusalLabel(refusal.Code)}",

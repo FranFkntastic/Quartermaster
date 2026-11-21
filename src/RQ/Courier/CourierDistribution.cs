@@ -22,8 +22,6 @@ public enum CourierProblem
     None,
     NoSource,
     NoDestination,
-    /// <summary>Every source with units sits on the character of every destination; the courier only moves between characters.</summary>
-    SameCharacter,
     /// <summary>Typed destinations want more than the sources can give (<see cref="CourierAllocation.Short"/>).</summary>
     Short,
     /// <summary>Typed sources give more than any destination takes (<see cref="CourierAllocation.Stuck"/>).</summary>
@@ -125,12 +123,12 @@ public static class CourierDistribution
     /// it holds above it; a typed destination ends with its target. Typed destinations fill first, in
     /// order, from typed sources and then from untyped sources in listed order. What typed sources still
     /// give, and everything untyped sources hold when the line has an untyped destination, goes to the
-    /// first untyped destination. Nothing moves between two containers of one character; an unobserved
+    /// first untyped destination. Two containers of one character move like any other pair; an unobserved
     /// source gives nothing and an unobserved destination is taken to hold nothing so its moves surface
     /// (and are refused) on the line. Units typed sources give that nothing takes count as Stuck, units
     /// typed destinations want that nothing gives as Short; either is a problem and the line moves nothing.
-    /// While the line has no destination, the observed holder with the most units that is not a source,
-    /// and not only on the sources' characters, is offered as a suggestion, unless dismissed.
+    /// While the line has no destination, the observed holder with the most units that is not a source
+    /// is offered as a suggestion, unless dismissed.
     /// </summary>
     public static CourierAllocation Allocate(CourierLine line, uint item, ItemQualityPolicy quality, OwnerScope? owner,
         IReadOnlyList<CourierLocation> locations, Func<OwnerScope, bool> listable)
@@ -146,7 +144,6 @@ public static class CourierDistribution
         if (line.Destinations.IsEmpty && !line.SuggestionDismissed)
         {
             var best = holding
-                .Where(held => line.Sources.IsEmpty || line.Sources.Any(source => !source.Character.Matches(held.At.Character)))
                 .OrderByDescending(held => held.Units)
                 .Select(held => held.At)
                 .FirstOrDefault();
@@ -202,7 +199,7 @@ public static class CourierDistribution
             else
                 flows.Add(new(from, to, units));
         }
-        bool Apart(int a, int b) => !listed[a].Who.Matches(listed[b].Who);
+        bool Apart(int a, int b) => listed[a].Retainer != listed[b].Retainer || !listed[a].Who.Matches(listed[b].Who);
 
         // Typed destinations fill first, from typed sources, then from untyped sources, in listed order.
         for (var taker = 0; taker < n; taker++)
@@ -225,15 +222,8 @@ public static class CourierDistribution
 
         var stuck = Enumerable.Range(0, n).Where(i => Source(i) && listed[i].Typed is not null).Sum(i => give[i]);
         var shortfall = Enumerable.Range(0, n).Where(i => !Source(i)).Sum(i => want[i]);
-        // Units are due to move, yet every source shares a character with every destination.
-        var due = stuck > 0 || shortfall > 0 ||
-                  Enumerable.Range(0, n).Any(t => !Source(t) && listed[t].Typed is null) &&
-                  Enumerable.Range(0, n).Any(g => Source(g) && listed[g].Typed is null && Held(g) > 0);
         var problem = sources.IsEmpty ? CourierProblem.NoSource
             : destinations.IsEmpty ? CourierProblem.NoDestination
-            : flows.Count == 0 && due && Enumerable.Range(0, n).Any(g => Source(g) && Spare(g) > 0) &&
-              !Enumerable.Range(0, n).Any(g => Source(g) && Spare(g) > 0 && Enumerable.Range(0, n).Any(t => !Source(t) && Apart(g, t)))
-                ? CourierProblem.SameCharacter
             : shortfall > 0 ? CourierProblem.Short
             : stuck > 0 ? CourierProblem.Unplaced
             : CourierProblem.None;
