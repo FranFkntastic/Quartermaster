@@ -492,7 +492,7 @@ public sealed class CourierConductor
             var steps = r.Schedule;
             for (; r.Cursor < steps.Length;)
             {
-                (trade as ICourierHoldPort)?.CheckHold();
+                if (!carrierless) (trade as ICourierHoldPort)?.CheckHold();
                 if (stop) throw new CourierFault(CourierOutcome.Cancelled, "StopRequested", "Stopped at verified checkpoint.");
                 var s = steps[r.Cursor]; var t = r.Plan.Trips[s.Trip];
                 bool ownerOnly = s.Phase is CourierPhase.EnsureSource or CourierPhase.Retrieve or CourierPhase.Deposit
