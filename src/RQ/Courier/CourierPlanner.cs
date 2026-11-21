@@ -44,6 +44,10 @@ public sealed record CourierLine
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool SuggestionDismissed { get; init; }
 
+    /// <summary>Whether the user dismissed the source this line would otherwise suggest.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool SourceSuggestionDismissed { get; init; }
+
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     [System.ComponentModel.EditorBrowsable(System.ComponentModel.EditorBrowsableState.Never)]
     public ImmutableArray<LegacyCourierPlace> Places { get; init; }
@@ -128,7 +132,8 @@ public sealed record CourierLine
 
     public bool Equals(CourierLine? other) =>
         other is not null && Sources.SequenceEqual(other.Sources) && Destinations.SequenceEqual(other.Destinations) &&
-        SuggestionDismissed == other.SuggestionDismissed && LegacyPlaces.SequenceEqual(other.LegacyPlaces) &&
+        SuggestionDismissed == other.SuggestionDismissed && SourceSuggestionDismissed == other.SourceSuggestionDismissed &&
+        LegacyPlaces.SequenceEqual(other.LegacyPlaces) &&
         Equals(Character, other.Character) && SourceRetainerId == other.SourceRetainerId && Equals(SourceCharacter, other.SourceCharacter) &&
         KeepInSource == other.KeepInSource && RetainerId == other.RetainerId;
 
@@ -142,6 +147,7 @@ public sealed record CourierLine
         foreach (var place in LegacyPlaces)
             hash.Add(place);
         hash.Add(SuggestionDismissed);
+        hash.Add(SourceSuggestionDismissed);
         hash.Add(Character);
         hash.Add(SourceRetainerId);
         return hash.ToHashCode();

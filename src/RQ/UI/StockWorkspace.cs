@@ -793,12 +793,19 @@ internal sealed class StockWorkspace
         if (canStow)
             reviewRegistry.RegisterLastButton($"{control}.stow", $"Stow carried {row.Item.ItemName}", true,
                 () => pendingLocationPopup = $"stow:{control}", "Available");
-        // With a Courier plan open, the add sends from exactly this container.
-        StockGroup PlanItem(QuartermasterRuntimeSnapshot at) =>
-            transferPlans.CourierPlanOpen(at) && LocationItem(at, itemId, location) is { } here ? here : current!;
+        // With a Courier plan open, bags and retainers join the item's line as a source; the saddlebag is
+        // not a courier place, so it adds the item with no source like any other plain add.
+        void AddToPlan(QuartermasterRuntimeSnapshot at)
+        {
+            if (location.Kind is BrowserScopeKind.Player or BrowserScopeKind.Retainer &&
+                transferPlans.AddCourierSource(at, itemId, row.Item.ItemName, location.Character,
+                    location.Kind == BrowserScopeKind.Retainer ? location.RetainerId : null))
+                return;
+            UpsertSelectedStockRules(at, [current!], stowCarried: false);
+        }
         if (canPlan)
             reviewRegistry.RegisterLastButton($"{control}.add-to-plan", $"Add {row.Item.ItemName} to the current plan", true,
-                () => UpsertSelectedStockRules(runtimeSnapshots.Current, [PlanItem(runtimeSnapshots.Current)], stowCarried: false), "Available");
+                () => AddToPlan(runtimeSnapshots.Current), "Available");
 
         if (pendingLocationPopup is { } pending && pending.Length == control.Length + 5 && pending.EndsWith(control, StringComparison.Ordinal))
         {
@@ -832,7 +839,7 @@ internal sealed class StockWorkspace
             if (canPlan)
             {
                 if (ImGui.MenuItem("Add to plan"))
-                    UpsertSelectedStockRules(runtime, [PlanItem(runtime)], stowCarried: false);
+                    AddToPlan(runtime);
                 if (ImGui.IsItemHovered())
                     ImGui.SetTooltip(transferPlans.CourierPlanOpen(runtime)
                         ? "Add to the open Courier plan"

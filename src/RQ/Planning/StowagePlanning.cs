@@ -188,6 +188,7 @@ public static class StowagePlanMigration
                 Sources = [.. sources],
                 Destinations = [.. destinations],
                 SuggestionDismissed = explicitLines.Any(line => line.SuggestionDismissed),
+                SourceSuggestionDismissed = explicitLines.Any(line => line.SourceSuggestionDismissed),
                 Places = places.Count > 0 ? [.. places] : default,
             };
             survivor.Quality = lines.Select(rule => rule.Quality).Distinct().Count() == 1 ? survivor.Quality : ItemQualityPolicy.Any;
