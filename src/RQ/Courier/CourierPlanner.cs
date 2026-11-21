@@ -164,6 +164,13 @@ public sealed record MeetingBell(uint Territory, uint World, uint ObjectId, floa
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] WardPoint[]? Trail = null)
 {
     internal int ApproachSeconds => Ward.HasValue ? 300 : 150;
+    /// <summary>
+    /// A rendezvous at a city's main aetheryte rather than a summoning bell (ObjectId 0): used where a
+    /// side cannot meet the carrier on its own home world, such as the cross-region Ravana — Ul'dah bridge.
+    /// No retainer can be reached there, so only carried stock and gil change hands.
+    /// </summary>
+    [JsonIgnore]
+    internal bool IsPlaza => ObjectId == 0;
     internal bool HasRoute => Ward!=null && Shard is >0 && Trail is {Length:>0};
     public bool SamePlace(MeetingBell other) => this with { Label = "",Shard=null,Trail=null } == other with { Label = "",Shard=null,Trail=null };
 }
@@ -181,13 +188,24 @@ public sealed record CourierSettings
     public ImmutableDictionary<ulong, MeetingBell> Bells { get; init; } = ImmutableDictionary<ulong, MeetingBell>.Empty;
 }
 public sealed record BagStock(uint ItemId, bool Hq, int Units);
-public sealed record InventoryView(OwnerScope Character, int FreeSlots, ImmutableArray<BagStock> Stock)
+/// <summary>
+/// A character's bags: its stacks, free slots and carried gil. Gil is never a stack: it takes no slot and
+/// is counted under (<see cref="CourierPlanner.GilItemId"/>, NQ), the same key trades verify it under.
+/// </summary>
+public sealed record InventoryView(OwnerScope Character, int FreeSlots, ImmutableArray<BagStock> Stock,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] int Gil = 0)
 {
-    public int Count(uint item, bool hq) => Stock.Where(x => x.ItemId == item && x.Hq == hq).Sum(x => x.Units);
+    public int Count(uint item, bool hq) => item == CourierPlanner.GilItemId && !hq ? Gil
+        : Stock.Where(x => x.ItemId == item && x.Hq == hq).Sum(x => x.Units);
 }
 public sealed record CourierLocation(OwnerScope Character, ulong? Retainer, InventoryView Inventory);
 public sealed record Shipment(Guid Line, uint Item, string Name, bool Hq, int Units, int StackSize,
-    ulong? From, ulong? To, OwnerScope Source, OwnerScope Destination);
+    ulong? From, ulong? To, OwnerScope Source, OwnerScope Destination)
+{
+    /// <summary>Carried gil: one shipment of up to the gil cap, taking no bag slot on any side and never a retainer.</summary>
+    [JsonIgnore]
+    internal bool IsGil => Item == CourierPlanner.GilItemId;
+}
 /// <summary>
 /// One carrier round from Source to Destination. A Local trip moves between containers of one character:
 /// the owner withdraws and deposits at its own bell with no carrier and no trade.
@@ -204,7 +222,11 @@ public sealed record Refusal(Guid Line, string Name, string Code, string? Source
 /// </summary>
 public sealed record CourierConsolidation(OwnerScope Destination, Guid Line, uint Item, string Name,
     ItemQualityPolicy Quality, ulong Retainer, int StackSize);
-public sealed record CourierPlan(Guid PlanId, long Revision, ImmutableArray<CourierTrip> Trips, ImmutableArray<Refusal> Refusals)
+/// <param name="ReturnDestinationHome">After the last deposit, a destination left off its home world (at a bridge) returns home.</param>
+/// <param name="RequestId">The IPC request that submitted this plan, its idempotency key; null for plans started in the UI.</param>
+public sealed record CourierPlan(Guid PlanId, long Revision, ImmutableArray<CourierTrip> Trips, ImmutableArray<Refusal> Refusals,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool ReturnDestinationHome = false,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? RequestId = null)
 {
     /// <summary>Absent in journals written before destination consolidation, which read as none.</summary>
     public ImmutableArray<CourierConsolidation> Consolidations { get; init; } = [];
@@ -212,6 +234,11 @@ public sealed record CourierPlan(Guid PlanId, long Revision, ImmutableArray<Cour
 
 public static class CourierPlanner
 {
+    /// <summary>The trade key carried gil is verified under (Franthropy's <c>TradePlanner.GilItemId</c>).</summary>
+    public const uint GilItemId = Franthropy.Dalamud.Automation.Trades.TradePlanner.GilItemId;
+    /// <summary>The most gil a character can carry.</summary>
+    public const int GilCap = 999_999_999;
+
     internal static bool Exact(OwnerScope? a, OwnerScope? b) => a is { HasStableIdentity: true }
         && b is { HasStableIdentity: true } && a.Matches(b) && !string.IsNullOrWhiteSpace(a.CharacterName)
         && string.Equals(a.CharacterName, b.CharacterName, StringComparison.OrdinalIgnoreCase);
@@ -385,7 +412,7 @@ public static class CourierPlanner
             var full = Exact(src, dst)
                 ? stacks.Count(Stays) > sourceCap || stacks.Any(Passes) && sourceCap <= 0
                     ? stacks.Where(s => s.From != null) : []
-                : stacks.Where(s => carrierCap <= 0 || s.From != null && sourceCap <= 0);
+                : stacks.Where(s => !s.IsGil && (carrierCap <= 0 || s.From != null && sourceCap <= 0));
             foreach (var s in full.DistinctBy(s => s.Line))
                 if (refusals.All(f => f.Line != s.Line))
                     refusals.Add(new(s.Line, s.Name, "BagSlotLimit", src.CharacterName, dst.CharacterName));
@@ -428,20 +455,29 @@ public static class CourierPlanner
     /// Packs stacks into trips of at most <paramref name="carrierCap"/> stacks, of which at most
     /// <paramref name="sourceCap"/> come from a retainer (stacks already in the source's bags take no
     /// source slot). Each trip takes retainer stacks first, then fills with bag stacks; stacks keep their
-    /// order within a trip. Both caps must be positive when any stack needs them.
+    /// order within a trip. Both caps must be positive when any stack needs them. Gil takes no slot on any
+    /// side: it rides with the first trip, and a gil-only manifest needs no free slot at all.
     /// </summary>
     internal static IEnumerable<ImmutableArray<Shipment>> Pack(IReadOnlyList<Shipment> stacks, int carrierCap, int sourceCap)
     {
         if (stacks.Count == 0) yield break;
+        var gil = Enumerable.Range(0, stacks.Count).Where(i => stacks[i].IsGil).ToList();
+        if (gil.Count == stacks.Count)
+        {
+            yield return [.. stacks];
+            yield break;
+        }
         if (carrierCap <= 0 || sourceCap <= 0 && stacks.Any(s => s.From != null))
             throw new ArgumentOutOfRangeException(nameof(carrierCap), "No bag slot for the stacks.");
-        var retained = new Queue<int>(Enumerable.Range(0, stacks.Count).Where(i => stacks[i].From != null));
-        var bagged = new Queue<int>(Enumerable.Range(0, stacks.Count).Where(i => stacks[i].From == null));
+        var retained = new Queue<int>(Enumerable.Range(0, stacks.Count).Where(i => !stacks[i].IsGil && stacks[i].From != null));
+        var bagged = new Queue<int>(Enumerable.Range(0, stacks.Count).Where(i => !stacks[i].IsGil && stacks[i].From == null));
         while (retained.Count + bagged.Count > 0)
         {
-            var take = new List<int>();
-            while (retained.Count > 0 && take.Count < Math.Min(carrierCap, sourceCap)) take.Add(retained.Dequeue());
-            while (bagged.Count > 0 && take.Count < carrierCap) take.Add(bagged.Dequeue());
+            var take = new List<int>(gil);
+            gil.Clear();
+            var slots = take.Count;
+            while (retained.Count > 0 && take.Count - slots < Math.Min(carrierCap, sourceCap)) take.Add(retained.Dequeue());
+            while (bagged.Count > 0 && take.Count - slots < carrierCap) take.Add(bagged.Dequeue());
             take.Sort();
             yield return [.. take.Select(i => stacks[i])];
         }

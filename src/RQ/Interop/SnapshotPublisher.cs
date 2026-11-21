@@ -15,6 +15,7 @@ public sealed class SnapshotPublisher
     public const string RestockPlansCapability = "restockPlans.v1";
     public const string VendorProcurementCapability = "vendorProcurement.v1";
     public const string AutomaticElementalDepositCapability = "automaticElementalDeposit";
+    public const string CrossRegionCourierCapability = "crossRegionCourier.v1";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string providerInstanceId;
     private readonly StateRepository state;
@@ -210,9 +211,10 @@ public sealed class SnapshotPublisher
         schema = "gooseworks-quartermaster-capabilities/v1",
         providerInstanceId,
         revision = Revision,
-        channels = new[] { IpcChannels.GetCapabilities, IpcChannels.GetSnapshot, IpcChannels.SubmitShortages, IpcChannels.SubmitElementalDeposit, IpcChannels.GetOperation, IpcChannels.Changed },
-        capabilities = new[] { AutomaticRetrievalCapability, AutomaticElementalDepositCapability, TransferPlansCapability, StowagePlansCapability, RestockPlansCapability, VendorProcurementCapability },
-        requestSchemas = new[] { ShortageSubmissionService.RequestSchema, ElementalDepositSubmissionService.RequestSchema },
+        channels = new[] { IpcChannels.GetCapabilities, IpcChannels.GetSnapshot, IpcChannels.SubmitShortages, IpcChannels.SubmitElementalDeposit, IpcChannels.GetOperation, IpcChannels.Changed,
+            IpcChannels.GetCourierStatus, IpcChannels.SubmitCourierTransfer, IpcChannels.StopCourierRun, IpcChannels.ResumeCourierRun },
+        capabilities = new[] { AutomaticRetrievalCapability, AutomaticElementalDepositCapability, TransferPlansCapability, StowagePlansCapability, RestockPlansCapability, VendorProcurementCapability, CrossRegionCourierCapability },
+        requestSchemas = new[] { ShortageSubmissionService.RequestSchema, ElementalDepositSubmissionService.RequestSchema, CourierIpcService.TransferSchema },
         statusVocabulary = new[] { OperationStatuses.Queued, OperationStatuses.Accepted, OperationStatuses.Running, OperationStatuses.Succeeded, OperationStatuses.PartiallySucceeded, OperationStatuses.Indeterminate, OperationStatuses.Failed, OperationStatuses.Cancelled, OperationStatuses.Rejected },
         executionPolicy = "request_selected",
         automaticExecutionField = "executeImmediately",

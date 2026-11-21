@@ -867,6 +867,24 @@ public sealed class CourierSession
         Launch(async () => await conductor.StartAsync(new(Guid.Empty, 0, [], []), new()).ConfigureAwait(false));
     }
 
+    /// <summary>
+    /// Starts a plan built outside the stowage view (the courier IPC). A clean, settled previous run
+    /// is archived first. False when a run is already active.
+    /// </summary>
+    internal bool StartPlan(CourierPlan courierPlan, CourierSettings settings, Guid? clearFirst, Guid runId)
+    {
+        Poll(force: true);
+        if (Conductor is not { } conductor || IsActive)
+            return false;
+        Launch(async () =>
+        {
+            if (clearFirst is { } previous)
+                await conductor.ClearAsync(previous, null).ConfigureAwait(false);
+            return await conductor.StartAsync(courierPlan, settings, runId).ConfigureAwait(false);
+        });
+        return true;
+    }
+
     private string? CarrierName() => state.ReadConfiguration(document => document.Courier.Carrier?.CharacterName);
 
     private void Launch(Func<Task<CourierSnapshot?>> start)
@@ -939,6 +957,11 @@ public sealed class CourierSession
             "AutomationBusy" => "Another automation is running",
             "AutoRetainerBusy" => "AutoRetainer is still running",
             "BagSlotLimit" => "No free bag slot",
+            "SourceGilShort" => "Source carries too little gil",
+            "DestinationGilShort" => "Gil did not arrive",
+            "CarrierGilCapExceeded" => $"{who} would pass the gil cap",
+            "DestinationGilCapExceeded" => "Destination would pass the gil cap",
+            "BagStockShort" => "Items no longer in bags",
             "DestinationBagsFull" => "Destination bags full",
             "SenderStockShort" => "Items no longer at the source",
             "CustodyInsufficient" => $"{who} holds fewer items than expected",
@@ -980,6 +1003,7 @@ public sealed class CourierSession
         nameof(CourierPhase.Consolidate) => "Consolidating",
         nameof(CourierPhase.ReturnOwner) => "Returning to the start character",
         nameof(CourierPhase.ReturnCarrier) => "Carrier returning",
+        nameof(CourierPhase.ReturnDestinationHome) => "Returning home",
         nameof(CourierPhase.Finish) => "Finishing",
         nameof(CourierCommand.Travel) => "Traveling to the meeting bell",
         nameof(CourierCommand.Receive) => "Receiving a trade",

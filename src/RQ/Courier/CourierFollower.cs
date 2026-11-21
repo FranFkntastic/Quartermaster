@@ -164,18 +164,21 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                 case CourierCommand.Travel:
                     if (m.Bell == null) return Refuse("BellMissing");
                     if ((await calls.Call("CarrierPosition", 15, bells.PositionAsync)).World != m.Bell.World)
-                        await calls.Call("CarrierWorld", 180, d => worlds.EnsureWorldAsync(m.Bell.World, d));
-                    await calls.Call(m.Bell.Ward.HasValue ? "WardTravel" : "CarrierBell", m.Bell.ApproachSeconds, d => bells.GoInRangeAsync(m.Bell, d)); break;
+                        await calls.Call("CarrierWorld", Deadline.WorldSeconds(m.Bell), d => worlds.EnsureWorldAsync(m.Bell.World, d));
+                    await calls.Call(m.Bell.Ward.HasValue ? "WardTravel" : m.Bell.IsPlaza ? "CarrierPlaza" : "CarrierBell", m.Bell.ApproachSeconds, d => bells.GoInRangeAsync(m.Bell, d)); break;
                 case CourierCommand.Receive:
                 case CourierCommand.Send:
                     bool send = m.Command == CourierCommand.Send;
                     // Any number of stacks: the trade runner packs them into successive five-slot windows.
-                    if (m.Manifest.IsDefaultOrEmpty || m.Manifest.Any(s => s.Units <= 0 || s.Units > s.StackSize))
+                    // Carried gil is one NQ shipment up to the gil cap, its stack size the cap itself.
+                    if (m.Manifest.IsDefaultOrEmpty || m.Manifest.Any(s => s.Units <= 0 || s.Units > s.StackSize ||
+                            s.IsGil && (s.Hq || s.StackSize != CourierPlanner.GilCap)))
                         return Refuse("InvalidManifest");
                     if (m.Manifest.Any(s => !CourierPlanner.Exact(m.Partner, send ? s.Destination : s.Source)))
                         return Refuse("ManifestPartnerMismatch");
+                    // Travel fees spend carried gil between hand-offs, so gil need only still cover the custody.
                     if (send && (!Custody.Covers(ledger.Units, m.Manifest) || m.Manifest.GroupBy(s => (s.Item, s.Hq))
-                        .Any(g => before.Count(g.Key.Item, g.Key.Hq) < g.Sum(s => s.Units) ||
+                        .Any(g => before.Count(g.Key.Item, g.Key.Hq) < g.Sum(s => (long)s.Units) || g.Key.Item != CourierPlanner.GilItemId &&
                             ledger.LastConfirmedBags?.Count(g.Key.Item, g.Key.Hq) != before.Count(g.Key.Item, g.Key.Hq))))
                     {
                         var refusal = Refuse("CustodyInsufficient");
@@ -294,7 +297,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     {
         var home = m.Carrier.HomeWorldId;
         var at = $"{m.Run}/{m.Step} ReturnHome";
-        await calls.Call("CarrierReturnWorld", 180, worlds.ReturnHomeAsync);
+        await calls.Call("CarrierReturnWorld", Deadline.DataCenterSeconds, worlds.ReturnHomeAsync);
         if (cfg.Bells.GetValueOrDefault(m.Carrier.LocalContentId ?? 0) is { } own)
         {
             if (own.World == home)

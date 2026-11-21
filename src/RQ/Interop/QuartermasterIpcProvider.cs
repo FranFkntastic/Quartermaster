@@ -15,7 +15,7 @@ public sealed class QuartermasterIpcProvider : IDisposable
     private readonly SnapshotPublisher snapshots;
     private readonly ShortageSubmissionService submissions;
     private readonly ElementalDepositSubmissionService deposits;
-    private bool disposed;
+    private bool disposed, courierAttached;
 
     public QuartermasterIpcProvider(
         IIpcRegistrar registrar,
@@ -38,6 +38,18 @@ public sealed class QuartermasterIpcProvider : IDisposable
         registrar.RegisterNotification(IpcChannels.Changed);
     }
 
+    /// <summary>Registers the courier channels once the courier wiring exists.</summary>
+    public void AttachCourier(CourierIpcService courier)
+    {
+        if (disposed || courierAttached)
+            return;
+        courierAttached = true;
+        registrar.Register(IpcChannels.GetCourierStatus, courier.GetStatus);
+        registrar.Register(IpcChannels.SubmitCourierTransfer, courier.Submit);
+        registrar.Register(IpcChannels.StopCourierRun, courier.Stop);
+        registrar.Register(IpcChannels.ResumeCourierRun, courier.Resume);
+    }
+
     public void PublishChanged(string json)
     {
         if (!disposed)
@@ -55,5 +67,12 @@ public sealed class QuartermasterIpcProvider : IDisposable
         registrar.Unregister(IpcChannels.SubmitElementalDeposit);
         registrar.Unregister(IpcChannels.GetOperation);
         registrar.Unregister(IpcChannels.Changed);
+        if (courierAttached)
+        {
+            registrar.Unregister(IpcChannels.GetCourierStatus);
+            registrar.Unregister(IpcChannels.SubmitCourierTransfer);
+            registrar.Unregister(IpcChannels.StopCourierRun);
+            registrar.Unregister(IpcChannels.ResumeCourierRun);
+        }
     }
 }

@@ -113,7 +113,8 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                     if(lease.Holder is not ("courier owner" or "courier carrier") || step==Guid.Empty)
                         return Result<bool>.Fail("TradeAuthorityMissing",d.Name);
                     if(DateTimeOffset.UtcNow>=d.Expires)return Result<bool>.Fail("TradeStartExpired",d.Name);
-                    if(manifest.IsDefaultOrEmpty || manifest.Any(s=>s.Item<=TradePlanner.GilItemId || s.Units<=0))
+                    // Carried gil trades as NQ gil; HQ gil, item 0 and empty quantities never do.
+                    if(manifest.IsDefaultOrEmpty || manifest.Any(s=>s.Item==0 || s.Item==TradePlanner.GilItemId && s.Hq || s.Units<=0))
                         return Result<bool>.Fail("InvalidItemManifest",d.Name);
                     var prior=store.Load();
                     if(prior.Arm!=null || prior.Recovery.AwaitingVerification!=null || prior.Recovery.CancellationPending || prior.Step==step)
@@ -153,7 +154,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                         var arm=state.Arm!;
                         if(bag==null || !CourierPlanner.Exact(arm.Before.Character,bag.Character) ||
                             arm.Before.Stock.Concat(bag.Stock).Select(x=>new TradeInventoryKey(x.ItemId,x.Hq))
-                            .Concat(receiver.Received!.Keys).Distinct().Any(k=>
+                            .Concat(receiver.Received!.Keys).Append(new TradeInventoryKey(TradePlanner.GilItemId,false)).Distinct().Any(k=>
                                 (long)bag.Count(k.ItemId,k.IsHighQuality)-arm.Before.Count(k.ItemId,k.IsHighQuality)!=receiver.Received!.GetValueOrDefault(k)))
                             return End(CourierOutcome.Indeterminate,"ReceiveBaselineMismatch",d.Name);
                         state.LastSettledArm=arm;state.Arm=null;state.ReceiveAfter=bag;
@@ -171,6 +172,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                 if (receive && result.Status==OperationStatus.Cancelled && state.Arm is {} cancelledArm) {
                     var after=game.Bags();
                     if(after==null || !CourierPlanner.Exact(after.Character,cancelledArm.Before.Character) ||
+                        after.Gil!=cancelledArm.Before.Gil ||
                         after.Stock.Concat(cancelledArm.Before.Stock).Any(x=>after.Count(x.ItemId,x.Hq)!=cancelledArm.Before.Count(x.ItemId,x.Hq)))
                         return End(CourierOutcome.Indeterminate,"ReceiveCancellationUnsettled",d.Name);
                     state.LastSettledArm=cancelledArm; state.Arm=null;state.ReceiveAfter=after;store.Save(state);
@@ -200,7 +202,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
         // already debited/credited here, including partial and zero deliveries.
         bool accounted = state.Original.Count==0 ? state.Items.All(i=>i.Quantity==0) :
             CourierPlanner.Exact(partner,peer.Before.Character) && CourierPlanner.Exact(partner,peer.After.Character) &&
-            state.Original.Concat(peer.Before.Stock).Concat(peer.After.Stock).Select(x=>(x.ItemId,x.Hq)).Distinct().All(k=>
+            state.Original.Concat(peer.Before.Stock).Concat(peer.After.Stock).Select(x=>(x.ItemId,x.Hq)).Append((ItemId: Custody.GilKey.Item, Hq: Custody.GilKey.Hq)).Distinct().All(k=>
                 state.Original.Where(x=>x.ItemId==k.ItemId && x.Hq==k.Hq).Sum(x=>(long)x.Units)-
                 state.Items.Where(x=>x.ItemId==k.ItemId && x.IsHighQuality==k.Hq).Sum(x=>(long)x.Quantity)==
                 (state.Receiving ? -1 : 1)*((long)peer.After.Count(k.ItemId,k.Hq)-peer.Before.Count(k.ItemId,k.Hq)));

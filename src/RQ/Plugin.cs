@@ -358,6 +358,12 @@ public sealed class Plugin : IDalamudPlugin
         courier.Link = courierPeer = new(courierGame,courier.Follower,DispatchOnFramework,s=>log.Warning(s),()=>state.ReadConfiguration(s=>s.Courier.LocalRoster));
         courier.Conductor = new(configDirectory,courierPeer,courierTrade,courierGame,courierGame,courierGame,courierGame,
             transfers,automation,autoRetainerSuppression,s=>log.Warning(s),s=>log.Information(s),AutoRetainerLoaded);
+        var courierWorldRegion = courier.WorldRegion!;
+        ipc.AttachCourier(new Interop.CourierIpcService(providerInstanceId, courier,
+            () => state.ReadConfiguration(s => s.Courier), () => courierPeer.LocalBags, courierGame.Bridge,
+            courierWorldRegion,
+            worldId => dataManager.GetExcelSheet<Lumina.Excel.Sheets.World>()?.GetRowOrDefault(worldId)?.Name.ToString() ?? "",
+            scanner.ResolveItemMetadata, s => log.Warning(s)));
         var marketHistory = new MarketRunHistoryWindow(marketRunStore.History, CurrentOwner, window.DrawTimings)
         {
             Size = new System.Numerics.Vector2(780, 650),
