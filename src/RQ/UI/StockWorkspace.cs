@@ -731,9 +731,12 @@ internal sealed class StockWorkspace
         if (canStow)
             reviewRegistry.RegisterLastButton($"{control}.stow", $"Stow carried {row.Item.ItemName}", true,
                 () => pendingLocationPopup = $"stow:{control}", "Available");
+        // With a Courier plan open, the add sends from exactly this container.
+        StockGroup PlanItem(QuartermasterRuntimeSnapshot at) =>
+            transferPlans.CourierPlanOpen(at) && LocationItem(at, itemId, location) is { } here ? here : current!;
         if (canPlan)
-            reviewRegistry.RegisterLastButton($"{control}.add-to-plan", $"Add {row.Item.ItemName} to the current Transfer Plan", true,
-                () => UpsertSelectedStockRules(runtimeSnapshots.Current, [current!], stowCarried: false), "Available");
+            reviewRegistry.RegisterLastButton($"{control}.add-to-plan", $"Add {row.Item.ItemName} to the current plan", true,
+                () => UpsertSelectedStockRules(runtimeSnapshots.Current, [PlanItem(runtimeSnapshots.Current)], stowCarried: false), "Available");
 
         if (pendingLocationPopup is { } pending && pending.Length == control.Length + 5 && pending.EndsWith(control, StringComparison.Ordinal))
         {
@@ -767,9 +770,11 @@ internal sealed class StockWorkspace
             if (canPlan)
             {
                 if (ImGui.MenuItem("Add to plan"))
-                    UpsertSelectedStockRules(runtime, [current!], stowCarried: false);
+                    UpsertSelectedStockRules(runtime, [PlanItem(runtime)], stowCarried: false);
                 if (ImGui.IsItemHovered())
-                    ImGui.SetTooltip("Add to the open Transfer plan, then set a target to retrieve");
+                    ImGui.SetTooltip(transferPlans.CourierPlanOpen(runtime)
+                        ? "Send from here on the open Courier plan, then pick retainers in Placement"
+                        : "Add to the open Transfer plan, then set a target to retrieve");
             }
             if (!canSend && !canStow && !canPlan)
                 ImGui.TextDisabled("Nothing to do from here");

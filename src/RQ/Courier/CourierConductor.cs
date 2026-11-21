@@ -485,11 +485,13 @@ public sealed class CourierConductor
                 if (s.Phase == CourierPhase.Retrieve && steps[r.Cursor - 1].Phase == CourierPhase.EnsureSource &&
                     (r.ScheduleVersion == 0 ? s.Batch[0] == t.Manifest[0] : s.Batch.SequenceEqual(t.Manifest)))
                 {
-                    var cap = Math.Min(carrier.FreeSlots, owner.FreeSlots);
-                    if (cap <= 0) throw new CourierFault(CourierOutcome.Failed, "BagSlotLimit", "No free slot for the next trip.");
-                    if (cap < t.Manifest.Length)
+                    // Stacks already in the owner's bags take no owner slot; only retainer-sourced ones are retrieved into it.
+                    var retrieved = t.Manifest.Count(x => x.From != null);
+                    if (carrier.FreeSlots <= 0 || retrieved > 0 && owner.FreeSlots <= 0)
+                        throw new CourierFault(CourierOutcome.Failed, "BagSlotLimit", "No free slot for the next trip.");
+                    if (t.Manifest.Length > carrier.FreeSlots || retrieved > owner.FreeSlots)
                     {
-                        var split = t.Manifest.Chunk(cap).Select(b => t with { Manifest = [.. b] }).ToArray();
+                        var split = CourierPlanner.Pack(t.Manifest, carrier.FreeSlots, owner.FreeSlots).Select(b => t with { Manifest = b }).ToArray();
                         r.Plan = r.Plan with { Trips = r.Plan.Trips.RemoveAt(s.Trip).InsertRange(s.Trip, split) };
                         // Previous trips may have dynamic hand-in batches; only replace the unstarted suffix.
                         var remaining = Steps(r).SkipWhile(x => x.Trip != s.Trip).Skip(1);

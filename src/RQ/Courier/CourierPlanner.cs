@@ -8,7 +8,10 @@ namespace RQ.Courier;
 // Null source retainer means bags; zero is not a retainer. A null SourceCharacter means the plan owner.
 // Where the units land on Character lives in the line's Routing, as in Transfer Placement: no
 // destinations keeps them in its bags, else its ranked retainers, then Any space.
-public sealed record CourierRoute(OwnerScope Character, ulong? SourceRetainerId, OwnerScope? SourceCharacter = null)
+// KeepInSource reads the line's TargetQuantity as the units to keep in the source container (Keep N:
+// send the surplus above N, Keep 0 sends all) instead of the units to send (Send N).
+public sealed record CourierRoute(OwnerScope Character, ulong? SourceRetainerId, OwnerScope? SourceCharacter = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool KeepInSource = false)
 {
     /// <summary>
     /// The single destination retainer of routes written before courier lines carried a Routing.
@@ -103,10 +106,19 @@ public static class CourierPlanner
             var stacks = new List<Shipment>();
             foreach (var r in group)
             {
-                if (r.TargetQuantity == 0) continue;
                 var route = r.Courier!;
+                if (r.TargetQuantity == 0 && !route.KeepInSource) continue;
                 var meta = metadata(r.ItemId);
                 var source = At(src, route.SourceRetainerId);
+                // Keep N sends the source's eligible units above N (NQ first, as below); nothing above N is nothing to do.
+                var send = r.TargetQuantity;
+                if (route.KeepInSource && source != null && r.TargetQuantity >= 0)
+                {
+                    send = Math.Max(0, stock[(src.LocalContentId, route.SourceRetainerId)]
+                        .Where(s => s.ItemId == r.ItemId && (r.Quality == ItemQualityPolicy.Any || s.Hq == (r.Quality == ItemQualityPolicy.HqOnly)))
+                        .Sum(s => s.Units) - r.TargetQuantity);
+                    if (send == 0) continue;
+                }
                 var targets = Destinations(r.Routing, destRetainers);
                 string? code = settings.Carrier is not { HasStableIdentity: true } ? "CarrierNotConfigured"
                     : !Exact(carrier?.Character, settings.Carrier) ? "CarrierUnreachable"
@@ -116,14 +128,14 @@ public static class CourierPlanner
                     : meta.IsTradable != true ? "ItemNotTradeable"
                     : source == null ? "SourceUnknown" : targets.Count == 0 ? "DestinationUnknown"
                     : meta.MaxStackSize is not (> 0 and <= int.MaxValue) || meta.IsUnique == null ? "ItemMetadataUnknown"
-                    : r.TargetQuantity <= 0 ? "InvalidQuantity" : null;
+                    : (route.KeepInSource ? r.TargetQuantity < 0 : r.TargetQuantity <= 0) ? "InvalidQuantity" : null;
                 void Refuse(string reason) => refusals.Add(new(r.Id, r.ItemName, reason,src.CharacterName,dst.CharacterName));
                 if (code != null) { Refuse(code); continue; }
-                if (meta.IsUnique == true && (r.TargetQuantity != 1 || tripUnique.Contains(r.ItemId) || uniqueDestinations.Contains((dst.LocalContentId,r.ItemId)) || carrier!.Stock.Any(s => s.ItemId == r.ItemId && s.Units > 0)
+                if (meta.IsUnique == true && (send != 1 || tripUnique.Contains(r.ItemId) || uniqueDestinations.Contains((dst.LocalContentId,r.ItemId)) || carrier!.Stock.Any(s => s.ItemId == r.ItemId && s.Units > 0)
                     || locations.Where(l => Exact(l.Character, dst)).Any(l => stock[(dst.LocalContentId, l.Retainer)].Any(s => s.ItemId == r.ItemId && s.Units > 0))))
                 { Refuse("UniqueConflict"); continue; }
                 var size = (int)meta.MaxStackSize!.Value;
-                var remaining = r.TargetQuantity;
+                var remaining = send;
                 foreach (var hq in new[] { false, true })
                 {
                     if (remaining == 0 || (r.Quality != ItemQualityPolicy.Any && hq != (r.Quality == ItemQualityPolicy.HqOnly))) continue;
@@ -173,10 +185,14 @@ public static class CourierPlanner
             }
             // Destination bag slots do not shorten a trip: the conductor splits the hand-in into batches that
             // each fit and are stowed before the next, which beats an extra round trip. It still needs one slot.
-            var cap = (destBags?.Inventory.FreeSlots ?? 0) <= 0 ? 0 : Math.Min(testSlotCap ?? int.MaxValue,
-                Math.Min(carrier?.FreeSlots ?? 0, sourceBags?.Inventory.FreeSlots ?? 0));
-            if (cap <= 0) foreach (var s in stacks.DistinctBy(s => s.Line)) refusals.Add(new(s.Line, s.Name, "BagSlotLimit",src.CharacterName,dst.CharacterName));
-            else foreach (var batch in stacks.Chunk(cap)) trips.Add(new(src, dst, pickup!, drop!, [.. batch]));
+            // Stacks already in the source's bags take no source slot; only retainer-sourced ones are retrieved into it.
+            var carrierCap = (destBags?.Inventory.FreeSlots ?? 0) <= 0 ? 0 : Math.Min(testSlotCap ?? int.MaxValue, carrier?.FreeSlots ?? 0);
+            var sourceCap = sourceBags?.Inventory.FreeSlots ?? 0;
+            var blocked = stacks.Where(s => carrierCap <= 0 || s.From != null && sourceCap <= 0).Select(s => s.Line).ToHashSet();
+            foreach (var s in stacks.Where(s => blocked.Contains(s.Line)).DistinctBy(s => s.Line))
+                refusals.Add(new(s.Line, s.Name, "BagSlotLimit",src.CharacterName,dst.CharacterName));
+            foreach (var batch in Pack(stacks.Where(s => !blocked.Contains(s.Line)).ToList(), carrierCap, sourceCap))
+                trips.Add(new(src, dst, pickup!, drop!, batch));
         }
         // A refused line delivers nothing, so there is nothing of it to gather.
         var refused = refusals.Select(f => f.Line).ToHashSet();
@@ -184,6 +200,29 @@ public static class CourierPlanner
         {
             Consolidations = [.. consolidations.Where(c => !refused.Contains(c.Line))],
         };
+    }
+
+    /// <summary>
+    /// Packs stacks into trips of at most <paramref name="carrierCap"/> stacks, of which at most
+    /// <paramref name="sourceCap"/> come from a retainer (stacks already in the source's bags take no
+    /// source slot). Each trip takes retainer stacks first, then fills with bag stacks; stacks keep their
+    /// order within a trip. Both caps must be positive when any stack needs them.
+    /// </summary>
+    internal static IEnumerable<ImmutableArray<Shipment>> Pack(IReadOnlyList<Shipment> stacks, int carrierCap, int sourceCap)
+    {
+        if (stacks.Count == 0) yield break;
+        if (carrierCap <= 0 || sourceCap <= 0 && stacks.Any(s => s.From != null))
+            throw new ArgumentOutOfRangeException(nameof(carrierCap), "No bag slot for the stacks.");
+        var retained = new Queue<int>(Enumerable.Range(0, stacks.Count).Where(i => stacks[i].From != null));
+        var bagged = new Queue<int>(Enumerable.Range(0, stacks.Count).Where(i => stacks[i].From == null));
+        while (retained.Count + bagged.Count > 0)
+        {
+            var take = new List<int>();
+            while (retained.Count > 0 && take.Count < Math.Min(carrierCap, sourceCap)) take.Add(retained.Dequeue());
+            while (bagged.Count > 0 && take.Count < carrierCap) take.Add(bagged.Dequeue());
+            take.Sort();
+            yield return [.. take.Select(i => stacks[i])];
+        }
     }
 
     /// <summary>

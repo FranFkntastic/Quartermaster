@@ -663,7 +663,8 @@ public sealed class CourierSession
             {
                 var rule = draft.Rules.Find(r => r.Id == line.Line && r.Courier is not null);
                 // A line re-routed or re-qualified during the run is a new instruction; what was delivered does not count against it.
-                if (rule is null || line.Moved <= 0 || line.Route is not { } sent || !StillLandsAt(rule.Routing, sent.To) ||
+                // A Keep N line is a standing threshold: delivering its surplus leaves it as it was.
+                if (rule is null || line.Moved <= 0 || rule.Courier!.KeepInSource || line.Route is not { } sent || !StillLandsAt(rule.Routing, sent.To) ||
                     rule.Courier!.SourceRetainerId != sent.From || !CourierPlanner.Exact(rule.Courier.Character, sent.Destination) ||
                     !CourierPlanner.Exact(rule.Courier.SourceCharacter ?? scratch.Owner, sent.Source) ||
                     rule.Quality != ItemQualityPolicy.Any && (rule.Quality == ItemQualityPolicy.HqOnly ? line.Nq : line.Hq))
