@@ -524,13 +524,36 @@ internal sealed partial class TransferPlanWorkspace
 /// <summary>A container's free space at a glance: a small fill bar, then "N free"; a dash when never observed.</summary>
 internal static class FreeSlotsBar
 {
-    private static readonly Vector4 Full = new(1f, .45f, .4f, 1f);
+    private static readonly Vector4 Red = new(1f, .45f, .4f, 1f);
+    private static readonly Vector4 FullChip = new(.16f, .03f, .03f, 1f);
 
-    /// <summary>Under this many free slots a container reads as nearly full.</summary>
-    internal const int Tight = 15;
+    /// <summary>Under this many free slots a container reads as filling up (amber).</summary>
+    internal const int Tight = 75;
+
+    /// <summary>Under this many free slots a container reads as nearly full (red).</summary>
+    internal const int Low = 20;
 
     internal static Vector4 Color(int free) =>
-        free <= 0 ? Full : free < Tight ? QuartermasterPalette.Amber : QuartermasterPalette.Green;
+        free < Low ? Red : free < Tight ? QuartermasterPalette.Amber : QuartermasterPalette.Green;
+
+    internal static string Text(int free) => $"{free:N0} free";
+
+    /// <summary>
+    /// Paints "N free" with its top-left at <paramref name="min"/> without taking layout space: amber when
+    /// filling up, red when nearly full, red on a dark chip when full, else <paramref name="plenty"/>.
+    /// </summary>
+    internal static void PaintText(Vector2 min, int free, Vector4? plenty = null)
+    {
+        var text = Text(free);
+        var draw = ImGui.GetWindowDrawList();
+        if (free <= 0)
+        {
+            var pad = new Vector2(3f, 0f) * ImGuiHelpers.GlobalScale;
+            draw.AddRectFilled(min - pad, min + ImGui.CalcTextSize(text) + pad, ImGui.GetColorU32(FullChip), 2f * ImGuiHelpers.GlobalScale);
+        }
+        var color = free < Tight ? Color(free) : plenty ?? ImGui.GetStyle().Colors[(int)ImGuiCol.Text];
+        draw.AddText(min, ImGui.GetColorU32(color), text);
+    }
 
     internal static void Draw(int capacity, int? free, bool withText = true)
     {
@@ -547,7 +570,9 @@ internal static class FreeSlotsBar
         if (!withText)
             return;
         ImGui.SameLine();
-        ImGui.TextUnformatted($"{left:N0} free");
+        var start = ImGui.GetCursorScreenPos();
+        PaintText(start, left);
+        ImGui.Dummy(ImGui.CalcTextSize(Text(left)));
     }
 
     /// <summary>Paints the bar at <paramref name="min"/> without taking layout space: the used share filled.</summary>
