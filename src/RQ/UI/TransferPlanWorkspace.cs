@@ -390,15 +390,17 @@ internal sealed class TransferPlanWorkspace
                     };
                     var key = StowagePlanCatalog.LineKey(candidate);
                     var rule = draft.Rules.FirstOrDefault(existing => StowagePlanCatalog.LineKey(existing) == key);
+                    var held = courier.Available(runtime, source, container, entry.ItemId, entry.Quality);
                     if (rule is null)
                     {
-                        var held = courier.Available(runtime, source, container, entry.ItemId, entry.Quality) ?? 0;
-                        candidate.TargetQuantity = Math.Max(1, entry.Quantity ?? held);
+                        var requested = entry.Quantity ?? held ?? 0;
+                        candidate.TargetQuantity = held is int most && most > 0 ? Math.Clamp(requested, 1, most) : Math.Max(1, requested);
                         draft.Rules.Add(rule = candidate);
                     }
                     else if (entry.Quantity is { } quantity)
                     {
-                        rule.TargetQuantity = (int)Math.Min(int.MaxValue, (long)rule.TargetQuantity + Math.Max(0, quantity));
+                        var summed = (int)Math.Min(int.MaxValue, (long)rule.TargetQuantity + Math.Max(0, quantity));
+                        rule.TargetQuantity = held is int most && most > 0 ? Math.Clamp(summed, 1, most) : Math.Max(1, summed);
                     }
                     rule.Enabled = true;
                     if (!ids.Contains(rule.Id))
@@ -1723,6 +1725,8 @@ internal sealed class TransferPlanWorkspace
         }
         if (DalamudGroupedIntegerInput.InputGroupedInt("##target", ref units, 0, 0))
             Set(units);
+        else if (ImGui.IsItemDeactivated() && available is int most && most > 0 && row.Rule.TargetQuantity > most)
+            Set(row.Rule.TargetQuantity);
         reviewRegistry.RegisterLastAction(
             $"quartermaster.transfer.line.quantity.{row.Rule.Id:N}",
             $"Set the units of {row.Rule.ItemName} to send",
@@ -2028,7 +2032,15 @@ internal sealed class TransferPlanWorkspace
             void From(ulong? container)
             {
                 if (container != route.SourceRetainerId)
-                    MutateRules(row.Owner, row.PlanId, ids, draftRule => draftRule.Courier = route with { SourceRetainerId = container });
+                {
+                    var available = courier.Available(runtime, source, container, row.Rule.ItemId, row.Rule.Quality);
+                    MutateRules(row.Owner, row.PlanId, ids, draftRule =>
+                    {
+                        draftRule.Courier = route with { SourceRetainerId = container };
+                        if (available is int most && most > 0 && draftRule.TargetQuantity > most)
+                            draftRule.TargetQuantity = most;
+                    });
+                }
             }
             if (ImGui.MenuItem("Bags##from", string.Empty, route.SourceRetainerId is null))
                 From(null);
@@ -2181,7 +2193,15 @@ internal sealed class TransferPlanWorkspace
         {
             var sourceCharacter = character.Matches(owner) ? null : character with { };
             if (!character.Matches(source) || container != route.SourceRetainerId)
-                MutateRules(owner, row.PlanId, ids, draftRule => draftRule.Courier = route with { SourceCharacter = sourceCharacter, SourceRetainerId = container });
+            {
+                var available = courier.Available(row.Runtime, character, container, row.Rule.ItemId, row.Rule.Quality);
+                MutateRules(owner, row.PlanId, ids, draftRule =>
+                {
+                    draftRule.Courier = route with { SourceCharacter = sourceCharacter, SourceRetainerId = container };
+                    if (available is int most && most > 0 && draftRule.TargetQuantity > most)
+                        draftRule.TargetQuantity = most;
+                });
+            }
             ImGui.CloseCurrentPopup();
         }, source, route.SourceRetainerId, $"quartermaster.courier.line.from.{row.Rule.Id:N}", "Send from");
         ImGui.EndPopup();
