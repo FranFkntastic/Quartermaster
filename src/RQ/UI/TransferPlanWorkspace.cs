@@ -228,10 +228,26 @@ internal sealed class TransferPlanWorkspace
         return planId;
     }
 
-    /// <summary>Adds stock-browser selections to the open Transfer plan, or the unsaved Transfer plan.</summary>
+    /// <summary>Whether the open plan is a Courier plan, so a plain add from Stock lands in it.</summary>
+    internal bool CourierPlanOpen(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (!runtime.Owner.HasStableIdentity)
+            return false;
+        EnsureSelection(runtime);
+        var selectedId = workbench.SelectedStowagePlanId;
+        return state.ReadConfiguration(document => document.StowagePlans.Any(plan =>
+            plan.Id == selectedId && plan.Owner.Matches(runtime.Owner) && plan.Kind == StowagePlanKind.Courier));
+    }
+
+    /// <summary>
+    /// Adds stock-browser selections to the open Transfer plan, or the unsaved Transfer plan. A plain
+    /// add (not a stow) while a Courier plan is open sends them on that plan instead (see <see cref="AddStockToCourier"/>).
+    /// </summary>
     public void AddStock(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, bool stow, ulong? retainerId = null)
     {
         if (!runtime.Owner.HasStableIdentity)
+            return;
+        if (!stow && retainerId is null && CourierPlanOpen(runtime) && AddStockToCourier(runtime, items))
             return;
         var planId = SelectPlanOfKind(runtime, StowagePlanKind.Transfer);
         state.Mutate(document =>
@@ -252,10 +268,34 @@ internal sealed class TransferPlanWorkspace
     /// character replaces that line's quantity. The lines go to the open Courier plan, or the
     /// unsaved Courier plan when a Transfer plan is open.
     /// </summary>
-    public void AddCourier(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, OwnerScope destination, ulong? retainerId, OwnerScope? source = null)
+    public void AddCourier(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, OwnerScope destination, ulong? retainerId, OwnerScope? source = null) =>
+        AddCourier(runtime, items, destination, retainerId, source, keepRouting: false);
+
+    /// <summary>
+    /// Adds the logged-in character's units of each item to the open Courier plan, one line per container
+    /// holding them, bound for the plan's existing destination (else the first other character), into its
+    /// bags so Placement picks the retainers. Lines already on that route keep their Placement. False when
+    /// there is no destination, so the add falls back to the Transfer plan.
+    /// </summary>
+    private bool AddStockToCourier(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items)
+    {
+        var planId = workbench.SelectedStowagePlanId!.Value;
+        var destinations = courier.Destinations(runtime).ToArray();
+        var destination = runtime.State.PlanItems
+            .Where(rule => rule.StowagePlanId == planId && rule.Courier is not null)
+            .Select(rule => destinations.FirstOrDefault(known => known.Matches(rule.Courier!.Character)))
+            .FirstOrDefault(known => known is not null) ?? destinations.FirstOrDefault();
+        if (destination is null)
+            return false;
+        if (!AddCourier(runtime, items, destination, null, null, keepRouting: true))
+            transferExecution.ReportInlineError("Nothing to send: the selection has no units in bags or retainers.");
+        return true;
+    }
+
+    private bool AddCourier(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, OwnerScope destination, ulong? retainerId, OwnerScope? source, bool keepRouting)
     {
         if (!runtime.Owner.HasStableIdentity || items.Count == 0)
-            return;
+            return false;
         var target = destination with { };
         var sourceCharacter = source is null || source.Matches(runtime.Owner) ? null : source with { };
         var holder = sourceCharacter ?? runtime.Owner;
@@ -271,7 +311,7 @@ internal sealed class TransferPlanWorkspace
                 .Select(group => (item.ItemId, item.ItemName, Source: group.Key, Units: group.Sum(stack => stack.Quantity))))
             .ToArray();
         if (sources.Length == 0)
-            return;
+            return false;
         var planId = SelectPlanOfKind(runtime, StowagePlanKind.Courier);
         try
         {
@@ -284,6 +324,7 @@ internal sealed class TransferPlanWorkspace
                     var rule = draft.Rules.FirstOrDefault(candidate => candidate.ItemId == itemId && candidate.Courier is { } route &&
                         (route.SourceCharacter ?? runtime.Owner).Matches(holder) && route.SourceRetainerId == container &&
                         route.Character.Matches(target));
+                    var added = rule is null;
                     if (rule is null)
                     {
                         rule = new TargetPlanItem
@@ -295,8 +336,14 @@ internal sealed class TransferPlanWorkspace
                         };
                         draft.Rules.Add(rule);
                     }
-                    rule.Routing = retainerId is { } first ? PlacementEdits.MakeFirst(rule.Routing, first) : PlacementEdits.Clear();
-                    rule.TargetQuantity = units;
+                    if (added || !keepRouting)
+                        rule.Routing = retainerId is { } first ? PlacementEdits.MakeFirst(rule.Routing, first) : PlacementEdits.Clear();
+                    // A plain add leaves a Keep N line's threshold be; an explicit Send to makes it Send these units.
+                    if (!keepRouting || !rule.Courier!.KeepInSource)
+                    {
+                        rule.Courier = rule.Courier! with { KeepInSource = false };
+                        rule.TargetQuantity = units;
+                    }
                     rule.Enabled = true;
                     ids.Add(rule.Id);
                 }
@@ -314,11 +361,21 @@ internal sealed class TransferPlanWorkspace
         {
             transferExecution.ReportInlineError(exception.Message);
         }
+        return true;
     }
 
-    /// <summary>Adds balanced lines for items not already in the selected plan and selects every affected line.</summary>
-    public void AddItems(QuartermasterRuntimeSnapshot runtime, IEnumerable<(uint ItemId, string Name)> items) =>
-        AddToSelectedPlan(runtime, items.Select(item => new PlanAddEntry(item.ItemId, item.Name, ItemQualityPolicy.Any)).ToArray());
+    /// <summary>
+    /// Adds balanced lines for items not already in the selected plan and selects every affected line.
+    /// With a Courier plan open they become courier lines on it, as from its own add box.
+    /// </summary>
+    public void AddItems(QuartermasterRuntimeSnapshot runtime, IEnumerable<(uint ItemId, string Name)> items)
+    {
+        var entries = items.Select(item => new PlanAddEntry(item.ItemId, item.Name, ItemQualityPolicy.Any)).ToArray();
+        if (entries.Length > 0 && CourierPlanOpen(runtime))
+            AddCourierLines(runtime, workbench.SelectedStowagePlanId!.Value, entries, selectAffected: true);
+        else
+            AddToSelectedPlan(runtime, entries);
+    }
 
     /// <summary>Adds a craft's materials × count: new lines target the amount, existing lines have it added.</summary>
     public void AddMaterials(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<CraftMaterial> materials, int count) =>
@@ -397,7 +454,7 @@ internal sealed class TransferPlanWorkspace
                         candidate.TargetQuantity = held is int most ? Math.Clamp(requested, 0, Math.Max(0, most)) : Math.Max(0, requested);
                         draft.Rules.Add(rule = candidate);
                     }
-                    else if (entry.Quantity is { } quantity)
+                    else if (entry.Quantity is { } quantity && !rule.Courier!.KeepInSource)
                     {
                         var summed = (int)Math.Min(int.MaxValue, (long)rule.TargetQuantity + Math.Max(0, quantity));
                         rule.TargetQuantity = held is int most ? Math.Clamp(summed, 0, Math.Max(0, most)) : Math.Max(0, summed);
@@ -627,7 +684,7 @@ internal sealed class TransferPlanWorkspace
         new(
             "Send",
             84,
-            row => row.Rule.TargetQuantity.ToString("N0"),
+            row => row.Rule.Courier?.KeepInSource == true ? $"Keep {row.Rule.TargetQuantity:N0}" : row.Rule.TargetQuantity.ToString("N0"),
             row => row.Rule.TargetQuantity,
             Draw: WithRowSpace(DrawCourierQuantity, "send"),
             Id: "send"),
@@ -867,7 +924,7 @@ internal sealed class TransferPlanWorkspace
                     rule.Id,
                     rule.Id.ToString("N"),
                     rule.Quality == ItemQualityPolicy.Any ? rule.ItemName : $"{rule.ItemName} {TransferPresentation.QualityLabel(rule.Quality)}",
-                    rule.TargetQuantity.ToString("N0"),
+                    rule.Courier?.KeepInSource == true ? $"Keep {rule.TargetQuantity:N0}" : rule.TargetQuantity.ToString("N0"),
                     routing,
                     PlacementMatrixData.Holdings(runtime, rule.ItemId, rule.Quality, destination, stock),
                     targets && rule.Routing.Consolidate ? GatherSummary(courier.Gather(runtime, rule)) : null)
@@ -1701,15 +1758,38 @@ internal sealed class TransferPlanWorkspace
     }
 
     /// <summary>
-    /// A courier line's quantity is the number of units to send: at least one, and no more than the
-    /// chosen source holds once that source has been observed.
+    /// A courier line's quantity: in Send mode the units to send, no more than the chosen source holds
+    /// once that source has been observed; in Keep mode the units to leave in the source, sending the
+    /// surplus, which stays as set however much the source holds now. The mode button flips between
+    /// them, carrying the quantity over so the units sent stay the same.
     /// </summary>
     private void DrawCourierQuantity(TransferWorkbenchRow row)
     {
         var route = row.Rule.Courier!;
+        var keep = route.KeepInSource;
         var available = courier.Available(row.Runtime, route.SourceCharacter ?? row.Owner, route.SourceRetainerId, row.Rule.ItemId, row.Rule.Quality);
         var units = row.Rule.TargetQuantity;
-        ImGui.SetNextItemWidth(Math.Min(66, Math.Max(32, ImGui.GetContentRegionAvail().X * .55f)));
+        void Flip()
+        {
+            var flipped = available is int held ? Math.Max(0, Math.Max(0, held) - Math.Max(0, row.Rule.TargetQuantity)) : 0;
+            MutateRules(row.Owner, row.PlanId, [row.Rule.Id], draftRule =>
+            {
+                draftRule.Courier = draftRule.Courier! with { KeepInSource = !keep };
+                draftRule.TargetQuantity = flipped;
+            });
+        }
+        if (ImGui.SmallButton(keep ? "Keep##courier-mode" : "Send##courier-mode"))
+            Flip();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Click to switch between Send N and Keep N (send surplus above N)");
+        reviewRegistry.RegisterLastButton(
+            $"quartermaster.transfer.line.mode.{row.Rule.Id:N}",
+            $"Switch {row.Rule.ItemName} to {(keep ? "Send N" : "Keep N")}",
+            true,
+            Flip,
+            keep ? "Keep" : "Send");
+        ImGui.SameLine(0, 2);
+        ImGui.SetNextItemWidth(Math.Min(66, Math.Max(32, ImGui.GetContentRegionAvail().X * .9f)));
         if (focusTargetRuleId == row.Rule.Id)
         {
             ImGui.SetScrollHereY(.5f);
@@ -1718,18 +1798,18 @@ internal sealed class TransferPlanWorkspace
         }
         int Set(int requested)
         {
-            var clamped = available is int most ? Math.Clamp(requested, 0, Math.Max(0, most)) : Math.Max(0, requested);
+            var clamped = !keep && available is int most ? Math.Clamp(requested, 0, Math.Max(0, most)) : Math.Max(0, requested);
             if (clamped != row.Rule.TargetQuantity)
                 MutateRules(row.Owner, row.PlanId, [row.Rule.Id], draftRule => draftRule.TargetQuantity = clamped);
             return clamped;
         }
         if (DalamudGroupedIntegerInput.InputGroupedInt("##target", ref units, 0, 0))
             Set(units);
-        else if (!ImGui.IsItemActive() && available is int most && row.Rule.TargetQuantity > Math.Max(0, most))
+        else if (!keep && !ImGui.IsItemActive() && available is int most && row.Rule.TargetQuantity > Math.Max(0, most))
             Set(most);
         reviewRegistry.RegisterLastAction(
             $"quartermaster.transfer.line.quantity.{row.Rule.Id:N}",
-            $"Set the units of {row.Rule.ItemName} to send",
+            keep ? $"Set the units of {row.Rule.ItemName} to keep in the source" : $"Set the units of {row.Rule.ItemName} to send",
             AgentBridgeUiControlKind.Input,
             true,
             false,
@@ -2037,7 +2117,7 @@ internal sealed class TransferPlanWorkspace
                     MutateRules(row.Owner, row.PlanId, ids, draftRule =>
                     {
                         draftRule.Courier = route with { SourceRetainerId = container };
-                        if (available is int most && draftRule.TargetQuantity > Math.Max(0, most))
+                        if (!route.KeepInSource && available is int most && draftRule.TargetQuantity > Math.Max(0, most))
                             draftRule.TargetQuantity = Math.Max(0, most);
                     });
                 }
@@ -2139,7 +2219,8 @@ internal sealed class TransferPlanWorkspace
     private static string CourierOutcome(TransferWorkbenchRow row) =>
         row.CourierRefusal is { } refusal && !CourierSession.IsPlanWide(refusal.Code)
             ? CourierSession.RefusalLabel(refusal.Code)
-            : row.Projection.Send > 0 ? $"Send {row.Projection.Send:N0}" : string.Empty;
+            : row.Projection.Send > 0 ? $"Send {row.Projection.Send:N0}"
+            : row.Rule.Courier?.KeepInSource == true ? $"Keep {row.Rule.TargetQuantity:N0} · OK" : string.Empty;
 
     // ---- Courier cells ----------------------------------------------------------------------
 
@@ -2198,7 +2279,7 @@ internal sealed class TransferPlanWorkspace
                 MutateRules(owner, row.PlanId, ids, draftRule =>
                 {
                     draftRule.Courier = route with { SourceCharacter = sourceCharacter, SourceRetainerId = container };
-                    if (available is int most && draftRule.TargetQuantity > Math.Max(0, most))
+                    if (!route.KeepInSource && available is int most && draftRule.TargetQuantity > Math.Max(0, most))
                         draftRule.TargetQuantity = Math.Max(0, most);
                 });
             }
@@ -2237,7 +2318,13 @@ internal sealed class TransferPlanWorkspace
                 ImGui.SetTooltip(courier.RefusalDetail(row.Runtime, refusal));
         }
         else if (row.Projection.Send > 0)
+        {
             ImGui.TextColored(TransferPresentation.SendColor, $"Send {row.Projection.Send:N0}");
+            if (row.Rule.Courier!.KeepInSource && ImGui.IsItemHovered())
+                ImGui.SetTooltip($"Keeping {row.Rule.TargetQuantity:N0}");
+        }
+        else if (row.Rule.Courier!.KeepInSource)
+            ImGui.TextDisabled($"Keep {row.Rule.TargetQuantity:N0} · OK");
         else if (row.Rule.TargetQuantity == 0)
             ImGui.TextDisabled("Nothing to send");
     }

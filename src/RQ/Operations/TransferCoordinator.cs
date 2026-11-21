@@ -665,6 +665,21 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                                 {
                                     var item = await DiagnoseMutationAsync(operationId, "Deposit", itemName, candidate.RetainerName,
                                         () => driver.DepositAsync(currentStack, quantity, mutationToken)).ConfigureAwait(false);
+                                    // The game occasionally drops the first deposit after a retainer opens: the verifier
+                                    // saw no movement on either side. Once the source slot proves untouched, retry once.
+                                    if (!item.Success && item.Transferred == 0 && item.Code == "VerificationWindowExpired" &&
+                                        (await driver.ScanPlayerInventoryAsync(new HashSet<uint> { stack.ItemId }, mutationToken).ConfigureAwait(false))
+                                            .Any(live => live.Container == currentStack.Container && live.SlotIndex == currentStack.SlotIndex &&
+                                                live.ItemId == currentStack.ItemId && live.IsHighQuality == currentStack.IsHighQuality &&
+                                                live.Quantity == currentStack.Quantity))
+                                    {
+                                        var retried = $"Deposit {itemName} at {candidate.RetainerName} moved nothing and its source slot is untouched; retrying once. {item.Code}: {item.Message}";
+                                        warning?.Invoke(retried);
+                                        journal.RecordWarning(operationId, "DepositZeroMovementRetried", retried);
+                                        await Task.Delay(250, mutationToken).ConfigureAwait(false);
+                                        item = await DiagnoseMutationAsync(operationId, "Deposit", itemName, candidate.RetainerName,
+                                            () => driver.DepositAsync(currentStack, quantity, mutationToken)).ConfigureAwait(false);
+                                    }
                                     result = (item.Success, item.Transferred, item.Code, item.Message);
                                 }
                                 if (!result.Success)
