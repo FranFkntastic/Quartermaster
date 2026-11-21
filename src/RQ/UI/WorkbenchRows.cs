@@ -15,7 +15,8 @@ internal sealed record StockWorkbenchRow(
     IReadOnlyList<ListingPlanItemEvaluation> ListingDemand,
     AccountStockItem? Account = null,
     int Sends = 0,
-    string RetainerHint = "");
+    string RetainerHint = "",
+    int Total = 0);
 
 internal sealed record StockWorkbenchProjection(
     long PlanningRevision,

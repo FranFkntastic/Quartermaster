@@ -78,7 +78,7 @@ internal sealed class StockWorkspace
     private readonly CourierSettingsSection courierSettings;
     /// <summary>Another character whose cached stock the browser shows instead of the logged-in one's.</summary>
     private OwnerScope? viewedCharacter;
-    private (IReadOnlyList<StockGroup> QueryItems, AccountStockProjection Account, StockWorkbenchRow[] Rows)? viewedRows;
+    private (IReadOnlyList<StockGroup> QueryItems, AccountStockProjection Account, bool External, StockWorkbenchRow[] Rows)? viewedRows;
     /// <summary>The viewed character's container: <see cref="BrowserScope.AllKey"/>, its bags or one of its retainers.</summary>
     private string viewedScopeKey = BrowserScope.AllKey;
     private (BrowserProjection Stock, string ScopeKey, IReadOnlyList<StockGroup> Items, Dictionary<uint, StockGroup> ById)? viewedItems;
@@ -121,6 +121,27 @@ internal sealed class StockWorkspace
     private string? pendingLocationPopup;
 
     private bool IsAccountMode => accountWide && viewedCharacter is null && !catalogMode;
+
+    // ---- Rail sources ----
+    /// <summary>One rail container: a character (by content ID) and one of its scope keys.</summary>
+    private readonly record struct RailSource(ulong Character, string ScopeKey);
+    /// <summary>
+    /// Containers picked together in the rail with Ctrl, Shift or a node's menu. A single pick is
+    /// always settled into that container's own view, so this holds none or two and more; two and
+    /// more narrow the account view to them. Session-only.
+    /// </summary>
+    private readonly HashSet<RailSource> sources = [];
+    private int sourcesRevision;
+    private RailSource? sourceAnchor;
+    /// <summary>Container rows in the order the rail drew them last frame, for Shift ranges.</summary>
+    private List<RailSource> railOrder = [];
+    private List<RailSource> railOrderDrawing = [];
+    private readonly List<RailSource> railScratch = [];
+    private (AccountStockProjection Account, int Revision, AccountStockProjection Scoped)? sourceAccount;
+    private (int Revision, string QueryScope, string Label)? sourceLabels;
+
+    /// <summary>The account view narrowed to the rail's picked sources.</summary>
+    private bool MultiSource => sources.Count > 1;
 
     public StockWorkspace(
         StateRepository state,
@@ -170,6 +191,14 @@ internal sealed class StockWorkspace
     private DalamudTableProjection<StockWorkbenchRow> CreateTable() => new(
     [
         ItemColumn(),
+        new(
+            "Total",
+            72,
+            row => row.Total.ToString("N0"),
+            row => row.Total,
+            TextColor: row => row.Total == 0 ? Disabled() : null,
+            DrawContextMenu: DrawStockRowContextMenu,
+            Id: "total"),
         new(
             "Locations",
             1.5f,
@@ -221,6 +250,30 @@ internal sealed class StockWorkspace
             DrawContextMenu: DrawStockRowContextMenu,
             Id: "total",
             HeaderTooltip: "Units across every observed character."),
+        new(
+            "Player",
+            64,
+            row => (row.Account?.InBags ?? 0).ToString("N0"),
+            row => row.Account?.InBags ?? 0,
+            TextColor: row => row.Account?.InBags is > 0 ? null : Disabled(),
+            DrawContextMenu: DrawStockRowContextMenu,
+            Id: "player"),
+        new(
+            "Saddlebag",
+            72,
+            row => (row.Account?.InSaddlebags ?? 0).ToString("N0"),
+            row => row.Account?.InSaddlebags ?? 0,
+            TextColor: row => row.Account?.InSaddlebags is > 0 ? null : Disabled(),
+            DrawContextMenu: DrawStockRowContextMenu,
+            Id: "saddlebag"),
+        new(
+            "Retainers",
+            72,
+            row => (row.Account?.InRetainers ?? 0).ToString("N0"),
+            row => row.Account?.InRetainers ?? 0,
+            TextColor: row => row.Account?.InRetainers is > 0 ? null : Disabled(),
+            DrawContextMenu: DrawStockRowContextMenu,
+            Id: "retainers"),
         new(
             "Here",
             64,
@@ -370,15 +423,22 @@ internal sealed class StockWorkspace
         var account = courier.AccountStock(runtime);
         PruneExpansion(account);
         var accountMode = IsAccountMode;
+        // Picked rail sources narrow the account view: only their items, counted only there.
+        var multiSource = accountMode && MultiSource;
+        var shown = multiSource ? SourceAccount(runtime, account) : account;
         var projection = viewed ?? runtime.Browser;
-        var availableItems = viewed is not null ? ViewedItems(viewed).Items : accountMode
-            ? GetAccountItemsWithListingDemand(runtime, account)
+        var availableItems = viewed is not null ? ViewedItems(viewed).Items
+            : multiSource ? shown.Items
+            : accountMode ? GetAccountItemsWithListingDemand(runtime, account)
             : GetStockItemsWithListingDemand(runtime, workbench.ScopeKey);
         // The toolbar runs first and updates IsInputActive. Use the same editing
         // snapshot for both cache lookups so a focus transition cannot rebuild twice.
         var isEditing = workbench.ItemFilterState.IsInputActive;
-        var scopeKey = viewed is not null ? viewedScopeKey : accountMode ? AccountQueryScope : workbench.ScopeKey;
-        var queryAccount = accountMode ? account : null;
+        var scopeKey = viewed is not null ? viewedScopeKey
+            : multiSource ? SourceLabels().QueryScope
+            : accountMode ? AccountQueryScope
+            : workbench.ScopeKey;
+        var queryAccount = accountMode ? shown : null;
         DrawStockToolbar(runtime, availableItems, scopeKey, isEditing, queryAccount);
         var result = queries.QueryItems(
             projection,
@@ -406,7 +466,7 @@ internal sealed class StockWorkspace
         var selectedPlan = ResolveSelectedStowagePlan(runtime.State, runtime.Owner);
         timings.Section("stock projection");
         var sourceRows = viewed is null
-            ? ResolveStockWorkbenchProjection(runtime, visibleItems, selectedPlan, account, accountMode)
+            ? ResolveStockWorkbenchProjection(runtime, visibleItems, selectedPlan, shown, accountMode)
             : ResolveViewedRows(visibleItems, viewed, account);
         timings.Section("stock table");
         if (viewedExternal)
@@ -426,8 +486,8 @@ internal sealed class StockWorkspace
         var tableHeight = Math.Max(180, ImGui.GetContentRegionAvail().Y);
         renderedStockRowCount = 0;
         if (table.Begin(
-                // The character table keeps its column ids and order, so it keeps its saved layout.
-                accountMode ? "RQStockAccountV1" : "RQStockWorkbenchV5",
+                // ImGui restores saved column settings by index, so inserting a column needs a new ID.
+                accountMode ? "RQStockAccountV2" : "RQStockWorkbenchV6",
                 new DalamudTableLayout(
                     new Vector2(0, tableHeight),
                     flags,
@@ -943,6 +1003,7 @@ internal sealed class StockWorkspace
     /// <summary>Another character's stock: all of it, or one container (its bags or one retainer).</summary>
     private void ViewCharacter(OwnerScope character, string scopeKey = BrowserScope.AllKey)
     {
+        ClearSources();
         SetViewedCharacter(character);
         viewedScopeKey = scopeKey;
         workbench.FocusedStockItemId = null;
@@ -952,6 +1013,7 @@ internal sealed class StockWorkspace
     /// <summary>Every observed character's stock together; the selection survives, as it does between scopes.</summary>
     private void ViewAccount()
     {
+        ClearSources();
         accountWide = true;
         SetViewedCharacter(null);
         workbench.FocusedStockItemId = null;
@@ -960,6 +1022,7 @@ internal sealed class StockWorkspace
 
     private void ViewHereScope(string scopeKey)
     {
+        ClearSources();
         accountWide = false;
         workbench.ScopeKey = scopeKey;
         workbench.FocusedStockItemId = null;
@@ -974,20 +1037,28 @@ internal sealed class StockWorkspace
     /// </summary>
     private IReadOnlyList<StockWorkbenchRow> ResolveViewedRows(IReadOnlyList<StockGroup> queryItems, BrowserProjection viewed, AccountStockProjection account)
     {
-        if (viewedRows is { } cached && ReferenceEquals(cached.QueryItems, queryItems) && ReferenceEquals(cached.Account, account))
+        if (viewedRows is { } cached && ReferenceEquals(cached.QueryItems, queryItems) && ReferenceEquals(cached.Account, account) &&
+            cached.External == viewedExternal)
             return cached.Rows;
         var retainers = TransferWorkbenchPresentation.AccessibleRetainerIds(viewed.RetainerStock, viewedCharacter!);
+        // The total counts what the row's columns show: another local character's saddlebag is never observed.
+        var external = viewedExternal;
         var rows = queryItems
-            .Select(item => new StockWorkbenchRow(
-                item,
-                TransferWorkbenchPresentation.AccessibleStorageQuantity(item, ItemQualityPolicy.Any, retainers),
-                null,
-                null,
-                [],
-                account.ById.GetValueOrDefault(item.ItemId),
-                RetainerHint: RetainerHint(viewed.RetainerStock, item, retainers)))
+            .Select(item =>
+            {
+                var retained = TransferWorkbenchPresentation.AccessibleStorageQuantity(item, ItemQualityPolicy.Any, retainers);
+                return new StockWorkbenchRow(
+                    item,
+                    retained,
+                    null,
+                    null,
+                    [],
+                    account.ById.GetValueOrDefault(item.ItemId),
+                    RetainerHint: RetainerHint(viewed.RetainerStock, item, retainers),
+                    Total: item.PlayerQuantity + (external ? item.SaddlebagQuantity : 0) + retained);
+            })
             .ToArray();
-        viewedRows = (queryItems, account, rows);
+        viewedRows = (queryItems, account, external, rows);
         return rows;
     }
 
@@ -1099,7 +1170,8 @@ internal sealed class StockWorkspace
                 return new StockWorkbenchRow(item, accessibleRetainerQuantity, rule, line, demand,
                     account.ById.GetValueOrDefault(item.ItemId),
                     sends.GetValueOrDefault(item.ItemId),
-                    accountMode ? string.Empty : RetainerHint(runtime.Retainers, item, accessible));
+                    accountMode ? string.Empty : RetainerHint(runtime.Retainers, item, accessible),
+                    accountMode ? 0 : item.PlayerQuantity + item.SaddlebagQuantity + accessibleRetainerQuantity);
             })
             .ToArray();
         stockWorkbenchProjection = new(runtime.PlanningRevision, selectedPlan?.Id, queryItems, rows, account, accountMode);
@@ -1266,6 +1338,8 @@ internal sealed class StockWorkspace
     {
         if (catalogMode)
             return RailCatalogLabel;
+        if (IsAccountMode && MultiSource)
+            return SourceLabels().Label;
         if (viewedCharacter is { } viewed)
             return viewedScopeKey != BrowserScope.AllKey &&
                    ViewStock(runtime, viewed)?.Scopes.FirstOrDefault(scope => scope.Key == viewedScopeKey) is { } container
@@ -1324,8 +1398,10 @@ internal sealed class StockWorkspace
     {
         var account = courier.AccountStock(runtime);
         var counts = ResolveRailCounts(account);
+        railOrderDrawing.Clear();
 
-        if (RailNode(AccountScopeLabel, counts.AccountText, IsAccountMode, null, out _))
+        var accountSelected = IsAccountMode && !MultiSource;
+        if (RailNode(AccountScopeLabel, counts.AccountText, accountSelected, null, out _))
             ViewAccount();
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip(string.Join("\n", account.Characters
@@ -1338,7 +1414,8 @@ internal sealed class StockWorkspace
             "Browse every observed character's stock",
             true,
             ViewAccount,
-            IsAccountMode ? "Selected" : "Available");
+            accountSelected ? "Selected" : "Available");
+        DrawSelectKindMenu(runtime, null, "quartermaster.stock.scope.account", "every character");
 
         DrawHereNode(runtime, counts);
 
@@ -1391,6 +1468,8 @@ internal sealed class StockWorkspace
             true,
             EnterCatalog,
             catalogMode ? "Selected" : "Available");
+        // Shift ranges run over the rows this frame drew, so the next frame reads a complete list.
+        (railOrder, railOrderDrawing) = (railOrderDrawing, railOrder);
     }
 
     /// <summary>The logged-in character: open by default, with its bags, saddlebag and retainers in game order.</summary>
@@ -1402,9 +1481,16 @@ internal sealed class StockWorkspace
         ImGui.PushID("here");
         try
         {
-            var allSelected = inHere && workbench.ScopeKey == BrowserScope.AllKey;
+            var ownerId = owner.LocalContentId ?? 0;
+            var allPicked = MultiSource && AllSourcesOn(ownerId, runtime.Browser, 0, counts, here: true, external: false);
+            var allSelected = inHere && workbench.ScopeKey == BrowserScope.AllKey || allPicked;
             if (RailNode(HereName(runtime), counts.Text(0, BrowserScope.AllKey), allSelected, open, out var toggled, QuartermasterPalette.Info))
-                ViewHereScope(BrowserScope.AllKey);
+            {
+                if (ImGui.GetIO().KeyCtrl)
+                    ToggleCharacterSources(runtime, owner);
+                else
+                    ViewHereScope(BrowserScope.AllKey);
+            }
             if (toggled)
                 ToggleRailExpanded(owner, true);
             if (ImGui.IsItemHovered())
@@ -1421,24 +1507,37 @@ internal sealed class StockWorkspace
                 true,
                 () => ToggleRailExpanded(runtimeSnapshots.Current.Owner, true),
                 open ? "Expanded" : "Collapsed");
+            reviewRegistry.RegisterLastButton(
+                "quartermaster.stock.scope.here.toggle-sources",
+                $"Add or remove all of {HereName(runtime)}'s containers in the picked sources",
+                true,
+                () => ToggleCharacterSources(runtimeSnapshots.Current, runtimeSnapshots.Current.Owner),
+                allPicked ? "Selected" : "Available");
+            DrawSelectKindMenu(runtime, owner, "quartermaster.stock.scope.here", HereName(runtime));
             if (!open)
                 return;
             ImGui.Indent();
-            foreach (var scope in runtime.Browser.Scopes)
+            var scopes = runtime.Browser.Scopes;
+            for (var scopeIndex = 0; scopeIndex < scopes.Count; scopeIndex++)
             {
+                var scope = scopes[scopeIndex];
                 if (scope.Kind == BrowserScopeKind.All)
                     continue;
                 var key = scope.Key;
-                var selected = inHere && key == workbench.ScopeKey;
+                var source = new RailSource(ownerId, key);
+                railOrderDrawing.Add(source);
+                var selected = MultiSource ? sources.Contains(source) : inHere && key == workbench.ScopeKey;
                 if (RailNode(ContainerName(scope), counts.Text(0, key), selected, null, out _,
                         space: courier.ContainerSpace(runtime, owner, scope, external: false)))
-                    ViewHereScope(key);
+                    ClickContainer(runtime, source);
+                var control = $"quartermaster.stock.scope.here.{key.Replace(':', '.')}";
                 reviewRegistry.RegisterLastButton(
-                    $"quartermaster.stock.scope.here.{key.Replace(':', '.')}",
+                    control,
                     $"Browse {HereName(runtime)} · {ContainerName(scope)}",
                     true,
                     () => ViewHereScope(key),
                     selected ? "Selected" : "Available");
+                RegisterSourceToggle(control, $"{HereName(runtime)} · {ContainerName(scope)}", source);
             }
             ImGui.Unindent();
         }
@@ -1462,10 +1561,17 @@ internal sealed class StockWorkspace
         var viewing = !catalogMode && viewedCharacter?.Matches(character) == true;
         var open = RailExpanded(character, false);
         var control = $"quartermaster.stock.scope.character.{character.LocalContentId}";
-        var allSelected = viewing && viewedScopeKey == BrowserScope.AllKey;
+        var characterId = character.LocalContentId ?? 0;
+        var allPicked = MultiSource && AllSourcesOn(characterId, stock, index, counts, here: false, external);
+        var allSelected = viewing && viewedScopeKey == BrowserScope.AllKey || allPicked;
         if (RailNode(CourierSession.CharacterLabel(character), counts.Text(index, BrowserScope.AllKey), allSelected, open, out var toggled,
                 external ? TradeTint : null))
-            ViewCharacter(character);
+        {
+            if (ImGui.GetIO().KeyCtrl)
+                ToggleCharacterSources(runtime, character);
+            else
+                ViewCharacter(character);
+        }
         if (toggled)
             ToggleRailExpanded(character, false);
         if (external && ImGui.IsItemHovered())
@@ -1482,28 +1588,37 @@ internal sealed class StockWorkspace
             true,
             () => ToggleRailExpanded(character, false),
             open ? "Expanded" : "Collapsed");
+        reviewRegistry.RegisterLastButton(
+            $"{control}.toggle-sources",
+            $"Add or remove all of {character.CharacterName}'s containers in the picked sources",
+            true,
+            () => ToggleCharacterSources(runtimeSnapshots.Current, character),
+            allPicked ? "Selected" : "Available");
+        DrawSelectKindMenu(runtime, character, control, character.CharacterName);
         if (!open)
             return;
         ImGui.Indent();
-        foreach (var scope in stock.Scopes)
+        var scopes = stock.Scopes;
+        for (var scopeIndex = 0; scopeIndex < scopes.Count; scopeIndex++)
         {
-            // Another local character's saddlebag is never observed here; another account's client
-            // observes its own, so it shows when that client saw any.
-            var shown = scope.Kind is BrowserScopeKind.Player or BrowserScopeKind.Retainer ||
-                        external && scope.Kind == BrowserScopeKind.Saddlebag && counts.Text(index, scope.Key) != "0";
-            if (!shown)
+            var scope = scopes[scopeIndex];
+            if (!RailShows(scope, here: false, external, counts, index))
                 continue;
             var key = scope.Key;
-            var selected = viewing && key == viewedScopeKey;
+            var source = new RailSource(characterId, key);
+            railOrderDrawing.Add(source);
+            var selected = MultiSource ? sources.Contains(source) : viewing && key == viewedScopeKey;
             if (RailNode(ContainerName(scope), counts.Text(index, key), selected, null, out _, external ? TradeTint : null,
                     courier.ContainerSpace(runtime, character, scope, external)))
-                ViewCharacter(character, key);
+                ClickContainer(runtime, source);
+            var containerControl = $"{control}.{key.Replace(':', '.')}";
             reviewRegistry.RegisterLastButton(
-                $"{control}.{key.Replace(':', '.')}",
+                containerControl,
                 $"Browse {character.CharacterName} · {ContainerName(scope)}",
                 true,
                 () => ViewCharacter(character, key),
                 selected ? "Selected" : "Available");
+            RegisterSourceToggle(containerControl, $"{character.CharacterName} · {ContainerName(scope)}", source);
         }
         ImGui.Unindent();
     }
@@ -1627,13 +1742,7 @@ internal sealed class StockWorkspace
                         previous = location.CharacterOrder;
                         Increment(counts, (previous, BrowserScope.AllKey));
                     }
-                    var scopeKey = location.Kind switch
-                    {
-                        BrowserScopeKind.Player => BrowserScope.PlayerKey,
-                        BrowserScopeKind.Saddlebag => BrowserScope.SaddlebagKey,
-                        _ => location.RetainerId is { } retainer ? BrowserScope.RetainerKey(retainer) : null,
-                    };
-                    if (scopeKey is not null)
+                    if (LocationScopeKey(location) is { } scopeKey)
                         Increment(counts, (location.CharacterOrder, scopeKey));
                 }
             }
@@ -1645,8 +1754,294 @@ internal sealed class StockWorkspace
         }
     }
 
+    // ---- Rail sources ------------------------------------------------------------------------
+
+    /// <summary>The rail scope key a location sits in; null for a retainer location without an ID.</summary>
+    private static string? LocationScopeKey(StockLocation location) => location.Kind switch
+    {
+        BrowserScopeKind.Player => BrowserScope.PlayerKey,
+        BrowserScopeKind.Saddlebag => BrowserScope.SaddlebagKey,
+        _ => location.RetainerId is { } retainer ? BrowserScope.RetainerKey(retainer) : null,
+    };
+
+    /// <summary>
+    /// Whether the rail lists a container under its character. The logged-in character lists every
+    /// container. Another local character's saddlebag is never observed here; another account's
+    /// client observes its own, so it shows when that client saw any.
+    /// </summary>
+    private static bool RailShows(BrowserScope scope, bool here, bool external, RailCounts counts, int index) =>
+        here ? scope.Kind != BrowserScopeKind.All
+        : scope.Kind is BrowserScopeKind.Player or BrowserScopeKind.Retainer ||
+          external && scope.Kind == BrowserScopeKind.Saddlebag && counts.Text(index, scope.Key) != "0";
+
+    /// <summary>Whether every container the rail lists for a character is picked; false when it lists none.</summary>
+    private bool AllSourcesOn(ulong character, BrowserProjection stock, int index, RailCounts counts, bool here, bool external)
+    {
+        var any = false;
+        var scopes = stock.Scopes;
+        for (var scopeIndex = 0; scopeIndex < scopes.Count; scopeIndex++)
+        {
+            var scope = scopes[scopeIndex];
+            if (!RailShows(scope, here, external, counts, index))
+                continue;
+            if (!sources.Contains(new RailSource(character, scope.Key)))
+                return false;
+            any = true;
+        }
+        return any;
+    }
+
+    /// <summary>Every container the rail lists, in rail order, for one character or everyone, optionally of one kind.</summary>
+    private void CollectRailContainers(QuartermasterRuntimeSnapshot runtime, OwnerScope? only, BrowserScopeKind? kind, List<RailSource> into)
+    {
+        into.Clear();
+        var account = courier.AccountStock(runtime);
+        var counts = ResolveRailCounts(account);
+        if (only is null || only.Matches(runtime.Owner))
+            Add(runtime.Owner.LocalContentId ?? 0, runtime.Browser, 0, here: true, external: false);
+        // Local characters first, then other accounts', as the rail draws them.
+        for (var pass = 0; pass < 2; pass++)
+            for (var index = 1; index < account.Characters.Count; index++)
+            {
+                var character = account.Characters[index];
+                var external = account.IsExternal(character);
+                if (external != (pass == 1) || only is not null && !character.Matches(only))
+                    continue;
+                if ((external ? courier.ExternalStock(runtime, character) : courier.Stock(runtime, character)) is { } stock)
+                    Add(character.LocalContentId ?? 0, stock, index, here: false, external);
+            }
+
+        void Add(ulong character, BrowserProjection stock, int index, bool here, bool external)
+        {
+            foreach (var scope in stock.Scopes)
+                if ((kind is null || scope.Kind == kind) && RailShows(scope, here, external, counts, index))
+                    into.Add(new RailSource(character, scope.Key));
+        }
+    }
+
+    /// <summary>The single container in view, which a first Ctrl-click keeps picked.</summary>
+    private RailSource? ViewedSource(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (catalogMode || sources.Count > 0)
+            return null;
+        if (viewedCharacter is { } viewed)
+            return viewedScopeKey == BrowserScope.AllKey ? null : new RailSource(viewed.LocalContentId ?? 0, viewedScopeKey);
+        return !accountWide && workbench.ScopeKey != BrowserScope.AllKey
+            ? new RailSource(runtime.Owner.LocalContentId ?? 0, workbench.ScopeKey)
+            : null;
+    }
+
+    /// <summary>A container row's click: Shift picks a range from the anchor, Ctrl toggles it, a plain click views it.</summary>
+    private void ClickContainer(QuartermasterRuntimeSnapshot runtime, RailSource source)
+    {
+        var io = ImGui.GetIO();
+        if (io.KeyShift && sourceAnchor is { } anchor && PickRange(runtime, anchor, source, io.KeyCtrl))
+            return;
+        sourceAnchor = source;
+        if (io.KeyCtrl)
+            ToggleSource(runtime, source);
+        else
+            ViewSource(runtime, source);
+    }
+
+    /// <summary>Picks the drawn containers between the anchor and <paramref name="target"/>; false when either was not drawn.</summary>
+    private bool PickRange(QuartermasterRuntimeSnapshot runtime, RailSource anchor, RailSource target, bool add)
+    {
+        var from = railOrder.IndexOf(anchor);
+        var to = railOrder.IndexOf(target);
+        if (from < 0 || to < 0)
+            return false;
+        if (!add)
+            sources.Clear();
+        else if (ViewedSource(runtime) is { } viewed)
+            sources.Add(viewed);
+        for (var index = Math.Min(from, to); index <= Math.Max(from, to); index++)
+            sources.Add(railOrder[index]);
+        ApplySources(runtime);
+        return true;
+    }
+
+    private void ToggleSource(QuartermasterRuntimeSnapshot runtime, RailSource source)
+    {
+        if (ViewedSource(runtime) is { } viewed)
+            sources.Add(viewed);
+        if (!sources.Remove(source))
+            sources.Add(source);
+        ApplySources(runtime);
+    }
+
+    /// <summary>Ctrl-click on a character: unpicks all its containers when all are picked, else picks them all.</summary>
+    private void ToggleCharacterSources(QuartermasterRuntimeSnapshot runtime, OwnerScope character)
+    {
+        CollectRailContainers(runtime, character, null, railScratch);
+        if (railScratch.Count == 0)
+            return;
+        if (ViewedSource(runtime) is { } viewed)
+            sources.Add(viewed);
+        var all = true;
+        foreach (var source in railScratch)
+            all &= sources.Contains(source);
+        foreach (var source in railScratch)
+        {
+            if (all)
+                sources.Remove(source);
+            else
+                sources.Add(source);
+        }
+        ApplySources(runtime);
+    }
+
+    /// <summary>Replaces the picked sources with every rail container of one kind, for one character or everyone.</summary>
+    private void PickKind(QuartermasterRuntimeSnapshot runtime, OwnerScope? character, BrowserScopeKind kind)
+    {
+        CollectRailContainers(runtime, character, kind, railScratch);
+        sources.Clear();
+        foreach (var source in railScratch)
+            sources.Add(source);
+        sourceAnchor = null;
+        ApplySources(runtime);
+    }
+
+    /// <summary>Settles the picked sources: none returns to the account view, one views that container, more narrow the account view.</summary>
+    private void ApplySources(QuartermasterRuntimeSnapshot runtime)
+    {
+        sourcesRevision++;
+        if (sources.Count == 0)
+        {
+            ViewAccount();
+            return;
+        }
+        if (sources.Count == 1)
+        {
+            var only = default(RailSource);
+            foreach (var source in sources)
+                only = source;
+            ViewSource(runtime, only);
+            return;
+        }
+        accountWide = true;
+        SetViewedCharacter(null);
+        workbench.FocusedStockItemId = null;
+        LeaveCatalog();
+    }
+
+    private void ClearSources()
+    {
+        if (sources.Count == 0)
+            return;
+        sources.Clear();
+        sourcesRevision++;
+    }
+
+    /// <summary>One container's own view: the logged-in character's scope, or another character's container.</summary>
+    private void ViewSource(QuartermasterRuntimeSnapshot runtime, RailSource source)
+    {
+        if (source.Character == (runtime.Owner.LocalContentId ?? 0))
+        {
+            ViewHereScope(source.ScopeKey);
+            return;
+        }
+        var characters = courier.AccountStock(runtime).Characters;
+        for (var index = 1; index < characters.Count; index++)
+            if ((characters[index].LocalContentId ?? 0) == source.Character)
+            {
+                ViewCharacter(characters[index], source.ScopeKey);
+                return;
+            }
+        ViewAccount();
+    }
+
+    private void RegisterSourceToggle(string control, string label, RailSource source) =>
+        reviewRegistry.RegisterLastButton(
+            $"{control}.toggle-source",
+            $"Add or remove {label} in the picked sources",
+            true,
+            () => ToggleSource(runtimeSnapshots.Current, source),
+            sources.Contains(source) ? "Selected" : "Available");
+
+    private static readonly (BrowserScopeKind Kind, string Label, string Id)[] PickKinds =
+    [
+        (BrowserScopeKind.Retainer, "Select all retainers", "retainers"),
+        (BrowserScopeKind.Player, "Select all bags", "bags"),
+        (BrowserScopeKind.Saddlebag, "Select all saddlebags", "saddlebags"),
+    ];
+
+    /// <summary>A node's right-click menu that picks every retainer, bag or saddlebag under it.</summary>
+    private void DrawSelectKindMenu(QuartermasterRuntimeSnapshot runtime, OwnerScope? character, string control, string owner)
+    {
+        foreach (var (kind, label, id) in PickKinds)
+            reviewRegistry.RegisterLastButton(
+                $"{control}.select.{id}",
+                $"{label} of {owner}",
+                true,
+                () => PickKind(runtimeSnapshots.Current, character, kind),
+                "Available");
+        if (!ImGui.BeginPopupContextItem("##rail-sources"))
+            return;
+        foreach (var (kind, label, _) in PickKinds)
+        {
+            CollectRailContainers(runtime, character, kind, railScratch);
+            ImGui.BeginDisabled(railScratch.Count == 0);
+            if (ImGui.MenuItem(label))
+                PickKind(runtime, character, kind);
+            ImGui.EndDisabled();
+        }
+        ImGui.EndPopup();
+    }
+
+    /// <summary>"account:12" and "7 sources" for the picked sources, rebuilt only when they change.</summary>
+    private (int Revision, string QueryScope, string Label) SourceLabels()
+    {
+        if (sourceLabels is not { } cached || cached.Revision != sourcesRevision)
+            sourceLabels = cached = (sourcesRevision,
+                $"{AccountQueryScope}:{sourcesRevision.ToString(System.Globalization.CultureInfo.InvariantCulture)}",
+                $"{sources.Count:N0} sources");
+        return cached;
+    }
+
+    /// <summary>
+    /// The account view narrowed to the picked sources, cached per account projection and pick.
+    /// Each item's in-scope stacks come from the picked characters' own projections, the same ones
+    /// the account view merged, because a merged stack does not name its character.
+    /// </summary>
+    private AccountStockProjection SourceAccount(QuartermasterRuntimeSnapshot runtime, AccountStockProjection account)
+    {
+        if (sourceAccount is { } cached && ReferenceEquals(cached.Account, account) && cached.Revision == sourcesRevision)
+            return cached.Scoped;
+        var stacks = new Dictionary<uint, List<StockStack>>();
+        for (var index = 0; index < account.Characters.Count; index++)
+        {
+            var character = account.Characters[index];
+            var id = character.LocalContentId ?? 0;
+            if (!sources.Any(source => source.Character == id))
+                continue;
+            // The account's first character is the logged-in one, merged from its live projection.
+            if ((index == 0 ? runtime.Browser : ViewStock(runtime, character)) is not { } stock)
+                continue;
+            foreach (var item in stock.Items)
+                foreach (var stack in item.Stacks)
+                {
+                    if (!sources.Contains(new RailSource(id, stack.ScopeKey)))
+                        continue;
+                    if (!stacks.TryGetValue(item.ItemId, out var held))
+                        stacks[item.ItemId] = held = [];
+                    held.Add(stack);
+                }
+        }
+        var items = new Dictionary<uint, StockGroup>(stacks.Count);
+        foreach (var (itemId, held) in stacks)
+            if (account.ById.TryGetValue(itemId, out var entry))
+                items[itemId] = entry.Item with { Stacks = held };
+        var scoped = account.Within(
+            location => LocationScopeKey(location) is { } key && sources.Contains(new RailSource(location.Character.LocalContentId ?? 0, key)),
+            items);
+        sourceAccount = (account, sourcesRevision, scoped);
+        return scoped;
+    }
+
     private void EnterCatalog()
     {
+        ClearSources();
         if (catalogMode)
             return;
         catalogMode = true;
@@ -2303,6 +2698,7 @@ internal sealed class StockWorkspace
     public void FocusFromListings(QuartermasterRuntimeSnapshot runtime, ListingItemKey group)
     {
         LeaveCatalog();
+        ClearSources();
         SetViewedCharacter(null);
         accountWide = true;
         stockSelection.Clear();

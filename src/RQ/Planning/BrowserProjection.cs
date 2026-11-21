@@ -154,6 +154,25 @@ public sealed record AccountStockItem(
     /// <summary>Held somewhere, but only by characters on another service account.</summary>
     public bool OnlyExternal => ExternalQuantity > 0 && ExternalQuantity == Total;
 
+    // Fixed with the locations, so the account table's sorts and cells read fields instead of summing per frame.
+    /// <summary>Units in bags across these locations.</summary>
+    public int InBags { get; } = Units(Locations, BrowserScopeKind.Player);
+
+    /// <summary>Units in saddlebags across these locations.</summary>
+    public int InSaddlebags { get; } = Units(Locations, BrowserScopeKind.Saddlebag);
+
+    /// <summary>Units in retainers across these locations.</summary>
+    public int InRetainers { get; } = Units(Locations, BrowserScopeKind.Retainer);
+
+    private static int Units(IReadOnlyList<StockLocation> locations, BrowserScopeKind kind)
+    {
+        var units = 0;
+        for (var index = 0; index < locations.Count; index++)
+            if (locations[index].Kind == kind)
+                units += locations[index].Quantity;
+        return units;
+    }
+
     /// <summary>The item's stacks on one character only, ready for actions that act from that character.</summary>
     public IEnumerable<StockLocation> On(OwnerScope character) =>
         Locations.Where(location => location.Character.Matches(character));
@@ -260,12 +279,8 @@ public sealed class AccountStockProjection
                 .ThenBy(location => location.ContainerOrder)
                 .ThenBy(location => location.Container, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
-            var here = placed.Where(location => location.IsCurrent).Sum(location => location.Quantity);
-            var elsewhere = placed.Where(location => !location.IsCurrent).Sum(location => location.Quantity);
-            var externalUnits = placed.Where(location => location.IsExternalAccount).Sum(location => location.Quantity);
-            var characterCount = placed.Select(location => location.CharacterOrder).Distinct().Count();
             items.Add(group);
-            byId[itemId] = new AccountStockItem(group, here, elsewhere, characterCount, placed, Summarize(placed, characterCount), externalUnits);
+            byId[itemId] = Placed(group, placed);
         }
         items.Sort((left, right) =>
         {
@@ -281,6 +296,49 @@ public sealed class AccountStockProjection
                 .Where(source => source.Profile is not null)
                 .ToDictionary(source => source.Character.LocalContentId!.Value, source => source.Profile!),
         };
+    }
+
+    /// <summary>
+    /// The same characters restricted to some of their containers: items held nowhere in scope drop
+    /// out, and each item's figures, locations and summary count only its in-scope locations.
+    /// <paramref name="scopedItems"/> holds each item's in-scope stacks, so the filter sees the same
+    /// units the figures do; an item missing there keeps its merged stacks.
+    /// </summary>
+    public AccountStockProjection Within(Func<StockLocation, bool> inScope, IReadOnlyDictionary<uint, StockGroup> scopedItems)
+    {
+        var byId = new Dictionary<uint, AccountStockItem>();
+        var items = new List<StockGroup>();
+        // Items are already in name order, and each item's locations in character then container order.
+        foreach (var item in Items)
+        {
+            if (!ById.TryGetValue(item.ItemId, out var entry))
+                continue;
+            List<StockLocation>? placed = null;
+            foreach (var location in entry.Locations)
+                if (inScope(location))
+                    (placed ??= []).Add(location);
+            if (placed is null)
+                continue;
+            var group = scopedItems.GetValueOrDefault(item.ItemId) ?? item;
+            items.Add(group);
+            byId[item.ItemId] = Placed(group, placed);
+        }
+        return new AccountStockProjection
+        {
+            Items = items,
+            ById = byId,
+            Characters = Characters,
+            ExternalProfiles = ExternalProfiles,
+        };
+    }
+
+    private static AccountStockItem Placed(StockGroup group, IReadOnlyList<StockLocation> placed)
+    {
+        var here = placed.Where(location => location.IsCurrent).Sum(location => location.Quantity);
+        var elsewhere = placed.Where(location => !location.IsCurrent).Sum(location => location.Quantity);
+        var externalUnits = placed.Where(location => location.IsExternalAccount).Sum(location => location.Quantity);
+        var characterCount = placed.Select(location => location.CharacterOrder).Distinct().Count();
+        return new AccountStockItem(group, here, elsewhere, characterCount, placed, Summarize(placed, characterCount), externalUnits);
     }
 
     private static string ContainerName(BrowserScopeKind kind, string label) => kind switch
