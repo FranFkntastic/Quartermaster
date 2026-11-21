@@ -783,7 +783,9 @@ internal sealed class StockWorkspace
                       transferPlans.HasCourierDestinations(runtime, location.Character);
         var current = location.IsCurrent && identified ? runtime.Browser.FindItem(itemId) : null;
         var canStow = location.Kind == BrowserScopeKind.Player && current is { PlayerQuantity: > 0 };
-        var canPlan = location.Kind is BrowserScopeKind.Saddlebag or BrowserScopeKind.Retainer && current is not null;
+        // Any character's bags or retainer can join an open Courier plan as a source.
+        var courierSource = location.Kind is BrowserScopeKind.Player or BrowserScopeKind.Retainer && transferPlans.CourierPlanOpen(runtime);
+        var canPlan = courierSource || location.Kind is BrowserScopeKind.Saddlebag or BrowserScopeKind.Retainer && current is not null;
 
         reviewRegistry.RegisterLastButton($"{control}.menu", $"Open actions for {row.Item.ItemName} in {location.Label}", true,
             () => pendingLocationPopup = $"menu:{control}", "Available");
@@ -801,7 +803,8 @@ internal sealed class StockWorkspace
                 transferPlans.AddCourierSource(at, itemId, row.Item.ItemName, location.Character,
                     location.Kind == BrowserScopeKind.Retainer ? location.RetainerId : null))
                 return;
-            UpsertSelectedStockRules(at, [current!], stowCarried: false);
+            if (current is not null)
+                UpsertSelectedStockRules(at, [current], stowCarried: false);
         }
         if (canPlan)
             reviewRegistry.RegisterLastButton($"{control}.add-to-plan", $"Add {row.Item.ItemName} to the current plan", true,
