@@ -367,7 +367,8 @@ public static class CourierPlanner
         int CarrierCap(OwnerScope dst) => (At(dst, null)?.Inventory.FreeSlots ?? 0) <= 0 ? 0 : Math.Min(testSlotCap ?? int.MaxValue, carrier?.FreeSlots ?? 0);
         int SourceCap(OwnerScope src) => At(src, null)?.Inventory.FreeSlots ?? 0;
         // A same-character group has no carrier: retainer stacks bound for the bags keep their slots, and
-        // stacks passing from one retainer to another need at least one more slot to pass through.
+        // stacks passing from one retainer to another need one free slot, which they hand back before
+        // any bag-bound stack is retrieved (they run first).
         static bool Stays(Shipment s) => s.From != null && s.To == null;
         static bool Passes(Shipment s) => s.From != null && s.To != null;
         foreach (var (src, dst, stacks) in groups)
@@ -375,7 +376,7 @@ public static class CourierPlanner
             var carrierCap = CarrierCap(dst);
             var sourceCap = SourceCap(src);
             var full = Exact(src, dst)
-                ? stacks.Count(Stays) + (stacks.Any(Passes) ? 1 : 0) > sourceCap
+                ? stacks.Count(Stays) > sourceCap || stacks.Any(Passes) && sourceCap <= 0
                     ? stacks.Where(s => s.From != null) : []
                 : stacks.Where(s => carrierCap <= 0 || s.From != null && sourceCap <= 0);
             foreach (var s in full.DistinctBy(s => s.Line))
