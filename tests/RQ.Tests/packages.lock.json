@@ -47,41 +47,41 @@
       },
       "Franthropy.AgentBridge": {
         "type": "Transitive",
-        "resolved": "0.1.0-commit.a8bf24b105bdd424c05cfa20db4a418b79fa726e",
-        "contentHash": "1L2DIhlJTo6iNIa6hEdwWkAaHEGyun6ME2j7Mxva5eCQndMnyXjVxRcRuX+bP9VS+OZRhF1ysvPU9uKB7b00ZQ==",
+        "resolved": "0.1.0-commit.5a5e433255b1dbb026a83dc67bd551ba6670c70d",
+        "contentHash": "alSnJKOFs7BPdYgcWsY6ZgPZX30WZmc4hc6KxcyCZOCZyVgltzeYilrmDEaJhpj9etZRhDpcGCEXhkKt0XIY7g==",
         "dependencies": {
           "System.Security.Cryptography.ProtectedData": "9.0.0"
         }
       },
       "Franthropy.Dalamud": {
         "type": "Transitive",
-        "resolved": "0.1.0-commit.a8bf24b105bdd424c05cfa20db4a418b79fa726e",
-        "contentHash": "NG3CcaxCuy5dbkaxPvku04ZN6ZwEXBJhXbzeMEUwEH4nnHW74SyyY+eJgz3pslPoBXsQDzwbF4ihw0JWWSwYTw==",
+        "resolved": "0.1.0-commit.5a5e433255b1dbb026a83dc67bd551ba6670c70d",
+        "contentHash": "SfGhO0fpp8CUdRk+9w5lOFyInAiALIQW10XdgH/mPIPIQgM1JwkU+g8TIi71NUFf/TiPTG0sSOyNx4ANx/HDkg==",
         "dependencies": {
           "ECommons": "3.2.1.15",
-          "Franthropy.AgentBridge": "0.1.0-commit.a8bf24b105bdd424c05cfa20db4a418b79fa726e",
-          "Franthropy.Filtering": "0.1.0-commit.a8bf24b105bdd424c05cfa20db4a418b79fa726e",
-          "Franthropy.Observations": "0.1.0-commit.a8bf24b105bdd424c05cfa20db4a418b79fa726e",
+          "Franthropy.AgentBridge": "0.1.0-commit.5a5e433255b1dbb026a83dc67bd551ba6670c70d",
+          "Franthropy.Filtering": "0.1.0-commit.5a5e433255b1dbb026a83dc67bd551ba6670c70d",
+          "Franthropy.Observations": "0.1.0-commit.5a5e433255b1dbb026a83dc67bd551ba6670c70d",
           "System.Security.Cryptography.ProtectedData": "9.0.0"
         }
       },
       "Franthropy.FFXIV": {
         "type": "Transitive",
-        "resolved": "0.1.0-commit.a8bf24b105bdd424c05cfa20db4a418b79fa726e",
-        "contentHash": "frgKZDgNRP9QxYuuI56GtT6JyaW1MiEBZ30y4NyK5zmQAqQXLWrE0Xixc5M+69w/jOGiP+MjwYUThOWdFbNeoA==",
+        "resolved": "0.1.0-commit.5a5e433255b1dbb026a83dc67bd551ba6670c70d",
+        "contentHash": "er2F73Mtd9T98P8Xg6pK+q1KGA6qyFdAY3oK9+LCNmBRRoJDs8mPwGyeurTcfeImM9NDhE99SkK6+OmQutcYWQ==",
         "dependencies": {
-          "Franthropy.Filtering": "0.1.0-commit.a8bf24b105bdd424c05cfa20db4a418b79fa726e"
+          "Franthropy.Filtering": "0.1.0-commit.5a5e433255b1dbb026a83dc67bd551ba6670c70d"
         }
       },
       "Franthropy.Filtering": {
         "type": "Transitive",
-        "resolved": "0.1.0-commit.a8bf24b105bdd424c05cfa20db4a418b79fa726e",
-        "contentHash": "BEkTBHCpHFRQW4KJctNFb/r54T5yno73yFJyBBIHC5Boo81ymv9XAqdPqhJKoOWDAofAyrFXX1zL83ZxrDvi5g=="
+        "resolved": "0.1.0-commit.5a5e433255b1dbb026a83dc67bd551ba6670c70d",
+        "contentHash": "zkJhtEXg9PmoHlzEys2iZK/QK75TwXZjmSt8LnTI7QUB6yc/cbPwZ3C4X8lIeH218IZZ/6vb5X8T79EP/p0Y5g=="
       },
       "Franthropy.Observations": {
         "type": "Transitive",
-        "resolved": "0.1.0-commit.a8bf24b105bdd424c05cfa20db4a418b79fa726e",
-        "contentHash": "e9LnzFVVfmWrvYWUQDDmfeugZ65OvScYMZLSYhwql2+E2N7ZiumS3ug2wB+/w1WL2OOEvbSdv9Er1/ZQTICqQw==",
+        "resolved": "0.1.0-commit.5a5e433255b1dbb026a83dc67bd551ba6670c70d",
+        "contentHash": "mnVGxRiX7g4HcbNSOKC1TBwyo77Jtf4EGjDhVy0uIIA6g4ZKOQHsf2Ht3iUbg5QT6OUhUMZfZuPWxI3OUCj8XA==",
         "dependencies": {
           "Microsoft.Data.Sqlite": "10.0.10",
           "SQLitePCLRaw.bundle_e_sqlite3": "3.0.5"
@@ -213,9 +213,9 @@
         "type": "Project",
         "dependencies": {
           "DalamudPackager": "[15.0.0, )",
-          "Franthropy.Dalamud": "[0.1.0-commit.a8bf24b105bdd424c05cfa20db4a418b79fa726e, 0.1.0-commit.a8bf24b105bdd424c05cfa20db4a418b79fa726e]",
-          "Franthropy.FFXIV": "[0.1.0-commit.a8bf24b105bdd424c05cfa20db4a418b79fa726e, 0.1.0-commit.a8bf24b105bdd424c05cfa20db4a418b79fa726e]",
-          "Franthropy.Observations": "[0.1.0-commit.a8bf24b105bdd424c05cfa20db4a418b79fa726e, 0.1.0-commit.a8bf24b105bdd424c05cfa20db4a418b79fa726e]",
+          "Franthropy.Dalamud": "[0.1.0-commit.5a5e433255b1dbb026a83dc67bd551ba6670c70d, 0.1.0-commit.5a5e433255b1dbb026a83dc67bd551ba6670c70d]",
+          "Franthropy.FFXIV": "[0.1.0-commit.5a5e433255b1dbb026a83dc67bd551ba6670c70d, 0.1.0-commit.5a5e433255b1dbb026a83dc67bd551ba6670c70d]",
+          "Franthropy.Observations": "[0.1.0-commit.5a5e433255b1dbb026a83dc67bd551ba6670c70d, 0.1.0-commit.5a5e433255b1dbb026a83dc67bd551ba6670c70d]",
           "Microsoft.Data.Sqlite": "[10.0.10, )",
           "SQLitePCLRaw.bundle_e_sqlite3": "[3.0.5, )"
         }
