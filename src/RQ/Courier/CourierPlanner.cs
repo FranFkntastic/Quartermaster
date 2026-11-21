@@ -103,6 +103,7 @@ public static class CourierPlanner
             var stacks = new List<Shipment>();
             foreach (var r in group)
             {
+                if (r.TargetQuantity == 0) continue;
                 var route = r.Courier!;
                 var meta = metadata(r.ItemId);
                 var source = At(src, route.SourceRetainerId);
