@@ -164,6 +164,7 @@ internal sealed partial class TransferPlanWorkspace
             renamingPlanId = null;
             showPlacement = false;
             pickerOpenRequest = null;
+            sourcePickerOpenRequest = null;
         }
         workbench.SelectedStowagePlanId = planId;
     }

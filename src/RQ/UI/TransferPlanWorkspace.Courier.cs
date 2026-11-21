@@ -237,12 +237,12 @@ internal sealed partial class TransferPlanWorkspace
         ImGui.PushID(CourierKey(rule.Id));
         for (var index = 0; index < sources; index++)
             DrawCourierPlace(row, allocation, allocation.Places[index], index, index == 0 ? "From" : null, layout);
-        DrawAddSource(row, allocation, sources == 0 ? "From" : null, layout);
+        DrawAddPlace(row, allocation, PlaceRole.Source, sources == 0 ? "From" : null, layout);
         for (var index = sources; index < allocation.Places.Length; index++)
             DrawCourierPlace(row, allocation, allocation.Places[index], index, index == sources ? "To" : null, layout);
         if (allocation.Suggestion is { } suggestion)
             DrawCourierPlace(row, allocation, suggestion, allocation.Places.Length, "To", layout, suggested: true);
-        DrawAddDestination(row, allocation, allocation.Places.Length == sources && allocation.Suggestion is null ? "To" : null, layout);
+        DrawAddPlace(row, allocation, PlaceRole.Destination, allocation.Places.Length == sources && allocation.Suggestion is null ? "To" : null, layout);
         ImGui.PopID();
     }
 
@@ -429,111 +429,85 @@ internal sealed partial class TransferPlanWorkspace
             Dismiss();
     }
 
-    /// <summary>The row that adds a source: a list of the places holding the item that the line does not list.</summary>
-    private void DrawAddSource(TransferWorkbenchRow row, CourierAllocation allocation, string? role, PlaceLayout layout)
+    /// <summary>Which list of a line a picker adds to.</summary>
+    private enum PlaceRole
     {
-        if (allocation.Holders.IsEmpty)
-            return;
-        var rule = row.Rule;
-        BeginPlaceRow(row, role, layout);
-        const string label = "+ Add source…";
-        ImGui.PushStyleColor(ImGuiCol.Text, QuartermasterPalette.Dim);
-        var clicked = ImGui.Selectable($"{label}##add-source", false, ImGuiSelectableFlags.None, new Vector2(ImGui.CalcTextSize(label).X, 0));
-        ImGui.PopStyleColor();
-        var ruleId = rule.Id;
-        reviewRegistry.RegisterLastButton(
-            $"quartermaster.courier.source.add.{ruleId:N}",
-            $"Choose a source for {rule.ItemName}",
-            true,
-            () => sourcePickerOpenRequest = ruleId,
-            "Available");
-        if (clicked || sourcePickerOpenRequest == ruleId)
-        {
-            sourcePickerOpenRequest = null;
-            ImGui.OpenPopup(SourcePickerPopup);
-        }
-        if (!DalamudOwnedPopup.BeginOpaquePopup(SourcePickerPopup))
-            return;
-        var close = false;
-        if (ImGui.BeginTable("##source-picker-table", 2, ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingFixedFit))
-        {
-            ImGui.TableSetupColumn("Place", ImGuiTableColumnFlags.WidthFixed);
-            ImGui.TableSetupColumn("Has", ImGuiTableColumnFlags.WidthFixed);
-            for (var index = 0; index < allocation.Holders.Length; index++)
-            {
-                var holder = allocation.Holders[index];
-                ImGui.TableNextRow();
-                ImGui.TableNextColumn();
-                var place = PlaceLabel(row.Runtime, holder);
-                void Add()
-                {
-                    MutateCourierLine(row, line => line.WithSource(holder.Character, holder.Retainer));
-                    close = true;
-                }
-                if (ImGui.Selectable($"{place}##source-pick:{index}", false, ImGuiSelectableFlags.SpanAllColumns))
-                    Add();
-                reviewRegistry.RegisterLastButton(
-                    $"quartermaster.courier.source.pick.{PlaceKey(ruleId, holder)}",
-                    $"Add {place} as a source of {rule.ItemName}",
-                    true,
-                    Add,
-                    $"{holder.Has:N0}");
-                ImGui.TableNextColumn();
-                RightAlignedLine((holder.Has ?? 0).ToString("N0"), null);
-            }
-            ImGui.EndTable();
-        }
-        if (close)
-            ImGui.CloseCurrentPopup();
-        ImGui.EndPopup();
-    }
-
-    /// <summary>Containers a line can add as a destination, by character: none already listed on it.</summary>
-    private (OwnerScope Character, CourierContainer[] Containers)[] DestinationChoices(TransferWorkbenchRow row, CourierAllocation allocation) =>
-        courier.DestinationCharacters(row.Runtime)
-            .Select(character => (Character: character, Containers: courier.Containers(row.Runtime, character, row.Rule.ItemId, row.Rule.Quality)
-                .Where(container => !allocation.Places.Any(spot => spot.Retainer == container.Retainer && spot.Character.Matches(character)))
-                .ToArray()))
-            .Where(choice => choice.Containers.Length > 0)
-            .ToArray();
-
-    private void DrawAddDestination(TransferWorkbenchRow row, CourierAllocation allocation, string? role, PlaceLayout layout)
-    {
-        var choices = DestinationChoices(row, allocation);
-        if (choices.Length == 0)
-            return;
-        var rule = row.Rule;
-        BeginPlaceRow(row, role, layout);
-        const string label = "+ Add destination…";
-        ImGui.PushStyleColor(ImGuiCol.Text, QuartermasterPalette.Dim);
-        var clicked = ImGui.Selectable($"{label}##add-destination", false, ImGuiSelectableFlags.None, new Vector2(ImGui.CalcTextSize(label).X, 0));
-        ImGui.PopStyleColor();
-        var ruleId = rule.Id;
-        reviewRegistry.RegisterLastButton(
-            $"quartermaster.courier.destination.add.{ruleId:N}",
-            $"Choose a destination for {rule.ItemName}",
-            true,
-            () => pickerOpenRequest = ruleId,
-            "Available");
-        if (clicked || pickerOpenRequest == ruleId)
-        {
-            pickerOpenRequest = null;
-            pickerCharacter = null;
-            pickerContainer = default;
-            pickerClose = false;
-            ImGui.OpenPopup(DestinationPickerPopup);
-        }
-        DrawDestinationPicker(row, choices);
+        Source,
+        Destination,
     }
 
     /// <summary>
-    /// Picks a destination container: a character, then one of its containers with its free space and
-    /// units of the item, beside everything the highlighted container holds.
+    /// Containers a line can add as a source or destination, by character: none already listed on it.
+    /// Sources put the characters and containers holding the item first, most units first.
     /// </summary>
-    private void DrawDestinationPicker(TransferWorkbenchRow row, (OwnerScope Character, CourierContainer[] Containers)[] choices)
+    private (OwnerScope Character, CourierContainer[] Containers)[] PlaceChoices(TransferWorkbenchRow row, CourierAllocation allocation, PlaceRole role)
     {
-        if (!DalamudOwnedPopup.BeginOpaquePopup(DestinationPickerPopup))
+        var choices = courier.DestinationCharacters(row.Runtime)
+            .Select(character => (Character: character, Containers: courier.Containers(row.Runtime, character, row.Rule.ItemId, row.Rule.Quality)
+                .Where(container => !allocation.Places.Any(spot => spot.Retainer == container.Retainer && spot.Character.Matches(character)))
+                .ToArray()))
+            .Where(choice => choice.Containers.Length > 0);
+        if (role == PlaceRole.Source)
+            choices = choices
+                .Select(choice => (choice.Character, Containers: choice.Containers.OrderByDescending(container => container.Has ?? 0).ToArray()))
+                .OrderByDescending(choice => choice.Containers.Sum(container => (long)(container.Has ?? 0)));
+        return choices.ToArray();
+    }
+
+    /// <summary>The row that adds a source or a destination, opening the place picker for that role.</summary>
+    private void DrawAddPlace(TransferWorkbenchRow row, CourierAllocation allocation, PlaceRole role, string? roleLabel, PlaceLayout layout)
+    {
+        var choices = PlaceChoices(row, allocation, role);
+        if (choices.Length == 0)
             return;
+        var rule = row.Rule;
+        var source = role == PlaceRole.Source;
+        BeginPlaceRow(row, roleLabel, layout);
+        var label = source ? "+ Add source…" : "+ Add destination…";
+        ImGui.PushStyleColor(ImGuiCol.Text, QuartermasterPalette.Dim);
+        var clicked = ImGui.Selectable($"{label}##add-{(source ? "source" : "destination")}", false, ImGuiSelectableFlags.None,
+            new Vector2(ImGui.CalcTextSize(label).X, 0));
+        ImGui.PopStyleColor();
+        var ruleId = rule.Id;
+        reviewRegistry.RegisterLastButton(
+            $"quartermaster.courier.{(source ? "source" : "destination")}.add.{ruleId:N}",
+            $"Choose a {(source ? "source" : "destination")} for {rule.ItemName}",
+            true,
+            () =>
+            {
+                if (source)
+                    sourcePickerOpenRequest = ruleId;
+                else
+                    pickerOpenRequest = ruleId;
+            },
+            "Available");
+        var requested = source ? sourcePickerOpenRequest == ruleId : pickerOpenRequest == ruleId;
+        if (clicked || requested)
+        {
+            if (source)
+                sourcePickerOpenRequest = null;
+            else
+                pickerOpenRequest = null;
+            pickerCharacter = null;
+            pickerContainer = default;
+            pickerClose = false;
+            ImGui.OpenPopup(source ? SourcePickerPopup : DestinationPickerPopup);
+        }
+        DrawPlacePicker(row, role, choices);
+    }
+
+    /// <summary>
+    /// Picks a source or destination container: a character, then one of its containers with its free
+    /// space and units of the item, beside everything the highlighted container holds.
+    /// </summary>
+    private void DrawPlacePicker(TransferWorkbenchRow row, PlaceRole role, (OwnerScope Character, CourierContainer[] Containers)[] choices)
+    {
+        var source = role == PlaceRole.Source;
+        if (!DalamudOwnedPopup.BeginOpaquePopup(source ? SourcePickerPopup : DestinationPickerPopup))
+            return;
+        // Destination rows keep their original IDs; source rows mirror them under the source prefix.
+        var ids = source ? "quartermaster.courier.source.picker" : "quartermaster.courier.picker";
+        var roleName = source ? "source" : "destination";
         if (pickerClose)
         {
             pickerClose = false;
@@ -559,7 +533,7 @@ internal sealed partial class TransferPlanWorkspace
         }
         void Add(OwnerScope character, ulong? retainer)
         {
-            MutateCourierLine(row, line => line.WithDestination(character, retainer));
+            MutateCourierLine(row, line => source ? line.WithSource(character, retainer) : line.WithDestination(character, retainer));
             pickerClose = true;
         }
 
@@ -578,7 +552,7 @@ internal sealed partial class TransferPlanWorkspace
                     var picked = character.Matches(current.Character);
                     if (ImGui.Selectable($"{CourierSession.CharacterLabel(character)}##picker:{character.LocalContentId}", picked))
                         Choose(character);
-                    reviewRegistry.RegisterLastSelectable($"quartermaster.courier.picker.character.{character.LocalContentId}",
+                    reviewRegistry.RegisterLastSelectable($"{ids}.character.{character.LocalContentId}",
                         $"Show the containers of {character.CharacterName}", true, picked, () => Choose(character), picked ? "Selected" : "Available");
                 }
                 ImGui.EndCombo();
@@ -590,7 +564,7 @@ internal sealed partial class TransferPlanWorkspace
                 {
                     var character = choice.Character;
                     var picked = character.Matches(current.Character);
-                    reviewRegistry.RegisterLastSelectable($"quartermaster.courier.picker.character.{character.LocalContentId}",
+                    reviewRegistry.RegisterLastSelectable($"{ids}.character.{character.LocalContentId}",
                         $"Show the containers of {character.CharacterName}", true, picked, () => Choose(character), picked ? "Selected" : "Available");
                 }
             }
@@ -617,7 +591,7 @@ internal sealed partial class TransferPlanWorkspace
                             Add(character, retainer);
                     }
                     reviewRegistry.RegisterLastSelectable(
-                        $"quartermaster.courier.picker.container.{character.LocalContentId}.{retainer?.ToString(CultureInfo.InvariantCulture) ?? "bags"}",
+                        $"{ids}.container.{character.LocalContentId}.{retainer?.ToString(CultureInfo.InvariantCulture) ?? "bags"}",
                         $"Highlight {character.CharacterName} · {container.Name}",
                         true,
                         isHighlighted,
@@ -647,8 +621,8 @@ internal sealed partial class TransferPlanWorkspace
             var retainer = highlighted.Retainer;
             if (ImGui.Button(addLabel))
                 Add(character, retainer);
-            reviewRegistry.RegisterLastButton("quartermaster.courier.picker.add",
-                $"Add {character.CharacterName} · {highlighted.Name} as a destination of {rule.ItemName}", true,
+            reviewRegistry.RegisterLastButton($"{ids}.add",
+                $"Add {character.CharacterName} · {highlighted.Name} as a {roleName} of {rule.ItemName}", true,
                 () => Add(character, retainer), $"{character.CharacterName} · {highlighted.Name}");
             ImGui.Separator();
             if (ImGui.BeginTable("##picker-content-table", 2, ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY))
