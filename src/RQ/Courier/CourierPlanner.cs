@@ -170,8 +170,10 @@ public static class CourierPlanner
                 if (r.Routing.Consolidate && r.Routing.PreferredRetainerIds.Count > 0)
                     consolidations.Add(new(dst, r.Id, r.ItemId, r.ItemName, r.Quality, r.Routing.PreferredRetainerIds[0], size));
             }
-            var cap = Math.Min(testSlotCap ?? int.MaxValue, Math.Min(carrier?.FreeSlots ?? 0,
-                Math.Min(sourceBags?.Inventory.FreeSlots ?? 0, destBags?.Inventory.FreeSlots ?? 0)));
+            // Destination bag slots do not shorten a trip: the conductor splits the hand-in into batches that
+            // each fit and are stowed before the next, which beats an extra round trip. It still needs one slot.
+            var cap = (destBags?.Inventory.FreeSlots ?? 0) <= 0 ? 0 : Math.Min(testSlotCap ?? int.MaxValue,
+                Math.Min(carrier?.FreeSlots ?? 0, sourceBags?.Inventory.FreeSlots ?? 0));
             if (cap <= 0) foreach (var s in stacks.DistinctBy(s => s.Line)) refusals.Add(new(s.Line, s.Name, "BagSlotLimit",src.CharacterName,dst.CharacterName));
             else foreach (var batch in stacks.Chunk(cap)) trips.Add(new(src, dst, pickup!, drop!, [.. batch]));
         }

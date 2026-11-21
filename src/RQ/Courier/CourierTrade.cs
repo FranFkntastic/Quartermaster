@@ -86,8 +86,11 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                     game.WatchLate(d.Name,()=>sent.ObserveLateEvidence()!=null);
                 if(outcome==CourierOutcome.Indeterminate && receiver is {} received && code=="ReceiveDeadline")
                     game.WatchLate(d.Name,()=>{received.Tick(DateTimeOffset.UtcNow);return received.Evidence!=null;});
+                // Never opened only if no window was credited: a multi-window trade stopped after its first
+                // verified window has moved items, and must settle rather than read as never opened.
                 if(outcome==CourierOutcome.Cancelled && state!=null && !locked && !io.IsRemoteLocked && !io.IsTradeOpen &&
-                    state.Arm==null && state.Recovery.AwaitingVerification==null && !state.Recovery.CancellationPending)
+                    state.Arm==null && state.Recovery.AwaitingVerification==null && !state.Recovery.CancellationPending &&
+                    state.Items.Sum(i=>(long)i.Quantity)==state.Original.Sum(x=>(long)x.Units))
                 {state.PreLockCancelled=true;store.Save(state);}
                 sender?.Dispose();sender=null;receiver=null;locked=false;
                 if(state?.Recovery.CancellationPending!=true)RestoreTradeAutoConfirm();

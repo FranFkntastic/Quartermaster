@@ -112,7 +112,7 @@ public sealed class CourierRunTests : IDisposable
     {
         owner.FailPlacement=deposit;
         var result=await engine.StartAsync(Plan(),cfg);
-        Assert.False(result.CanClear);Assert.True(result.CanResume);
+        Assert.True(result.CanClear);Assert.True(result.CanResume);
         engine=Conductor();
         var resumed=await engine.StartAsync(Plan(),cfg);
         Assert.True(resumed.State=="Completed",resumed.Code+":"+resumed.Detail);
@@ -272,24 +272,29 @@ public sealed class CourierRunTests : IDisposable
             }
             Quantities[who] = Units + m.Sum(x => x.Units) + ReceiveOffset; return UncertainTrade ? Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate, "LockUnknown", "Missing locked partner evidence")) : OK(true); }
         public Task<Result<bool>> CancelPreLockAsync(Deadline d) => OK(true);
-        public Task<Result<int>> RetainerUnits(OwnerScope owner,Shipment s,bool deposit,Deadline d)=>OK(deposit?Deposited:100-Retrieved);
         public int Retrieved;
         public bool? FailPlacement;
-        readonly Dictionary<string,int> movements=[];
-        public int? JournalUnits(string id,OwnerScope owner,Shipment s)=>movements.GetValueOrDefault(id);
-        public Task<Result<bool>> MoveAsync(StowagePlan plan,Shipment s,bool deposit,IDisposable lease,Func<bool> auth,Deadline d,Action<string> recordOperation)
+        readonly Dictionary<string,(ImmutableArray<PlacementTally> Lines,string Status)> movements=[];
+        public ImmutableArray<PlacementTally>? JournalUnits(string id,OwnerScope owner)=>movements.TryGetValue(id,out var m)?m.Lines:null;
+        // A failing batch stops after one verified unit, journaled like the coordinator's lines.
+        public Task<Result<bool>> MoveBatchAsync(StowagePlan plan,ImmutableArray<Shipment> batch,bool deposit,IDisposable lease,Func<bool> auth,Deadline d,Action<string> recordOperation)
         {
-            Assert.True(auth()); Assert.Equal(plan.Owner, who); Assert.Equal(deposit ? 22ul : 11ul, deposit ? s.To : s.From);
+            Assert.True(auth()); Assert.Equal(plan.Owner, who); Assert.All(batch,s=>Assert.Equal(deposit ? 22ul : 11ul, deposit ? s.To : s.From));
             var id=Guid.NewGuid().ToString();recordOperation(id);
-            bool fail=FailPlacement==deposit;int n=fail?1:s.Units;movements[id]=n;if(!deposit)Retrieved+=n;
-            if(fail){FailPlacement=null;Quantities[who]=Units+(deposit?-n:n);if(deposit)Deposited+=n;
-                return Task.FromResult(Result<bool>.Fail("PlacementStopped","fixture"));}
-            Quantities[who] = Units + (deposit ? -s.Units : s.Units); if (deposit) Deposited += s.Units; return OK(true);
+            bool fail=FailPlacement==deposit;int n=fail?1:batch.Sum(s=>s.Units),left=n;
+            var lines=deposit
+                ? CourierPlacementBatch.Deposits(batch).Select(r=>(r.Line,r.Item,r.Hq,Units:r.Shipments.Sum(s=>s.Units)))
+                : batch.GroupBy(s=>(s.Item,s.Hq)).Select(g=>(g.First().Line,g.Key.Item,g.Key.Hq,Units:g.Sum(s=>s.Units)));
+            movements[id]=([..lines.Select(l=>{var u=Math.Min(left,l.Units);left-=u;return new PlacementTally(l.Line,l.Item,l.Hq,u);})],
+                fail?OperationStatuses.Failed:OperationStatuses.Succeeded);
+            Quantities[who]=Units+(deposit?-n:n);if(deposit)Deposited+=n;else Retrieved+=n;
+            if(fail){FailPlacement=null;return Task.FromResult(Result<bool>.Fail("PlacementStopped","fixture"));}
+            return OK(true);
         }
         public readonly List<OwnerScope> Consolidations = [];
         public Result<bool>? ConsolidationResult;
         public string? ConsolidationJournalStatus = OperationStatuses.Indeterminate;
-        public string? OperationStatus(string id, OwnerScope owner) => ConsolidationJournalStatus;
+        public string? OperationStatus(string id, OwnerScope owner) => movements.TryGetValue(id,out var m) ? m.Status : ConsolidationJournalStatus;
         public Task<Result<bool>> ConsolidateAsync(StowagePlan plan, ImmutableArray<CourierConsolidation> lines, IDisposable lease, Func<bool> auth, Deadline d, Action<string> recordOperation)
         {
             Assert.True(auth()); Assert.Equal(plan.Owner, who);
