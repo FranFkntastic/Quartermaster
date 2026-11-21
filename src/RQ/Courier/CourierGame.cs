@@ -384,7 +384,9 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 var pos=new Vector3(here.X,here.Y,here.Z);
                 if(walkingToShard)
                 {
-                    if(!shardIdle.Ready(this,true))return null;
+                    if(Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.Nav.PathfindInProgress") || !IdleCharacter())return null;
+                    // Stopped beside the shard: hop on this tick. Stopping short retries the walk after a settled pause.
+                    if(!(NearestShard(pos) is {} reached && Vector3.Distance(pos,reached.Position)<=10) && !shardIdle.Ready(this,true))return null;
                     walkingToShard=ownsPath=false;
                 }
                 if(!following && Vector3.Distance(pos,points[0].Position)>6)

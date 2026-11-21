@@ -5,12 +5,40 @@ using RQ.Planning;
 
 namespace RQ.Operations;
 
+/// <summary>Verified units one journal line moved: the line (null when the journal merged lines), item and quality.</summary>
+public sealed record PlacementTally(Guid? Line, uint Item, bool Hq, int Units);
+
+/// <summary>
+/// The one grouping both the placement port and the courier's resume settlement use, so a
+/// journaled operation can be attributed back to the shipments it served.
+/// </summary>
+public static class CourierPlacementBatch
+{
+    /// <summary>Retainer-sourced shipments per source retainer, in first-appearance order: one retrieval operation each.</summary>
+    public static ImmutableArray<(ulong Retainer, ImmutableArray<Shipment> Shipments)> Retrievals(ImmutableArray<Shipment> batch) =>
+        [.. batch.Where(s => s.From != null).GroupBy(s => s.From!.Value).Select(g => (g.Key, g.ToImmutableArray()))];
+    /// <summary>
+    /// Retainer-bound shipments per (line, item, quality, destination), in first-appearance order: one
+    /// deposit route each, so the single deposit operation's journal lines follow this order.
+    /// </summary>
+    public static ImmutableArray<(Guid Line, uint Item, bool Hq, ulong To, ImmutableArray<Shipment> Shipments)> Deposits(ImmutableArray<Shipment> batch) =>
+        [.. batch.Where(s => s.To != null).GroupBy(s => (s.Line, s.Item, s.Hq, To: s.To!.Value))
+            .Select(g => (g.Key.Line, g.Key.Item, g.Key.Hq, g.Key.To, g.ToImmutableArray()))];
+}
+
 public interface ICourierPlacementPort
 {
-    Task<Result<int>> RetainerUnits(OwnerScope owner,Shipment shipment,bool deposit,Deadline deadline);
-    int? JournalUnits(string operationId,OwnerScope owner,Shipment shipment);
+    /// <summary>Verified transfers per journal line, in line order; null if the operation is unknown or another owner's.</summary>
+    ImmutableArray<PlacementTally>? JournalUnits(string operationId, OwnerScope owner);
     string? OperationStatus(string operationId, OwnerScope owner);
-    Task<Result<bool>> MoveAsync(StowagePlan plan, Shipment shipment, bool deposit, IDisposable lease,
+    /// <summary>
+    /// Moves a whole trip batch inside one summoning-bell session. Retrieval runs one journaled
+    /// operation per source retainer (<see cref="CourierPlacementBatch.Retrievals"/>) and keeps the
+    /// retainer list open between them; deposit runs a single journaled operation over every
+    /// destination retainer. Each operation id is reported as soon as it is journaled.
+    /// Shipments with no retainer on that side only have their bag stock verified.
+    /// </summary>
+    Task<Result<bool>> MoveBatchAsync(StowagePlan plan, ImmutableArray<Shipment> batch, bool deposit, IDisposable lease,
         Func<bool> authorized, Deadline deadline, Action<string> recordOperation);
     /// <summary>
     /// Gathers each line's stray stacks on the logged-in plan owner's retainers into the line's
@@ -24,75 +52,104 @@ public interface ICourierPlacementPort
 
 public sealed partial class TransferCoordinator : ICourierPlacementPort
 {
-    async Task<Result<int>> ICourierPlacementPort.RetainerUnits(OwnerScope owner,Shipment shipment,bool deposit,Deadline deadline)
-    {
-        var id=deposit?shipment.To:shipment.From;
-        if (id==null)return Result<int>.Ok(0);
-        if(!SamePlacementOwner(owner) || !cache.Snapshot().TryGetValue(id.Value,out var ret) || !ret.Owner.Matches(owner))
-            return Result<int>.Fail("PlacementRetainerUnknown",shipment.Name);
-        using var cts=new CancellationTokenSource(deadline.Expires-DateTimeOffset.UtcNow);
-        await driver.RequireRetainerListAsync(cts.Token);
-        try {
-            await driver.OpenRetainerAsync(new(id.Value,ret.RetainerName,ret.ObservedAtUtc),cts.Token);
-            await driver.OpenInventoryAsync(cts.Token);
-            var stacks=await driver.ScanRetainerAsync(new HashSet<uint>{shipment.Item},cts.Token);
-            return SamePlacementOwner(owner)?Result<int>.Ok(stacks.Where(x=>x.ItemId==shipment.Item && x.IsHighQuality==shipment.Hq).Sum(x=>x.Quantity)):
-                Result<int>.Fail("PlacementOwnerChanged",shipment.Name);
-        } finally { await driver.CloseRetainerAsync(cts.Token);await driver.CloseRetainerListAsync(cts.Token); }
-    }
-    int? ICourierPlacementPort.JournalUnits(string id,OwnerScope owner,Shipment s) =>
-        journal.Get(id) is {} record && CourierPlanner.Exact(record.Owner,owner) && record.Lines.All(l=>l.SourceRuleId==s.Line && l.ItemId==s.Item) ?
-        record.Lines.Sum(l=>l.TransferredQuantity):null;
+    ImmutableArray<PlacementTally>? ICourierPlacementPort.JournalUnits(string id, OwnerScope owner) =>
+        journal.Get(id) is { } record && CourierPlanner.Exact(record.Owner, owner)
+            ? record.Lines.Select(l => new PlacementTally(l.SourceRuleId, l.ItemId, l.Quality == ItemQualityPolicy.HqOnly, l.TransferredQuantity)).ToImmutableArray()
+            : null;
     string? ICourierPlacementPort.OperationStatus(string id, OwnerScope owner) =>
         journal.Get(id) is { } record && CourierPlanner.Exact(record.Owner, owner) ? record.Status : null;
-    async Task<Result<bool>> ICourierPlacementPort.MoveAsync(StowagePlan plan, Shipment s, bool deposit,
+    async Task<Result<bool>> ICourierPlacementPort.MoveBatchAsync(StowagePlan plan, ImmutableArray<Shipment> batch, bool deposit,
         IDisposable lease, Func<bool> authorized, Deadline deadline, Action<string> recordOperation)
     {
+        if (batch.IsDefaultOrEmpty) return Result<bool>.Ok(true);
         using var cancel = new CancellationTokenSource(deadline.Expires - DateTimeOffset.UtcNow);
         bool Allowed() => authorized() && automation.Owns(lease) && SamePlacementOwner(plan.Owner) && !cancel.IsCancellationRequested;
-        if (!Allowed()) return Result<bool>.Fail("PlacementAuthorityLost", s.Name);
+        if (!Allowed()) return Result<bool>.Fail("PlacementAuthorityLost", string.Join(", ", batch.Select(s => s.Name).Distinct()));
         var bags = await driver.ReadPlacementBagsAsync(cancel.Token);
-        var held = bags.Stacks.Where(x => x.ItemId == s.Item && x.IsHighQuality == s.Hq).Sum(x => x.Quantity);
-        var quality = s.Hq ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly;
-        if ((deposit || s.From == null) && held < s.Units) return Result<bool>.Fail("BagStockShort", s.Name);
-        if ((deposit ? s.To : s.From) == null) return Result<bool>.Ok(true);
-        if (!Allowed()) return Result<bool>.Fail("PlacementAuthorityLost", s.Name);
-        string id;
-        TransferExecutionResult result;
-        if (!deposit)
+        int Held(uint item, bool hq) => bags.Stacks.Where(x => x.ItemId == item && x.IsHighQuality == hq).Sum(x => x.Quantity);
+        // Deposits leave from the bags; bag-sourced retrieval lines never touch a retainer but must already be held.
+        foreach (var need in batch.Where(s => deposit || s.From == null).GroupBy(s => (s.Item, s.Hq)))
+            if (Held(need.Key.Item, need.Key.Hq) < need.Sum(s => s.Units))
+                return Result<bool>.Fail("BagStockShort", need.First().Name);
+        return deposit
+            ? await DepositBatchAsync(plan, batch, lease, Allowed, Held, cancel, recordOperation)
+            : await RetrieveBatchAsync(plan, batch, lease, Allowed, cancel, recordOperation);
+    }
+    private async Task<Result<bool>> RetrieveBatchAsync(StowagePlan plan, ImmutableArray<Shipment> batch, IDisposable lease,
+        Func<bool> allowed, CancellationTokenSource cancel, Action<string> recordOperation)
+    {
+        var sources = CourierPlacementBatch.Retrievals(batch);
+        if (sources.IsEmpty) return Result<bool>.Ok(true);
+        var listUsed = false;
+        try
         {
-            var row = new TargetPlanItem
+            foreach (var (retainer, shipments) in sources)
             {
-                Id = s.Line,
-                StowagePlanId = plan.Id,
-                ItemId = s.Item,
-                ItemName = s.Name,
-                TargetQuantity = checked(held + s.Units),
-                Quality = quality
-            };
-            var leg = new PlacementLeg(Allowed, new Dictionary<(uint, ItemQualityPolicy), int> { [(s.Item, quality)] = held }, s.From, KeepListOpen: false);
-            id = journal.CreateTransferRetrieval(plan.Owner, plan, [row]).OperationId;
-            recordOperation(id);
-            result = await ExecuteRetrievalUnderLeaseAsync(id, lease, cancel.Token, leg);
+                if (!allowed()) return Result<bool>.Fail("PlacementAuthorityLost", shipments[0].Name);
+                // Earlier sources may have retrieved the same item: each leg's baseline is a fresh bag read.
+                var bags = await driver.ReadPlacementBagsAsync(cancel.Token);
+                var wanted = shipments.GroupBy(s => (s.Item, s.Hq)).Select(g =>
+                {
+                    var held = bags.Stacks.Where(x => x.ItemId == g.Key.Item && x.IsHighQuality == g.Key.Hq).Sum(x => x.Quantity);
+                    var quality = g.Key.Hq ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly;
+                    return (Quality: quality, Held: held, Row: new TargetPlanItem
+                    {
+                        Id = g.First().Line,
+                        StowagePlanId = plan.Id,
+                        ItemId = g.Key.Item,
+                        ItemName = g.First().Name,
+                        TargetQuantity = checked(held + g.Sum(s => s.Units)),
+                        Quality = quality,
+                    });
+                }).ToArray();
+                // KeepListOpen: the next source retainer reuses this bell session; the finally below closes it once.
+                var leg = new PlacementLeg(allowed, wanted.ToDictionary(w => (w.Row.ItemId, w.Quality), w => w.Held), retainer, KeepListOpen: true);
+                var id = journal.CreateTransferRetrieval(plan.Owner, plan, [.. wanted.Select(w => w.Row)]).OperationId;
+                recordOperation(id);
+                listUsed = true;
+                var result = await ExecuteRetrievalUnderLeaseAsync(id, lease, cancel.Token, leg);
+                var record = journal.Get(id);
+                if (!result.Started || record?.Status != OperationStatuses.Succeeded ||
+                    record.Lines.Sum(l => l.TransferredQuantity) != shipments.Sum(s => s.Units))
+                    return new(CourierOutcome.Indeterminate, "PlacementNotVerified", $"{shipments[0].Name}: {id}: {record?.Message ?? result.Message}");
+            }
+            return Result<bool>.Ok(true);
         }
-        else
+        finally
         {
-            var request = new StowageDepositRequest(plan.Id, s.Line, s.Item, s.Name, s.Hq, s.Units,
-                new() { PreferredRetainerIds = [s.To!.Value] }, s.To, s.StackSize);
-            var batch = StowageRouter.BuildBatch([request], cache.Snapshot(), plan.Owner, _ => s.StackSize, utcNow());
-            if (batch.PlannedQuantity != s.Units) return Result<bool>.Fail("DestinationFull", s.Name);
-            var leg = new PlacementLeg(Allowed, DepositFloors: new Dictionary<(uint, bool), (ItemQualityPolicy, int)>
+            if (listUsed)
             {
-                [(s.Item, s.Hq)] = (quality, held - s.Units)
-            }, KeepListOpen: false);
-            id = journal.CreateTransferDeposit(plan.Owner, plan, batch).OperationId;
-            recordOperation(id);
-            result = await ExecuteDepositUnderLeaseAsync(id, lease, cancel.Token, leg);
+                try { await driver.CloseRetainerListAsync(CancellationToken.None); }
+                catch (Exception) { /* A failed leg already released the session; nothing is in transit here. */ }
+            }
         }
+    }
+    private async Task<Result<bool>> DepositBatchAsync(StowagePlan plan, ImmutableArray<Shipment> batch, IDisposable lease,
+        Func<bool> allowed, Func<uint, bool, int> held, CancellationTokenSource cancel, Action<string> recordOperation)
+    {
+        var routes = CourierPlacementBatch.Deposits(batch);
+        if (routes.IsEmpty) return Result<bool>.Ok(true);
+        if (!allowed()) return Result<bool>.Fail("PlacementAuthorityLost", routes[0].Shipments[0].Name);
+        var sizes = routes.GroupBy(r => r.Item).ToDictionary(g => g.Key, g => Math.Max(1, g.Max(r => r.Shipments.Max(s => s.StackSize))));
+        var requests = routes.Select(r => new StowageDepositRequest(plan.Id, r.Line, r.Item, r.Shipments[0].Name, r.Hq,
+            r.Shipments.Sum(s => s.Units), new() { PreferredRetainerIds = [r.To] }, r.To, sizes[r.Item])).ToArray();
+        var built = StowageRouter.BuildBatch(requests, cache.Snapshot(), plan.Owner, item => sizes.GetValueOrDefault(item, 1), utcNow());
+        // Every route must fit whole: the journal's lines then follow CourierPlacementBatch.Deposits order exactly.
+        var unrouted = built.Routes.Where(r => r.RoutedQuantity != r.Request.Quantity).Select(r => r.Request.ItemName).ToArray();
+        if (built.Routes.Count != requests.Length || unrouted.Length > 0)
+            return Result<bool>.Fail("DestinationFull", string.Join(", ", unrouted));
+        // One floor per (item, quality): what stays in the bags once every route in this batch is stowed.
+        var floors = routes.GroupBy(r => (r.Item, r.Hq)).ToDictionary(g => g.Key,
+            g => (g.Key.Hq ? ItemQualityPolicy.HqOnly : ItemQualityPolicy.NqOnly, held(g.Key.Item, g.Key.Hq) - g.Sum(r => r.Shipments.Sum(s => s.Units))));
+        // The deposit core opens each destination retainer once and stows all of its stacks before moving on.
+        var leg = new PlacementLeg(allowed, DepositFloors: floors, KeepListOpen: false);
+        var id = journal.CreateTransferDeposit(plan.Owner, plan, built).OperationId;
+        recordOperation(id);
+        var result = await ExecuteDepositUnderLeaseAsync(id, lease, cancel.Token, leg);
         var record = journal.Get(id);
         return result.Started && record?.Status == OperationStatuses.Succeeded &&
-            record.Lines.Sum(l => l.TransferredQuantity) == s.Units ? Result<bool>.Ok(true) :
-            new(CourierOutcome.Indeterminate, "PlacementNotVerified", $"{s.Name}: {id}: {record?.Message ?? result.Message}");
+            record.Lines.Sum(l => l.TransferredQuantity) == requests.Sum(r => r.Quantity) ? Result<bool>.Ok(true) :
+            new(CourierOutcome.Indeterminate, "PlacementNotVerified", $"{routes[0].Shipments[0].Name}: {id}: {record?.Message ?? result.Message}");
     }
     async Task<Result<bool>> ICourierPlacementPort.ConsolidateAsync(StowagePlan plan, ImmutableArray<CourierConsolidation> lines,
         IDisposable lease, Func<bool> authorized, Deadline deadline, Action<string> recordOperation)

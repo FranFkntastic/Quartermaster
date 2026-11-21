@@ -12,8 +12,16 @@ public sealed record Result<T>(CourierOutcome Outcome, string Code, string Detai
 public sealed record Deadline(string Name, DateTimeOffset Expires)
 {
     // A return may lead into a housing ward only the carrier knows about, so it gets the ward budget.
-    internal static int PeerSeconds(MeetingBell? bell, CourierCommand command) =>
-        bell?.Ward != null || command == CourierCommand.ReturnHome ? 540 : 360;
+    // A trade step must outlive the carrier's whole multi-window trade plus its partner observation.
+    internal static int PeerSeconds(MeetingBell? bell, CourierCommand command, ImmutableArray<Shipment> manifest = default) =>
+        Math.Max(bell?.Ward != null || command == CourierCommand.ReturnHome ? 540 : 360,
+            command is CourierCommand.Send or CourierCommand.Receive ? TradeSeconds(manifest) + 120 : 0);
+    /// <summary>
+    /// One trade step may span several five-slot game windows (fragmented bag slots pack into
+    /// more), so its budget grows generously with the manifest instead of tearing the trade down per window.
+    /// </summary>
+    internal static int TradeSeconds(ImmutableArray<Shipment> manifest) =>
+        Math.Clamp((manifest.IsDefault ? 0 : manifest.Length) * 30, 180, 900);
     public static Deadline After(string name, int seconds) => new(name, DateTimeOffset.UtcNow.AddSeconds(seconds));
 }
 public enum CourierCommand { Status, Travel, Receive, Send, Confirm, ReturnHome, Stop, Begin, Finish, Settle, Clear, VerifySettlement, NotDelivered }

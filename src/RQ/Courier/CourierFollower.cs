@@ -169,7 +169,8 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                 case CourierCommand.Receive:
                 case CourierCommand.Send:
                     bool send = m.Command == CourierCommand.Send;
-                    if (m.Manifest.IsDefaultOrEmpty || m.Manifest.Length > 5 || m.Manifest.Any(s => s.Units <= 0 || s.Units > s.StackSize))
+                    // Any number of stacks: the trade runner packs them into successive five-slot windows.
+                    if (m.Manifest.IsDefaultOrEmpty || m.Manifest.Any(s => s.Units <= 0 || s.Units > s.StackSize))
                         return Refuse("InvalidManifest");
                     if (m.Manifest.Any(s => !CourierPlanner.Exact(m.Partner, send ? s.Destination : s.Source)))
                         return Refuse("ManifestPartnerMismatch");
@@ -187,7 +188,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                     CourierGame.TradeStarted.Value=()=>started?.Invoke(new(m.Run,m.Step,"TradeStarted"));
                     try
                     {
-                        await calls.Call("CarrierTrade", 120, d => send ? trade.SendAsync(m.Partner, m.Manifest, d) : trade.ReceiveAsync(m.Partner, m.Manifest, d));
+                        await calls.Call("CarrierTrade", Deadline.TradeSeconds(m.Manifest), d => send ? trade.SendAsync(m.Partner, m.Manifest, d) : trade.ReceiveAsync(m.Partner, m.Manifest, d));
                     }
                     catch (CourierFault fault) when (fault.Outcome == CourierOutcome.Cancelled)
                     {

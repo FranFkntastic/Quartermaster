@@ -15,7 +15,22 @@ public enum CourierPhase
     Consolidate
 }
 public sealed record CourierStep(CourierPhase Phase, int Trip, ImmutableArray<Shipment> Batch);
-public sealed record RunIntent(Guid Id, CourierStep Action, InventoryView OwnerBefore, InventoryView CarrierBefore, bool LocalMayHaveStarted=true,int? RetainerBefore=null,string? PlacementOperation=null);
+/// <param name="RetainerBefore">Legacy single-stack placement baseline; batched placement settles from the journal and bags.</param>
+/// <param name="PlacementOperation">Consolidation's operation id (and a legacy single-stack placement's).</param>
+/// <param name="PlacementOperations">A batched Retrieve/Deposit's journaled operations, in dispatch order
+/// (retrieval: one per <see cref="CourierPlacementBatch.Retrievals"/> source, deposit: one).</param>
+public sealed record RunIntent(Guid Id, CourierStep Action, InventoryView OwnerBefore, InventoryView CarrierBefore, bool LocalMayHaveStarted=true,int? RetainerBefore=null,string? PlacementOperation=null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)] ImmutableArray<string> PlacementOperations = default)
+{
+    internal ImmutableArray<string> Operations
+    {
+        get
+        {
+            var batched = PlacementOperations.IsDefault ? ImmutableArray<string>.Empty : PlacementOperations;
+            return PlacementOperation is { } legacy ? batched.Insert(0, legacy) : batched;
+        }
+    }
+}
 public sealed record HandOff(Guid Step, TradeEvidence? Owner, TradeEvidence? Carrier, bool BothTradesVerified,string? Disposition=null);
 public sealed class CourierJournal
 {
@@ -44,7 +59,19 @@ public sealed class CourierJournal
     /// Delivery still completes; the run then ends as ConsolidationLimited with these in its detail.
     /// </summary>
     public List<string> ConsolidationLimits { get; set; } = [];
+    /// <summary>
+    /// 0: a schedule written before batching (per-stack placement, carrier travels in CarrierToSource).
+    /// 1: batched placement and trades, carrier travels to the pickup during EnsureSource.
+    /// </summary>
+    public int ScheduleVersion { get; set; }
+    /// <summary>
+    /// A carrier travel or return dispatched in the background of owner-only steps, journaled before it is
+    /// sent. Until the step that needs the carrier settles it, it is re-sent with the same id (the carrier
+    /// resumes or replays its receipt), so an interrupted one never leaves the carrier an unsettled intent.
+    /// </summary>
+    public CourierCarrierMove? CarrierMove { get; set; }
 }
+public sealed record CourierCarrierMove(Guid Id, CourierCommand Command, OwnerScope Partner, MeetingBell? Bell);
 public sealed record LineProgress(Guid Line, string Name, int Moved, int Remaining, Shipment? Route = null, bool Nq = false, bool Hq = false);
 public sealed record CourierSnapshot(Guid Run, string State, string OwnerPhase, string CarrierPhase, int Trip, int Trips,
     string Code, string Detail, ImmutableArray<LineProgress> Lines, ImmutableArray<Refusal> Refusals,bool CanResume,bool CanClear,ImmutableArray<CustodyRow> Custody,
@@ -102,17 +129,18 @@ public sealed class CourierConductor
         for (int i = 0; i < r.Plan.Trips.Length; i++)
         {
             var trip = r.Plan.Trips[i];
+            // One bell session per side and one trade per hand-off: the placement port and the trade
+            // runner both work through the whole trip manifest without leaving the bell or the trade.
+            // Retrieve and Deposit stay even for bag-only manifests: they verify bag stock, Retrieve
+            // anchors the bag-slot split and Deposit credits delivery.
             yield return new(CourierPhase.EnsureSource, i, []);
-            foreach (var s in trip.Manifest) yield return new(CourierPhase.Retrieve, i, [s]);
+            yield return new(CourierPhase.Retrieve, i, trip.Manifest);
             yield return new(CourierPhase.CarrierToSource, i, []);
-            foreach (var b in trip.Manifest.Chunk(5)) yield return new(CourierPhase.HandOut, i, [.. b]);
+            yield return new(CourierPhase.HandOut, i, trip.Manifest);
             yield return new(CourierPhase.SwitchToDestination, i, []);
             yield return new(CourierPhase.CarrierToDestination, i, []);
-            foreach (var b in trip.Manifest.Chunk(5))
-            {
-                yield return new(CourierPhase.HandIn, i, [.. b]);
-                foreach (var s in b) yield return new(CourierPhase.Deposit, i, [s]);
-            }
+            yield return new(CourierPhase.HandIn, i, trip.Manifest);
+            yield return new(CourierPhase.Deposit, i, trip.Manifest);
             if (r.Plan.Consolidations.Any(c => CourierPlanner.Exact(c.Destination, trip.Destination)) &&
                 !r.Plan.Trips.Skip(i + 1).Any(later => CourierPlanner.Exact(later.Destination, trip.Destination)))
                 yield return new(CourierPhase.Consolidate, i, []);
@@ -123,6 +151,8 @@ public sealed class CourierConductor
     }
     /// <summary>Whether a phase runs inside a trip (before the closing returns), with the owner at a bell.</summary>
     private static bool InTrip(CourierPhase phase) => phase < CourierPhase.ReturnOwner || phase == CourierPhase.Consolidate;
+    /// <summary>Only an unsettled trade blocks clearing a stopped run; travel and local placement have no cross-account custody in limbo.</summary>
+    private static bool HasPendingTrade(CourierJournal r) => r.Pending?.Action.Phase is CourierPhase.HandOut or CourierPhase.HandIn;
     public CourierSnapshot Snapshot()=>Project(store.Load());
     private CourierSnapshot Project(CourierJournal r)
     {
@@ -131,7 +161,7 @@ public sealed class CourierConductor
         var attempt=pending?.Action.Phase switch {
             CourierPhase.HandOut or CourierPhase.HandIn => pending.LocalMayHaveStarted==false ||
                 trade is ICourierSettlement or ICourierDispatchEvidence || r.Evidence.Any(e=>e.Step==pending.Id && e.BothTradesVerified),
-            CourierPhase.Retrieve or CourierPhase.Deposit => pending.RetainerBefore!=null,
+            // Placement settles from its journaled operations and fresh bags; no retainer baseline is needed.
             CourierPhase.Finish => false,
             _=>true
         };
@@ -141,7 +171,7 @@ public sealed class CourierConductor
             [..r.Plan.Trips.SelectMany(t=>t.Manifest).GroupBy(s=>s.Line).Select(g=>new LineProgress(g.Key,g.First().Name,
                 r.Delivered.GetValueOrDefault(g.Key),g.Sum(s=>s.Units)-r.Delivered.GetValueOrDefault(g.Key),g.First(),g.Any(s=>!s.Hq),g.Any(s=>s.Hq)))], r.Plan.Refusals,
             connected && attempt && r.State is "Failed" or "Interrupted" or "Indeterminate",
-            (connected || r.Custody.IsEmpty) && r.Pending==null && r.State is "Completed" or "Failed" or "Interrupted" or "Indeterminate" or "Refused",Rows(r.Custody,r.Settings.Carrier),
+            (connected || r.Custody.IsEmpty) && !HasPendingTrade(r) && r.State is "Completed" or "Failed" or "Interrupted" or "Indeterminate" or "Refused",Rows(r.Custody,r.Settings.Carrier),
             Unverified(r),r.Plan.PlanId);
     }
     private static CourierUnverified? Unverified(CourierJournal r)
@@ -161,7 +191,7 @@ public sealed class CourierConductor
             var r=store.Load();
             if(r.Run!=expectedRun || r.State is not ("Completed" or "Failed" or "Interrupted" or "Indeterminate" or "Refused"))
                 throw new InvalidOperationException("RunNotClearable");
-            if(r.Pending!=null)
+            if(HasPendingTrade(r))
                 throw new InvalidOperationException("Settle the pending trade before clearing custody.");
             // Completed includes a durable empty-ledger Finish acknowledgement.
             CourierReceipt? receipt=null;
@@ -206,7 +236,7 @@ public sealed class CourierConductor
     {
         var step = id ?? Guid.NewGuid();
         var message = new CourierMessage(bell?.Ward != null ? 2 : 1, r.Run, step, type, r.Start, partner, r.Settings.Carrier!, manifest, bell, confirm, evidence,r.RunKey,carrierBaseline);
-        var reply = await calls.Call("Peer" + type, Deadline.PeerSeconds(bell, type), async d =>
+        var reply = await calls.Call("Peer" + type, Deadline.PeerSeconds(bell, type, manifest), async d =>
         {
             var result = await peer.SendAsync(message, d);
             if (result is { Outcome: not CourierOutcome.Succeeded, Value: { } receipt } && receipt.Run == r.Run && receipt.Step == step)
@@ -243,6 +273,28 @@ public sealed class CourierConductor
         void RemoteStop(Guid run) { if (run == r.Run) { stop = true; _ = CancelLocal(); } }
         void Progress(CourierProgress p) { if (p.Run == r.Run) peerPhase = p.Phase; }
         bool beginAttempted = false, existingRun=false;
+        // The carrier's gate serializes its commands, so while it travels in the background the owner sends it
+        // nothing: owner-only steps reuse the last verified carrier snapshot (its custody cannot change in transit).
+        Task<CourierReceipt>? carrierMove = null;
+        bool Moving() => carrierMove is { IsCompleted: false };
+        Task<CourierReceipt> Dispatch(CourierCarrierMove move)
+        {
+            var sent = Send(r, move.Command, move.Partner, [], move.Bell, id: move.Id);
+            // Observed here as well, so a move abandoned by a failed run never raises an unobserved exception.
+            _ = sent.ContinueWith(static x => _ = x.Exception, CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            return sent;
+        }
+        void Launch(CourierCarrierMove move) { r.CarrierMove = move; store.Save(r); carrierMove = Dispatch(move); }
+        // Waits for the journaled move (re-sending it on a resume) and returns it once the carrier has arrived.
+        async Task<CourierCarrierMove?> SettleMove()
+        {
+            if (r.CarrierMove is not { } move) return null;
+            var sent = carrierMove ?? Dispatch(move); carrierMove = null;
+            await sent;
+            r.CarrierMove = null; store.Save(r);
+            return move;
+        }
         IDisposable? lease = null, tradeHold = null; AutoRetainerSuppression.Scope? suppress = null;
         void ReleaseOwner()
         {
@@ -320,11 +372,11 @@ public sealed class CourierConductor
                         else
                         {
                             var action=uncertain.Action;
-                            var after=r.Cursor+1+(sign==1 ? action.Batch.Length : 0);
+                            var after=r.Cursor+1+(sign==1 ? DepositsFor(r.Schedule,r.Cursor,action.Batch) : 0);
                             var next=new List<CourierStep>();
-                            if(sign==1)foreach(var unit in moved)next.Add(new(CourierPhase.Deposit,action.Trip,[unit]));
+                            if(sign==1)next.Add(new(CourierPhase.Deposit,action.Trip,moved));
                             next.Add(action with {Batch=rest});
-                            if(sign==1)foreach(var unit in rest)next.Add(new(CourierPhase.Deposit,action.Trip,[unit]));
+                            if(sign==1)next.Add(new(CourierPhase.Deposit,action.Trip,rest));
                             r.Schedule=[..r.Schedule.Take(r.Cursor),..next,..r.Schedule.Skip(after)];
                         }
                         r.Pending=null;store.Save(r);
@@ -355,20 +407,10 @@ public sealed class CourierConductor
                 }
                 if(r.Pending is {Action.Phase:CourierPhase.Retrieve or CourierPhase.Deposit} move)
                 {
-                    var s=move.Action.Batch.Single();bool deposit=move.Action.Phase==CourierPhase.Deposit;
                     if(!CourierPlanner.Exact(owner.Character,move.OwnerBefore.Character) || !Agrees(move.CarrierBefore,carrier,r) ||
                         !Custody.Covers(status.Custody,r.Custody) || !Custody.Covers(r.Custody,status.Custody))
                         throw Fault("PlacementSettlementIdentity","Placement owner, carrier or custody changed.");
-                    int delta=(deposit?-1:1)*(owner.Count(s.Item,s.Hq)-move.OwnerBefore.Count(s.Item,s.Hq));
-                    var ret=await calls.Call("PlacementSettlementRetainer",90,d=>placement.RetainerUnits(owner.Character,s,deposit,d));
-                    var recorded=move.PlacementOperation==null?0:placement.JournalUnits(move.PlacementOperation,owner.Character,s);
-                    if(delta<0 || delta>s.Units || recorded==null || recorded>delta || (move.PlacementOperation==null && delta!=0) || move.RetainerBefore is not {} baseline ||
-                        (deposit?1:-1)*(ret-baseline)!=delta ||
-                        !Custody.Matches(new(move.OwnerBefore,owner),owner.Character,[s with {Units=Math.Max(1,delta)}],delta==0?0:deposit?-1:1))
-                        throw Fault("PlacementSettlementMismatch","Bag, retainer and placement journal must agree.");
-                    if(deposit)r.Delivered[s.Line]=checked(r.Delivered.GetValueOrDefault(s.Line)+delta);
-                    if(delta==s.Units)r.Cursor++;
-                    else r.Schedule=r.Schedule.SetItem(r.Cursor,move.Action with {Batch=[s with {Units=s.Units-delta}]});
+                    SettlePlacement(r,move,owner);
                     r.OwnerCheckpoint=owner;r.CarrierCheckpoint=carrier;r.Pending=null;store.Save(r);
                 }
                 if (r.Pending is { Action.Phase: CourierPhase.Consolidate } con)
@@ -413,7 +455,7 @@ public sealed class CourierConductor
                     || (!travel && !unstartedTrade && r.Cursor != 0 && (!Agrees(r.OwnerCheckpoint, owner, r) || !Agrees(r.CarrierCheckpoint, carrier, r))))
                     throw Fault("ResumeUnsettled", "Journal intent, ledger or bags cannot prove a forward checkpoint.");
             }
-            if (r.Schedule.IsEmpty) r.Schedule = [.. Steps(r)];
+            if (r.Schedule.IsEmpty) { r.Schedule = [.. Steps(r)]; r.ScheduleVersion = 1; }
             // Begin may succeed on the peer even if its acknowledgement is lost.
             if(stop)throw new CourierFault(CourierOutcome.Cancelled,"StopBeforeBegin","Begin was not dispatched.");
             r.State = "Running"; r.Code=r.Detail=""; store.Save(r); beginAttempted = true;
@@ -425,10 +467,23 @@ public sealed class CourierConductor
                 (trade as ICourierHoldPort)?.CheckHold();
                 if (stop) throw new CourierFault(CourierOutcome.Cancelled, "StopRequested", "Stopped at verified checkpoint.");
                 var s = steps[r.Cursor]; var t = r.Plan.Trips[s.Trip];
+                bool ownerOnly = s.Phase is CourierPhase.EnsureSource or CourierPhase.Retrieve or CourierPhase.Deposit
+                    or CourierPhase.Consolidate or CourierPhase.ReturnOwner;
+                // CarrierToSource and ReturnCarrier settle the move themselves; any other carrier step needs it settled first.
+                if (r.CarrierMove != null && !ownerOnly && s.Phase is not (CourierPhase.CarrierToSource or CourierPhase.ReturnCarrier))
+                    await SettleMove();
+                else if (r.CarrierMove is { } resumed && carrierMove == null && ownerOnly)
+                    carrierMove = Dispatch(resumed); // A resumed run sets the carrier off again behind the owner.
                 if (InTrip(s.Phase) || r.Code=="")owner=await Observe();
-                status = await Send(r, CourierCommand.Status, r.Start, []);
-                carrier = status.Bags ?? throw Fault("CarrierBagsMissing", "Missing before snapshot");
-                if (s.Phase == CourierPhase.Retrieve && steps[r.Cursor - 1].Phase == CourierPhase.EnsureSource && s.Batch[0]==t.Manifest[0])
+                if (!Moving())
+                {
+                    status = await Send(r, CourierCommand.Status, r.Start, []);
+                    carrier = status.Bags ?? throw Fault("CarrierBagsMissing", "Missing before snapshot");
+                }
+                // A trip's bag slots are re-checked once, before anything of it is retrieved. A resumed,
+                // partly retrieved batch is never the whole manifest, so it cannot re-split the trip.
+                if (s.Phase == CourierPhase.Retrieve && steps[r.Cursor - 1].Phase == CourierPhase.EnsureSource &&
+                    (r.ScheduleVersion == 0 ? s.Batch[0] == t.Manifest[0] : s.Batch.SequenceEqual(t.Manifest)))
                 {
                     var cap = Math.Min(carrier.FreeSlots, owner.FreeSlots);
                     if (cap <= 0) throw new CourierFault(CourierOutcome.Failed, "BagSlotLimit", "No free slot for the next trip.");
@@ -444,54 +499,31 @@ public sealed class CourierConductor
                 }
                 if (s.Phase == CourierPhase.HandIn && owner.FreeSlots < s.Batch.Length)
                 {
+                    // Hand in retainer-bound stacks before bag-bound ones so each Deposit frees slots for the next batch.
+                    var ordered = s.Batch.Any(x => x.To == null) && s.Batch.Any(x => x.To != null)
+                        ? [.. s.Batch.Where(x => x.To != null), .. s.Batch.Where(x => x.To == null)]
+                        : s.Batch;
                     int count = 0, slots = owner.FreeSlots;
-                    foreach (var unit in s.Batch)
+                    foreach (var unit in ordered)
                     {
                         // A partial stack can take a whole manifest slot without consuming a free bag slot.
-                        var held = owner.Count(unit.Item, unit.Hq) + s.Batch.Take(count).Where(x => x.Item == unit.Item && x.Hq == unit.Hq).Sum(x => x.Units);
+                        var held = owner.Count(unit.Item, unit.Hq) + ordered.Take(count).Where(x => x.Item == unit.Item && x.Hq == unit.Hq).Sum(x => x.Units);
                         if ((unit.StackSize - held % unit.StackSize) % unit.StackSize < unit.Units && --slots < 0) break;
                         count++;
                     }
                     if (count == 0) throw new CourierFault(CourierOutcome.Failed, "DestinationBagsFull", "Cannot accept the next custody stack.");
-                    if (count < s.Batch.Length)
+                    if (count < ordered.Length)
                     {
-                        var deposits = steps.Skip(r.Cursor + 1).Take(s.Batch.Length).ToArray();
-                        steps = r.Schedule = [..steps.Take(r.Cursor),s with {Batch=s.Batch[..count]},..deposits.Take(count),
-                            s with {Batch=s.Batch[count..]},..deposits.Skip(count),..steps.Skip(r.Cursor+1+s.Batch.Length)];
+                        // Hand in what fits, stow it in one bell session, then hand in the rest.
+                        var deposits = DepositsFor(steps, r.Cursor, s.Batch);
+                        ImmutableArray<Shipment> head = ordered[..count], tail = ordered[count..];
+                        steps = r.Schedule = [..steps.Take(r.Cursor), s with {Batch=head}, new(CourierPhase.Deposit, s.Trip, head),
+                            s with {Batch=tail}, new(CourierPhase.Deposit, s.Trip, tail), ..steps.Skip(r.Cursor+1+deposits)];
                         s = steps[r.Cursor]; store.Save(r);
                     }
                 }
-                if (s.Phase is CourierPhase.HandOut or CourierPhase.HandIn)
-                {
-                    // Five manifest rows need not fit one window: one row can draw from many
-                    // fragmented bag slots. Credit each game window before allowing another.
-                    var stock=(s.Phase==CourierPhase.HandOut?owner:carrier).Stock;
-                    var batch=s.Batch;
-                    int Slots(IEnumerable<Shipment> lines)=>lines.GroupBy(x=>(x.Item,x.Hq)).Sum(g=>{
-                        var n=g.Sum(x=>x.Units);var count=0;
-                        foreach(var slot in stock.Where(x=>x.ItemId==g.Key.Item && x.Hq==g.Key.Hq && x.Units>0))
-                        {count++;n-=slot.Units;if(n<=0)break;}
-                        return count;
-                    });
-                    if(Slots(batch)>5)
-                    {
-                        var first=batch[0];
-                        var qty=Math.Min(first.Units,stock.Where(x=>x.ItemId==first.Item && x.Hq==first.Hq && x.Units>0)
-                            .Take(5).Sum(x=>x.Units));
-                        if(qty<=0)throw Fault("SenderStockShort",first.Name);
-                        ImmutableArray<Shipment> head=[first with {Units=qty}];
-                        var tail=batch.RemoveAt(0);
-                        if(qty<first.Units)tail=tail.Insert(0,first with {Units=first.Units-qty});
-                        IEnumerable<CourierStep> Window(ImmutableArray<Shipment> part)
-                        {
-                            yield return s with {Batch=part};
-                            if(s.Phase==CourierPhase.HandIn)foreach(var unit in part)yield return new(CourierPhase.Deposit,s.Trip,[unit]);
-                        }
-                        var suffix=r.Cursor+1+(s.Phase==CourierPhase.HandIn?batch.Length:0);
-                        steps=r.Schedule=[..steps.Take(r.Cursor),..Window(head),..Window(tail),..steps.Skip(suffix)];
-                        s=steps[r.Cursor];store.Save(r);
-                    }
-                }
+                // No five-slot pre-split: one trade step runs every window back to back (the trade runner
+                // packs fragmented bag slots into successive windows and credits each before the next).
                 if (!CourierPlanner.Exact(carrier.Character, r.Settings.Carrier) ||
                     !Custody.Covers(status.Custody, r.Custody) || !Custody.Covers(r.Custody, status.Custody))
                     throw Fault("CustodyMismatch", "Carrier identity or custody changed.");
@@ -500,12 +532,8 @@ public sealed class CourierConductor
                     s.Phase is CourierPhase.Deposit or CourierPhase.CarrierToDestination or CourierPhase.HandIn or CourierPhase.Consolidate &&
                     !CourierPlanner.Exact(owner.Character, t.Destination)) throw Fault("OwnerIdentityMismatch", owner.Character.CharacterName);
                 if (stop) throw new CourierFault(CourierOutcome.Cancelled,"StopRequested","Stopped before dispatch.");
+                // Placement needs no retainer baseline: a resume settles it from the journal and the bags.
                 var intent=r.Pending ?? new(Guid.NewGuid(),s,owner,carrier);
-                if (s.Phase is CourierPhase.Retrieve or CourierPhase.Deposit)
-                {
-                    var qty=await calls.Call("PlacementBaselineRetainer",90,d=>placement.RetainerUnits(owner.Character,s.Batch.Single(),s.Phase==CourierPhase.Deposit,d));
-                    intent=intent with {RetainerBefore=qty,OwnerBefore=await Observe()};
-                }
                 if (s.Phase is not (CourierPhase.HandOut or CourierPhase.HandIn)) { r.Pending=intent; store.Save(r); }
                 CourierGame.Step.Value = intent.Id;
                 CourierGame.CanContinue.Value=()=>!stop && !unloaded;
@@ -514,6 +542,13 @@ public sealed class CourierConductor
                 switch (s.Phase)
                 {
                     case CourierPhase.EnsureSource:
+                        // The carrier heads for the pickup in the background while the owner switches, reaches it
+                        // and retrieves; CarrierToSource waits for it. It may already have set out after the previous
+                        // trip's last hand-in, or be there when that trip dropped off at the same bell.
+                        if (r.CarrierMove is { } earlier && !(earlier.Command == CourierCommand.Travel && earlier.Bell?.SamePlace(t.Pickup) == true))
+                            await SettleMove();
+                        if (r.CarrierMove == null && !(s.Trip > 0 && t.Pickup.SamePlace(r.Plan.Trips[s.Trip - 1].Dropoff)))
+                            Launch(new(Guid.NewGuid(), CourierCommand.Travel, t.Source, t.Pickup));
                         await Switch(t.Source); await Meet(t.Pickup); break;
                     case CourierPhase.SwitchToDestination:
                         // Both legs are authorized by this single persisted rendezvous intent.
@@ -522,7 +557,13 @@ public sealed class CourierConductor
                             Send(r, CourierCommand.Travel, t.Destination, [], t.Dropoff,id:intent.Id)); break;
                     case CourierPhase.CarrierToSource:
                     case CourierPhase.CarrierToDestination:
-                        if (s.Phase == CourierPhase.CarrierToSource) await Send(r, CourierCommand.Travel, owner.Character, [], t.Pickup,id:intent.Id);
+                        // The carrier set out for the pickup in the background (in EnsureSource, or after the previous
+                        // trip's last hand-in). A pre-batching schedule, or a resume whose move already settled, sends
+                        // it here; a carrier already at the bell arrives on the first tick.
+                        if (s.Phase == CourierPhase.CarrierToSource &&
+                            !(await SettleMove() is { Command: CourierCommand.Travel, Bell: { } went } && went.SamePlace(t.Pickup)) &&
+                            !(s.Trip > 0 && t.Pickup.SamePlace(r.Plan.Trips[s.Trip - 1].Dropoff)))
+                            await Send(r, CourierCommand.Travel, owner.Character, [], t.Pickup,id:intent.Id);
                         await calls.Call("Rendezvous", 30, d => bells.ObserveTradeableAsync(r.Settings.Carrier!, d));
                         break;
                     case CourierPhase.HandOut:
@@ -539,9 +580,16 @@ public sealed class CourierConductor
                         break;
                     case CourierPhase.Retrieve:
                     case CourierPhase.Deposit:
-                        var unit = s.Batch.Single(); bool deposit = s.Phase == CourierPhase.Deposit;
-                        await calls.Call("CourierPlacement", 180, d => placement.MoveAsync(new() { Id = r.Plan.PlanId, Revision = r.Plan.Revision, Owner = owner.Character },
-                            unit, deposit, lease!, () => !stop && automation.Owns(lease), d,id=>{r.Pending=intent with {PlacementOperation=id};store.Save(r);}));
+                        bool deposit = s.Phase == CourierPhase.Deposit;
+                        // The whole batch moves in one bell session, so its budget scales with the stacks.
+                        await calls.Call("CourierPlacement", Math.Clamp(s.Batch.Length * 30, 180, 900), d => placement.MoveBatchAsync(
+                            new() { Id = r.Plan.PlanId, Revision = r.Plan.Revision, Owner = owner.Character },
+                            s.Batch, deposit, lease!, () => !stop && automation.Owns(lease), d, id =>
+                            {
+                                var held = r.Pending ?? intent;
+                                r.Pending = held with { PlacementOperations = (held.PlacementOperations.IsDefault ? ImmutableArray<string>.Empty : held.PlacementOperations).Add(id) };
+                                store.Save(r);
+                            }));
                         break;
                     case CourierPhase.Consolidate:
                         await ConsolidateAsync(r, intent, t.Destination, owner.Character, lease!);
@@ -550,16 +598,27 @@ public sealed class CourierConductor
                     case CourierPhase.ReturnCarrier:
                         try
                         {
-                            if(s.Phase==CourierPhase.ReturnOwner)await Switch(r.Start);
-                            else await Send(r,CourierCommand.ReturnHome,r.Start,[],id:intent.Id);
+                            if(s.Phase==CourierPhase.ReturnOwner)
+                            {
+                                // A run resumed here has not sent the carrier home yet: it returns alongside the owner.
+                                if(r.CarrierMove==null && r.Custody.IsEmpty && status.Custody.IsEmpty && status.Unconfirmed==null &&
+                                    steps.Skip(r.Cursor+1).Any(x=>x.Phase==CourierPhase.ReturnCarrier))
+                                    Launch(new(Guid.NewGuid(),CourierCommand.ReturnHome,r.Start,null));
+                                await Switch(r.Start);
+                            }
+                            // The carrier usually set off home after the last hand-in, while the owner stowed and returned.
+                            else if(await SettleMove() is not {Command:CourierCommand.ReturnHome})
+                                await Send(r,CourierCommand.ReturnHome,r.Start,[],id:intent.Id);
                         }
                         catch(CourierFault fault) when (!stop && !unloaded && fault.Outcome!=CourierOutcome.Cancelled &&
                             r.Custody.IsEmpty && status.Custody.IsEmpty && status.Unconfirmed==null &&
                             r.Plan.Trips.SelectMany(trip=>trip.Manifest).GroupBy(x=>x.Line)
                                 .All(g=>r.Delivered.GetValueOrDefault(g.Key)==g.Sum(x=>x.Units)))
                         {
-                            finished=await Send(r,CourierCommand.Status,r.Start,[]);
-                            if(!finished.Custody.IsEmpty || finished.Unconfirmed!=null)
+                            // A carrier still returning holds the custody it held when it set off: empty, as checked above.
+                            if(s.Phase==CourierPhase.ReturnCarrier)r.CarrierMove=null; // The failed return is abandoned, as before.
+                            finished=Moving() ? null : await Send(r,CourierCommand.Status,r.Start,[]);
+                            if(finished is {} fresh && (!fresh.Custody.IsEmpty || fresh.Unconfirmed!=null))
                                 throw Fault("ReturnCustodyUnsettled","Carrier reported custody or an unconfirmed hand-off after the return failed.");
                             r.Code=fault.Code;
                             r.Detail+=(r.Detail.Length==0?"":"; ")+$"{s.Phase}: {fault.Code}: {fault.Message}";
@@ -580,11 +639,30 @@ public sealed class CourierConductor
                 else
                 {
                     if(InTrip(s.Phase) || r.Code=="")r.OwnerCheckpoint = await Observe();
-                    r.CarrierCheckpoint = finished?.Bags ?? (s.Phase == CourierPhase.Finish ? r.CarrierCheckpoint :
+                    r.CarrierCheckpoint = finished?.Bags ?? (s.Phase == CourierPhase.Finish ? r.CarrierCheckpoint : Moving() ? carrier :
                         (await Send(r, CourierCommand.Status, r.Start, [])).Bags);
                 }
-                if(s.Phase==CourierPhase.Deposit){var unit=s.Batch.Single();r.Delivered[unit.Line]=checked(r.Delivered.GetValueOrDefault(unit.Line)+unit.Units);}
+                if(s.Phase==CourierPhase.Deposit)
+                    foreach(var shipped in s.Batch)r.Delivered[shipped.Line]=checked(r.Delivered.GetValueOrDefault(shipped.Line)+shipped.Units);
                 r.Pending = null; r.Cursor++; store.Save(r);
+                // The trip's last hand-in frees the carrier (a bag-slot split leaves custody for the next one): it sets
+                // out for the next trip's pickup, or home, while the owner deposits, consolidates and returns.
+                if (s.Phase == CourierPhase.HandIn && r.Custody.IsEmpty && r.CarrierMove == null && !stop)
+                {
+                    CourierCarrierMove? next = s.Trip + 1 < r.Plan.Trips.Length
+                        ? r.Plan.Trips[s.Trip + 1] is var following && !following.Pickup.SamePlace(t.Dropoff)
+                            ? new(Guid.NewGuid(), CourierCommand.Travel, following.Source, following.Pickup) : null
+                        : steps.Skip(r.Cursor).Any(x => x.Phase == CourierPhase.ReturnCarrier)
+                            ? new(Guid.NewGuid(), CourierCommand.ReturnHome, r.Start, null) : null;
+                    if (next != null)
+                    {
+                        // The snapshot the owner-only steps reuse while the carrier is away.
+                        status = await Send(r, CourierCommand.Status, r.Start, []);
+                        carrier = status.Bags ?? throw Fault("CarrierBagsMissing", "Missing before the carrier set out.");
+                        if (status.Unconfirmed == null && Custody.Covers(status.Custody, r.Custody) && Custody.Covers(r.Custody, status.Custody))
+                            Launch(next);
+                    }
+                }
             }
             r.State = "Completed";
             if (r.ConsolidationLimits.Count > 0)
@@ -603,6 +681,11 @@ public sealed class CourierConductor
             if(!existingRun && !beginAttempted)return Project(r) with {CanResume=false,CanClear=false};
             store.Save(r);
             if (r.PeerClaimed || beginAttempted) try { await Send(r, CourierCommand.Stop, r.Start, []); } catch (Exception cleanup) { warning(cleanup.Message); }
+            // Stop reaches the carrier ahead of its command queue and cancels a background move; the move stays
+            // journaled so a resume re-sends it under the same id. Its fault is observed at dispatch.
+            if (Interlocked.Exchange(ref carrierMove, null) is { } abandoned &&
+                await Task.WhenAny(abandoned, Task.Delay(TimeSpan.FromSeconds(15))) != abandoned)
+                warning($"{r.Run} CarrierMoveStopDeadline: 15s elapsed after Stop.");
         }
         finally { peer.LinkLost -= Lost; peer.Progress -= Progress; peer.StopRequested -= RemoteStop; calls.WhenSettled(() => { try { ReleaseOwner(); } finally { Volatile.Write(ref releaseOwner,null);gate.Release(); } }); }
         return Snapshot();
@@ -634,6 +717,99 @@ public sealed class CourierConductor
             r.ConsolidationLimits.Add(prefix + $"{fault.Code}: {fault.Message}");
             warning($"{r.Run}/{intent.Id} ConsolidationLimited {destination.CharacterName} {fault.Code}: {fault.Message}");
         }
+    }
+    /// <summary>
+    /// Settles an interrupted Retrieve or Deposit from its journaled operations and the owner's fresh
+    /// bags, never by replaying it. Every journaled operation must be settled (never indeterminate),
+    /// and for every item and quality the journal's verified transfers must equal the bag delta, with
+    /// nothing unrelated changed. Verified units are credited; only the unmoved remainder stays scheduled.
+    /// </summary>
+    private void SettlePlacement(CourierJournal r, RunIntent move, InventoryView owner)
+    {
+        var batch=move.Action.Batch; bool deposit=move.Action.Phase==CourierPhase.Deposit; int sign=deposit?-1:1;
+        CourierFault Mismatch(string detail)=>Fault("PlacementSettlementMismatch",$"Bags and placement journal must agree: {detail}");
+        var tallies=new List<ImmutableArray<PlacementTally>>();
+        var journaled=new Dictionary<(uint Item,bool Hq),long>();
+        foreach(var op in move.Operations)
+        {
+            var state=placement.OperationStatus(op,owner.Character);
+            // Accepted never started; every other settled status carries only verified transfers.
+            if(state is null || state==OperationStatuses.Indeterminate || state!=OperationStatuses.Accepted && !OperationStatuses.IsTerminal(state) ||
+                placement.JournalUnits(op,owner.Character) is not {} units)
+                throw Mismatch($"operation {op} is {state ?? "unknown"}.");
+            tallies.Add(units);
+            foreach(var t in units)journaled[(t.Item,t.Hq)]=journaled.GetValueOrDefault((t.Item,t.Hq))+t.Units;
+        }
+        bool Moves(Shipment s)=>deposit ? s.To!=null : s.From!=null;
+        foreach(var (item,hq) in move.OwnerBefore.Stock.Concat(owner.Stock).Select(x=>(x.ItemId,x.Hq))
+            .Concat(batch.Select(s=>(s.Item,s.Hq))).Concat(journaled.Keys).Distinct())
+        {
+            long seen=sign*((long)owner.Count(item,hq)-move.OwnerBefore.Count(item,hq));
+            long movable=batch.Where(s=>Moves(s) && s.Item==item && s.Hq==hq).Sum(s=>(long)s.Units);
+            long recorded=journaled.GetValueOrDefault((item,hq));
+            if(seen<0 || seen>movable || seen!=recorded)
+                throw Mismatch($"item {item}{(hq?" HQ":"")}: bags moved {seen}, journal {recorded}, scheduled {movable}.");
+        }
+        var moved=new List<Shipment>(); var rest=new List<Shipment>();
+        void Allocate(IEnumerable<Shipment> shipments,long units)
+        {
+            foreach(var s in shipments)
+            {
+                var n=(int)Math.Min(s.Units,units); units-=n;
+                if(n>0)moved.Add(s with {Units=n});
+                if(n<s.Units)rest.Add(s with {Units=s.Units-n});
+            }
+            if(units!=0)throw Mismatch("journaled units exceed the shipments they served.");
+        }
+        if(deposit)
+        {
+            // One deposit operation; its journal lines follow CourierPlacementBatch.Deposits order.
+            var routes=CourierPlacementBatch.Deposits(batch);
+            var lines=tallies.Count switch { 0 => ImmutableArray<PlacementTally>.Empty, 1 => tallies[0], _ => throw Mismatch("a deposit batch journals one operation.") };
+            if(!lines.IsEmpty && lines.Length!=routes.Length)throw Mismatch("deposit journal lines differ from the batch routes.");
+            for(int i=0;i<routes.Length;i++)
+            {
+                var route=routes[i];
+                if(!lines.IsEmpty && (lines[i].Item!=route.Item || lines[i].Hq!=route.Hq || lines[i].Line is {} line && line!=route.Line))
+                    throw Mismatch("deposit journal lines differ from the batch routes.");
+                Allocate(route.Shipments,lines.IsEmpty?0:lines[i].Units);
+            }
+        }
+        else
+        {
+            // One retrieval operation per source retainer, journaled in CourierPlacementBatch.Retrievals order.
+            var sources=CourierPlacementBatch.Retrievals(batch);
+            if(tallies.Count>sources.Length)throw Mismatch("more retrieval operations than source retainers.");
+            for(int i=0;i<sources.Length;i++)
+            {
+                var units=i<tallies.Count?tallies[i]:ImmutableArray<PlacementTally>.Empty;
+                var keys=sources[i].Shipments.Select(s=>(s.Item,s.Hq)).ToHashSet();
+                if(units.Any(t=>t.Units>0 && !keys.Contains((t.Item,t.Hq))))throw Mismatch("a retrieval journaled an item its source did not supply.");
+                foreach(var group in sources[i].Shipments.GroupBy(s=>(s.Item,s.Hq)))
+                    Allocate(group,units.Where(t=>t.Item==group.Key.Item && t.Hq==group.Key.Hq).Sum(t=>(long)t.Units));
+            }
+        }
+        if(moved.Count==0)return; // Nothing moved: the step runs again as scheduled.
+        // Bag-only shipments need no retainer: a deposit that moved anything has settled them too.
+        if(deposit)foreach(var s in moved.Concat(batch.Where(s=>!Moves(s))))
+            r.Delivered[s.Line]=checked(r.Delivered.GetValueOrDefault(s.Line)+s.Units);
+        if(rest.Count==0)r.Cursor++;
+        else r.Schedule=r.Schedule.SetItem(r.Cursor,move.Action with {Batch=[..rest]});
+    }
+    /// <summary>
+    /// The Deposit steps right after the hand-in at <paramref name="cursor"/> that together stow exactly
+    /// its batch: one batched step, or a pre-batching schedule's one step per stack.
+    /// </summary>
+    private static int DepositsFor(ImmutableArray<CourierStep> steps, int cursor, ImmutableArray<Shipment> batch)
+    {
+        var stowed=new List<Shipment>(); int count=0;
+        foreach(var step in steps.Skip(cursor+1))
+        {
+            if(step.Phase!=CourierPhase.Deposit || stowed.Count>=batch.Length)break;
+            stowed.AddRange(step.Batch); count++;
+        }
+        if(!stowed.SequenceEqual(batch))throw Fault("ScheduleShapeMismatch","The hand-in's deposits do not match its batch.");
+        return count;
     }
     private static bool Agrees(InventoryView? checkpoint, InventoryView fresh, CourierJournal r) =>
         checkpoint != null && CourierPlanner.Exact(checkpoint.Character, fresh.Character) &&
@@ -693,7 +869,7 @@ public sealed class CourierConductor
             if(stop)throw Fault("StopBeforeLocalTrade","Carrier acknowledged; owner did not dispatch.");
             r.Pending=intent;store.Save(r);
         } finally {peer.Progress-=Started;}
-        var local = calls.Call("OwnerTrade", 120, d => send ? trade.SendAsync(r.Settings.Carrier!, batch, d) : trade.ReceiveAsync(r.Settings.Carrier!, batch, d));
+        var local = calls.Call("OwnerTrade", Deadline.TradeSeconds(batch), d => send ? trade.SendAsync(r.Settings.Carrier!, batch, d) : trade.ReceiveAsync(r.Settings.Carrier!, batch, d));
         try { await Task.WhenAll(local, remote); }
         catch (CourierFault) when (remote.Exception?.GetBaseException() is CourierFault { Outcome: CourierOutcome.Cancelled } && cancellationReceipt != null && local.Exception?.GetBaseException() is CourierFault { Outcome: CourierOutcome.Cancelled })
         {
