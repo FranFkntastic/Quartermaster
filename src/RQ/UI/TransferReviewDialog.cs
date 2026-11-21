@@ -241,8 +241,10 @@ internal sealed class TransferReviewDialog
                 {
                     var trip = plan.Trips[i];
                     var stacks = trip.Manifest.Length;
-                    ImGui.TextDisabled($"Trip {i + 1} · {CourierSession.CharacterLabel(trip.Source)} at {trip.Pickup.Label} → " +
-                        $"{CourierSession.CharacterLabel(trip.Destination)} at {trip.Dropoff.Label} · {stacks:N0} stack{(stacks == 1 ? string.Empty : "s")}");
+                    var route = trip.Local
+                        ? $"{CourierSession.CharacterLabel(trip.Source)} at {trip.Pickup.Label}"
+                        : $"{CourierSession.CharacterLabel(trip.Source)} at {trip.Pickup.Label} → {CourierSession.CharacterLabel(trip.Destination)} at {trip.Dropoff.Label}";
+                    ImGui.TextDisabled($"Trip {i + 1} · {route} · {stacks:N0} stack{(stacks == 1 ? string.Empty : "s")}");
                 }
             }
             ImGui.EndChild();

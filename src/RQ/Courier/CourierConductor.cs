@@ -133,13 +133,17 @@ public sealed class CourierConductor
             // runner both work through the whole trip manifest without leaving the bell or the trade.
             // Retrieve and Deposit stay even for bag-only manifests: they verify bag stock, Retrieve
             // anchors the bag-slot split and Deposit credits delivery.
+            // A local trip is the owner's own withdrawal and deposit at its bell: no carrier, no trade.
             yield return new(CourierPhase.EnsureSource, i, []);
             yield return new(CourierPhase.Retrieve, i, trip.Manifest);
-            yield return new(CourierPhase.CarrierToSource, i, []);
-            yield return new(CourierPhase.HandOut, i, trip.Manifest);
-            yield return new(CourierPhase.SwitchToDestination, i, []);
-            yield return new(CourierPhase.CarrierToDestination, i, []);
-            yield return new(CourierPhase.HandIn, i, trip.Manifest);
+            if (!trip.Local)
+            {
+                yield return new(CourierPhase.CarrierToSource, i, []);
+                yield return new(CourierPhase.HandOut, i, trip.Manifest);
+                yield return new(CourierPhase.SwitchToDestination, i, []);
+                yield return new(CourierPhase.CarrierToDestination, i, []);
+                yield return new(CourierPhase.HandIn, i, trip.Manifest);
+            }
             yield return new(CourierPhase.Deposit, i, trip.Manifest);
             if (r.Plan.Consolidations.Any(c => CourierPlanner.Exact(c.Destination, trip.Destination)) &&
                 !r.Plan.Trips.Skip(i + 1).Any(later => CourierPlanner.Exact(later.Destination, trip.Destination)))
@@ -148,6 +152,14 @@ public sealed class CourierConductor
         if (r.Settings.ReturnOwner) yield return new(CourierPhase.ReturnOwner, 0, []);
         if (r.Settings.ReturnCarrier) yield return new(CourierPhase.ReturnCarrier, 0, []);
         yield return new(CourierPhase.Finish, 0, []);
+    }
+    /// <summary>The carrier trip nearest before or after trip <paramref name="i"/>, skipping local trips; null when none.</summary>
+    private static CourierTrip? Carried(CourierJournal r, int i, int step)
+    {
+        for (i += step; i >= 0 && i < r.Plan.Trips.Length; i += step)
+            if (!r.Plan.Trips[i].Local)
+                return r.Plan.Trips[i];
+        return null;
     }
     /// <summary>Whether a phase runs inside a trip (before the closing returns), with the owner at a bell.</summary>
     private static bool InTrip(CourierPhase phase) => phase < CourierPhase.ReturnOwner || phase == CourierPhase.Consolidate;
@@ -487,11 +499,13 @@ public sealed class CourierConductor
                 {
                     // Stacks already in the owner's bags take no owner slot; only retainer-sourced ones are retrieved into it.
                     var retrieved = t.Manifest.Count(x => x.From != null);
-                    if (carrier.FreeSlots <= 0 || retrieved > 0 && owner.FreeSlots <= 0)
+                    // A local trip takes nothing into the carrier's bags.
+                    var room = t.Local ? int.MaxValue : carrier.FreeSlots;
+                    if (room <= 0 || retrieved > 0 && owner.FreeSlots <= 0)
                         throw new CourierFault(CourierOutcome.Failed, "BagSlotLimit", "No free slot for the next trip.");
-                    if (t.Manifest.Length > carrier.FreeSlots || retrieved > owner.FreeSlots)
+                    if (t.Manifest.Length > room || retrieved > owner.FreeSlots)
                     {
-                        var split = CourierPlanner.Pack(t.Manifest, carrier.FreeSlots, owner.FreeSlots).Select(b => t with { Manifest = b }).ToArray();
+                        var split = CourierPlanner.Pack(t.Manifest, room, owner.FreeSlots).Select(b => t with { Manifest = b }).ToArray();
                         r.Plan = r.Plan with { Trips = r.Plan.Trips.RemoveAt(s.Trip).InsertRange(s.Trip, split) };
                         // Previous trips may have dynamic hand-in batches; only replace the unstarted suffix.
                         var remaining = Steps(r).SkipWhile(x => x.Trip != s.Trip).Skip(1);
@@ -543,13 +557,19 @@ public sealed class CourierConductor
                 CourierReceipt? finished = null;
                 switch (s.Phase)
                 {
+                    case CourierPhase.EnsureSource when t.Local:
+                        // The carrier is not needed here. Ahead of the run's first carrier trip it sets out for that
+                        // pickup meanwhile; later ones it heads for after the previous hand-in.
+                        if (r.CarrierMove == null && r.Custody.IsEmpty && Carried(r, s.Trip, -1) == null && Carried(r, s.Trip, 1) is { } first)
+                            Launch(new(Guid.NewGuid(), CourierCommand.Travel, first.Source, first.Pickup));
+                        await Switch(t.Source); await Meet(t.Pickup); break;
                     case CourierPhase.EnsureSource:
                         // The carrier heads for the pickup in the background while the owner switches, reaches it
                         // and retrieves; CarrierToSource waits for it. It may already have set out after the previous
                         // trip's last hand-in, or be there when that trip dropped off at the same bell.
                         if (r.CarrierMove is { } earlier && !(earlier.Command == CourierCommand.Travel && earlier.Bell?.SamePlace(t.Pickup) == true))
                             await SettleMove();
-                        if (r.CarrierMove == null && !(s.Trip > 0 && t.Pickup.SamePlace(r.Plan.Trips[s.Trip - 1].Dropoff)))
+                        if (r.CarrierMove == null && Carried(r, s.Trip, -1)?.Dropoff.SamePlace(t.Pickup) != true)
                             Launch(new(Guid.NewGuid(), CourierCommand.Travel, t.Source, t.Pickup));
                         await Switch(t.Source); await Meet(t.Pickup); break;
                     case CourierPhase.SwitchToDestination:
@@ -564,7 +584,7 @@ public sealed class CourierConductor
                         // it here; a carrier already at the bell arrives on the first tick.
                         if (s.Phase == CourierPhase.CarrierToSource &&
                             !(await SettleMove() is { Command: CourierCommand.Travel, Bell: { } went } && went.SamePlace(t.Pickup)) &&
-                            !(s.Trip > 0 && t.Pickup.SamePlace(r.Plan.Trips[s.Trip - 1].Dropoff)))
+                            Carried(r, s.Trip, -1)?.Dropoff.SamePlace(t.Pickup) != true)
                             await Send(r, CourierCommand.Travel, owner.Character, [], t.Pickup,id:intent.Id);
                         await calls.Call("Rendezvous", 30, d => bells.ObserveTradeableAsync(r.Settings.Carrier!, d));
                         break;
@@ -651,8 +671,8 @@ public sealed class CourierConductor
                 // out for the next trip's pickup, or home, while the owner deposits, consolidates and returns.
                 if (s.Phase == CourierPhase.HandIn && r.Custody.IsEmpty && r.CarrierMove == null && !stop)
                 {
-                    CourierCarrierMove? next = s.Trip + 1 < r.Plan.Trips.Length
-                        ? r.Plan.Trips[s.Trip + 1] is var following && !following.Pickup.SamePlace(t.Dropoff)
+                    CourierCarrierMove? next = Carried(r, s.Trip, 1) is { } following
+                        ? !following.Pickup.SamePlace(t.Dropoff)
                             ? new(Guid.NewGuid(), CourierCommand.Travel, following.Source, following.Pickup) : null
                         : steps.Skip(r.Cursor).Any(x => x.Phase == CourierPhase.ReturnCarrier)
                             ? new(Guid.NewGuid(), CourierCommand.ReturnHome, r.Start, null) : null;
