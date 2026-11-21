@@ -143,10 +143,11 @@ internal sealed class CourierSettingsSection
         ImGui.TableHeadersRow();
         foreach (var character in characters)
         {
-            if (settings.Carrier is { } carrier && CourierPlanner.Exact(carrier, character))
+            var current = character.Matches(runtime.Owner);
+            // The carrier's own bell is where it returns after a run; it is set from the carrier's client.
+            if (settings.Carrier is { } carrier && CourierPlanner.Exact(carrier, character) && !current)
                 continue;
             var id = character.LocalContentId!.Value;
-            var current = character.Matches(runtime.Owner);
             ImGui.TableNextRow();
             ImGui.TableNextColumn();
             ImGui.TextUnformatted(CourierSession.CharacterLabel(character));

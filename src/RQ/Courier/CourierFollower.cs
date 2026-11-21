@@ -250,10 +250,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                     ledger.LastConfirmedBags = staged.Result!.Value!.Evidence!.After;
                     ledger.Unconfirmed = null; break;
                 case CourierCommand.ReturnHome:
-                    var start = ledger.Start ?? throw new InvalidOperationException("CarrierStartUnknown");
-                    await calls.Call("CarrierReturnWorld", 180, d => start.World == m.Carrier.HomeWorldId
-                        ? worlds.ReturnHomeAsync(d) : worlds.EnsureWorldAsync(start.World, d));
-                    await calls.Call("CarrierReturnPosition", start.Ward != null ? 300 : 150, d => bells.ReturnToAsync(start, d)); break;
+                    await ReturnHomeAsync(cfg, m, ledger.Start); break;
                 case CourierCommand.Clear:
                     if (ledger.Unconfirmed!=null || !Custody.Covers(ledger.Units,m.Manifest) || !Custody.Covers(m.Manifest,ledger.Units))
                         return Refuse("ClearCustodyChanged");
@@ -287,6 +284,37 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                 if(stopped && store.Load() is {Run:not null,Paused:false} held){held.Paused=true;store.Save(held);}
             }
             finally{try{if(refused || stopped)Release();}finally{gate.Release();}}
+        }
+    }
+    // The carrier always ends a run on its home world: at its own meeting bell when one is saved, otherwise back where
+    // the run found it if that was an ordinary place on the home world, otherwise wherever the home-world return lands.
+    // Where a run happened to start elsewhere (a visited world or ward) is never a destination, so a stranding cannot
+    // become the next run's home.
+    private async Task ReturnHomeAsync(CourierSettings cfg, CourierMessage m, CourierPosition? start)
+    {
+        var home = m.Carrier.HomeWorldId;
+        var at = $"{m.Run}/{m.Step} ReturnHome";
+        await calls.Call("CarrierReturnWorld", 180, worlds.ReturnHomeAsync);
+        if (cfg.Bells.GetValueOrDefault(m.Carrier.LocalContentId ?? 0) is { } own)
+        {
+            if (own.World == home)
+            {
+                await calls.Call(own.Ward.HasValue ? "CarrierReturnWardBell" : "CarrierReturnBell", own.ApproachSeconds, d => bells.GoInRangeAsync(own, d));
+                return;
+            }
+            warning($"{at}: CarrierBellOffHomeWorld: saved bell {own.Label} is on world {own.World}, home world {home}; returning to the start position instead.");
+        }
+        if (start is null || start.World != home || start.Ward != null)
+        {
+            information?.Invoke($"{at}: no meeting bell saved and the run started " + (start is null ? "at an unknown position" :
+                start.World != home ? $"on world {start.World}" : $"in ward {start.Ward}") + $"; carrier left on home world {home}.");
+            return;
+        }
+        try { await calls.Call("CarrierReturnStart", 150, d => bells.ReturnToAsync(start, d)); }
+        catch (CourierFault fault) when (fault.Code == "ReturnStartUnreachable")
+        {
+            // The home world was reached; only the exact start cannot be travelled to by ordinary navigation.
+            warning($"{at}: ReturnStartUnreachable: territory {start.Territory} ({start.X:0.0}, {start.Y:0.0}, {start.Z:0.0}) on home world {home}: {fault.Message}; carrier left on home world.");
         }
     }
     private Task<InventoryView> Observe() => calls.Call("CarrierBags", 15, inventory.ObserveAsync);

@@ -193,7 +193,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         var at=objects.LocalPlayer!.Position;
         return bell with {Shard=recordingShard,Trail=[..trail,new(at.X,at.Y,at.Z)]};
     }
-    private const float TradeRange=3.5f, MeetRange=3.2f;
+    private const float TradeRange=3.5f, MeetRange=3.2f, ReturnArrivalRange=3f;
     private (TradePartner Partner,Vector3 Position,float Distance)? Sighting(OwnerScope expected) =>
         io.TryGetPartner(expected.CharacterName,expected.HomeWorldName,out var p) && p.HomeWorldId == expected.HomeWorldId &&
         objects.LocalPlayer is {} me && objects.SearchById(p.GameObjectId) is {} other
@@ -315,6 +315,8 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
             return Result<bool>.Fail(code,detail);
         }
         bool wardOwned=false, arrived=false;
+        // A return to a plain position (no bell) walks to it; one walk may be cut short and is resubmitted once.
+        int returnWalks=0;
         try { var outcome=await Poll<bool>(d, () =>
         {
             if(allowed?.Invoke()==false)return new(CourierOutcome.Cancelled,"RouteStopped",d.Name);
@@ -377,7 +379,8 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 route??=DalamudGilVendorCatalogBuilder.ResolveTravelRoutesForTerritory(data,p.Territory)
                     .Where(r => attuned.Any(a => a.AetheryteId == r.AetheryteId))
                     .MinBy(r => DestinationDistanceSquared(r.AethernetId ?? r.AetheryteId, target));
-                if(route==null)return Result<bool>.Fail("NoAttunedAetheryte",p.Territory.ToString());
+                if(route==null)return bell==null ? WardFailure("ReturnStartUnreachable","No attuned aetheryte serves this territory")
+                    : Result<bool>.Fail("NoAttunedAetheryte",p.Territory.ToString());
                 if(hopped)return null;
                 if(route.AethernetId is {} shard && here.Territory==route.AetheryteTerritoryId &&
                     objects.Any(o=>o.ObjectKind==ObjectKind.Aetheryte && o.BaseId==route.AetheryteId &&
@@ -392,9 +395,16 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 teleported=result.Submitted;
                 return teleported || result.Retryable ? null : Result<bool>.Fail(result.Code,result.Message);
             }
+            if (bell == null)
+            {
+                // Arrival is standing at the position, not entering its territory or ward.
+                var gap=Vector3.Distance(new(here.X,here.Y,here.Z),target);
+                if (gap<=ReturnArrivalRange) return Result<bool>.Ok(true);
+                if (moving) return null;
+                if (returnWalks>=2) return WardFailure("ReturnPositionUnreached",$"Walk ended {gap:0.0} yalms from {target}");
+            }
             var b=bell == null ? null : bells.ObserveNavigationTarget();
-            if (bell == null ||
-                b is {Available:true} && b.Distance <= b.OrdinaryInteractionDistance &&
+            if (bell != null && b is {Available:true} && b.Distance <= b.OrdinaryInteractionDistance &&
                 objects.SearchById(b.BellGameObjectId)?.BaseId == bell.ObjectId && Vector3.Distance(target,b.Position)<0.5f)
                 return Result<bool>.Ok(true);
             if (moving) return null;
@@ -442,6 +452,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
             pathMarker.Save();
             var path=nav.TryMoveCloseTo(target,1.5f);
             ownsPath=moving=path.Submitted;
+            if (moving && bell == null) returnWalks++;
             return moving || path.Retryable ? null : Result<bool>.Fail(path.Code,path.Message);
         }); arrived=outcome.Outcome==CourierOutcome.Succeeded; if(!arrived)warn($"{outcome.Code}: {outcome.Detail}");return outcome; }
         catch(Dalamud.Plugin.Ipc.Exceptions.IpcError e){return WardFailure("NavigationIpcUnavailable",e.Message);}
