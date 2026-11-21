@@ -1148,7 +1148,8 @@ internal sealed partial class TransferPlanWorkspace
             return;
         if (courierPlan.Trips.Length > 1)
             clause($"{courierPlan.Trips.Length:N0} trips", TransferPresentation.SendColor);
-        if (courier.StartGate(runtime, courierPlan) is { Status: { } status } gate)
+        // With nothing planned, "everything in place" already says there is nothing to send.
+        if ((!courierPlan.Trips.IsEmpty || !courierPlan.Refusals.IsEmpty) && courier.StartGate(runtime, courierPlan) is { Status: { } status } gate)
         {
             clause(status, AmberColor);
             if (gate.OpensSettings)
@@ -1265,7 +1266,7 @@ internal sealed partial class TransferPlanWorkspace
         var isCourier = plan.Kind == StowagePlanKind.Courier;
         var table = drawingTable = isCourier ? courierWorkbenchTable : transferWorkbenchTable;
         if (!table.Begin(
-                isCourier ? "RQCourierWorkbenchV1" : "RQTransferWorkbenchV5",
+                isCourier ? "RQCourierWorkbenchV2" : "RQTransferWorkbenchV5",
                 new DalamudTableLayout(
                     new Vector2(0, Math.Max(200, ImGui.GetContentRegionAvail().Y)),
                     flags,
