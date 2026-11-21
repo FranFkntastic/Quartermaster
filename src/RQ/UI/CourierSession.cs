@@ -193,24 +193,160 @@ public sealed class CourierSession
         return projection;
     }
 
-    private (long Revision, BrowserProjection Browser, AccountStockProjection Projection)? account;
+    private (long Revision, BrowserProjection Browser, IReadOnlyList<ExternalCharacter> External, AccountStockProjection Projection)? account;
 
     /// <summary>
     /// The logged-in character's stock merged with every other observed, non-carrier character's
-    /// (<see cref="Browsable"/>). The logged-in character's own projection stays the source for its
-    /// planning; this view only adds the other characters beside it. Cached per planning revision.
+    /// (<see cref="Browsable"/>), then every character on another service account
+    /// (<see cref="ExternalCharacters"/>). The logged-in character's own projection stays the source
+    /// for its planning; this view only adds the other characters beside it. Cached per planning
+    /// revision and sibling-cache revision.
     /// </summary>
     internal AccountStockProjection AccountStock(QuartermasterRuntimeSnapshot runtime)
     {
-        if (account is { } cached && cached.Revision == runtime.PlanningRevision && ReferenceEquals(cached.Browser, runtime.Browser))
+        var external = ExternalCharacters(runtime);
+        if (account is { } cached && cached.Revision == runtime.PlanningRevision && ReferenceEquals(cached.Browser, runtime.Browser) &&
+            ReferenceEquals(cached.External, external))
             return cached.Projection;
         var others = Browsable(runtime)
             .Select(character => (character, Stock(runtime, character)))
             .Where(entry => entry.Item2 is not null)
             .Select(entry => (entry.character, entry.Item2!));
-        var projection = AccountStockProjection.Build(runtime.Owner, runtime.Browser, others);
-        account = (runtime.PlanningRevision, runtime.Browser, projection);
+        var projection = AccountStockProjection.Build(runtime.Owner, runtime.Browser, others,
+            external.Select(entry => (entry.Character, entry.Stock, entry.Profile)));
+        account = (runtime.PlanningRevision, runtime.Browser, external, projection);
         return projection;
+    }
+
+    // ---- Other service accounts -------------------------------------------------------------
+
+    /// <summary>
+    /// Sibling XIVLauncher profiles' cached stock. Null keeps the stock browser to this account.
+    /// Its characters are read-only visibility: never courier sources, plan stock or retrievable.
+    /// </summary>
+    public ExternalAccountStockCache? ExternalStockCache { get; set; }
+
+    /// <summary>Characters this client's own player cache holds, so a sibling's copy of one is never shown as another account's.</summary>
+    public Func<IReadOnlyList<OwnerScope>>? LocalOwners { get; set; }
+
+    /// <summary>A character on another service account, with the profile its cached stock came from.</summary>
+    internal sealed record ExternalCharacter(OwnerScope Character, string Profile, BrowserProjection Stock);
+
+    private (long Revision, IReadOnlyList<ExternalCharacter> All)? externalBuilt;
+    private (long Revision, long ExternalRevision, IReadOnlyList<ExternalCharacter> Visible)? externalVisible;
+
+    /// <summary>
+    /// Characters whose stock only a sibling profile's cache holds, by name. Characters this client
+    /// knows (logged in, roster, own caches) are left out. The list instance changes only when its
+    /// contents do, so the account projection stays cached between sibling polls.
+    /// </summary>
+    internal IReadOnlyList<ExternalCharacter> ExternalCharacters(QuartermasterRuntimeSnapshot runtime)
+    {
+        var snapshot = ExternalStockCache?.Current ?? ExternalAccountSnapshot.Empty;
+        if (externalVisible is { } cached && cached.Revision == runtime.Revision && cached.ExternalRevision == snapshot.Revision)
+            return cached.Visible;
+        var local = LocalContentIds(runtime);
+        IReadOnlyList<ExternalCharacter> visible = BuildExternal(snapshot)
+            .Where(entry => !local.Contains(entry.Character.LocalContentId!.Value))
+            .ToArray();
+        if (externalVisible is { } previous && previous.Visible.SequenceEqual(visible))
+            visible = previous.Visible;
+        externalVisible = (runtime.Revision, snapshot.Revision, visible);
+        return visible;
+    }
+
+    /// <summary>The cached stock of a character on another service account; null for this account's characters.</summary>
+    internal BrowserProjection? ExternalStock(QuartermasterRuntimeSnapshot runtime, OwnerScope character) =>
+        FindExternal(runtime, character)?.Stock;
+
+    internal bool IsExternal(QuartermasterRuntimeSnapshot runtime, OwnerScope character) =>
+        FindExternal(runtime, character) is not null;
+
+    /// <summary>"XIVLauncher-Multibox-2" for a character on another service account; null otherwise.</summary>
+    internal string? ExternalProfile(QuartermasterRuntimeSnapshot runtime, OwnerScope character) =>
+        FindExternal(runtime, character)?.Profile;
+
+    private ExternalCharacter? FindExternal(QuartermasterRuntimeSnapshot runtime, OwnerScope character)
+    {
+        foreach (var entry in ExternalCharacters(runtime))
+            if (entry.Character.Matches(character))
+                return entry;
+        return null;
+    }
+
+    private HashSet<ulong> LocalContentIds(QuartermasterRuntimeSnapshot runtime)
+    {
+        var ids = new HashSet<ulong>();
+        if (runtime.Owner.LocalContentId is > 0)
+            ids.Add(runtime.Owner.LocalContentId.Value);
+        foreach (var owner in runtime.State.Courier.LocalRoster)
+            if (owner.LocalContentId is > 0)
+                ids.Add(owner.LocalContentId.Value);
+        foreach (var retainer in runtime.Retainers.Values)
+            if (retainer.Owner.LocalContentId is > 0)
+                ids.Add(retainer.Owner.LocalContentId.Value);
+        try
+        {
+            foreach (var owner in LocalOwners?.Invoke() ?? [])
+                if (owner.LocalContentId is > 0)
+                    ids.Add(owner.LocalContentId.Value);
+        }
+        catch (Exception exception) { Warn?.Invoke($"Quartermaster could not list this client's cached characters: {exception.Message}"); }
+        return ids;
+    }
+
+    /// <summary>One read-only stock projection per sibling-profile character, rebuilt only when a sibling cache changed.</summary>
+    private IReadOnlyList<ExternalCharacter> BuildExternal(ExternalAccountSnapshot snapshot)
+    {
+        if (externalBuilt is { } cached && cached.Revision == snapshot.Revision)
+            return cached.All;
+        var characters = new Dictionary<ulong, OwnerScope>();
+        foreach (var player in snapshot.PlayerBags.Values)
+            if (player.Owner.LocalContentId is > 0 && !string.IsNullOrWhiteSpace(player.Owner.CharacterName))
+                characters.TryAdd(player.Owner.LocalContentId.Value, player.Owner);
+        foreach (var retainer in snapshot.Retainers.Values)
+            if (retainer.Owner.LocalContentId is > 0 && !string.IsNullOrWhiteSpace(retainer.Owner.CharacterName))
+                characters.TryAdd(retainer.Owner.LocalContentId.Value, retainer.Owner);
+        var built = new List<ExternalCharacter>(characters.Count);
+        foreach (var (id, owner) in characters)
+        {
+            var bags = ExternalBags(snapshot.PlayerBags.GetValueOrDefault(id), owner);
+            var retainerObserved = snapshot.Retainers.Values.Any(retainer =>
+                retainer.Owner.Matches(owner) && retainer.IsCurrentlyAssigned is not false &&
+                RetainerPageNames.All(name => retainer.ObservedSources.Contains(name, StringComparer.Ordinal)));
+            if (bags.Length == 0 && !retainerObserved)
+                continue;
+            try
+            {
+                built.Add(new(owner, snapshot.ProfileByCharacter.GetValueOrDefault(id) ?? "another profile",
+                    BrowserProjectionBuilder.Build(bags, snapshot.Retainers, owner, metadata)));
+            }
+            catch (Exception exception)
+            {
+                Warn?.Invoke($"Quartermaster skipped {owner.CharacterName}'s other-account stock: {exception.Message}");
+            }
+        }
+        built.Sort((left, right) =>
+        {
+            var byName = StringComparer.OrdinalIgnoreCase.Compare(left.Character.CharacterName, right.Character.CharacterName);
+            return byName != 0 ? byName : StringComparer.OrdinalIgnoreCase.Compare(left.Character.HomeWorldName, right.Character.HomeWorldName);
+        });
+        externalBuilt = (snapshot.Revision, built);
+        return built;
+    }
+
+    /// <summary>A sibling character's fully observed bags and any observed saddlebag pages.</summary>
+    private static InventoryBag[] ExternalBags(CachedPlayerInventory? cached, OwnerScope owner)
+    {
+        if (cached is null || !owner.Matches(cached.Owner))
+            return [];
+        var observed = cached.ObservedSources;
+        var bagsComplete = PlayerBagNames.All(name => observed.Contains(name, StringComparer.Ordinal));
+        return cached.Bags
+            .Where(bag => observed.Contains(bag.BagName, StringComparer.Ordinal) &&
+                          (bagsComplete && PlayerBagNames.Contains(bag.BagName, StringComparer.Ordinal) || InventoryScanner.IsSaddlebag(bag.BagName)))
+            .Select(bag => new InventoryBag { BagName = bag.BagName, Location = bag.Location, Items = bag.Items })
+            .ToArray();
     }
 
     private (long Revision, Dictionary<(Guid, ulong, ItemQualityPolicy), PlacementMovePlan?> Plans)? gathers;
