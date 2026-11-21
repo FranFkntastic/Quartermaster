@@ -76,7 +76,8 @@ internal sealed record TransferWorkbenchRow(
     QuartermasterRuntimeSnapshot Runtime,
     TransferLineProjection Projection,
     TransferVendorProcurementLine? VendorPreview,
-    Courier.Refusal? CourierRefusal = null);
+    Courier.Refusal? CourierRefusal = null,
+    Courier.CourierAllocation? Distribution = null);
 
 internal sealed record TransferReviewRow(
     TargetPlanItem Rule,

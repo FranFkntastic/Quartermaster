@@ -125,36 +125,51 @@ public static class StowagePlanMigration
     }
 
     /// <summary>
-    /// Moves the single destination retainer of courier lines written before courier lines carried a
-    /// Routing (<see cref="Courier.CourierRoute.RetainerId"/>) into the line's Routing as its rank 1,
-    /// and clears it. Lines of one plan that now share a <see cref="StowagePlanCatalog.LineKey"/>
-    /// (the same item and quality from one source container to one character, formerly to different
-    /// containers) merge as <see cref="StowagePlanCatalog.MergeCourierDuplicates"/> does: quantities
-    /// add up and the destinations rank in line order. Returns whether anything changed; running it
-    /// again changes nothing.
+    /// Folds courier lines written one per route into one line per item and plan. A line that kept N
+    /// in its source becomes that source with N typed. Every line's destination container (its single
+    /// retainer, else its rank 1, else bags) is added as a destination that takes what is left, so a
+    /// line that sent N moves nothing until a number is typed. Ranked fallbacks and Any space are
+    /// dropped. Quality is kept when the lines agree, otherwise Any. Returns whether anything changed;
+    /// running it again changes nothing.
     /// </summary>
-    public static bool MoveCourierRetainersToRouting(QuartermasterState state)
+    public static bool CollapseCourierLines(QuartermasterState state)
     {
         var plans = new HashSet<Guid>();
-        foreach (var rule in state.PlanItems)
+        foreach (var group in state.PlanItems.Where(rule => rule.Courier is not null)
+                     .GroupBy(rule => (rule.StowagePlanId, rule.ItemId))
+                     .Where(group => group.Count() > 1 || group.Any(rule => rule.Courier!.IsLegacy)).ToArray())
         {
-            if (rule.Courier is not { RetainerId: { } legacy } route)
-                continue;
-            rule.Routing = StowageRoutingPolicy.CopyOf(rule.Routing);
-            if (!rule.Routing.PreferredRetainerIds.Contains(legacy))
-                rule.Routing.PreferredRetainerIds.Insert(0, legacy);
-            rule.Courier = route with { RetainerId = null };
-            plans.Add(rule.StowagePlanId);
+            var lines = group.ToList();
+            var owner = state.StowagePlans.FirstOrDefault(plan => plan.Id == group.Key.StowagePlanId)?.Owner;
+            var survivor = lines.FirstOrDefault(rule => !rule.Courier!.IsLegacy) ?? lines[0];
+            var places = new List<Courier.CourierPlace>();
+            void Add(Courier.CourierPlace place)
+            {
+                if (!places.Any(known => known.Is(place.Character, place.Retainer)))
+                    places.Add(place);
+            }
+            foreach (var line in lines.Where(rule => !rule.Courier!.IsLegacy).SelectMany(rule => rule.Courier!.Places))
+                Add(line);
+            foreach (var line in lines.Where(rule => rule.Courier!.IsLegacy))
+            {
+                var route = line.Courier!;
+                if (route.KeepInSource && (route.SourceCharacter ?? owner) is { } source)
+                    Add(new(source with { }, route.SourceRetainerId, Math.Max(0, line.TargetQuantity)));
+                var to = route.RetainerId ?? (line.Routing.PreferredRetainerIds.Count > 0 ? line.Routing.PreferredRetainerIds[0] : null);
+                Add(new(route.Character! with { }, to, Destination: true));
+            }
+            survivor.Courier = new Courier.CourierLine { Places = [.. places] };
+            survivor.Quality = lines.Select(rule => rule.Quality).Distinct().Count() == 1 ? survivor.Quality : ItemQualityPolicy.Any;
+            survivor.Enabled = lines.Any(rule => rule.Enabled);
+            if (string.IsNullOrWhiteSpace(survivor.Notes))
+                survivor.Notes = lines.Select(rule => rule.Notes).FirstOrDefault(notes => !string.IsNullOrWhiteSpace(notes)) ?? survivor.Notes;
+            survivor.TargetQuantity = 0;
+            survivor.Routing = new();
+            state.PlanItems.RemoveAll(rule => rule != survivor && lines.Contains(rule));
+            plans.Add(group.Key.StowagePlanId);
         }
-        foreach (var planId in plans)
-        {
-            var lines = state.PlanItems.Where(rule => rule.StowagePlanId == planId).ToList();
-            StowagePlanCatalog.MergeCourierDuplicates(lines);
-            var kept = lines.ToHashSet();
-            state.PlanItems.RemoveAll(rule => rule.StowagePlanId == planId && !kept.Contains(rule));
-            if (state.StowagePlans.FirstOrDefault(plan => plan.Id == planId) is { } changed)
-                changed.Revision = checked(changed.Revision + 1);
-        }
+        foreach (var plan in state.StowagePlans.Where(plan => plans.Contains(plan.Id)))
+            plan.Revision = checked(plan.Revision + 1);
         if (plans.Count > 0)
             StowagePlanCatalog.ClearStaleRecovery(state);
         return plans.Count > 0;
@@ -214,21 +229,9 @@ public static class StowagePlanMigration
                 };
                 state.StowagePlans.Add(target);
             }
+            // Lines of one item in the target become one line in CollapseCourierLines, which runs next.
             foreach (var line in courierLines)
-            {
-                // Two identical routes would be one line in the target: keep both quantities on the first.
-                var same = state.PlanItems.FirstOrDefault(rule => rule.StowagePlanId == target.Id &&
-                    StowagePlanCatalog.LineKey(rule) == StowagePlanCatalog.LineKey(line));
-                if (same is null)
-                {
-                    line.StowagePlanId = target.Id;
-                    continue;
-                }
-                same.TargetQuantity = (int)Math.Min(int.MaxValue, (long)same.TargetQuantity + Math.Max(0, line.TargetQuantity));
-                same.Enabled |= line.Enabled;
-                same.Routing = StowagePlanCatalog.UnionRouting(same.Routing, line.Routing);
-                state.PlanItems.Remove(line);
-            }
+                line.StowagePlanId = target.Id;
             plan.Revision = checked(plan.Revision + 1);
             target.Revision = checked(target.Revision + 1);
             changed = true;

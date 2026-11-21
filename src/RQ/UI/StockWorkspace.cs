@@ -294,7 +294,7 @@ internal sealed class StockWorkspace
         TextColor: row => row.Rule is null && row.Sends == 0 ? Disabled() : null,
         DrawContextMenu: DrawStockRowContextMenu,
         Id: "target",
-        HeaderTooltip: "The open plan's target, or what its courier lines send.");
+        HeaderTooltip: "The open plan's target, or what its courier lines move.");
 
     private DalamudTableColumn<StockWorkbenchRow> PlanStateColumn() => new(
         "Plan state",
@@ -310,7 +310,7 @@ internal sealed class StockWorkspace
 
     private static string StockTarget(StockWorkbenchRow row) =>
         row.Rule is { } rule ? rule.TargetQuantity.ToString("N0")
-        : row.Sends > 0 ? $"Send {row.Sends:N0}"
+        : row.Sends > 0 ? $"Move {row.Sends:N0}"
         : "—";
 
     private static void DrawRetainerCell(StockWorkbenchRow row)
@@ -773,7 +773,7 @@ internal sealed class StockWorkspace
                     UpsertSelectedStockRules(runtime, [PlanItem(runtime)], stowCarried: false);
                 if (ImGui.IsItemHovered())
                     ImGui.SetTooltip(transferPlans.CourierPlanOpen(runtime)
-                        ? "Send from here on the open Courier plan, then pick retainers in Placement"
+                        ? "Add to the open Courier plan"
                         : "Add to the open Transfer plan, then set a target to retrieve");
             }
             if (!canSend && !canStow && !canPlan)
@@ -1077,7 +1077,7 @@ internal sealed class StockWorkspace
             : runtime.State.PlanItems
                 .Where(rule => rule.StowagePlanId == selectedPlan.Id && rule.Courier is not null && rule.Enabled)
                 .GroupBy(rule => rule.ItemId)
-                .ToDictionary(group => group.Key, group => group.Sum(rule => rule.TargetQuantity));
+                .ToDictionary(group => group.Key, group => group.Sum(rule => courier.Allocation(runtime, selectedPlan.Owner, rule).Moving));
         var accessible = TransferWorkbenchPresentation.AccessibleRetainerIds(runtime.Retainers, runtime.Owner);
         var evaluated = selectedPlan is null
             ? new Dictionary<Guid, StowageEvaluationLine>()
@@ -1356,7 +1356,7 @@ internal sealed class StockWorkspace
             if (courier.Stock(runtime, character) is not { } stock)
                 continue;
             ImGui.PushID(index);
-            try { DrawCharacterNode(character, stock, index, counts, null); }
+            try { DrawCharacterNode(runtime, character, stock, index, counts, null); }
             finally { ImGui.PopID(); }
         }
 
@@ -1373,7 +1373,7 @@ internal sealed class StockWorkspace
                 if (!account.IsExternal(character) || courier.ExternalStock(runtime, character) is not { } stock)
                     continue;
                 ImGui.PushID(index);
-                try { DrawCharacterNode(character, stock, index, counts, account.ExternalProfiles.GetValueOrDefault(character.LocalContentId!.Value)); }
+                try { DrawCharacterNode(runtime, character, stock, index, counts, account.ExternalProfiles.GetValueOrDefault(character.LocalContentId!.Value)); }
                 finally { ImGui.PopID(); }
             }
         }
@@ -1430,7 +1430,8 @@ internal sealed class StockWorkspace
                     continue;
                 var key = scope.Key;
                 var selected = inHere && key == workbench.ScopeKey;
-                if (RailNode(ContainerName(scope), counts.Text(0, key), selected, null, out _))
+                if (RailNode(ContainerName(scope), counts.Text(0, key), selected, null, out _,
+                        space: courier.ContainerSpace(runtime, owner, scope, external: false)))
                     ViewHereScope(key);
                 reviewRegistry.RegisterLastButton(
                     $"quartermaster.stock.scope.here.{key.Replace(':', '.')}",
@@ -1449,7 +1450,13 @@ internal sealed class StockWorkspace
     /// character on another service account (<paramref name="externalProfile"/> set) is tinted, and
     /// also lists its saddlebag when its own client observed one.
     /// </summary>
-    private void DrawCharacterNode(OwnerScope character, BrowserProjection stock, int index, RailCounts counts, string? externalProfile)
+    private void DrawCharacterNode(
+        QuartermasterRuntimeSnapshot runtime,
+        OwnerScope character,
+        BrowserProjection stock,
+        int index,
+        RailCounts counts,
+        string? externalProfile)
     {
         var external = externalProfile is not null;
         var viewing = !catalogMode && viewedCharacter?.Matches(character) == true;
@@ -1488,7 +1495,8 @@ internal sealed class StockWorkspace
                 continue;
             var key = scope.Key;
             var selected = viewing && key == viewedScopeKey;
-            if (RailNode(ContainerName(scope), counts.Text(index, key), selected, null, out _, external ? TradeTint : null))
+            if (RailNode(ContainerName(scope), counts.Text(index, key), selected, null, out _, external ? TradeTint : null,
+                    courier.ContainerSpace(runtime, character, scope, external)))
                 ViewCharacter(character, key);
             reviewRegistry.RegisterLastButton(
                 $"{control}.{key.Replace(':', '.')}",
@@ -1501,11 +1509,19 @@ internal sealed class StockWorkspace
     }
 
     /// <summary>
-    /// One rail row: a tree node (a leaf when <paramref name="open"/> is null) with its count drawn
-    /// right-aligned in muted text. The count is not an item, so the node stays the last item for
-    /// hover checks and review registration. Returns whether the label (not the chevron) was clicked.
+    /// One rail row: a tree node (a leaf when <paramref name="open"/> is null) with its count of
+    /// distinct items drawn right-aligned in muted text, and a container's fill bar left of it when
+    /// its free slots are known. Neither is an item, so the node stays the last item for hover
+    /// checks and review registration. Returns whether the label (not the chevron) was clicked.
     /// </summary>
-    private static bool RailNode(string label, string? count, bool selected, bool? open, out bool toggled, Vector4? color = null)
+    private static bool RailNode(
+        string label,
+        string? count,
+        bool selected,
+        bool? open,
+        out bool toggled,
+        Vector4? color = null,
+        (int Capacity, int? Free)? space = null)
     {
         var flags = ImGuiTreeNodeFlags.SpanAvailWidth | ImGuiTreeNodeFlags.NoTreePushOnOpen;
         if (selected)
@@ -1524,15 +1540,25 @@ internal sealed class StockWorkspace
             ImGui.PopStyleColor();
         toggled = open is not null && ImGui.IsItemToggledOpen();
         var clicked = ImGui.IsItemClicked(ImGuiMouseButton.Left) && !toggled;
+        var min = ImGui.GetItemRectMin();
+        var max = ImGui.GetItemRectMax();
+        var right = max.X - ImGui.GetStyle().FramePadding.X;
         if (!string.IsNullOrEmpty(count))
         {
-            var min = ImGui.GetItemRectMin();
-            var max = ImGui.GetItemRectMax();
             var size = ImGui.CalcTextSize(count);
+            right -= size.X;
             ImGui.GetWindowDrawList().AddText(
-                new Vector2(max.X - size.X - ImGui.GetStyle().FramePadding.X, min.Y + ((max.Y - min.Y - size.Y) / 2f)),
+                new Vector2(right, min.Y + ((max.Y - min.Y - size.Y) / 2f)),
                 ImGui.GetColorU32(ImGuiCol.TextDisabled),
                 count);
+            right -= ImGui.GetStyle().ItemInnerSpacing.X;
+        }
+        if (space is ({ } capacity, { } free))
+        {
+            var bar = new Vector2(22f, 4f) * ImGuiHelpers.GlobalScale;
+            FreeSlotsBar.Paint(new Vector2(right - bar.X, min.Y + ((max.Y - min.Y - bar.Y) / 2f)), bar, capacity, free);
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip($"{free:N0} free");
         }
         return clicked;
     }
@@ -2188,7 +2214,7 @@ internal sealed class StockWorkspace
     {
         transferPlans.DrawCourierDestinations(runtime, (character, retainer) =>
         {
-            transferPlans.AddCourier(runtime, items, character, retainer, source);
+            transferPlans.AddCourier(runtime, items, character, retainer);
             stockSelection.Clear();
         }, controlPrefix: controlPrefix, source: source);
     }

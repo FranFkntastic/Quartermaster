@@ -340,7 +340,7 @@ public sealed class Plugin : IDalamudPlugin
             log,
             courier = new CourierSession(
                 state,
-                owner => playerInventory.Snapshot(owner, CourierSession.PlayerBags),
+                owner => playerInventory.Snapshot(owner, CourierSession.PlayerStorage),
                 scanner.ResolveItemMetadata));
         var tradeIo = new DalamudTradeIo(gameGui,targets,objects,playerState,condition,sigScanner,dataManager,log);
         courierGame = new(pluginInterface,playerState,clientState,objects,condition,commands,dataManager,aetheryteList,

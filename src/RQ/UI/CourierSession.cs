@@ -14,6 +14,13 @@ namespace RQ.UI;
 /// <summary>Whether Start is offered, whether it can run, and the short cause when it cannot.</summary>
 internal readonly record struct CourierStartGate(bool Offer, bool CanStart, string? Status, bool OpensSettings);
 
+/// <summary>One container of a character as the destination picker shows it; Free and Has are null when it was never observed.</summary>
+internal sealed record CourierContainer(ulong? Retainer, string Name, int Capacity, int? Free, int? Has,
+    IReadOnlyList<(string Name, long Quantity)> Contents)
+{
+    internal int? Stacks => Free is { } free ? Capacity - free : null;
+}
+
 public sealed record CourierPeer(OwnerScope Character, InventoryView? Bags,IReadOnlyList<OwnerScope>? Roster=null);
 
 /// <summary>
@@ -63,7 +70,9 @@ public sealed class CourierSession
 {
     private static readonly string[] PlayerBagNames = InventoryScanner.PlayerBags.Select(bag => bag.ToString()).ToArray();
     private static readonly string[] RetainerPageNames = InventoryScanner.RequiredRetainerContainers.Select(bag => bag.ToString()).ToArray();
+    private static readonly string[] SaddlebagNames = InventoryScanner.SaddlebagContainers.Select(bag => bag.ToString()).ToArray();
     private const int PlayerBagSlots = 140;
+    private const int SaddlebagSlots = 140;
     private const int RetainerSlots = 175;
     private static readonly long PollTicks = Stopwatch.Frequency / 4;
 
@@ -73,7 +82,6 @@ public sealed class CourierSession
     private (long Revision, IReadOnlyList<OwnerScope> Characters)? characters;
     private (long Revision, Guid PlanId, object Peers, CourierPlan? Plan)? plan;
     private CourierSnapshot? run;
-    private Guid? settledRun;
     private CarrierView? carried;
     private long polledAt;
     private Task? starting;
@@ -132,6 +140,9 @@ public sealed class CourierSession
     }
 
     internal static IReadOnlyList<string> PlayerBags => PlayerBagNames;
+
+    /// <summary>The player containers the session reads from the player cache: bags, then the saddlebag pages.</summary>
+    internal static IReadOnlyList<string> PlayerStorage { get; } = [.. PlayerBagNames, .. SaddlebagNames];
 
     // ---- Characters -------------------------------------------------------------------------
 
@@ -371,46 +382,113 @@ public sealed class CourierSession
             .ToArray();
     }
 
-    private (long Revision, Dictionary<(Guid, ulong, ItemQualityPolicy), PlacementMovePlan?> Plans)? gathers;
+    /// <summary>
+    /// Characters a courier line can add as a destination: every known character the carrier can
+    /// reach, except the carrier, with at least one container observed on this client.
+    /// </summary>
+    internal IEnumerable<OwnerScope> DestinationCharacters(QuartermasterRuntimeSnapshot runtime) =>
+        Characters(runtime).Where(character => !IsCarrier(runtime, character) && IsRegionEligible(runtime, character) &&
+                                               Locations(runtime).Any(location => location.Character.Matches(character)));
+
+    private (long Revision, Dictionary<(ulong?, uint, ItemQualityPolicy), IReadOnlyList<CourierContainer>> Views)? containers;
 
     /// <summary>
-    /// What destination consolidation would gather for a courier line on its destination character
-    /// today: the item's stacks on that character's other retainers moved into the line's rank 1.
-    /// Null when the line does not consolidate or its stack size is unknown. Delivery itself is not
-    /// projected; the run plans the moves again from fresh stock after its deposits.
+    /// A character's bags then retainers in game order with their space, their units of an item and
+    /// everything they hold, from the last observation on this client. An unobserved container has no
+    /// free count and no contents. Cached per runtime revision.
     /// </summary>
-    internal PlacementMovePlan? Gather(QuartermasterRuntimeSnapshot runtime, TargetPlanItem rule)
+    internal IReadOnlyList<CourierContainer> Containers(QuartermasterRuntimeSnapshot runtime, OwnerScope character, uint itemId, ItemQualityPolicy quality)
     {
-        if (rule.Courier is not { } route || !rule.Routing.Consolidate || rule.Routing.PreferredRetainerIds.Count == 0)
-            return null;
-        if (gathers is not { } cache || cache.Revision != runtime.Revision)
-            gathers = cache = (runtime.Revision, []);
-        var key = (rule.Id, rule.Routing.PreferredRetainerIds[0], rule.Quality);
-        if (cache.Plans.TryGetValue(key, out var hit))
+        if (containers is not { } cache || cache.Revision != runtime.Revision)
+            containers = cache = (runtime.Revision, []);
+        var key = (character.LocalContentId, itemId, quality);
+        if (cache.Views.TryGetValue(key, out var hit))
             return hit;
-        PlacementMovePlan? plan = null;
-        if (metadata(rule.ItemId).MaxStackSize is > 0 and <= int.MaxValue and var size)
+        CourierContainer View(ulong? retainer, string name, int capacity, IEnumerable<(uint ItemId, string ItemName, uint Quantity, bool IsHq)>? items)
         {
-            var probe = new TargetPlanItem
-            {
-                Id = rule.Id, ItemId = rule.ItemId, ItemName = rule.ItemName, Quality = rule.Quality,
-                Routing = new() { PreferredRetainerIds = [rule.Routing.PreferredRetainerIds[0]], Consolidate = true },
-            };
-            plan = PlacementMovePlanner.FromCache(probe, Retainers(runtime, route.Character), (int)size);
+            if (items is null)
+                return new(retainer, name, capacity, null, null, []);
+            var held = items.Where(item => item.ItemId > 0 && item.Quantity > 0).ToArray();
+            var contents = held.GroupBy(item => item.ItemId)
+                .Select(group => (Name: group.Select(item => item.ItemName).FirstOrDefault(text => !string.IsNullOrWhiteSpace(text)) ?? metadata(group.Key).Name,
+                    Quantity: group.Sum(item => (long)item.Quantity)))
+                .OrderByDescending(entry => entry.Quantity)
+                .ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var has = held.Where(item => item.ItemId == itemId && (quality == ItemQualityPolicy.Any || item.IsHq == (quality == ItemQualityPolicy.HqOnly)))
+                .Sum(item => (long)item.Quantity);
+            return new(retainer, name, capacity, Math.Max(0, capacity - held.Length), (int)Math.Min(int.MaxValue, has), contents);
         }
-        cache.Plans[key] = plan;
-        return plan;
+        var capture = cachedBags(character);
+        var views = new List<CourierContainer>
+        {
+            View(null, ContainerLabel(runtime, null), PlayerBagSlots,
+                PlayerBagNames.All(name => capture.ObservedSources.Contains(name, StringComparer.Ordinal))
+                    ? capture.Bags.Where(bag => PlayerBagNames.Contains(bag.BagName, StringComparer.Ordinal))
+                        .SelectMany(bag => bag.Items).Select(item => (item.ItemId, item.ItemName, item.Quantity, item.IsHq))
+                    : null),
+        };
+        foreach (var retainer in Retainers(runtime, character))
+            views.Add(View(retainer.RetainerId, retainer.RetainerName, RetainerSlots,
+                RetainerPageNames.All(name => retainer.ObservedSources.Contains(name, StringComparer.Ordinal))
+                    ? retainer.Bags.Where(bag => RetainerPageNames.Contains(bag.BagName, StringComparer.Ordinal))
+                        .SelectMany(bag => bag.Items).Select(item => (item.ItemId, item.ItemName, item.Quantity, item.IsHq))
+                    : null));
+        cache.Views[key] = views;
+        return views;
     }
 
-    /// <summary>Free slots in a character's observed bags; null while its bags have not been observed.</summary>
-    internal int? FreeBagSlots(OwnerScope character)
+    private (long Revision, long External, Dictionary<(ulong? Character, string Scope), (int Capacity, int? Free)> Spaces)? spaces;
+
+    /// <summary>
+    /// A rail container's slots and how many are free, from the cache that last saw it whole: this
+    /// client's player and retainer caches, or a sibling profile's for a character on another
+    /// account. Free is null while any of its pages is unobserved; a saddlebag needs all four.
+    /// </summary>
+    internal (int Capacity, int? Free) ContainerSpace(QuartermasterRuntimeSnapshot runtime, OwnerScope character, BrowserScope scope, bool external)
     {
-        var capture = cachedBags(character);
-        if (!PlayerBagNames.All(name => capture.ObservedSources.Contains(name, StringComparer.Ordinal)))
-            return null;
-        var used = capture.Bags.Where(bag => PlayerBagNames.Contains(bag.BagName, StringComparer.Ordinal))
-            .SelectMany(bag => bag.Items).Count(item => item.ItemId > 0 && item.Quantity > 0);
-        return Math.Max(0, PlayerBagSlots - used);
+        var snapshot = ExternalStockCache?.Current ?? ExternalAccountSnapshot.Empty;
+        if (spaces is not { } cache || cache.Revision != runtime.Revision || cache.External != snapshot.Revision)
+            spaces = cache = (runtime.Revision, snapshot.Revision, []);
+        var key = (character.LocalContentId, scope.Key);
+        if (cache.Spaces.TryGetValue(key, out var hit))
+            return hit;
+
+        (int, int?) Pages(IReadOnlyList<string> pages, int capacity)
+        {
+            IEnumerable<string> observed;
+            IEnumerable<(string BagName, IEnumerable<InventoryItem> Items)> bags;
+            if (external)
+            {
+                var cached = snapshot.PlayerBags.GetValueOrDefault(character.LocalContentId ?? 0);
+                observed = cached?.ObservedSources ?? [];
+                bags = cached?.Bags.Select(bag => (bag.BagName, (IEnumerable<InventoryItem>)bag.Items)) ?? [];
+            }
+            else
+            {
+                var capture = cachedBags(character);
+                observed = capture.ObservedSources;
+                bags = capture.Bags.Select(bag => (bag.BagName, (IEnumerable<InventoryItem>)bag.Items));
+            }
+            if (!pages.All(observed.Contains))
+                return (capacity, null);
+            var used = bags.Where(bag => pages.Contains(bag.BagName, StringComparer.Ordinal))
+                .SelectMany(bag => bag.Items).Count(item => item.ItemId > 0 && item.Quantity > 0);
+            return (capacity, Math.Max(0, capacity - used));
+        }
+
+        (int Capacity, int? Free) space = scope.Kind switch
+        {
+            BrowserScopeKind.Player => Pages(PlayerBagNames, PlayerBagSlots),
+            BrowserScopeKind.Saddlebag => Pages(SaddlebagNames, SaddlebagSlots),
+            BrowserScopeKind.Retainer when scope.RetainerId is { } id =>
+                (RetainerSlots, (external ? snapshot.Retainers.GetValueOrDefault(id) : runtime.Retainers.GetValueOrDefault(id)) is { } retainer
+                    ? StowageRouter.FreeInventorySlots(retainer)
+                    : null),
+            _ => (0, null),
+        };
+        cache.Spaces[key] = space;
+        return space;
     }
 
     internal static bool IsCarrier(QuartermasterRuntimeSnapshot runtime, OwnerScope owner) =>
@@ -431,45 +509,13 @@ public sealed class CourierSession
             ? runtime.Retainers.GetValueOrDefault(id)?.RetainerName is { Length: > 0 } name ? name : $"Retainer {id}"
             : "Bags";
 
-    /// <summary>"Eris → Fran · Skrrt +1": each side names its character only when it is not the logged-in one.</summary>
-    internal static string RouteLabel(QuartermasterRuntimeSnapshot runtime, TargetPlanItem rule) =>
-        rule.Courier is { } route
-            ? $"{Side(runtime, route.SourceCharacter, route.SourceRetainerId)} → {Destination(runtime, route.Character, rule.Routing)}"
-            : string.Empty;
-
-    /// <summary>
-    /// Where a courier line lands, as Transfer Placement reads it: "Bags" with no destinations, else its
-    /// rank-1 retainer and how many fallbacks follow ("Grungel +1"), or "Any space" alone. The character
-    /// is named unless it is the logged-in one and <paramref name="includeOwner"/> is off.
-    /// </summary>
-    internal static string Destination(QuartermasterRuntimeSnapshot runtime, OwnerScope character, StowageRoutingPolicy routing, bool includeOwner = false)
+    /// <summary>"Bags, Taffy-swordsman → Gryngle": the containers a line gives from and lands in.</summary>
+    internal static string RouteSummary(QuartermasterRuntimeSnapshot runtime, CourierAllocation allocation)
     {
-        var listed = routing.PreferredRetainerIds.Distinct().ToArray();
-        var container = listed.Length == 0
-            ? routing.AnySpace ? TransferPresentation.AnySpaceLabel : ContainerLabel(runtime, null)
-            : ContainerLabel(runtime, listed[0]) + (listed.Length - 1 + (routing.AnySpace ? 1 : 0) is > 0 and var more ? $" +{more}" : string.Empty);
-        if (!includeOwner && character.Matches(runtime.Owner))
-            return container;
-        return $"{CharacterLabel(character)} · {container}";
+        string Containers(Func<CourierSpot, bool> side) => string.Join(", ", allocation.Places.Where(side)
+            .Select(spot => ContainerLabel(runtime, spot.Retainer)).Distinct());
+        return $"{Containers(spot => spot.Delta < 0)} → {Containers(spot => spot.Delta > 0)}";
     }
-
-    /// <summary>The full destination order ("Grungel → Eris → Any space", or "Bags"), for tooltips and the review.</summary>
-    internal static string DestinationOrder(QuartermasterRuntimeSnapshot runtime, OwnerScope character, StowageRoutingPolicy routing)
-    {
-        var listed = routing.PreferredRetainerIds.Distinct().Select(id => ContainerLabel(runtime, id)).ToList();
-        if (routing.AnySpace)
-            listed.Add(TransferPresentation.AnySpaceLabel);
-        var order = listed.Count == 0 ? ContainerLabel(runtime, null) : string.Join(" → ", listed);
-        return $"{CharacterLabel(character)} · {order}{(routing.Consolidate && routing.PreferredRetainerIds.Count > 0 ? $" · gathers strays into {ContainerLabel(runtime, routing.PreferredRetainerIds[0])}" : string.Empty)}";
-    }
-
-    /// <summary>
-    /// The container a destination chooser checks for a line: null for bags (no destinations), its
-    /// rank-1 retainer, or <see cref="PlacementEdits.AnySpace"/> (no retainer) for Any space alone.
-    /// </summary>
-    internal static ulong? FirstDestination(StowageRoutingPolicy routing) =>
-        routing.PreferredRetainerIds.Count > 0 ? routing.PreferredRetainerIds[0]
-        : routing.AnySpace ? PlacementEdits.AnySpace : null;
 
     internal static string Side(QuartermasterRuntimeSnapshot runtime, OwnerScope? character, ulong? retainer, bool includeOwner = false)
     {
@@ -510,9 +556,32 @@ public sealed class CourierSession
         return built;
     }
 
-    /// <summary>Observed containers of every known character; unobserved ones are omitted.</summary>
-    private IReadOnlyList<CourierLocation> Locations(QuartermasterRuntimeSnapshot runtime)
+    private (long Revision, IReadOnlyList<CourierLocation> Locations)? located;
+    private (long Revision, object Settings, Dictionary<Guid, (CourierLine Line, ItemQualityPolicy Quality, OwnerScope Owner, CourierAllocation Allocation)> Lines)? allocations;
+
+    /// <summary>
+    /// Where a courier line's item sits and where it would move, as the planner sees it: the listed
+    /// places with their observed units, typed values and end states. Cached per runtime revision and line.
+    /// </summary>
+    internal CourierAllocation Allocation(QuartermasterRuntimeSnapshot runtime, OwnerScope planOwner, TargetPlanItem rule)
     {
+        var line = rule.Courier ?? new CourierLine();
+        var settings = runtime.State.Courier;
+        if (allocations is not { } cache || cache.Revision != runtime.Revision || !ReferenceEquals(cache.Settings, settings))
+            allocations = cache = (runtime.Revision, settings, []);
+        if (cache.Lines.TryGetValue(rule.Id, out var hit) && ReferenceEquals(hit.Line, line) && hit.Quality == rule.Quality && hit.Owner.Matches(planOwner))
+            return hit.Allocation;
+        var allocation = CourierDistribution.Allocate(line, rule.ItemId, rule.Quality, planOwner, Locations(runtime),
+            who => CourierPlanner.Listable(who, settings, WorldRegion));
+        cache.Lines[rule.Id] = (line, rule.Quality, planOwner, allocation);
+        return allocation;
+    }
+
+    /// <summary>Observed containers of every known character; unobserved ones are omitted. Cached per runtime revision.</summary>
+    internal IReadOnlyList<CourierLocation> Locations(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (located is { } cached && cached.Revision == runtime.Revision)
+            return cached.Locations;
         var locations = new List<CourierLocation>();
         foreach (var owner in Characters(runtime))
         {
@@ -534,6 +603,7 @@ public sealed class CourierSession
                     [.. items.Select(item => new BagStock(item.ItemId, item.IsHq, checked((int)item.Quantity)))])));
             }
         }
+        located = (runtime.Revision, locations);
         return locations;
     }
 
@@ -616,7 +686,7 @@ public sealed class CourierSession
             "MeetingBellMissing" => $"No meeting bell for {string.Join(" or ", MissingBells(runtime, named).DefaultIfEmpty(source))}",
             "ItemNotTradeable" => $"{refusal.Name} cannot be traded",
             "SourceUnknown" => $"Source container on {source} not observed",
-            "DestinationUnknown" => $"Destination retainers on {destination} not observed",
+            "DestinationUnknown" => $"Destination container on {destination} not observed",
             "ItemMetadataUnknown" => $"No item data for {refusal.Name}",
             "InvalidQuantity" => $"No quantity for {refusal.Name}",
             "UniqueConflict" => $"{refusal.Name} is unique and {destination} or {carrier} already holds one",
@@ -652,65 +722,11 @@ public sealed class CourierSession
         try
         {
             run = Conductor?.Snapshot();
-            if (run is { State: "Completed" } completed && settledRun != completed.Run)
-            {
-                ApplyCompleted(completed);
-                settledRun = completed.Run;
-            }
         }
         catch (Exception exception) { Fail("Courier run state unreadable", exception.ToString()); }
         try { carried = Follower?.View(); }
         catch (Exception exception) { Fail("Carrier state unreadable", exception.ToString()); }
     }
-
-    /// <summary>
-    /// The unsaved plan a completed run's delivered lines clear from: the run's own plan, or, for a
-    /// run started from an unsaved Transfer plan before courier lines moved to their own unsaved
-    /// Courier plan, that owner's unsaved Courier plan. Saved plans keep their lines.
-    /// </summary>
-    private static StowagePlan? CompletedScratch(QuartermasterState document, CourierSnapshot completed) =>
-        document.StowagePlans.SingleOrDefault(p => p.Id == completed.PlanId && p.IsEphemeral) is { } scratch
-            ? scratch.Kind == StowagePlanKind.Courier ? scratch : StowagePlanCatalog.FindScratch(document, scratch.Owner, StowagePlanKind.Courier)
-            : null;
-
-    private void ApplyCompleted(CourierSnapshot completed)
-    {
-        if (!state.ReadConfiguration(document => CompletedScratch(document, completed) is { } p && p.LastAppliedCourierRun != completed.Run))
-            return;
-        state.Mutate(document =>
-        {
-            var scratch = CompletedScratch(document, completed);
-            if (scratch is null || scratch.LastAppliedCourierRun == completed.Run)
-                return;
-            var draft = StowagePlanCatalog.Draft(document, scratch.Owner, scratch.Id);
-            foreach (var line in completed.Lines)
-            {
-                var rule = draft.Rules.Find(r => r.Id == line.Line && r.Courier is not null);
-                // A line re-routed or re-qualified during the run is a new instruction; what was delivered does not count against it.
-                // A Keep N line is a standing threshold: delivering its surplus leaves it as it was.
-                if (rule is null || line.Moved <= 0 || rule.Courier!.KeepInSource || line.Route is not { } sent || !StillLandsAt(rule.Routing, sent.To) ||
-                    rule.Courier!.SourceRetainerId != sent.From || !CourierPlanner.Exact(rule.Courier.Character, sent.Destination) ||
-                    !CourierPlanner.Exact(rule.Courier.SourceCharacter ?? scratch.Owner, sent.Source) ||
-                    rule.Quality != ItemQualityPolicy.Any && (rule.Quality == ItemQualityPolicy.HqOnly ? line.Nq : line.Hq))
-                    continue;
-                if (rule.TargetQuantity <= line.Moved)
-                    draft.Rules.Remove(rule);
-                else
-                    rule.TargetQuantity -= line.Moved;
-            }
-            StowagePlanCatalog.Apply(document, scratch.Owner, draft);
-            scratch.LastAppliedCourierRun = completed.Run;
-        });
-    }
-
-    /// <summary>
-    /// Whether a line's destinations still take a delivered shipment's container: bags only when the
-    /// line has none, a retainer when the line lists it or fills Any space.
-    /// </summary>
-    internal static bool StillLandsAt(StowageRoutingPolicy routing, ulong? container) =>
-        container is { } retainer
-            ? routing.AnySpace || routing.PreferredRetainerIds.Contains(retainer)
-            : routing.PreferredRetainerIds.Count == 0 && !routing.AnySpace;
 
     /// <summary>
     /// Whether Start is offered for a courier plan and, when offered but blocked, the short cause.
@@ -746,8 +762,7 @@ public sealed class CourierSession
     internal void Start(QuartermasterRuntimeSnapshot runtime, StowagePlan stowagePlan)
     {
         Poll(force: true);
-        if (run is { State: "Completed" } completed && settledRun != completed.Run ||
-            !state.ReadConfiguration(document => document.StowagePlans.Any(p => p.Id == stowagePlan.Id && p.Revision == stowagePlan.Revision)))
+        if (!state.ReadConfiguration(document => document.StowagePlans.Any(p => p.Id == stowagePlan.Id && p.Revision == stowagePlan.Revision)))
             return;
         plan = null;
         var courierPlan = Plan(runtime, stowagePlan);
@@ -764,7 +779,7 @@ public sealed class CourierSession
     /// </summary>
     internal void Clear(Guid expectedRun, ImmutableArray<CustodyRow> shown)
     {
-        if (Conductor is not { } conductor || IsActive || run is { State: "Completed" } completed && settledRun != completed.Run) return;
+        if (Conductor is not { } conductor || IsActive) return;
         var acknowledgement = ClearAcknowledgement;
         Launch(async () =>
         {
