@@ -292,6 +292,11 @@ public sealed class CourierSession
                     ids.Add(owner.LocalContentId.Value);
         }
         catch (Exception exception) { Warn?.Invoke($"Quartermaster could not list this client's cached characters: {exception.Message}"); }
+        // The configured carrier belongs to another service account (and is excluded from local
+        // Browsable): never let a stale local cache entry hide it from the Other accounts section.
+        if (runtime.State.Courier.Carrier?.LocalContentId is { } carrierId &&
+            runtime.Owner.LocalContentId != carrierId)
+            ids.Remove(carrierId);
         return ids;
     }
 
