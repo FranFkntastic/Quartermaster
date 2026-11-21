@@ -783,7 +783,9 @@ internal sealed class StockWorkspace
                       transferPlans.HasCourierDestinations(runtime, location.Character);
         var current = location.IsCurrent && identified ? runtime.Browser.FindItem(itemId) : null;
         var canStow = location.Kind == BrowserScopeKind.Player && current is { PlayerQuantity: > 0 };
-        var canPlan = location.Kind is BrowserScopeKind.Saddlebag or BrowserScopeKind.Retainer && current is not null;
+        // Any character's bags or retainer can join an open Courier plan as a source.
+        var courierSource = location.Kind is BrowserScopeKind.Player or BrowserScopeKind.Retainer && transferPlans.CourierPlanOpen(runtime);
+        var canPlan = courierSource || location.Kind is BrowserScopeKind.Saddlebag or BrowserScopeKind.Retainer && current is not null;
 
         reviewRegistry.RegisterLastButton($"{control}.menu", $"Open actions for {row.Item.ItemName} in {location.Label}", true,
             () => pendingLocationPopup = $"menu:{control}", "Available");
@@ -793,12 +795,20 @@ internal sealed class StockWorkspace
         if (canStow)
             reviewRegistry.RegisterLastButton($"{control}.stow", $"Stow carried {row.Item.ItemName}", true,
                 () => pendingLocationPopup = $"stow:{control}", "Available");
-        // With a Courier plan open, the add sends from exactly this container.
-        StockGroup PlanItem(QuartermasterRuntimeSnapshot at) =>
-            transferPlans.CourierPlanOpen(at) && LocationItem(at, itemId, location) is { } here ? here : current!;
+        // With a Courier plan open, bags and retainers join the item's line as a source; the saddlebag is
+        // not a courier place, so it adds the item with no source like any other plain add.
+        void AddToPlan(QuartermasterRuntimeSnapshot at)
+        {
+            if (location.Kind is BrowserScopeKind.Player or BrowserScopeKind.Retainer &&
+                transferPlans.AddCourierSource(at, itemId, row.Item.ItemName, location.Character,
+                    location.Kind == BrowserScopeKind.Retainer ? location.RetainerId : null))
+                return;
+            if (current is not null)
+                UpsertSelectedStockRules(at, [current], stowCarried: false);
+        }
         if (canPlan)
             reviewRegistry.RegisterLastButton($"{control}.add-to-plan", $"Add {row.Item.ItemName} to the current plan", true,
-                () => UpsertSelectedStockRules(runtimeSnapshots.Current, [PlanItem(runtimeSnapshots.Current)], stowCarried: false), "Available");
+                () => AddToPlan(runtimeSnapshots.Current), "Available");
 
         if (pendingLocationPopup is { } pending && pending.Length == control.Length + 5 && pending.EndsWith(control, StringComparison.Ordinal))
         {
@@ -832,7 +842,7 @@ internal sealed class StockWorkspace
             if (canPlan)
             {
                 if (ImGui.MenuItem("Add to plan"))
-                    UpsertSelectedStockRules(runtime, [PlanItem(runtime)], stowCarried: false);
+                    AddToPlan(runtime);
                 if (ImGui.IsItemHovered())
                     ImGui.SetTooltip(transferPlans.CourierPlanOpen(runtime)
                         ? "Add to the open Courier plan"

@@ -215,7 +215,7 @@ internal sealed partial class TransferPlanWorkspace
 
     /// <summary>
     /// A line's sources then its destinations as rows of the plan table, each list followed by the row
-    /// that adds to it. A line without a destination offers one suggested destination above that row.
+    /// that adds to it. A line without a source or a destination offers one suggested place above that row.
     /// </summary>
     private void DrawCourierPlaces(TransferWorkbenchRow row)
     {
@@ -228,8 +228,9 @@ internal sealed partial class TransferPlanWorkspace
         var whoWidth = 0f;
         foreach (var spot in allocation.Places)
             whoWidth = Math.Max(whoWidth, ImGui.CalcTextSize(CourierSession.CharacterLabel(spot.Character)).X);
-        if (allocation.Suggestion is { } offered)
-            whoWidth = Math.Max(whoWidth, ImGui.CalcTextSize(CourierSession.CharacterLabel(offered.Character)).X);
+        foreach (var offered in new[] { allocation.SourceSuggestion, allocation.Suggestion })
+            if (offered is not null)
+                whoWidth = Math.Max(whoWidth, ImGui.CalcTextSize(CourierSession.CharacterLabel(offered.Character)).X);
         // The widest name seen so far, so containers line up across items rather than per item.
         courierWhoWidth = whoWidth = Math.Max(courierWhoWidth, whoWidth);
         var layout = new PlaceLayout(indent, roleWidth, whoWidth);
@@ -237,7 +238,9 @@ internal sealed partial class TransferPlanWorkspace
         ImGui.PushID(CourierKey(rule.Id));
         for (var index = 0; index < sources; index++)
             DrawCourierPlace(row, allocation, allocation.Places[index], index, index == 0 ? "From" : null, layout);
-        DrawAddPlace(row, allocation, PlaceRole.Source, sources == 0 ? "From" : null, layout);
+        if (allocation.SourceSuggestion is { } sourceSuggestion)
+            DrawCourierPlace(row, allocation, sourceSuggestion, allocation.Places.Length + 1, "From", layout, suggested: true);
+        DrawAddPlace(row, allocation, PlaceRole.Source, sources == 0 && allocation.SourceSuggestion is null ? "From" : null, layout);
         for (var index = sources; index < allocation.Places.Length; index++)
             DrawCourierPlace(row, allocation, allocation.Places[index], index, index == sources ? "To" : null, layout);
         if (allocation.Suggestion is { } suggestion)
@@ -271,7 +274,7 @@ internal sealed partial class TransferPlanWorkspace
 
     /// <summary>
     /// One listed place: character, container, what it has, its target and its move. A suggested
-    /// destination is drawn dimmed with its target locked and offers to be confirmed or dismissed.
+    /// source or destination is drawn dimmed with its target locked and offers to be confirmed or dismissed.
     /// </summary>
     private void DrawCourierPlace(TransferWorkbenchRow row, CourierAllocation allocation, CourierSpot spot, int index, string? role,
         PlaceLayout layout, bool suggested = false)
@@ -398,18 +401,28 @@ internal sealed partial class TransferPlanWorkspace
             "Available");
     }
 
-    /// <summary>Confirms the suggested destination as a destination of the line, or dismisses it for good.</summary>
+    /// <summary>
+    /// Confirms a suggested place in its role on the line, or dismisses it for good. The suggested
+    /// destination keeps its review IDs; the suggested source registers the same pair under "source".
+    /// </summary>
     private void DrawSuggestionChoice(TransferWorkbenchRow row, CourierSpot spot)
     {
         var rule = row.Rule;
-        void Confirm() => MutateCourierLine(row, line => line.WithDestination(spot.Character, spot.Retainer));
-        void Dismiss() => MutateCourierLine(row, line => line with { SuggestionDismissed = true });
+        var destination = spot.Destination;
+        var role = destination ? "destination" : "source";
+        var prefix = destination ? "quartermaster.courier.suggestion" : "quartermaster.courier.source.suggestion";
+        void Confirm() => MutateCourierLine(row, line => destination
+            ? line.WithDestination(spot.Character, spot.Retainer)
+            : line.WithSource(spot.Character, spot.Retainer));
+        void Dismiss() => MutateCourierLine(row, line => destination
+            ? line with { SuggestionDismissed = true }
+            : line with { SourceSuggestionDismissed = true });
         ImGui.PushFont(UiBuilder.IconFont);
         var confirmed = ImGui.SmallButton($"{ConfirmIcon}##confirm-suggestion");
         ImGui.PopFont();
         reviewRegistry.RegisterLastButton(
-            $"quartermaster.courier.suggestion.confirm.{rule.Id:N}",
-            $"Add {PlaceLabel(row.Runtime, spot)} as a destination of {rule.ItemName}",
+            $"{prefix}.confirm.{rule.Id:N}",
+            $"Add {PlaceLabel(row.Runtime, spot)} as a {role} of {rule.ItemName}",
             true,
             Confirm,
             PlaceLabel(row.Runtime, spot));
@@ -418,8 +431,8 @@ internal sealed partial class TransferPlanWorkspace
         var dismissed = ImGui.SmallButton($"{DismissIcon}##dismiss-suggestion");
         ImGui.PopFont();
         reviewRegistry.RegisterLastButton(
-            $"quartermaster.courier.suggestion.dismiss.{rule.Id:N}",
-            $"Dismiss {PlaceLabel(row.Runtime, spot)} as the suggested destination of {rule.ItemName}",
+            $"{prefix}.dismiss.{rule.Id:N}",
+            $"Dismiss {PlaceLabel(row.Runtime, spot)} as the suggested {role} of {rule.ItemName}",
             true,
             Dismiss,
             PlaceLabel(row.Runtime, spot));

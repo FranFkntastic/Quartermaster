@@ -272,6 +272,31 @@ internal sealed partial class TransferPlanWorkspace
     }
 
     /// <summary>
+    /// Adds an item to the open Courier plan, or finds its line there, and lists a character's bags
+    /// (null <paramref name="retainerId"/>) or retainer as a source of it, unless the line already
+    /// lists that place in either role. Returns false when no Courier plan is open.
+    /// </summary>
+    public bool AddCourierSource(QuartermasterRuntimeSnapshot runtime, uint itemId, string itemName, OwnerScope source, ulong? retainerId)
+    {
+        if (!runtime.Owner.HasStableIdentity || !CourierPlanOpen(runtime))
+            return false;
+        var from = source with { };
+        var affected = AddCourierLines(runtime, workbench.SelectedStowagePlanId!.Value,
+            [new PlanAddEntry(itemId, itemName, ItemQualityPolicy.Any)],
+            selectAffected: true,
+            rule =>
+            {
+                var line = rule.Courier is { HasLegacyPlaces: true }
+                    ? courier.Allocation(runtime, runtime.Owner, rule).Line
+                    : rule.Courier ?? new CourierLine();
+                rule.Courier = line.Lists(from, retainerId) ? line : line.WithSource(from, retainerId);
+            });
+        foreach (var id in affected)
+            courierExpansion.SetExpanded(CourierKey(id), true);
+        return true;
+    }
+
+    /// <summary>
     /// Adds balanced lines for items not already in the selected plan and selects every affected line.
     /// With a Courier plan open they become courier lines on it, as from its own add box.
     /// </summary>

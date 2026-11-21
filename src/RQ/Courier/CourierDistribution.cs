@@ -31,7 +31,8 @@ public enum CourierProblem
 /// <summary>
 /// A line's solved moves. Places are its sources, then its destinations, in listed order. Line is the
 /// line as solved (older lines converted). Holders are observed places holding the item that the line
-/// does not list and the courier can use; Suggestion is the destination offered while the line has none.
+/// does not list and the courier can use; Suggestion is the destination offered while the line has none,
+/// SourceSuggestion the source offered while it has none.
 /// </summary>
 public sealed record CourierAllocation(
     CourierLine Line,
@@ -43,6 +44,7 @@ public sealed record CourierAllocation(
 {
     public ImmutableArray<CourierSpot> Holders { get; init; } = [];
     public CourierSpot? Suggestion { get; init; }
+    public CourierSpot? SourceSuggestion { get; init; }
 
     public int Total => Places.Sum(p => p.Has ?? 0);
     public int Moving => Flows.Sum(f => f.Units);
@@ -128,7 +130,9 @@ public static class CourierDistribution
     /// (and are refused) on the line. Units typed sources give that nothing takes count as Stuck, units
     /// typed destinations want that nothing gives as Short; either is a problem and the line moves nothing.
     /// While the line has no destination, the observed holder with the most units that is not a source
-    /// is offered as a suggestion, unless dismissed.
+    /// is offered as a suggestion, unless dismissed. While it has no source, the observed holder with the
+    /// most units that is neither a destination nor the suggested destination is offered as a source,
+    /// unless dismissed. Suggestions are solved against the line as listed and move nothing.
     /// </summary>
     public static CourierAllocation Allocate(CourierLine line, uint item, ItemQualityPolicy quality, OwnerScope? owner,
         IReadOnlyList<CourierLocation> locations, Func<OwnerScope, bool> listable)
@@ -140,20 +144,22 @@ public static class CourierDistribution
             .ToArray();
         ImmutableArray<CourierSpot> holders =
             [.. holding.Select(held => new CourierSpot(held.At.Character, held.At.Retainer, held.Units, null, false, held.Units))];
+        CourierLocation? Best(CourierLocation? except) => holding
+            .Where(held => except is null || held.At.Retainer != except.Retainer || !held.At.Character.Matches(except.Character))
+            .OrderByDescending(held => held.Units)
+            .Select(held => held.At)
+            .FirstOrDefault();
         CourierSpot? suggestion = null;
-        if (line.Destinations.IsEmpty && !line.SuggestionDismissed)
+        CourierLocation? suggested = null;
+        if (line.Destinations.IsEmpty && !line.SuggestionDismissed && Best(null) is { } destination)
         {
-            var best = holding
-                .OrderByDescending(held => held.Units)
-                .Select(held => held.At)
-                .FirstOrDefault();
-            if (best is not null)
-            {
-                var offered = Solve(line.Sources, [new(best.Character, best.Retainer)], item, quality, locations);
-                suggestion = offered.Places[^1];
-            }
+            suggested = destination;
+            suggestion = Solve(line.Sources, [new(destination.Character, destination.Retainer)], item, quality, locations).Places[^1];
         }
-        return solved with { Line = line, Holders = holders, Suggestion = suggestion };
+        CourierSpot? sourceSuggestion = null;
+        if (line.Sources.IsEmpty && !line.SourceSuggestionDismissed && Best(suggested) is { } source)
+            sourceSuggestion = Solve([new(source.Character, source.Retainer)], line.Destinations, item, quality, locations).Places[0];
+        return solved with { Line = line, Holders = holders, Suggestion = suggestion, SourceSuggestion = sourceSuggestion };
     }
 
     private static CourierAllocation Solve(ImmutableArray<CourierPlace> sources, ImmutableArray<CourierPlace> destinations,
