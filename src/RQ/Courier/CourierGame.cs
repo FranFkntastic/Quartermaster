@@ -78,15 +78,35 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     };
     private float DestinationDistanceSquared(uint nodeId, Vector3 target)
     {
-        if (data.GetExcelSheet<Aetheryte>().GetRowOrDefault(nodeId) is { } node)
+        if (data.GetExcelSheet<Aetheryte>().GetRowOrDefault(nodeId) is not { } node)
+            return float.MaxValue;
+        foreach (var reference in node.Level)
         {
-            foreach (var reference in node.Level)
+            if (reference.RowId == 0 || reference.ValueNullable is not { } level)
+                continue;
+            var position = new Vector3(level.X, level.Y, level.Z);
+            var distance = Vector3.DistanceSquared(position, target);
+            if (position != Vector3.Zero && float.IsFinite(distance))
+                return distance;
+        }
+        // City aethernet shards leave Aetheryte.Level empty (and often Aetheryte.Map too); their
+        // positions live in MapMarker (DataType 4 = aethernet shard keyed by AethernetName,
+        // DataType 3 = main aetheryte keyed by RowId).
+        var mapRef = node.Map.RowId != 0 ? node.Map : node.Territory.ValueNullable?.Map ?? default;
+        if (mapRef.RowId != 0 && mapRef.ValueNullable is { SizeFactor: > 0 } map &&
+            data.GetSubrowExcelSheet<Lumina.Excel.Sheets.MapMarker>().GetRowOrDefault(map.MapMarkerRange) is { } markers)
+        {
+            var expectedType = node.IsAetheryte ? (byte)3 : (byte)4;
+            var expectedKey = node.IsAetheryte ? node.RowId : node.AethernetName.RowId;
+            var scale = map.SizeFactor / 100f;
+            foreach (var marker in markers)
             {
-                if (reference.RowId == 0 || reference.ValueNullable is not { } level)
+                if (marker.DataType != expectedType || marker.DataKey.RowId != expectedKey)
                     continue;
-                var position = new Vector3(level.X, level.Y, level.Z);
-                var distance = Vector3.DistanceSquared(position, target);
-                if (position != Vector3.Zero && float.IsFinite(distance))
+                var worldX = ((marker.X - 1024f) / scale) - map.OffsetX;
+                var worldZ = ((marker.Y - 1024f) / scale) - map.OffsetY;
+                var distance = Vector2.DistanceSquared(new Vector2(worldX, worldZ), new Vector2(target.X, target.Z));
+                if (float.IsFinite(distance))
                     return distance;
             }
         }
