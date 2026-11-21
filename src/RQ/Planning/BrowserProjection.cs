@@ -129,7 +129,9 @@ public sealed record StockLocation(
     int NqQuantity,
     int HqQuantity,
     int CharacterOrder,
-    int ContainerOrder)
+    int ContainerOrder,
+    bool IsExternalAccount = false,
+    string? ExternalProfileLabel = null)
 {
     public int Quantity => NqQuantity + HqQuantity;
 
@@ -144,9 +146,13 @@ public sealed record AccountStockItem(
     int Elsewhere,
     int CharacterCount,
     IReadOnlyList<StockLocation> Locations,
-    string LocationSummary)
+    string LocationSummary,
+    int ExternalQuantity = 0)
 {
     public int Total => Here + Elsewhere;
+
+    /// <summary>Held somewhere, but only by characters on another service account.</summary>
+    public bool OnlyExternal => ExternalQuantity > 0 && ExternalQuantity == Total;
 
     /// <summary>The item's stacks on one character only, ready for actions that act from that character.</summary>
     public IEnumerable<StockLocation> On(OwnerScope character) =>
@@ -165,18 +171,37 @@ public sealed class AccountStockProjection
     public required IReadOnlyList<StockGroup> Items { get; init; }
     public required IReadOnlyDictionary<uint, AccountStockItem> ById { get; init; }
 
-    /// <summary>The characters merged, logged-in first, then the rest in the order supplied.</summary>
+    /// <summary>
+    /// The characters merged, logged-in first, then the rest in the order supplied, then characters
+    /// on other service accounts (<see cref="IsExternal"/>).
+    /// </summary>
     public required IReadOnlyList<OwnerScope> Characters { get; init; }
+
+    /// <summary>Sibling-profile characters by content ID, with the XIVLauncher profile their stock was read from.</summary>
+    public IReadOnlyDictionary<ulong, string> ExternalProfiles { get; init; } = new Dictionary<ulong, string>();
+
+    /// <summary>Whether a character's stock is another service account's local cache: visible, never local-account stock.</summary>
+    public bool IsExternal(OwnerScope character) =>
+        character.LocalContentId is { } id && ExternalProfiles.ContainsKey(id);
 
     public static AccountStockProjection Build(
         OwnerScope current,
         BrowserProjection currentStock,
-        IEnumerable<(OwnerScope Character, BrowserProjection Stock)> others)
+        IEnumerable<(OwnerScope Character, BrowserProjection Stock)> others,
+        IEnumerable<(OwnerScope Character, BrowserProjection Stock, string Profile)>? external = null)
     {
-        var sources = new List<(OwnerScope Character, BrowserProjection Stock, bool IsCurrent)> { (current, currentStock, true) };
+        var sources = new List<(OwnerScope Character, BrowserProjection Stock, bool IsCurrent, string? Profile)> { (current, currentStock, true, null) };
         sources.AddRange(others
             .Where(other => !other.Character.Matches(current))
-            .Select(other => (other.Character, other.Stock, false)));
+            .Select(other => (other.Character, other.Stock, false, (string?)null)));
+        foreach (var (character, stock, profile) in external ?? [])
+        {
+            // A character this client knows is never shown as another account's, nor twice.
+            if (character.LocalContentId is not > 0 || sources.Any(source =>
+                    source.Character.LocalContentId == character.LocalContentId || source.Character.Matches(character)))
+                continue;
+            sources.Add((character, stock, false, profile));
+        }
 
         var stacks = new Dictionary<uint, List<StockStack>>();
         var names = new Dictionary<uint, string>();
@@ -185,7 +210,7 @@ public sealed class AccountStockProjection
         var containerOrder = new Dictionary<(int Character, BrowserScopeKind Kind, ulong? Retainer), (int Order, string Label)>();
         for (var characterIndex = 0; characterIndex < sources.Count; characterIndex++)
         {
-            var (_, projection, _) = sources[characterIndex];
+            var projection = sources[characterIndex].Stock;
             // Scopes are already in game display order: player, saddlebag, then retainers.
             for (var scopeIndex = 0; scopeIndex < projection.Scopes.Count; scopeIndex++)
             {
@@ -229,7 +254,7 @@ public sealed class AccountStockProjection
                     var (order, label) = containerOrder[entry.Key];
                     var source = sources[characterIndex];
                     return new StockLocation(source.Character, source.IsCurrent, kind, retainer, label,
-                        entry.Value.Nq, entry.Value.Hq, characterIndex, order);
+                        entry.Value.Nq, entry.Value.Hq, characterIndex, order, source.Profile is not null, source.Profile);
                 })
                 .OrderBy(location => location.CharacterOrder)
                 .ThenBy(location => location.ContainerOrder)
@@ -237,9 +262,10 @@ public sealed class AccountStockProjection
                 .ToArray();
             var here = placed.Where(location => location.IsCurrent).Sum(location => location.Quantity);
             var elsewhere = placed.Where(location => !location.IsCurrent).Sum(location => location.Quantity);
+            var externalUnits = placed.Where(location => location.IsExternalAccount).Sum(location => location.Quantity);
             var characterCount = placed.Select(location => location.CharacterOrder).Distinct().Count();
             items.Add(group);
-            byId[itemId] = new AccountStockItem(group, here, elsewhere, characterCount, placed, Summarize(placed, characterCount));
+            byId[itemId] = new AccountStockItem(group, here, elsewhere, characterCount, placed, Summarize(placed, characterCount), externalUnits);
         }
         items.Sort((left, right) =>
         {
@@ -251,6 +277,9 @@ public sealed class AccountStockProjection
             Items = items,
             ById = byId,
             Characters = sources.Select(source => source.Character).ToArray(),
+            ExternalProfiles = sources
+                .Where(source => source.Profile is not null)
+                .ToDictionary(source => source.Character.LocalContentId!.Value, source => source.Profile!),
         };
     }
 

@@ -46,6 +46,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly InventoryScanner scanner;
     // Courier wiring (Q2) sets Link, Conductor and Follower on this session.
     private readonly CourierSession courier;
+    private readonly ExternalAccountStockCache externalAccountStock;
     private readonly CourierPeerLink courierPeer;
     private readonly CourierGame courierGame;
     private readonly CourierTrade courierTrade;
@@ -347,6 +348,9 @@ public sealed class Plugin : IDalamudPlugin
         courierTrade = new(courierGame,tradeIo,automation,pluginInterface,externalUiSuppression,log,configDirectory);
         bool AutoRetainerLoaded()=>pluginInterface.InstalledPlugins.Any(p=>p.IsLoaded && p.InternalName=="AutoRetainer");
         courier.Warn = s => log.Warning(s);
+        // Sibling XIVLauncher profiles' caches: read-only stock browser visibility, never courier stock.
+        courier.LocalOwners = playerInventory.Owners;
+        courier.ExternalStockCache = externalAccountStock = new ExternalAccountStockCache(configDirectory, s => log.Warning(s));
         courier.Follower = new(configDirectory,()=>state.ReadConfiguration(s=>s.Courier),automation,autoRetainerSuppression,courierTrade,
             courierGame,courierGame,courierGame,s=>log.Warning(s),s=>log.Information(s),AutoRetainerLoaded);
         courier.Follower.RestoreCustodyHold();
@@ -976,6 +980,7 @@ public sealed class Plugin : IDalamudPlugin
         observationHost?.Dispose();
         cache.Dispose();
         playerInventory.Dispose();
+        externalAccountStock.Dispose();
         windows.RemoveAllWindows();
     }
 }

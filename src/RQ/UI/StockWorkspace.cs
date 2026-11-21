@@ -82,6 +82,16 @@ internal sealed class StockWorkspace
     /// <summary>The viewed character's container: <see cref="BrowserScope.AllKey"/>, its bags or one of its retainers.</summary>
     private string viewedScopeKey = BrowserScope.AllKey;
     private (BrowserProjection Stock, string ScopeKey, IReadOnlyList<StockGroup> Items, Dictionary<uint, StockGroup> ById)? viewedItems;
+    /// <summary>The viewed character is on another service account (a sibling profile's cache); resolved each frame.</summary>
+    private bool viewedExternal;
+
+    // ---- Other service accounts ----
+    /// <summary>Muted amber for stock that sits on another service account and must be traded by hand.</summary>
+    private static readonly Vector4 TradeTint = new(.86f, .68f, .42f, .9f);
+    private const string ExternalNodeTooltip = "Other service account — items must be traded directly";
+    private const string ExternalLocationTooltip = "On another service account — must be traded directly";
+    private const string ExternalOnlyTooltip = "Only on another service account — trade required";
+    private const string ExternalMenuLabel = "Other account — trade in game";
 
     // ---- Scope rail ----
     private bool railOpen = true;
@@ -178,10 +188,10 @@ internal sealed class StockWorkspace
         new(
             "Saddlebag",
             72,
-            // Another character's saddlebag is never observed here.
-            row => viewedCharacter is null ? row.Item.SaddlebagQuantity.ToString("N0") : "—",
+            // Another local character's saddlebag is never observed here; another account's client observes its own.
+            row => viewedCharacter is null || viewedExternal ? row.Item.SaddlebagQuantity.ToString("N0") : "—",
             row => row.Item.SaddlebagQuantity,
-            TextColor: row => viewedCharacter is not null || row.Item.SaddlebagQuantity == 0 ? Disabled() : null,
+            TextColor: row => viewedCharacter is not null && !viewedExternal || row.Item.SaddlebagQuantity == 0 ? Disabled() : null,
             DrawContextMenu: DrawStockRowContextMenu,
             Id: "saddlebag"),
         new(
@@ -228,7 +238,7 @@ internal sealed class StockWorkspace
             TextColor: row => row.Account?.Elsewhere is > 0 ? null : Disabled(),
             DrawContextMenu: DrawStockRowContextMenu,
             Id: "elsewhere",
-            HeaderTooltip: "Units on your other observed characters and their retainers."),
+            HeaderTooltip: "Units on your other observed characters and their retainers, including other service accounts' cached stock."),
         new(
             "Locations",
             1.2f,
@@ -238,8 +248,10 @@ internal sealed class StockWorkspace
             Draw: row =>
             {
                 if (row.Account is null) ImGui.TextDisabled("—");
+                else if (row.Account.OnlyExternal) ImGui.TextColored(TradeTint, row.Account.LocationSummary);
                 else ImGui.TextUnformatted(row.Account.LocationSummary);
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(LocationsTooltip(row));
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip(row.Account is { OnlyExternal: true } ? $"{ExternalOnlyTooltip}\n{LocationsTooltip(row)}" : LocationsTooltip(row));
             },
             DrawContextMenu: DrawStockRowContextMenu,
             Id: "locations",
@@ -345,6 +357,7 @@ internal sealed class StockWorkspace
 
     private void DrawWorkspace(QuartermasterRuntimeSnapshot runtime, FrameTimings timings)
     {
+        viewedExternal = false;
         if (catalogMode)
         {
             timings.Section("stock catalog");
@@ -353,6 +366,7 @@ internal sealed class StockWorkspace
         }
         timings.Section("stock filter");
         var viewed = ViewedStock(runtime);
+        viewedExternal = viewed is not null && courier.IsExternal(runtime, viewedCharacter!);
         var account = courier.AccountStock(runtime);
         PruneExpansion(account);
         var accountMode = IsAccountMode;
@@ -393,8 +407,10 @@ internal sealed class StockWorkspace
         timings.Section("stock projection");
         var sourceRows = viewed is null
             ? ResolveStockWorkbenchProjection(runtime, visibleItems, selectedPlan, account, accountMode)
-            : ResolveViewedRows(runtime, visibleItems, account);
+            : ResolveViewedRows(visibleItems, viewed, account);
         timings.Section("stock table");
+        if (viewedExternal)
+            DrawExternalBanner(runtime);
         DrawSelectionBar(runtime, stockVisible, canSelectVisible: true);
         if (viewed is null)
             DrawSingleStockSelection(runtime);
@@ -426,6 +442,20 @@ internal sealed class StockWorkspace
             DalamudTableSelectionRenderer.EndRows(stockSelection);
             table.End();
         }
+    }
+
+    private static readonly string TradeIcon = FontAwesomeIcon.ExchangeAlt.ToIconString();
+
+    /// <summary>One muted strip over another service account's stock: visible here, moved only by trading in game.</summary>
+    private void DrawExternalBanner(QuartermasterRuntimeSnapshot runtime)
+    {
+        ImGui.PushFont(UiBuilder.IconFont);
+        ImGui.TextColored(TradeTint, TradeIcon);
+        ImGui.PopFont();
+        ImGui.SameLine();
+        ImGui.TextColored(TradeTint, "Other service account (local cache) — items here must be traded directly.");
+        if (ImGui.IsItemHovered() && viewedCharacter is { } viewed)
+            ImGui.SetTooltip($"Read from {courier.ExternalProfile(runtime, viewed) ?? "another XIVLauncher profile"}'s Quartermaster cache; it updates when that client observes its stock.\nQuartermaster cannot send, stow or plan from another service account.");
     }
 
     /// <summary>
@@ -581,7 +611,8 @@ internal sealed class StockWorkspace
         if (locations.Length == 0)
             return row.Item.Stacks.Count == 0 ? $"{row.Item.ItemName}: not in stock" : row.Item.ItemName;
         return string.Join("\n", locations.Select(location =>
-            $"{(IsAccountMode ? location.Label : location.Container)}: {location.Quantity:N0}{QualitySuffix(location)}"));
+            $"{(IsAccountMode ? location.Label : location.Container)}: {location.Quantity:N0}{QualitySuffix(location)}" +
+            (IsAccountMode && location.IsExternalAccount ? " · other account" : string.Empty)));
     }
 
     private static string QualitySuffix(StockLocation location) =>
@@ -627,14 +658,22 @@ internal sealed class StockWorkspace
                     // Each character is named once, on its first location; the row target spans every column.
                     var named = location.CharacterOrder != previousCharacter;
                     previousCharacter = location.CharacterOrder;
-                    if (named && location.IsCurrent)
-                        ImGui.PushStyleColor(ImGuiCol.Text, QuartermasterPalette.Info);
-                    ImGui.Selectable(named ? location.Character.CharacterName : string.Empty, false,
+                    var tint = named && location.IsCurrent ? QuartermasterPalette.Info
+                        : named && location.IsExternalAccount ? TradeTint
+                        : (Vector4?)null;
+                    if (tint is { } color)
+                        ImGui.PushStyleColor(ImGuiCol.Text, color);
+                    // Another account's character carries its trade hint beside its name.
+                    ImGui.Selectable(!named ? string.Empty
+                        : location.IsExternalAccount ? $"{location.Character.CharacterName} · Trade"
+                        : location.Character.CharacterName, false,
                         ImGuiSelectableFlags.SpanAllColumns);
-                    if (named && location.IsCurrent)
+                    if (tint is not null)
                         ImGui.PopStyleColor();
                     if (ImGui.IsItemHovered())
-                        ImGui.SetTooltip(named && location.IsCurrent ? "Logged in here. Right-click for actions." : "Right-click for actions.");
+                        ImGui.SetTooltip(location.IsExternalAccount
+                            ? $"{ExternalLocationTooltip}{(location.ExternalProfileLabel is { } profile ? $" ({profile})" : string.Empty)}."
+                            : named && location.IsCurrent ? "Logged in here. Right-click for actions." : "Right-click for actions.");
                     DrawLocationMenu(runtime, row, location);
                     ImGui.TableNextColumn();
                     ImGui.TextUnformatted(location.Container);
@@ -671,6 +710,11 @@ internal sealed class StockWorkspace
     {
         var itemId = row.Item.ItemId;
         var control = $"quartermaster.stock.location.{itemId}.{LocationToken(location)}";
+        if (location.IsExternalAccount)
+        {
+            DrawExternalLocationMenu(row, location, control);
+            return;
+        }
         var identified = runtime.Owner.HasStableIdentity;
         // Courier lines move bags and retainer stock; the saddlebag is not a courier source.
         var canSend = location.Kind is BrowserScopeKind.Player or BrowserScopeKind.Retainer &&
@@ -747,6 +791,32 @@ internal sealed class StockWorkspace
         }
     }
 
+    /// <summary>
+    /// Another service account's location: courier, stow and plan actions would refuse it
+    /// (OutsideClientRoster), so its menu only says how it moves.
+    /// </summary>
+    private void DrawExternalLocationMenu(StockWorkbenchRow row, StockLocation location, string control)
+    {
+        reviewRegistry.RegisterLastButton($"{control}.menu", $"Open actions for {row.Item.ItemName} in {location.Label}", true,
+            () => pendingLocationPopup = $"menu:{control}", "Other service account; trade in game");
+        if (pendingLocationPopup is { } pending && pending.Length == control.Length + 5 && pending.EndsWith(control, StringComparison.Ordinal))
+        {
+            if (pending.StartsWith("menu:", StringComparison.Ordinal))
+                ImGui.OpenPopup("##location-menu");
+            pendingLocationPopup = null;
+        }
+        if (!ImGui.BeginPopupContextItem("##location-menu"))
+            return;
+        ImGui.TextDisabled($"{location.Character.CharacterName} · {location.Container}");
+        ImGui.Separator();
+        ImGui.BeginDisabled();
+        ImGui.MenuItem(ExternalMenuLabel);
+        ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(ExternalLocationTooltip);
+        ImGui.EndPopup();
+    }
+
     /// <summary>A character's own stock group for an item: the logged-in projection or that character's cached one.</summary>
     private StockGroup? CharacterItem(QuartermasterRuntimeSnapshot runtime, OwnerScope character, uint itemId) =>
         character.Matches(runtime.Owner)
@@ -765,11 +835,12 @@ internal sealed class StockWorkspace
 
     /// <summary>
     /// Characters that can send an item in the account view, logged-in first: those holding it in
-    /// bags or retainers.
+    /// bags or retainers. Another service account's characters never send; they trade in game.
     /// </summary>
     private static IReadOnlyList<StockLocation> SendSources(AccountStockItem? item) =>
         item is null ? [] : item.Locations
-            .Where(location => location.Kind is BrowserScopeKind.Player or BrowserScopeKind.Retainer && location.Quantity > 0)
+            .Where(location => location.Kind is BrowserScopeKind.Player or BrowserScopeKind.Retainer && location.Quantity > 0 &&
+                               !location.IsExternalAccount)
             .GroupBy(location => location.CharacterOrder)
             .OrderBy(group => group.Key)
             .Select(group => group.First())
@@ -778,6 +849,7 @@ internal sealed class StockWorkspace
     /// <summary>
     /// The source a bulk send uses for an item in the account view: the logged-in character when it
     /// holds some, else the only character that does. Null when several other characters hold it.
+    /// Another service account's holdings are never a source.
     /// </summary>
     private static OwnerScope? DefaultSendSource(AccountStockItem? item)
     {
@@ -787,7 +859,8 @@ internal sealed class StockWorkspace
         StockLocation? first = null;
         foreach (var location in item.Locations)
         {
-            if (location.Kind is not (BrowserScopeKind.Player or BrowserScopeKind.Retainer) || location.Quantity <= 0)
+            if (location.Kind is not (BrowserScopeKind.Player or BrowserScopeKind.Retainer) || location.Quantity <= 0 ||
+                location.IsExternalAccount)
                 continue;
             if (first is null)
             {
@@ -820,8 +893,12 @@ internal sealed class StockWorkspace
     {
         if (viewedCharacter is not { } character || catalogMode)
             return null;
-        if (!character.Matches(runtime.Owner) && !CourierSession.IsCarrier(runtime, character) &&
-            courier.Stock(runtime, character) is { } stock)
+        // Another service account's character stays viewable even when it is the carrier.
+        var stock = courier.ExternalStock(runtime, character) ??
+                    (!character.Matches(runtime.Owner) && !CourierSession.IsCarrier(runtime, character)
+                        ? courier.Stock(runtime, character)
+                        : null);
+        if (stock is not null)
         {
             // A retainer that left the character takes its scope with it.
             if (viewedScopeKey != BrowserScope.AllKey && !stock.Scopes.Any(scope => scope.Key == viewedScopeKey))
@@ -831,6 +908,10 @@ internal sealed class StockWorkspace
         SetViewedCharacter(null);
         return null;
     }
+
+    /// <summary>A character's browsable stock: another service account's cached stock, else this client's cached stock.</summary>
+    private BrowserProjection? ViewStock(QuartermasterRuntimeSnapshot runtime, OwnerScope character) =>
+        courier.ExternalStock(runtime, character) ?? courier.Stock(runtime, character);
 
     /// <summary>The viewed character's items in its chosen container, cached per projection and container.</summary>
     private (BrowserProjection Stock, string ScopeKey, IReadOnlyList<StockGroup> Items, Dictionary<uint, StockGroup> ById) ViewedItems(BrowserProjection stock)
@@ -881,12 +962,16 @@ internal sealed class StockWorkspace
         LeaveCatalog();
     }
 
-    /// <summary>Another character's rows: its stock only, with no plan, target or listing columns of its own.</summary>
-    private IReadOnlyList<StockWorkbenchRow> ResolveViewedRows(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> queryItems, AccountStockProjection account)
+    /// <summary>
+    /// Another character's rows: its stock only, with no plan, target or listing columns of its own.
+    /// Retainers resolve against the projection's own cache, so another service account's retainers
+    /// are named and counted from its sibling cache.
+    /// </summary>
+    private IReadOnlyList<StockWorkbenchRow> ResolveViewedRows(IReadOnlyList<StockGroup> queryItems, BrowserProjection viewed, AccountStockProjection account)
     {
         if (viewedRows is { } cached && ReferenceEquals(cached.QueryItems, queryItems) && ReferenceEquals(cached.Account, account))
             return cached.Rows;
-        var retainers = TransferWorkbenchPresentation.AccessibleRetainerIds(runtime.Retainers, viewedCharacter!);
+        var retainers = TransferWorkbenchPresentation.AccessibleRetainerIds(viewed.RetainerStock, viewedCharacter!);
         var rows = queryItems
             .Select(item => new StockWorkbenchRow(
                 item,
@@ -895,14 +980,14 @@ internal sealed class StockWorkspace
                 null,
                 [],
                 account.ById.GetValueOrDefault(item.ItemId),
-                RetainerHint: RetainerHint(runtime, item, retainers)))
+                RetainerHint: RetainerHint(viewed.RetainerStock, item, retainers)))
             .ToArray();
         viewedRows = (queryItems, account, rows);
         return rows;
     }
 
     /// <summary>"Grungel" when one accessible retainer holds the item, "3 retainers" when several do.</summary>
-    private static string RetainerHint(QuartermasterRuntimeSnapshot runtime, StockGroup item, IReadOnlySet<ulong> accessible)
+    private static string RetainerHint(IReadOnlyDictionary<ulong, CachedRetainer> names, StockGroup item, IReadOnlySet<ulong> accessible)
     {
         var held = item.Stacks
             .Where(stack => stack.ScopeKind == BrowserScopeKind.Retainer && stack.Quantity > 0 &&
@@ -913,7 +998,7 @@ internal sealed class StockWorkspace
         return held.Length switch
         {
             0 => string.Empty,
-            1 => CourierSession.ContainerLabel(runtime, held[0]),
+            1 => names.GetValueOrDefault(held[0])?.RetainerName is { Length: > 0 } name ? name : $"Retainer {held[0]}",
             _ => $"{held.Length} retainers",
         };
     }
@@ -1009,7 +1094,7 @@ internal sealed class StockWorkspace
                 return new StockWorkbenchRow(item, accessibleRetainerQuantity, rule, line, demand,
                     account.ById.GetValueOrDefault(item.ItemId),
                     sends.GetValueOrDefault(item.ItemId),
-                    accountMode ? string.Empty : RetainerHint(runtime, item, accessible));
+                    accountMode ? string.Empty : RetainerHint(runtime.Retainers, item, accessible));
             })
             .ToArray();
         stockWorkbenchProjection = new(runtime.PlanningRevision, selectedPlan?.Id, queryItems, rows, account, accountMode);
@@ -1178,7 +1263,7 @@ internal sealed class StockWorkspace
             return RailCatalogLabel;
         if (viewedCharacter is { } viewed)
             return viewedScopeKey != BrowserScope.AllKey &&
-                   courier.Stock(runtime, viewed)?.Scopes.FirstOrDefault(scope => scope.Key == viewedScopeKey) is { } container
+                   ViewStock(runtime, viewed)?.Scopes.FirstOrDefault(scope => scope.Key == viewedScopeKey) is { } container
                 ? $"{CourierSession.CharacterLabel(viewed)} · {ContainerName(container)}"
                 : CourierSession.CharacterLabel(viewed);
         if (accountWide)
@@ -1239,7 +1324,9 @@ internal sealed class StockWorkspace
             ViewAccount();
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip(string.Join("\n", account.Characters
-                .Select(character => character.Matches(runtime.Owner) ? $"{HereName(runtime)} (logged in)" : character.CharacterName)
+                .Select(character => character.Matches(runtime.Owner) ? $"{HereName(runtime)} (logged in)"
+                    : account.IsExternal(character) ? $"{character.CharacterName} (other account)"
+                    : character.CharacterName)
                 .Prepend("Every observed character:")));
         reviewRegistry.RegisterLastButton(
             "quartermaster.stock.scope.account",
@@ -1250,15 +1337,40 @@ internal sealed class StockWorkspace
 
         DrawHereNode(runtime, counts);
 
-        // Account characters after the first are the other observed characters, by name.
+        // Account characters after the first are the other observed characters, by name, then
+        // characters on other service accounts.
+        var hasExternal = false;
         for (var index = 1; index < account.Characters.Count; index++)
         {
             var character = account.Characters[index];
+            if (account.IsExternal(character))
+            {
+                hasExternal = true;
+                continue;
+            }
             if (courier.Stock(runtime, character) is not { } stock)
                 continue;
             ImGui.PushID(index);
-            try { DrawCharacterNode(character, stock, index, counts); }
+            try { DrawCharacterNode(character, stock, index, counts, null); }
             finally { ImGui.PopID(); }
+        }
+
+        if (hasExternal)
+        {
+            ImGui.Spacing();
+            ImGui.Separator();
+            ImGui.TextDisabled("Other accounts");
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Characters on another service account, from that client's Quartermaster cache.\nItems there must be traded directly.");
+            for (var index = 1; index < account.Characters.Count; index++)
+            {
+                var character = account.Characters[index];
+                if (!account.IsExternal(character) || courier.ExternalStock(runtime, character) is not { } stock)
+                    continue;
+                ImGui.PushID(index);
+                try { DrawCharacterNode(character, stock, index, counts, account.ExternalProfiles.GetValueOrDefault(character.LocalContentId!.Value)); }
+                finally { ImGui.PopID(); }
+            }
         }
 
         ImGui.Spacing();
@@ -1327,17 +1439,25 @@ internal sealed class StockWorkspace
         finally { ImGui.PopID(); }
     }
 
-    /// <summary>Another observed character: closed by default, with its bags and observed retainers.</summary>
-    private void DrawCharacterNode(OwnerScope character, BrowserProjection stock, int index, RailCounts counts)
+    /// <summary>
+    /// Another observed character: closed by default, with its bags and observed retainers. A
+    /// character on another service account (<paramref name="externalProfile"/> set) is tinted, and
+    /// also lists its saddlebag when its own client observed one.
+    /// </summary>
+    private void DrawCharacterNode(OwnerScope character, BrowserProjection stock, int index, RailCounts counts, string? externalProfile)
     {
+        var external = externalProfile is not null;
         var viewing = !catalogMode && viewedCharacter?.Matches(character) == true;
         var open = RailExpanded(character, false);
         var control = $"quartermaster.stock.scope.character.{character.LocalContentId}";
         var allSelected = viewing && viewedScopeKey == BrowserScope.AllKey;
-        if (RailNode(CourierSession.CharacterLabel(character), counts.Text(index, BrowserScope.AllKey), allSelected, open, out var toggled))
+        if (RailNode(CourierSession.CharacterLabel(character), counts.Text(index, BrowserScope.AllKey), allSelected, open, out var toggled,
+                external ? TradeTint : null))
             ViewCharacter(character);
         if (toggled)
             ToggleRailExpanded(character, false);
+        if (external && ImGui.IsItemHovered())
+            ImGui.SetTooltip($"{ExternalNodeTooltip}\nFrom {externalProfile}'s Quartermaster cache");
         reviewRegistry.RegisterLastButton(
             control,
             $"Browse {character.CharacterName}'s stock",
@@ -1355,12 +1475,15 @@ internal sealed class StockWorkspace
         ImGui.Indent();
         foreach (var scope in stock.Scopes)
         {
-            // Another character's saddlebag is never observed here.
-            if (scope.Kind is not (BrowserScopeKind.Player or BrowserScopeKind.Retainer))
+            // Another local character's saddlebag is never observed here; another account's client
+            // observes its own, so it shows when that client saw any.
+            var shown = scope.Kind is BrowserScopeKind.Player or BrowserScopeKind.Retainer ||
+                        external && scope.Kind == BrowserScopeKind.Saddlebag && counts.Text(index, scope.Key) != "0";
+            if (!shown)
                 continue;
             var key = scope.Key;
             var selected = viewing && key == viewedScopeKey;
-            if (RailNode(ContainerName(scope), counts.Text(index, key), selected, null, out _))
+            if (RailNode(ContainerName(scope), counts.Text(index, key), selected, null, out _, external ? TradeTint : null))
                 ViewCharacter(character, key);
             reviewRegistry.RegisterLastButton(
                 $"{control}.{key.Replace(':', '.')}",
@@ -1554,9 +1677,13 @@ internal sealed class StockWorkspace
             $"visible={visible.Ids.Length:N0}; selected={stockSelection.Count:N0}");
 
         // Another character's stock can only be sent; the logged-in character's own actions do not apply.
+        // Another service account's stock cannot even be sent: it is traded in game.
         if (viewedCharacter is null)
             DrawOwnSelectionActions(runtime, hasSelection);
-        DrawSendSelection(runtime, hasSelection);
+        if (viewedExternal)
+            DrawExternalSendBlocked();
+        else
+            DrawSendSelection(runtime, hasSelection);
 
         DalamudUiLayout.SameLineIfFits("Clear");
         ImGui.BeginDisabled(!hasSelection);
@@ -1618,12 +1745,25 @@ internal sealed class StockWorkspace
         }
     }
 
+    /// <summary>Send stays in its place, disabled, so the reason is one hover away.</summary>
+    private void DrawExternalSendBlocked()
+    {
+        DalamudUiLayout.SameLineIfFits("Send to…");
+        ImGui.BeginDisabled();
+        ImGui.Button("Send to…");
+        ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip("Items on another service account must be traded directly in game.\nQuartermaster cannot send, stow or plan from there.");
+        reviewRegistry.RegisterLastButton("quartermaster.stock.send", "Choose another character to send to", false,
+            () => { }, "Other service account; trade in game");
+    }
+
     private void DrawSendSelection(QuartermasterRuntimeSnapshot runtime, bool hasSelection)
     {
         // Sending to another character exists only once another character is known.
         if (!transferPlans.HasCourierDestinations(runtime, viewedCharacter))
             return;
-        var send = hasSelection ? ResolveSendSelection(runtime) : (null, [], 0);
+        var send = hasSelection ? ResolveSendSelection(runtime) : (null, [], 0, 0);
         var canSend = runtime.Owner.HasStableIdentity && send.Items.Count > 0 &&
                       transferPlans.HasCourierDestinations(runtime, send.Source);
         DalamudUiLayout.SameLineIfFits("Send to…");
@@ -1656,26 +1796,30 @@ internal sealed class StockWorkspace
     /// items go first, else one other character's. Items on other sources are left for their
     /// location rows.
     /// </summary>
-    private (OwnerScope? Source, IReadOnlyList<StockGroup> Items, int Skipped) ResolveSendSelection(QuartermasterRuntimeSnapshot runtime)
+    private (OwnerScope? Source, IReadOnlyList<StockGroup> Items, int Skipped, int External) ResolveSendSelection(QuartermasterRuntimeSnapshot runtime)
     {
         if (!IsAccountMode)
-            return (viewedCharacter, ResolveSelection(runtime).Stock.Where(CanSend).ToArray(), 0);
+            return (viewedCharacter, ResolveSelection(runtime).Stock.Where(CanSend).ToArray(), 0, 0);
         var account = courier.AccountStock(runtime);
         var resolved = new List<(OwnerScope Source, uint ItemId)>();
         var unresolved = 0;
+        var external = 0;
         foreach (var id in stockSelection.SelectedKeys)
         {
-            if (DefaultSendSource(account.ById.GetValueOrDefault(id)) is { } source)
+            var entry = account.ById.GetValueOrDefault(id);
+            if (DefaultSendSource(entry) is { } source)
                 resolved.Add((source, id));
-            else if (account.ById.ContainsKey(id))
+            else if (entry is { OnlyExternal: true })
+                external++;
+            else if (entry is not null)
                 unresolved++;
         }
         if (resolved.Count == 0)
-            return (null, [], unresolved);
+            return (null, [], unresolved, external);
         var chosen = resolved.FirstOrDefault(entry => entry.Source.Matches(runtime.Owner)).Source
                      ?? (resolved.All(entry => entry.Source.Matches(resolved[0].Source)) ? resolved[0].Source : null);
         if (chosen is null)
-            return (null, [], resolved.Count + unresolved);
+            return (null, [], resolved.Count + unresolved, external);
         var items = resolved
             .Where(entry => entry.Source.Matches(chosen))
             .Select(entry => CharacterItem(runtime, chosen, entry.ItemId))
@@ -1683,19 +1827,23 @@ internal sealed class StockWorkspace
             .Where(CanSend)
             .ToList();
         items.Sort(CompareByName);
-        return (chosen, items, resolved.Count + unresolved - items.Count);
+        return (chosen, items, resolved.Count + unresolved - items.Count, external);
     }
 
-    private static string SendSelectionTooltip(QuartermasterRuntimeSnapshot runtime, (OwnerScope? Source, IReadOnlyList<StockGroup> Items, int Skipped) send)
+    private static string SendSelectionTooltip(QuartermasterRuntimeSnapshot runtime, (OwnerScope? Source, IReadOnlyList<StockGroup> Items, int Skipped, int External) send)
     {
+        var external = send.External > 0
+            ? $"\n{send.External:N0} only on another service account: trade those directly."
+            : string.Empty;
         if (send.Source is not { } source)
-            return send.Skipped > 0
+            return (send.Skipped > 0
                 ? "The selected items sit on several other characters. Expand a row to send from one location."
-                : "Nothing selected that a character holds in bags or retainers.";
+                : send.External > 0 ? "The selected items are only on another service account."
+                : "Nothing selected that a character holds in bags or retainers.") + external;
         var from = source.Matches(runtime.Owner) ? HereName(runtime) : source.CharacterName;
-        return send.Skipped > 0
+        return (send.Skipped > 0
             ? $"Sends {send.Items.Count:N0} items from {from}.\n{send.Skipped:N0} others are on other characters: expand their rows to send from there."
-            : $"Sends {send.Items.Count:N0} items from {from}.";
+            : $"Sends {send.Items.Count:N0} items from {from}.") + external;
     }
 
     private void SelectVisible()
@@ -1782,7 +1930,7 @@ internal sealed class StockWorkspace
         // container first, as the logged-in character's scopes do, then all of it.
         if (!catalogMode && viewedCharacter is { } viewed)
         {
-            var stock = courier.Stock(runtime, viewed);
+            var stock = ViewStock(runtime, viewed);
             item = (stock is null ? null : ViewedItems(stock).ById.GetValueOrDefault(itemId) ?? stock.FindItem(itemId))!;
             carried = item?.PlayerQuantity > 0;
             return item is not null;
@@ -1942,7 +2090,10 @@ internal sealed class StockWorkspace
 
         if (viewedCharacter is { } viewed)
         {
-            DrawSendMenu(runtime, row.Item, viewed);
+            if (viewedExternal)
+                DrawExternalMenuItem();
+            else
+                DrawSendMenu(runtime, row.Item, viewed);
             return;
         }
 
@@ -1985,6 +2136,9 @@ internal sealed class StockWorkspace
                 DrawSendMenu(runtime, item, null);
             return;
         }
+        // Another service account's units never send; say how they move instead.
+        if (row.Account is { ExternalQuantity: > 0 })
+            DrawExternalMenuItem();
         // One holder sends directly; several get a "Send from" menu each.
         var sources = SendSources(row.Account);
         if (sources.Count == 1)
@@ -1997,6 +2151,15 @@ internal sealed class StockWorkspace
             if (CharacterItem(runtime, source.Character, row.Item.ItemId) is { } held)
                 DrawSendMenu(runtime, held, source.Character,
                     $"Send from {(source.IsCurrent ? HereName(runtime) : source.Character.CharacterName)}##send-from:{source.Character.LocalContentId}");
+    }
+
+    private static void DrawExternalMenuItem()
+    {
+        ImGui.BeginDisabled();
+        ImGui.MenuItem(ExternalMenuLabel);
+        ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(ExternalLocationTooltip);
     }
 
     /// <summary>A menu of courier destinations for one character's units of an item.</summary>
