@@ -394,13 +394,13 @@ internal sealed class TransferPlanWorkspace
                     if (rule is null)
                     {
                         var requested = entry.Quantity ?? held ?? 0;
-                        candidate.TargetQuantity = held is int most && most > 0 ? Math.Clamp(requested, 1, most) : Math.Max(1, requested);
+                        candidate.TargetQuantity = held is int most ? Math.Clamp(requested, 0, Math.Max(0, most)) : Math.Max(0, requested);
                         draft.Rules.Add(rule = candidate);
                     }
                     else if (entry.Quantity is { } quantity)
                     {
                         var summed = (int)Math.Min(int.MaxValue, (long)rule.TargetQuantity + Math.Max(0, quantity));
-                        rule.TargetQuantity = held is int most && most > 0 ? Math.Clamp(summed, 1, most) : Math.Max(1, summed);
+                        rule.TargetQuantity = held is int most ? Math.Clamp(summed, 0, Math.Max(0, most)) : Math.Max(0, summed);
                     }
                     rule.Enabled = true;
                     if (!ids.Contains(rule.Id))
@@ -1718,15 +1718,15 @@ internal sealed class TransferPlanWorkspace
         }
         int Set(int requested)
         {
-            var clamped = available is int most && most > 0 ? Math.Clamp(requested, 1, most) : Math.Max(1, requested);
+            var clamped = available is int most ? Math.Clamp(requested, 0, Math.Max(0, most)) : Math.Max(0, requested);
             if (clamped != row.Rule.TargetQuantity)
                 MutateRules(row.Owner, row.PlanId, [row.Rule.Id], draftRule => draftRule.TargetQuantity = clamped);
             return clamped;
         }
         if (DalamudGroupedIntegerInput.InputGroupedInt("##target", ref units, 0, 0))
             Set(units);
-        else if (ImGui.IsItemDeactivated() && available is int most && most > 0 && row.Rule.TargetQuantity > most)
-            Set(row.Rule.TargetQuantity);
+        else if (!ImGui.IsItemActive() && available is int most && row.Rule.TargetQuantity > Math.Max(0, most))
+            Set(most);
         reviewRegistry.RegisterLastAction(
             $"quartermaster.transfer.line.quantity.{row.Rule.Id:N}",
             $"Set the units of {row.Rule.ItemName} to send",
@@ -2037,8 +2037,8 @@ internal sealed class TransferPlanWorkspace
                     MutateRules(row.Owner, row.PlanId, ids, draftRule =>
                     {
                         draftRule.Courier = route with { SourceRetainerId = container };
-                        if (available is int most && most > 0 && draftRule.TargetQuantity > most)
-                            draftRule.TargetQuantity = most;
+                        if (available is int most && draftRule.TargetQuantity > Math.Max(0, most))
+                            draftRule.TargetQuantity = Math.Max(0, most);
                     });
                 }
             }
@@ -2198,8 +2198,8 @@ internal sealed class TransferPlanWorkspace
                 MutateRules(owner, row.PlanId, ids, draftRule =>
                 {
                     draftRule.Courier = route with { SourceCharacter = sourceCharacter, SourceRetainerId = container };
-                    if (available is int most && most > 0 && draftRule.TargetQuantity > most)
-                        draftRule.TargetQuantity = most;
+                    if (available is int most && draftRule.TargetQuantity > Math.Max(0, most))
+                        draftRule.TargetQuantity = Math.Max(0, most);
                 });
             }
             ImGui.CloseCurrentPopup();
@@ -2238,6 +2238,8 @@ internal sealed class TransferPlanWorkspace
         }
         else if (row.Projection.Send > 0)
             ImGui.TextColored(TransferPresentation.SendColor, $"Send {row.Projection.Send:N0}");
+        else if (row.Rule.TargetQuantity == 0)
+            ImGui.TextDisabled("Nothing to send");
     }
 
     private void DrawHoverRemove(TransferWorkbenchRow row)
