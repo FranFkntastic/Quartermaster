@@ -77,7 +77,9 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
         var width = Math.Max(1, ImGui.GetContentRegionAvail().X);
         var status = run is null || run.State != "Running"
             ? "Starting"
-            : $"{CourierSession.PhaseLabel(run.OwnerPhase)} · Carrier: {CourierSession.PhaseLabel(run.CarrierPhase)}";
+            : run.CarrierPhase.Length == 0
+                ? CourierSession.PhaseLabel(run.OwnerPhase)
+                : $"{CourierSession.PhaseLabel(run.OwnerPhase)} · Carrier: {CourierSession.PhaseLabel(run.CarrierPhase)}";
         var counts = run is { Trips: > 0 } ? $"Trip {Math.Max(1, run.Trip):N0} of {run.Trips:N0}" : string.Empty;
         var countsWidth = counts.Length == 0 ? 0 : ImGui.CalcTextSize(counts).X;
         var line = ImGui.GetTextLineHeight();

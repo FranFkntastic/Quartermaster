@@ -150,9 +150,14 @@ public sealed class CourierConductor
                 yield return new(CourierPhase.Consolidate, i, []);
         }
         if (r.Settings.ReturnOwner) yield return new(CourierPhase.ReturnOwner, 0, []);
-        if (r.Settings.ReturnCarrier) yield return new(CourierPhase.ReturnCarrier, 0, []);
+        if (r.Settings.ReturnCarrier && !Carrierless(r)) yield return new(CourierPhase.ReturnCarrier, 0, []);
         yield return new(CourierPhase.Finish, 0, []);
     }
+    /// <summary>
+    /// Whether every trip is the owner's own: the run then never needs, contacts or waits on a carrier. A run
+    /// journaled before that, which already claimed the carrier, keeps it until it finishes.
+    /// </summary>
+    private static bool Carrierless(CourierJournal r) => !r.PeerClaimed && r.Plan.Trips.All(t => t.Local);
     /// <summary>The carrier trip nearest before or after trip <paramref name="i"/>, skipping local trips; null when none.</summary>
     private static CourierTrip? Carried(CourierJournal r, int i, int step)
     {
@@ -168,7 +173,8 @@ public sealed class CourierConductor
     public CourierSnapshot Snapshot()=>Project(store.Load());
     private CourierSnapshot Project(CourierJournal r)
     {
-        var connected=peer is not RQ.UI.ICourierLink link || link.Peers.Count(p=>CourierPlanner.Exact(p.Character,r.Settings.Carrier))==1;
+        var carrierless=!r.Plan.Trips.IsEmpty && Carrierless(r);
+        var connected=carrierless || peer is not RQ.UI.ICourierLink link || link.Peers.Count(p=>CourierPlanner.Exact(p.Character,r.Settings.Carrier))==1;
         var pending=r.Pending;
         var attempt=pending?.Action.Phase switch {
             CourierPhase.HandOut or CourierPhase.HandIn => pending.LocalMayHaveStarted==false ||
@@ -178,7 +184,7 @@ public sealed class CourierConductor
             _=>true
         };
         var step = r.Schedule.Skip(r.Cursor).FirstOrDefault();
-        return new(r.Run, r.State, step?.Phase.ToString() ?? r.State, r.State=="Running"?peerPhase:"Idle", r.Plan.Trips.IsEmpty ? 0 :
+        return new(r.Run, r.State, step?.Phase.ToString() ?? r.State, carrierless?"":r.State=="Running"?peerPhase:"Idle", r.Plan.Trips.IsEmpty ? 0 :
             step is null || !InTrip(step.Phase) ? r.Plan.Trips.Length : step.Trip + 1, r.Plan.Trips.Length, r.Code, r.Detail,
             [..r.Plan.Trips.SelectMany(t=>t.Manifest).GroupBy(s=>s.Line).Select(g=>new LineProgress(g.Key,g.First().Name,
                 r.Delivered.GetValueOrDefault(g.Key),g.Sum(s=>s.Units)-r.Delivered.GetValueOrDefault(g.Key),g.First(),g.Any(s=>!s.Hq),g.Any(s=>s.Hq)))], r.Plan.Refusals,
@@ -207,7 +213,7 @@ public sealed class CourierConductor
                 throw new InvalidOperationException("Settle the pending trade before clearing custody.");
             // Completed includes a durable empty-ledger Finish acknowledgement.
             CourierReceipt? receipt=null;
-            if (r.State is not ("Completed" or "Refused") && r.Start.HasStableIdentity)
+            if (r.State is not ("Completed" or "Refused") && r.Start.HasStableIdentity && !Carrierless(r))
                 try { receipt=await Send(r,CourierCommand.Status,r.Start,[]); }
                 catch(CourierFault e) when(r.Custody.IsEmpty && e.Code is "CarrierEndpointAmbiguous" or "PeerLinkLost")
                 { warning($"OfflineClear {r.Run}: {e.Message}"); }
@@ -240,7 +246,7 @@ public sealed class CourierConductor
     {
         stop = true;
         try { await calls.Call("OwnerCancelPreLock",10,trade.CancelPreLockAsync); }
-        finally {var r=store.Load();if(r.State=="Running")await Send(r,CourierCommand.Stop,r.Start,[]);}
+        finally {var r=store.Load();if(r.State=="Running" && !Carrierless(r))await Send(r,CourierCommand.Stop,r.Start,[]);}
     }
     private Task<InventoryView> Observe() => calls.Call("OwnerBags", 15, inventory.ObserveAsync);
     private async Task<CourierReceipt> Send(CourierJournal r, CourierCommand type, OwnerScope partner, ImmutableArray<Shipment> manifest,
@@ -284,7 +290,11 @@ public sealed class CourierConductor
         void Lost() { stop = true; warning($"CourierLinkLost: {r.Run}"); _ = CancelLocal(); }
         void RemoteStop(Guid run) { if (run == r.Run) { stop = true; _ = CancelLocal(); } }
         void Progress(CourierProgress p) { if (p.Run == r.Run) peerPhase = p.Phase; }
-        bool beginAttempted = false, existingRun=false;
+        bool beginAttempted = false, existingRun=false, carrierless=false;
+        // A carrier-less run has no carrier to ask: it stands in an empty bag view and ledger for one.
+        Task<CourierReceipt> CarrierStatus() => carrierless
+            ? Task.FromResult(new CourierReceipt(r.Run, Guid.Empty, new(r.Settings.Carrier ?? new(), 0, []), Custody: []))
+            : Send(r, CourierCommand.Status, r.Start, []);
         // The carrier's gate serializes its commands, so while it travels in the background the owner sends it
         // nothing: owner-only steps reuse the last verified carrier snapshot (its custody cannot change in transit).
         Task<CourierReceipt>? carrierMove = null;
@@ -325,18 +335,21 @@ public sealed class CourierConductor
                     RunKey=Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)) };
                 if (!plan.Refusals.IsEmpty || plan.Trips.IsEmpty) { r.State = "Refused"; r.Code = "PlanRefused"; warning($"{r.Run} PlanRefused"); return Project(r) with {CanClear=false}; }
             }
+            carrierless = Carrierless(r);
             if (!automation.TryAcquire("courier owner", out lease) || lease == null) throw new CourierFault(CourierOutcome.Failed, "AutomationBusy", automation.AcquisitionBlockReason ?? "Busy");
             if(needsSuppression())suppress = suppression.Acquire();
             if (suppression.IsBusy) throw new CourierFault(CourierOutcome.Failed, "AutoRetainerBusy", "AutoRetainer still active");
             peerPhase = "Idle";
-            peer.LinkLost += Lost; peer.Progress += Progress; peer.StopRequested += RemoteStop;
-            if (trade is ICourierHoldPort holds)
+            if (!carrierless) peer.LinkLost += Lost;
+            peer.Progress += Progress; peer.StopRequested += RemoteStop;
+            // The trade hold keeps MarketMafioso off the trade window; a run with no trades needs none.
+            if (!carrierless && trade is ICourierHoldPort holds)
                 tradeHold = await calls.Call("OwnerTradeHold",10,d=>holds.BeginHold(r.Run,d));
             var owner = await Observe();
             if (!resume || !r.Start.HasStableIdentity && !r.PeerClaimed && r.Cursor == 0 && r.Pending == null) r.Start = owner.Character;
-            var status = await Send(r, CourierCommand.Status, r.Start, []);
+            var status = await CarrierStatus();
             var carrier = status.Bags ?? throw Fault("CarrierBagsMissing", "Fresh observation required.");
-            if (!CourierPlanner.Exact(carrier.Character, r.Settings.Carrier)) throw Fault("CarrierIdentityMismatch", "Unexpected carrier.");
+            if (!carrierless && !CourierPlanner.Exact(carrier.Character, r.Settings.Carrier)) throw Fault("CarrierIdentityMismatch", "Unexpected carrier.");
             if(status.ActiveRun is {} other && other!=r.Run && !resume && status.Custody.IsEmpty && status.Unconfirmed==null)
             {
                 var closed=new CourierStore<CourierJournal>(Path.Combine(directory,$"courier-closed-{other:N}.json")).Load();
@@ -419,7 +432,7 @@ public sealed class CourierConductor
                 }
                 if(r.Pending is {Action.Phase:CourierPhase.Retrieve or CourierPhase.Deposit} move)
                 {
-                    if(!CourierPlanner.Exact(owner.Character,move.OwnerBefore.Character) || !Agrees(move.CarrierBefore,carrier,r) ||
+                    if(!CourierPlanner.Exact(owner.Character,move.OwnerBefore.Character) || !carrierless && !Agrees(move.CarrierBefore,carrier,r) ||
                         !Custody.Covers(status.Custody,r.Custody) || !Custody.Covers(r.Custody,status.Custody))
                         throw Fault("PlacementSettlementIdentity","Placement owner, carrier or custody changed.");
                     SettlePlacement(r,move,owner);
@@ -427,7 +440,7 @@ public sealed class CourierConductor
                 }
                 if (r.Pending is { Action.Phase: CourierPhase.Consolidate } con)
                 {
-                    if (!CourierPlanner.Exact(owner.Character, con.OwnerBefore.Character) || !Agrees(con.CarrierBefore, carrier, r) ||
+                    if (!CourierPlanner.Exact(owner.Character, con.OwnerBefore.Character) || !carrierless && !Agrees(con.CarrierBefore, carrier, r) ||
                         !Custody.Covers(status.Custody, r.Custody) || !Custody.Covers(r.Custody, status.Custody))
                         throw Fault("PlacementSettlementIdentity", "Consolidation owner, carrier or custody changed.");
                     var conLines = r.Plan.Consolidations.Where(c => CourierPlanner.Exact(c.Destination, owner.Character)).ToArray();
@@ -464,15 +477,18 @@ public sealed class CourierConductor
                     or CourierPhase.ReturnCarrier or CourierPhase.CarrierToSource or CourierPhase.CarrierToDestination;
                 var unstartedTrade=r.Pending==null && r.Schedule.Skip(r.Cursor).FirstOrDefault()?.Phase is CourierPhase.HandIn or CourierPhase.HandOut;
                 if (r.Pending != null && !travel || status.Unconfirmed != null || !Custody.Covers(status.Custody, r.Custody) || !Custody.Covers(r.Custody, status.Custody)
-                    || (!travel && !unstartedTrade && r.Cursor != 0 && (!Agrees(r.OwnerCheckpoint, owner, r) || !Agrees(r.CarrierCheckpoint, carrier, r))))
+                    || (!travel && !unstartedTrade && r.Cursor != 0 && (!Agrees(r.OwnerCheckpoint, owner, r) || !carrierless && !Agrees(r.CarrierCheckpoint, carrier, r))))
                     throw Fault("ResumeUnsettled", "Journal intent, ledger or bags cannot prove a forward checkpoint.");
             }
             if (r.Schedule.IsEmpty) { r.Schedule = [.. Steps(r)]; r.ScheduleVersion = 1; }
             // Begin may succeed on the peer even if its acknowledgement is lost.
             if(stop)throw new CourierFault(CourierOutcome.Cancelled,"StopBeforeBegin","Begin was not dispatched.");
             r.State = "Running"; r.Code=r.Detail=""; store.Save(r); beginAttempted = true;
-            await Send(r, CourierCommand.Begin, r.Start, []);
-            r.PeerClaimed = true; store.Save(r);
+            if (!carrierless)
+            {
+                await Send(r, CourierCommand.Begin, r.Start, []);
+                r.PeerClaimed = true; store.Save(r);
+            }
             var steps = r.Schedule;
             for (; r.Cursor < steps.Length;)
             {
@@ -489,7 +505,7 @@ public sealed class CourierConductor
                 if (InTrip(s.Phase) || r.Code=="")owner=await Observe();
                 if (!Moving())
                 {
-                    status = await Send(r, CourierCommand.Status, r.Start, []);
+                    status = await CarrierStatus();
                     carrier = status.Bags ?? throw Fault("CarrierBagsMissing", "Missing before snapshot");
                 }
                 // A trip's bag slots are re-checked once, before anything of it is retrieved. A resumed,
@@ -540,7 +556,7 @@ public sealed class CourierConductor
                 }
                 // No five-slot pre-split: one trade step runs every window back to back (the trade runner
                 // packs fragmented bag slots into successive windows and credits each before the next).
-                if (!CourierPlanner.Exact(carrier.Character, r.Settings.Carrier) ||
+                if (!carrierless && !CourierPlanner.Exact(carrier.Character, r.Settings.Carrier) ||
                     !Custody.Covers(status.Custody, r.Custody) || !Custody.Covers(r.Custody, status.Custody))
                     throw Fault("CustodyMismatch", "Carrier identity or custody changed.");
                 if (s.Phase is CourierPhase.Retrieve or CourierPhase.CarrierToSource or CourierPhase.HandOut &&
@@ -616,6 +632,8 @@ public sealed class CourierConductor
                     case CourierPhase.Consolidate:
                         await ConsolidateAsync(r, intent, t.Destination, owner.Character, lease!);
                         break;
+                    case CourierPhase.ReturnCarrier when carrierless:
+                        break;
                     case CourierPhase.ReturnOwner:
                     case CourierPhase.ReturnCarrier:
                         try
@@ -623,7 +641,7 @@ public sealed class CourierConductor
                             if(s.Phase==CourierPhase.ReturnOwner)
                             {
                                 // A run resumed here has not sent the carrier home yet: it returns alongside the owner.
-                                if(r.CarrierMove==null && r.Custody.IsEmpty && status.Custody.IsEmpty && status.Unconfirmed==null &&
+                                if(!carrierless && r.CarrierMove==null && r.Custody.IsEmpty && status.Custody.IsEmpty && status.Unconfirmed==null &&
                                     steps.Skip(r.Cursor+1).Any(x=>x.Phase==CourierPhase.ReturnCarrier))
                                     Launch(new(Guid.NewGuid(),CourierCommand.ReturnHome,r.Start,null));
                                 await Switch(r.Start);
@@ -639,13 +657,15 @@ public sealed class CourierConductor
                         {
                             // A carrier still returning holds the custody it held when it set off: empty, as checked above.
                             if(s.Phase==CourierPhase.ReturnCarrier)r.CarrierMove=null; // The failed return is abandoned, as before.
-                            finished=Moving() ? null : await Send(r,CourierCommand.Status,r.Start,[]);
+                            finished=Moving() ? null : await CarrierStatus();
                             if(finished is {} fresh && (!fresh.Custody.IsEmpty || fresh.Unconfirmed!=null))
                                 throw Fault("ReturnCustodyUnsettled","Carrier reported custody or an unconfirmed hand-off after the return failed.");
                             r.Code=fault.Code;
                             r.Detail+=(r.Detail.Length==0?"":"; ")+$"{s.Phase}: {fault.Code}: {fault.Message}";
                             warning($"{r.Run} {r.Detail}");
                         }
+                        break;
+                    case CourierPhase.Finish when carrierless:
                         break;
                     case CourierPhase.Finish:
                         if (!r.Custody.IsEmpty) throw Fault("CustodyRemaining", "Carrier still holds stock");
@@ -662,7 +682,7 @@ public sealed class CourierConductor
                 {
                     if(InTrip(s.Phase) || r.Code=="")r.OwnerCheckpoint = await Observe();
                     r.CarrierCheckpoint = finished?.Bags ?? (s.Phase == CourierPhase.Finish ? r.CarrierCheckpoint : Moving() ? carrier :
-                        (await Send(r, CourierCommand.Status, r.Start, [])).Bags);
+                        (await CarrierStatus()).Bags);
                 }
                 if(s.Phase==CourierPhase.Deposit)
                     foreach(var shipped in s.Batch)r.Delivered[shipped.Line]=checked(r.Delivered.GetValueOrDefault(shipped.Line)+shipped.Units);
@@ -702,7 +722,7 @@ public sealed class CourierConductor
             warning($"{r.Run}/{r.Pending?.Id} {r.State} {r.Code}: {e.Message}");
             if(!existingRun && !beginAttempted)return Project(r) with {CanResume=false,CanClear=false};
             store.Save(r);
-            if (r.PeerClaimed || beginAttempted) try { await Send(r, CourierCommand.Stop, r.Start, []); } catch (Exception cleanup) { warning(cleanup.Message); }
+            if (!carrierless && (r.PeerClaimed || beginAttempted)) try { await Send(r, CourierCommand.Stop, r.Start, []); } catch (Exception cleanup) { warning(cleanup.Message); }
             // Stop reaches the carrier ahead of its command queue and cancels a background move; the move stays
             // journaled so a resume re-sends it under the same id. Its fault is observed at dispatch.
             if (Interlocked.Exchange(ref carrierMove, null) is { } abandoned &&

@@ -299,10 +299,11 @@ public static class CourierPlanner
                 (srcName, dstName) = (src.CharacterName, dst.CharacterName);
                 var pickup = settings.Bells.GetValueOrDefault(src.LocalContentId ?? 0);
                 var drop = settings.Bells.GetValueOrDefault(dst.LocalContentId ?? 0);
-                code = settings.Carrier is not { HasStableIdentity: true } ? "CarrierNotConfigured"
-                    : !Exact(carrier?.Character, settings.Carrier) ? "CarrierUnreachable"
+                // A local move involves no carrier: it needs none chosen, running or able to reach the character.
+                code = !local && settings.Carrier is not { HasStableIdentity: true } ? "CarrierNotConfigured"
+                    : !local && !Exact(carrier?.Character, settings.Carrier) ? "CarrierUnreachable"
                     : !settings.LocalRoster.Any(o => Exact(o, src)) || !settings.LocalRoster.Any(o => Exact(o, dst)) ? "OutsideClientRoster"
-                    : !Reachable(src) || !Reachable(dst) ? "RegionUnreachable"
+                    : !local && (!Reachable(src) || !Reachable(dst)) ? "RegionUnreachable"
                     : At(src, null) == null || At(dst, null) == null || !local && src.Matches(dst) || Exact(src, settings.Carrier) || Exact(dst, settings.Carrier) ? "CharacterNotKnown"
                     : pickup?.World != src.HomeWorldId || drop?.World != dst.HomeWorldId || pickup == null || drop == null ? "MeetingBellMissing"
                     : !local && meta.IsTradable != true ? "ItemNotTradeable"
