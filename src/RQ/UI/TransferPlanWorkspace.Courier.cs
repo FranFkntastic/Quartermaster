@@ -417,6 +417,8 @@ internal sealed partial class TransferPlanWorkspace
             ImGui.SetNextItemWidth(-1);
             if (ImGui.BeginCombo("##picker-character", CourierSession.CharacterLabel(current.Character)))
             {
+                // The picker re-raises itself above its owner every frame, which would bury this list under it.
+                ImGuiP.BringWindowToDisplayFront(ImGuiP.GetCurrentWindow());
                 foreach (var choice in choices)
                 {
                     var character = choice.Character;
