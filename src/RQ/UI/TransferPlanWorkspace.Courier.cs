@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface;
 using Dalamud.Interface.Utility;
 using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.UI.Tables;
@@ -12,19 +13,25 @@ using RQ.Runtime;
 namespace RQ.UI;
 
 /// <summary>
-/// The Courier plan table: one row per item with the places it sits in listed under it. Each place
-/// takes what it should hold after the run; the moves follow from those numbers (see <see cref="CourierDistribution"/>).
+/// The Courier plan table: one row per item with its sources, then its destinations, listed under it.
+/// Each place may take what it should hold after the run; the moves follow from those numbers (see
+/// <see cref="CourierDistribution"/>).
 /// </summary>
 internal sealed partial class TransferPlanWorkspace
 {
     private const string DestinationPickerPopup = "courier-destination-picker";
+    private const string SourcePickerPopup = "courier-source-picker";
+    private static readonly string ConfirmIcon = FontAwesomeIcon.Check.ToIconString();
+    private static readonly string DismissIcon = FontAwesomeIcon.Times.ToIconString();
     private readonly DalamudExpandableRows courierExpansion = new();
     /// <summary>Lines drawn at least once: a line opens the first time it is shown, then keeps the user's choice.</summary>
     private readonly HashSet<Guid> courierSeen = [];
     private readonly Dictionary<Guid, string> courierKeys = [];
-    /// <summary>The After run input being typed in and its text, so a half-typed number survives redraws.</summary>
+    /// <summary>The Target input being typed in and its text, so a half-typed number survives redraws.</summary>
     private string? afterEditKey;
     private string afterEditText = string.Empty;
+    /// <summary>A source picker the agent bridge asked to open; it opens on the line's next draw.</summary>
+    private Guid? sourcePickerOpenRequest;
     /// <summary>A destination picker the agent bridge asked to open; it opens on the line's next draw.</summary>
     private Guid? pickerOpenRequest;
     private OwnerScope? pickerCharacter;
@@ -49,7 +56,7 @@ internal sealed partial class TransferPlanWorkspace
             Draw: row => RightAligned((row.Distribution?.Total ?? 0).ToString("N0"), null),
             Id: "has"),
         new(
-            "After run",
+            "Target",
             88,
             _ => string.Empty,
             Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoSort,
@@ -171,13 +178,9 @@ internal sealed partial class TransferPlanWorkspace
     private static string CourierOutcome(TransferWorkbenchRow row) =>
         !row.Rule.Enabled ? "Paused"
         : row.CourierRefusal is { } refusal && !CourierSession.IsPlanWide(refusal.Code) ? CourierSession.RefusalLabel(refusal.Code)
-        : row.Distribution is { Stuck: > 0 } ? StuckLabel(row.Distribution)
+        : row.Distribution is { Problem: not CourierProblem.None } ? CourierSession.ProblemLabel(row.Distribution)
         : row.Distribution is { Moving: > 0 and var moving } ? moving.ToString("N0")
         : "In place";
-
-    /// <summary>A line whose typed places give up units that have nowhere to go.</summary>
-    private static string StuckLabel(Courier.CourierAllocation distribution) =>
-        distribution.Moving > 0 ? $"{distribution.Moving:N0} · no destination" : "No destination";
 
     private void DrawCourierMoves(TransferWorkbenchRow row)
     {
@@ -189,8 +192,8 @@ internal sealed partial class TransferPlanWorkspace
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip(courier.RefusalDetail(row.Runtime, refusal));
         }
-        else if (row.Distribution is { Stuck: > 0 } stuck)
-            RightAligned(StuckLabel(stuck), AmberColor);
+        else if (row.Distribution is { Problem: not CourierProblem.None } problem)
+            RightAligned(CourierSession.ProblemLabel(problem), AmberColor);
         else if (row.Distribution is { Moving: > 0 and var moving })
             RightAligned(moving.ToString("N0"), null);
         else
@@ -209,49 +212,102 @@ internal sealed partial class TransferPlanWorkspace
             ImGui.TextUnformatted(text);
     }
 
-    /// <summary>A line's places as rows of the plan table, then the row that adds a destination.</summary>
+    /// <summary>
+    /// A line's sources then its destinations as rows of the plan table, each list followed by the row
+    /// that adds to it. A line without a destination offers one suggested destination above that row.
+    /// </summary>
     private void DrawCourierPlaces(TransferWorkbenchRow row)
     {
         if (row.Distribution is not { } allocation)
             return;
         var rule = row.Rule;
-        var runtime = row.Runtime;
         var style = ImGui.GetStyle();
         var indent = CourierIndent();
-        var whoWidth = allocation.Places.Length == 0 ? 0f
-            : allocation.Places.Max(spot => ImGui.CalcTextSize(CourierSession.CharacterLabel(spot.Character)).X);
+        var roleWidth = Math.Max(ImGui.CalcTextSize("From").X, ImGui.CalcTextSize("To").X) + style.ItemSpacing.X * 2f;
+        var whoWidth = 0f;
+        foreach (var spot in allocation.Places)
+            whoWidth = Math.Max(whoWidth, ImGui.CalcTextSize(CourierSession.CharacterLabel(spot.Character)).X);
+        if (allocation.Suggestion is { } offered)
+            whoWidth = Math.Max(whoWidth, ImGui.CalcTextSize(CourierSession.CharacterLabel(offered.Character)).X);
+        var layout = new PlaceLayout(indent, roleWidth, whoWidth);
+        var sources = allocation.SourceCount;
         ImGui.PushID(CourierKey(rule.Id));
-        for (var index = 0; index < allocation.Places.Length; index++)
+        for (var index = 0; index < sources; index++)
+            DrawCourierPlace(row, allocation, allocation.Places[index], index, index == 0 ? "From" : null, layout);
+        DrawAddSource(row, allocation, sources == 0 ? "From" : null, layout);
+        for (var index = sources; index < allocation.Places.Length; index++)
+            DrawCourierPlace(row, allocation, allocation.Places[index], index, index == sources ? "To" : null, layout);
+        if (allocation.Suggestion is { } suggestion)
+            DrawCourierPlace(row, allocation, suggestion, allocation.Places.Length, "To", layout, suggested: true);
+        DrawAddDestination(row, allocation, allocation.Places.Length == sources && allocation.Suggestion is null ? "To" : null, layout);
+        ImGui.PopID();
+    }
+
+    /// <summary>Where a place row's role, character and container start, so every row of a line lines up.</summary>
+    private readonly record struct PlaceLayout(float Indent, float RoleWidth, float WhoWidth);
+
+    /// <summary>Starts a place row and draws its role, if any, in the item column; returns where the role cell ends.</summary>
+    private float BeginPlaceRow(TransferWorkbenchRow row, string? role, PlaceLayout layout)
+    {
+        ImGui.TableNextRow();
+        if (!row.Rule.Enabled)
+            ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0, ImGui.GetColorU32(PausedRowColor));
+        ImGui.TableSetColumnIndex(0);
+        var start = ImGui.GetCursorPosX() + layout.Indent;
+        ImGui.SetCursorPosX(start);
+        ImGui.AlignTextToFramePadding();
+        if (role is not null)
         {
-            var spot = allocation.Places[index];
-            ImGui.TableNextRow();
-            if (!rule.Enabled)
-                ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0, ImGui.GetColorU32(PausedRowColor));
-            ImGui.PushID(index);
-            ImGui.TableSetColumnIndex(0);
-            var rowTop = ImGui.GetCursorScreenPos().Y - style.CellPadding.Y;
-            var start = ImGui.GetCursorPosX() + indent;
-            ImGui.SetCursorPosX(start);
-            ImGui.AlignTextToFramePadding();
-            ImGui.TextColored(spot.Character.Matches(runtime.Owner) ? QuartermasterPalette.Info : QuartermasterPalette.Dim,
-                CourierSession.CharacterLabel(spot.Character));
-            ImGui.SameLine(start + whoWidth + style.ItemSpacing.X * 2f);
+            ImGui.TextColored(QuartermasterPalette.Dim, role);
+            ImGui.SameLine(start + layout.RoleWidth);
+        }
+        else
+            ImGui.SetCursorPosX(start + layout.RoleWidth);
+        return start + layout.RoleWidth;
+    }
+
+    /// <summary>
+    /// One listed place: character, container, what it has, its target and its move. A suggested
+    /// destination is drawn dimmed with its target locked and offers to be confirmed or dismissed.
+    /// </summary>
+    private void DrawCourierPlace(TransferWorkbenchRow row, CourierAllocation allocation, CourierSpot spot, int index, string? role,
+        PlaceLayout layout, bool suggested = false)
+    {
+        var runtime = row.Runtime;
+        var style = ImGui.GetStyle();
+        ImGui.PushID(index);
+        var start = BeginPlaceRow(row, role, layout);
+        var rowTop = ImGui.GetCursorScreenPos().Y - style.CellPadding.Y;
+        ImGui.TextColored(suggested ? QuartermasterPalette.Dim : spot.Character.Matches(runtime.Owner) ? QuartermasterPalette.Info : QuartermasterPalette.Dim,
+            CourierSession.CharacterLabel(spot.Character));
+        ImGui.SameLine(start + layout.WhoWidth + style.ItemSpacing.X * 2f);
+        if (suggested)
+            ImGui.TextDisabled(CourierSession.ContainerLabel(runtime, spot.Retainer));
+        else
             ImGui.TextUnformatted(CourierSession.ContainerLabel(runtime, spot.Retainer));
 
-            ImGui.TableSetColumnIndex(1);
-            RightAligned(spot.Has?.ToString("N0") ?? "—", spot.Has is null ? QuartermasterPalette.Dim : null);
-            ImGui.TableSetColumnIndex(2);
-            DrawAfterInput(row, allocation, spot);
-            ImGui.TableSetColumnIndex(3);
-            var delta = spot.Delta;
-            RightAligned(delta < 0 ? $"−{-delta:N0}" : delta > 0 ? $"+{delta:N0}" : "—",
-                delta < 0 ? QuartermasterPalette.Amber : delta > 0 ? QuartermasterPalette.Green : QuartermasterPalette.Dim);
-            ImGui.TableSetColumnIndex(4);
-            if (spot.Destination)
-                DrawRemoveDestination(row, spot, rowTop, rowTop + ImGui.GetFrameHeight() + (style.CellPadding.Y * 2f));
-            ImGui.PopID();
+        ImGui.TableSetColumnIndex(1);
+        RightAligned(spot.Has?.ToString("N0") ?? "—", spot.Has is null || suggested ? QuartermasterPalette.Dim : null);
+        ImGui.TableSetColumnIndex(2);
+        if (suggested)
+        {
+            var locked = string.Empty;
+            ImGui.BeginDisabled();
+            ImGui.SetNextItemWidth(-1);
+            ImGui.InputTextWithHint("##target", spot.End.ToString("N0"), ref locked, 16, ImGuiInputTextFlags.ReadOnly);
+            ImGui.EndDisabled();
         }
-        DrawAddDestination(row, allocation, indent);
+        else
+            DrawTargetInput(row, allocation, spot);
+        ImGui.TableSetColumnIndex(3);
+        var delta = spot.Delta;
+        RightAligned(delta < 0 ? $"−{-delta:N0}" : delta > 0 ? $"+{delta:N0}" : "—",
+            suggested || delta == 0 ? QuartermasterPalette.Dim : delta < 0 ? QuartermasterPalette.Amber : QuartermasterPalette.Green);
+        ImGui.TableSetColumnIndex(4);
+        if (suggested)
+            DrawSuggestionChoice(row, spot);
+        else
+            DrawRemovePlace(row, spot, rowTop, rowTop + ImGui.GetFrameHeight() + (style.CellPadding.Y * 2f));
         ImGui.PopID();
     }
 
@@ -261,18 +317,26 @@ internal sealed partial class TransferPlanWorkspace
     private static string PlaceLabel(QuartermasterRuntimeSnapshot runtime, CourierSpot spot) =>
         $"{CourierSession.CharacterLabel(spot.Character)} · {CourierSession.ContainerLabel(runtime, spot.Retainer)}";
 
+    /// <summary>The line a change starts from: the stored one, or a line in the older shape as it was solved.</summary>
+    private static CourierLine EditableLine(TransferWorkbenchRow row, TargetPlanItem draftRule) =>
+        draftRule.Courier is { HasLegacyPlaces: false } line ? line : row.Distribution?.Line ?? draftRule.Courier ?? new CourierLine();
+
+    private bool MutateCourierLine(TransferWorkbenchRow row, Func<CourierLine, CourierLine> change) =>
+        MutateRules(row.Owner, row.PlanId, [row.Rule.Id], draftRule => draftRule.Courier = change(EditableLine(row, draftRule)));
+
     /// <summary>
-    /// What a place should hold after the run: a whole number up to the line's total, or empty to
-    /// leave it to the line's other places. Empty shows the place's computed end state.
+    /// What a place should hold after the run: a whole number, up to what it has for a source and up to
+    /// the line's total for a destination, or empty to leave it to the line's other places. Empty shows
+    /// the place's computed end state.
     /// </summary>
-    private void DrawAfterInput(TransferWorkbenchRow row, CourierAllocation allocation, CourierSpot spot)
+    private void DrawTargetInput(TransferWorkbenchRow row, CourierAllocation allocation, CourierSpot spot)
     {
         var rule = row.Rule;
         var key = PlaceKey(rule.Id, spot);
-        var total = allocation.Total;
+        var limit = !spot.Destination && spot.Has is { } has ? has : allocation.Total;
         var text = afterEditKey == key ? afterEditText : spot.Typed?.ToString("N0") ?? string.Empty;
         ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##after", spot.End.ToString("N0"), ref text, 16,
+        ImGui.InputTextWithHint("##target", spot.End.ToString("N0"), ref text, 16,
             ImGuiInputTextFlags.CharsDecimal | ImGuiInputTextFlags.AutoSelectAll);
         if (ImGui.IsItemActive())
         {
@@ -285,7 +349,7 @@ internal sealed partial class TransferPlanWorkspace
             afterEditKey = null;
 
         reviewRegistry.RegisterLastAction(
-            $"quartermaster.courier.place.after.{key}",
+            $"quartermaster.courier.place.target.{key}",
             $"Set how many {rule.ItemName} {PlaceLabel(row.Runtime, spot)} holds after the run; omit quantity to clear",
             AgentBridgeUiControlKind.Input,
             true,
@@ -298,7 +362,7 @@ internal sealed partial class TransferPlanWorkspace
                     return Set(null) ? AgentBridgeUiActionResult.Ok("Cleared.") : AgentBridgeUiActionResult.Fail("Not changed.");
                 if (!quantity.TryGetInt64(out var requested) || requested < 0)
                     return AgentBridgeUiActionResult.Fail("quantity must be a whole number of at least 0.");
-                var clamped = (int)Math.Min(requested, total);
+                var clamped = (int)Math.Min(requested, limit);
                 return Set(clamped) ? AgentBridgeUiActionResult.Ok($"Set to {clamped:N0}.") : AgentBridgeUiActionResult.Fail("Not changed.");
             });
 
@@ -308,29 +372,117 @@ internal sealed partial class TransferPlanWorkspace
             if (digits.Length == 0)
                 return null;
             return long.TryParse(digits, NumberStyles.None, CultureInfo.InvariantCulture, out var number)
-                ? (int)Math.Min(number, total)
-                : total;
+                ? (int)Math.Min(number, limit)
+                : limit;
         }
 
-        bool Set(int? after) =>
-            after == spot.Typed ||
-            MutateRules(row.Owner, row.PlanId, [rule.Id], draftRule =>
-                draftRule.Courier = (draftRule.Courier ?? new CourierLine()).WithAfter(spot.Character, spot.Retainer, after));
+        bool Set(int? target) =>
+            target == spot.Typed ||
+            MutateCourierLine(row, line => line.WithTarget(spot.Character, spot.Retainer, target));
     }
 
-    private void DrawRemoveDestination(TransferWorkbenchRow row, CourierSpot spot, float rowTop, float rowBottom)
+    private void DrawRemovePlace(TransferWorkbenchRow row, CourierSpot spot, float rowTop, float rowBottom)
     {
         var rule = row.Rule;
-        void Remove() => MutateRules(row.Owner, row.PlanId, [rule.Id], draftRule =>
-            draftRule.Courier = (draftRule.Courier ?? new CourierLine()).WithoutDestination(spot.Character, spot.Retainer));
-        if (DalamudRowRemoveButton.Draw("remove-destination", DalamudRowRemoveButton.IsRowHovered(rowTop, rowBottom)))
+        void Remove() => MutateCourierLine(row, line => line.Without(spot.Character, spot.Retainer));
+        if (DalamudRowRemoveButton.Draw("remove-place", DalamudRowRemoveButton.IsRowHovered(rowTop, rowBottom)))
             Remove();
         reviewRegistry.RegisterLastButton(
             $"quartermaster.courier.place.remove.{PlaceKey(rule.Id, spot)}",
-            $"Remove {PlaceLabel(row.Runtime, spot)} as a destination of {rule.ItemName}",
+            $"Remove {PlaceLabel(row.Runtime, spot)} as a {(spot.Destination ? "destination" : "source")} of {rule.ItemName}",
             true,
             Remove,
             "Available");
+    }
+
+    /// <summary>Confirms the suggested destination as a destination of the line, or dismisses it for good.</summary>
+    private void DrawSuggestionChoice(TransferWorkbenchRow row, CourierSpot spot)
+    {
+        var rule = row.Rule;
+        void Confirm() => MutateCourierLine(row, line => line.WithDestination(spot.Character, spot.Retainer));
+        void Dismiss() => MutateCourierLine(row, line => line with { SuggestionDismissed = true });
+        ImGui.PushFont(UiBuilder.IconFont);
+        var confirmed = ImGui.SmallButton($"{ConfirmIcon}##confirm-suggestion");
+        ImGui.PopFont();
+        reviewRegistry.RegisterLastButton(
+            $"quartermaster.courier.suggestion.confirm.{rule.Id:N}",
+            $"Add {PlaceLabel(row.Runtime, spot)} as a destination of {rule.ItemName}",
+            true,
+            Confirm,
+            PlaceLabel(row.Runtime, spot));
+        ImGui.SameLine(0f, ImGui.GetStyle().ItemInnerSpacing.X);
+        ImGui.PushFont(UiBuilder.IconFont);
+        var dismissed = ImGui.SmallButton($"{DismissIcon}##dismiss-suggestion");
+        ImGui.PopFont();
+        reviewRegistry.RegisterLastButton(
+            $"quartermaster.courier.suggestion.dismiss.{rule.Id:N}",
+            $"Dismiss {PlaceLabel(row.Runtime, spot)} as the suggested destination of {rule.ItemName}",
+            true,
+            Dismiss,
+            PlaceLabel(row.Runtime, spot));
+        if (confirmed)
+            Confirm();
+        else if (dismissed)
+            Dismiss();
+    }
+
+    /// <summary>The row that adds a source: a list of the places holding the item that the line does not list.</summary>
+    private void DrawAddSource(TransferWorkbenchRow row, CourierAllocation allocation, string? role, PlaceLayout layout)
+    {
+        if (allocation.Holders.IsEmpty)
+            return;
+        var rule = row.Rule;
+        BeginPlaceRow(row, role, layout);
+        const string label = "+ Add source…";
+        ImGui.PushStyleColor(ImGuiCol.Text, QuartermasterPalette.Dim);
+        var clicked = ImGui.Selectable($"{label}##add-source", false, ImGuiSelectableFlags.None, new Vector2(ImGui.CalcTextSize(label).X, 0));
+        ImGui.PopStyleColor();
+        var ruleId = rule.Id;
+        reviewRegistry.RegisterLastButton(
+            $"quartermaster.courier.source.add.{ruleId:N}",
+            $"Choose a source for {rule.ItemName}",
+            true,
+            () => sourcePickerOpenRequest = ruleId,
+            "Available");
+        if (clicked || sourcePickerOpenRequest == ruleId)
+        {
+            sourcePickerOpenRequest = null;
+            ImGui.OpenPopup(SourcePickerPopup);
+        }
+        if (!DalamudOwnedPopup.BeginOpaquePopup(SourcePickerPopup))
+            return;
+        var close = false;
+        if (ImGui.BeginTable("##source-picker-table", 2, ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingFixedFit))
+        {
+            ImGui.TableSetupColumn("Place", ImGuiTableColumnFlags.WidthFixed);
+            ImGui.TableSetupColumn("Has", ImGuiTableColumnFlags.WidthFixed);
+            for (var index = 0; index < allocation.Holders.Length; index++)
+            {
+                var holder = allocation.Holders[index];
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn();
+                var place = PlaceLabel(row.Runtime, holder);
+                void Add()
+                {
+                    MutateCourierLine(row, line => line.WithSource(holder.Character, holder.Retainer));
+                    close = true;
+                }
+                if (ImGui.Selectable($"{place}##source-pick:{index}", false, ImGuiSelectableFlags.SpanAllColumns))
+                    Add();
+                reviewRegistry.RegisterLastButton(
+                    $"quartermaster.courier.source.pick.{PlaceKey(ruleId, holder)}",
+                    $"Add {place} as a source of {rule.ItemName}",
+                    true,
+                    Add,
+                    $"{holder.Has:N0}");
+                ImGui.TableNextColumn();
+                RightAlignedLine((holder.Has ?? 0).ToString("N0"), null);
+            }
+            ImGui.EndTable();
+        }
+        if (close)
+            ImGui.CloseCurrentPopup();
+        ImGui.EndPopup();
     }
 
     /// <summary>Containers a line can add as a destination, by character: none already listed on it.</summary>
@@ -342,15 +494,13 @@ internal sealed partial class TransferPlanWorkspace
             .Where(choice => choice.Containers.Length > 0)
             .ToArray();
 
-    private void DrawAddDestination(TransferWorkbenchRow row, CourierAllocation allocation, float indent)
+    private void DrawAddDestination(TransferWorkbenchRow row, CourierAllocation allocation, string? role, PlaceLayout layout)
     {
         var choices = DestinationChoices(row, allocation);
         if (choices.Length == 0)
             return;
         var rule = row.Rule;
-        ImGui.TableNextRow();
-        ImGui.TableSetColumnIndex(0);
-        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + indent);
+        BeginPlaceRow(row, role, layout);
         const string label = "+ Add destination…";
         ImGui.PushStyleColor(ImGuiCol.Text, QuartermasterPalette.Dim);
         var clicked = ImGui.Selectable($"{label}##add-destination", false, ImGuiSelectableFlags.None, new Vector2(ImGui.CalcTextSize(label).X, 0));
@@ -406,8 +556,7 @@ internal sealed partial class TransferPlanWorkspace
         }
         void Add(OwnerScope character, ulong? retainer)
         {
-            MutateRules(row.Owner, row.PlanId, [rule.Id], draftRule =>
-                draftRule.Courier = (draftRule.Courier ?? new CourierLine()).WithDestination(character, retainer));
+            MutateCourierLine(row, line => line.WithDestination(character, retainer));
             pickerClose = true;
         }
 

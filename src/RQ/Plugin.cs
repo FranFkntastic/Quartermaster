@@ -490,6 +490,8 @@ public sealed class Plugin : IDalamudPlugin
         var liveOwner = CurrentOwner();
         StowagePlanMigration.EnsureOwnerPlan(state, liveOwner);
         TransferPlanMigration.EnsureOwnerPlans(state, liveOwner);
+        // Courier lines written before sources and destinations were listed apart need observed stock to convert.
+        courier.MigrateRoles(runtimeSnapshots.Current);
         if (RuntimeOwnerTransition.RequiresReconciliation(runtimeSnapshots.Current.Owner, liveOwner))
             reconciliation.Request(RuntimeDomain.All, "owner_transition");
         updateTimings.Section("work queue");

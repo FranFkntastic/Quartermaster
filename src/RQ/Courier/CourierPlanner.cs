@@ -6,28 +6,47 @@ using RQ.Inventory;
 namespace RQ.Courier;
 
 /// <summary>
-/// One container of one character on a courier line: its bags (null Retainer) or one retainer.
-/// After is the units the line wants there once the run is done; null leaves it to the line's
-/// other places. Destination marks a place the user added to receive the item; places that only
-/// hold the item are listed from observed stock and are not stored unless After is set.
+/// One container of one character listed on a courier line: its bags (null Retainer) or one retainer.
+/// Target is the units it should hold once the run is done; null leaves it to the line's other places
+/// (see <see cref="CourierDistribution"/>).
 /// </summary>
 public sealed record CourierPlace(OwnerScope Character, ulong? Retainer,
-    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? After = null,
-    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool Destination = false)
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? Target = null)
 {
     internal bool Is(OwnerScope character, ulong? retainer) => Retainer == retainer && Character.Matches(character);
 }
 
 /// <summary>
-/// A Courier plan line: one item and the places it should sit in after a run. Everything that
-/// moves is derived from these places and observed stock (see <see cref="CourierDistribution"/>).
-/// The other members are the per-route shape written before lines held places; they are read once
-/// from older state, folded into places on load (<c>StowagePlanMigration.CollapseCourierLines</c>)
-/// and never written again.
+/// A place as written before lines listed their sources and destinations apart: After is what it
+/// should hold after the run, Destination marks a place the user added to receive the item. Read from
+/// older state and converted by <see cref="CourierDistribution.Resolve"/>.
+/// </summary>
+public sealed record LegacyCourierPlace(OwnerScope Character, ulong? Retainer, int? After = null, bool Destination = false)
+{
+    internal bool Is(OwnerScope character, ulong? retainer) => Retainer == retainer && Character.Matches(character);
+}
+
+/// <summary>
+/// A Courier plan line: one item, the places it is taken from and the places it is brought to, in
+/// order. Places not listed are never touched and a place is never both. Everything that moves is
+/// derived from these places and observed stock (see <see cref="CourierDistribution"/>).
+/// <see cref="Places"/> and the members after it are older shapes: places written before roles were
+/// listed apart (kept until stock is known, then converted by <see cref="CourierDistribution.Resolve"/>),
+/// and the per-route shape folded into places on load (<c>StowagePlanMigration.CollapseCourierLines</c>).
 /// </summary>
 public sealed record CourierLine
 {
-    public ImmutableArray<CourierPlace> Places { get; init; } = [];
+    public ImmutableArray<CourierPlace> Sources { get; init; } = [];
+
+    public ImmutableArray<CourierPlace> Destinations { get; init; } = [];
+
+    /// <summary>Whether the user dismissed the destination this line would otherwise suggest.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool SuggestionDismissed { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    [System.ComponentModel.EditorBrowsable(System.ComponentModel.EditorBrowsableState.Never)]
+    public ImmutableArray<LegacyCourierPlace> Places { get; init; }
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     [System.ComponentModel.EditorBrowsable(System.ComponentModel.EditorBrowsableState.Never)]
@@ -53,49 +72,76 @@ public sealed record CourierLine
     [JsonIgnore]
     internal bool IsLegacy => Character is not null;
 
-    private int IndexOf(OwnerScope who, ulong? retainer)
+    /// <summary>Whether this line still holds places written before roles were listed apart.</summary>
+    [JsonIgnore]
+    internal bool HasLegacyPlaces => !Places.IsDefaultOrEmpty;
+
+    [JsonIgnore]
+    internal ImmutableArray<LegacyCourierPlace> LegacyPlaces => Places.IsDefault ? [] : Places;
+
+    internal bool Lists(OwnerScope who, ulong? retainer) =>
+        Sources.Any(place => place.Is(who, retainer)) || Destinations.Any(place => place.Is(who, retainer));
+
+    private CourierLine Without(OwnerScope who, ulong? retainer, out CourierPlace? removed)
     {
-        for (var i = 0; i < Places.Length; i++)
-            if (Places[i].Is(who, retainer))
-                return i;
-        return -1;
+        removed = Sources.FirstOrDefault(place => place.Is(who, retainer)) ?? Destinations.FirstOrDefault(place => place.Is(who, retainer));
+        return removed is null ? this : this with
+        {
+            Sources = [.. Sources.Where(place => !place.Is(who, retainer))],
+            Destinations = [.. Destinations.Where(place => !place.Is(who, retainer))],
+        };
     }
 
-    /// <summary>Sets what a place should hold after the run; null clears it, dropping a place that only held a value.</summary>
-    internal CourierLine WithAfter(OwnerScope who, ulong? retainer, int? after)
+    /// <summary>Lists a place as the last source; a destination there becomes a source with its target.</summary>
+    internal CourierLine WithSource(OwnerScope who, ulong? retainer)
     {
-        var index = IndexOf(who, retainer);
-        if (index < 0)
-            return after is null ? this : this with { Places = Places.Add(new(who with { }, retainer, after)) };
-        var place = Places[index];
-        return !place.Destination && after is null
-            ? this with { Places = Places.RemoveAt(index) }
-            : this with { Places = Places.SetItem(index, place with { After = after }) };
+        if (Sources.Any(place => place.Is(who, retainer)))
+            return this;
+        var line = Without(who, retainer, out var removed);
+        return line with { Sources = line.Sources.Add(new(who with { }, retainer, removed?.Target)) };
     }
 
-    /// <summary>Adds a place as a destination, keeping a value it already has.</summary>
+    /// <summary>Lists a place as the last destination; a source there becomes a destination with its target.</summary>
     internal CourierLine WithDestination(OwnerScope who, ulong? retainer)
     {
-        var index = IndexOf(who, retainer);
-        if (index < 0)
-            return this with { Places = Places.Add(new(who with { }, retainer, Destination: true)) };
-        return Places[index].Destination ? this : this with { Places = Places.SetItem(index, Places[index] with { Destination = true }) };
+        if (Destinations.Any(place => place.Is(who, retainer)))
+            return this;
+        var line = Without(who, retainer, out var removed);
+        return line with { Destinations = line.Destinations.Add(new(who with { }, retainer, removed?.Target)) };
     }
 
-    /// <summary>Removes an added destination and its value.</summary>
-    internal CourierLine WithoutDestination(OwnerScope who, ulong? retainer) =>
-        this with { Places = [.. Places.Where(place => !(place.Destination && place.Is(who, retainer)))] };
+    /// <summary>Removes a place from the line, whichever role it has.</summary>
+    internal CourierLine Without(OwnerScope who, ulong? retainer) => Without(who, retainer, out _);
+
+    /// <summary>Sets what a listed place should hold after the run; null leaves it to the line's other places.</summary>
+    internal CourierLine WithTarget(OwnerScope who, ulong? retainer, int? target)
+    {
+        static ImmutableArray<CourierPlace> Set(ImmutableArray<CourierPlace> places, OwnerScope who, ulong? retainer, int? target)
+        {
+            for (var i = 0; i < places.Length; i++)
+                if (places[i].Is(who, retainer))
+                    return places.SetItem(i, places[i] with { Target = target });
+            return places;
+        }
+        return this with { Sources = Set(Sources, who, retainer, target), Destinations = Set(Destinations, who, retainer, target) };
+    }
 
     public bool Equals(CourierLine? other) =>
-        other is not null && Places.SequenceEqual(other.Places) && Equals(Character, other.Character) &&
-        SourceRetainerId == other.SourceRetainerId && Equals(SourceCharacter, other.SourceCharacter) &&
+        other is not null && Sources.SequenceEqual(other.Sources) && Destinations.SequenceEqual(other.Destinations) &&
+        SuggestionDismissed == other.SuggestionDismissed && LegacyPlaces.SequenceEqual(other.LegacyPlaces) &&
+        Equals(Character, other.Character) && SourceRetainerId == other.SourceRetainerId && Equals(SourceCharacter, other.SourceCharacter) &&
         KeepInSource == other.KeepInSource && RetainerId == other.RetainerId;
 
     public override int GetHashCode()
     {
         var hash = new HashCode();
-        foreach (var place in Places)
+        foreach (var place in Sources)
             hash.Add(place);
+        foreach (var place in Destinations)
+            hash.Add(place);
+        foreach (var place in LegacyPlaces)
+            hash.Add(place);
+        hash.Add(SuggestionDismissed);
         hash.Add(Character);
         hash.Add(SourceRetainerId);
         return hash.ToHashCode();
@@ -209,6 +255,9 @@ public static class CourierPlanner
         {
             var allocation = CourierDistribution.Allocate(r.Courier!, r.ItemId, r.Quality, plan.Owner, locations,
                 who => Listable(who, settings, worldRegion));
+            // A line that cannot reach its listed end states moves nothing; the plan table names why.
+            if (allocation.Problem != CourierProblem.None)
+                continue;
             var meta = metadata(r.ItemId);
             string? code = null, srcName = null, dstName = null;
             if (allocation.Places.FirstOrDefault(p => p.Has == null && p.Typed != null) is { } unseen)

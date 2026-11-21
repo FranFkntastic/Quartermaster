@@ -329,14 +329,16 @@ internal sealed class TransferPlanManager
         ImGui.TableNextColumn();
         if (rule.Courier is null)
             ImGui.TextUnformatted(rule.TargetQuantity.ToString("N0"));
-        else if (row.Distribution is { Moving: > 0 } moving)
-            ImGui.TextUnformatted(moving.Moving.ToString("N0"));
+        else if (row.Distribution is { Runs: > 0 } moving)
+            ImGui.TextUnformatted(moving.Runs.ToString("N0"));
         ImGui.TableNextColumn();
         var destination = rule.Courier is null
             ? StowTo(runtime, rule.Routing)
-            : row.Distribution is { Moving: > 0 } distribution
-                ? CourierSession.RouteSummary(runtime, distribution)
-                : row.Distribution is { Stuck: > 0 } ? "No destination" : "In place";
+            : row.Distribution is { Problem: not Courier.CourierProblem.None } problem
+                ? CourierSession.ProblemLabel(problem)
+                : row.Distribution is { Moving: > 0 } distribution
+                    ? CourierSession.RouteSummary(runtime, distribution)
+                    : "In place";
         var shown = DalamudUiLayout.ElideText(destination, ImGui.GetContentRegionAvail().X);
         ImGui.TextUnformatted(shown);
         if (shown.Length != destination.Length && ImGui.IsItemHovered())

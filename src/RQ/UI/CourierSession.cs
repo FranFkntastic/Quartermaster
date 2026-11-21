@@ -577,6 +577,56 @@ public sealed class CourierSession
         return allocation;
     }
 
+    private long rolesChecked = -1;
+
+    /// <summary>
+    /// Writes back courier lines whose places predate listing sources and destinations apart, converted
+    /// against observed stock (<see cref="CourierDistribution.Resolve"/>). A line waits while its plan
+    /// owner's bags or any of its typed places are unobserved; until then it is converted afresh wherever
+    /// it is solved. Checked once per runtime revision.
+    /// </summary>
+    internal void MigrateRoles(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (runtime.Revision == rolesChecked || !runtime.Owner.HasStableIdentity)
+            return;
+        rolesChecked = runtime.Revision;
+        var pending = runtime.State.PlanItems.Where(rule => rule.Courier is { IsLegacy: false, HasLegacyPlaces: true }).ToArray();
+        if (pending.Length == 0)
+            return;
+        var locations = Locations(runtime);
+        var settings = runtime.State.Courier;
+        bool Seen(OwnerScope who, ulong? retainer) => locations.Any(l => l.Retainer == retainer && l.Character.Matches(who));
+        var converted = new Dictionary<(Guid Plan, Guid Rule), (CourierLine From, CourierLine To)>();
+        foreach (var rule in pending)
+        {
+            var line = rule.Courier!;
+            var owner = runtime.State.StowagePlans.FirstOrDefault(plan => plan.Id == rule.StowagePlanId)?.Owner;
+            if (owner is null || !Seen(owner, null) || line.Places.Any(place => !place.Destination && place.After is not null && !Seen(place.Character, place.Retainer)))
+                continue;
+            converted[(rule.StowagePlanId, rule.Id)] = (line, CourierDistribution.Resolve(line, rule.ItemId, rule.Quality, owner, locations,
+                who => CourierPlanner.Listable(who, settings, WorldRegion)));
+        }
+        if (converted.Count == 0)
+            return;
+        state.Mutate(document =>
+        {
+            foreach (var rule in document.PlanItems)
+                if (converted.TryGetValue((rule.StowagePlanId, rule.Id), out var change) && Equals(rule.Courier, change.From))
+                    rule.Courier = change.To;
+        });
+    }
+
+    /// <summary>A courier line's problem as its outcome label; empty when it has none.</summary>
+    internal static string ProblemLabel(CourierAllocation allocation) => allocation.Problem switch
+    {
+        CourierProblem.NoSource => "No source",
+        CourierProblem.NoDestination => "No destination",
+        CourierProblem.SameCharacter => "Same character",
+        CourierProblem.Short => $"Short {allocation.Short:N0}",
+        CourierProblem.Unplaced => $"{allocation.Stuck:N0} · no destination",
+        _ => string.Empty,
+    };
+
     /// <summary>Observed containers of every known character; unobserved ones are omitted. Cached per runtime revision.</summary>
     internal IReadOnlyList<CourierLocation> Locations(QuartermasterRuntimeSnapshot runtime)
     {
