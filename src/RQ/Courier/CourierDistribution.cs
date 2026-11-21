@@ -85,7 +85,7 @@ public static class CourierDistribution
     /// returned as is. An added destination stays a destination with its value. A typed place below
     /// what it holds becomes a source with its value, above it a destination; one never observed
     /// becomes a source. Untyped places that only held the item are dropped, except that a line left
-    /// with destinations and no source takes every untyped holder as an untyped source.
+    /// with only typed destinations and no source takes every untyped holder as an untyped source.
     /// </summary>
     public static CourierLine Resolve(CourierLine line, uint item, ItemQualityPolicy quality, OwnerScope? owner,
         IReadOnlyList<CourierLocation> locations, Func<OwnerScope, bool> listable)
@@ -111,7 +111,9 @@ public static class CourierDistribution
                     sources.Add(new(place.Character with { }, place.Retainer, after));
             }
         }
-        if (destinations.Count > 0 && sources.Count == 0)
+        // Only typed destinations drew from untyped holders before; a blank destination moved nothing,
+        // so holders become sources only when every destination is typed and they give just its demand.
+        if (destinations.Count > 0 && sources.Count == 0 && destinations.All(place => place.Target is not null))
             foreach (var (at, _) in Holding(item, quality, owner, locations, listable))
                 if (!Listed(at.Character, at.Retainer))
                     sources.Add(new(at.Character with { }, at.Retainer));
