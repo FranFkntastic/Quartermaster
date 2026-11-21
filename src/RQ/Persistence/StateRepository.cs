@@ -27,10 +27,10 @@ public sealed class StateRepository
         var databaseName = $"{Path.GetFileNameWithoutExtension(store.Path)}-operations.db";
         operationStore = new OperationStateStore(Path.Combine(directory, databaseName));
         MigrateLegacyOperations();
-        // Courier lines written before they carried a Routing name one destination retainer on the route.
-        var routed = Planning.StowagePlanMigration.MoveCourierRetainersToRouting(state);
         // Plans written before Courier plans existed may mix courier lines into Transfer plans.
-        if (Planning.StowagePlanMigration.SeparateCourierLines(state) | routed)
+        var separated = Planning.StowagePlanMigration.SeparateCourierLines(state);
+        // Courier lines written one per route become one line per item.
+        if (Planning.StowagePlanMigration.CollapseCourierLines(state) | separated)
         {
             state.Revision = checked(state.Revision + 1);
             store.Save(state);

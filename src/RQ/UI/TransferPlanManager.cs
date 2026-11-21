@@ -232,9 +232,12 @@ internal sealed class TransferPlanManager
         if (courier)
         {
             var destinations = rows
-                .Where(row => row.Rule.Courier is not null)
-                .GroupBy(row => (row.Rule.Courier!.Character.LocalContentId, row.Rule.Courier.Character.HomeWorldId))
-                .Select(group => $"{CourierSession.CharacterLabel(group.First().Rule.Courier!.Character)} {group.Count():N0}")
+                .SelectMany(row => row.Rule.Courier is { } line
+                    ? line.Places.Where(place => place.Destination).Select(place => place.Character)
+                        .DistinctBy(character => (character.LocalContentId, character.HomeWorldId))
+                    : [])
+                .GroupBy(character => (character.LocalContentId, character.HomeWorldId))
+                .Select(group => $"{CourierSession.CharacterLabel(group.First())} {group.Count():N0}")
                 .ToArray();
             if (destinations.Length > 0)
                 ImGui.TextDisabled($"To {string.Join(" · ", destinations)}");
@@ -254,7 +257,7 @@ internal sealed class TransferPlanManager
         {
             ImGui.TableSetupScrollFreeze(0, 1);
             ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1f);
-            ImGui.TableSetupColumn(courier ? "Send" : "Keep", ImGuiTableColumnFlags.WidthFixed, ImGui.CalcTextSize("999,999").X);
+            ImGui.TableSetupColumn(courier ? "Moves" : "Keep", ImGuiTableColumnFlags.WidthFixed, ImGui.CalcTextSize("999,999").X);
             ImGui.TableSetupColumn(courier ? "Route" : "Stowage", ImGuiTableColumnFlags.WidthStretch, courier ? 1.4f : .8f);
             ImGui.TableHeadersRow();
             foreach (var row in rows)
@@ -324,11 +327,16 @@ internal sealed class TransferPlanManager
         if (display.Length != full.Length && ImGui.IsItemHovered())
             ImGui.SetTooltip(full);
         ImGui.TableNextColumn();
-        ImGui.TextUnformatted(rule.TargetQuantity.ToString("N0"));
+        if (rule.Courier is null)
+            ImGui.TextUnformatted(rule.TargetQuantity.ToString("N0"));
+        else if (row.Distribution is { Moving: > 0 } moving)
+            ImGui.TextUnformatted(moving.Moving.ToString("N0"));
         ImGui.TableNextColumn();
-        var destination = rule.Courier is { } route
-            ? $"{CourierSession.Side(runtime, route.SourceCharacter ?? row.Owner, route.SourceRetainerId, includeOwner: true)} → {CourierSession.Destination(runtime, route.Character, rule.Routing, includeOwner: true)}"
-            : StowTo(runtime, rule.Routing);
+        var destination = rule.Courier is null
+            ? StowTo(runtime, rule.Routing)
+            : row.Distribution is { Moving: > 0 } distribution
+                ? CourierSession.RouteSummary(runtime, distribution)
+                : "In place";
         var shown = DalamudUiLayout.ElideText(destination, ImGui.GetContentRegionAvail().X);
         ImGui.TextUnformatted(shown);
         if (shown.Length != destination.Length && ImGui.IsItemHovered())

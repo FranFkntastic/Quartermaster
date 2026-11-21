@@ -128,7 +128,7 @@ public sealed class CachedPlayerBag
 public sealed class TargetPlanItem
 {
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public Courier.CourierRoute? Courier { get; set; }
+    public Courier.CourierLine? Courier { get; set; }
     public Guid Id { get; set; } = Guid.NewGuid();
     public Guid StowagePlanId { get; set; }
     public uint ItemId { get; set; }

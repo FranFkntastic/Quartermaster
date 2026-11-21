@@ -21,6 +21,7 @@ public sealed class CourierRunTests : IDisposable
     CourierFollower follower;
     CourierConductor engine;
     readonly TargetPlanItem line;
+    bool consolidate; // New plans plan no consolidation; a journaled one from an older plan still settles.
     readonly MeetingBell bell = new(1, 1, 1, 0, 0, 0, "Fixture bell");
 
     public CourierRunTests()
@@ -31,10 +32,8 @@ public sealed class CourierRunTests : IDisposable
             StowagePlanId = plan.Id,
             ItemId = 1,
             ItemName = "Titanium Ore",
-            TargetQuantity = 7,
             Quality = ItemQualityPolicy.NqOnly,
-            Courier = new(destination, 11),
-            Routing = new() { PreferredRetainerIds = [22] },
+            Courier = new CourierLine { Places = [new(source, 11, After: 0), new(destination, 22, Destination: true)] },
         };
         mule.Quantities[carrier] = 10; // Private carrier stock must survive.
         follower = Follower(); wire.Handler = m => follower.HandleAsync(source, m, Deadline.After("Fixture", 30),started:wire.Started);
@@ -42,7 +41,8 @@ public sealed class CourierRunTests : IDisposable
     }
     CourierFollower Follower(string? root = null) => new(root ?? dir, () => cfg, new(), new(new AR()), mule, mule, mule, mule, _ => { });
     CourierConductor Conductor(string? root = null) => new(root ?? dir, wire, owner, owner, owner, owner, owner, owner, new(), new(new AR()), _ => { });
-    CourierPlan Plan() => CourierPlanner.Build(plan, [line],
+    CourierPlan Plan() => consolidate ? Planned() with { Consolidations = [new(destination, line.Id, 1, "Titanium Ore", ItemQualityPolicy.NqOnly, 22, 3)] } : Planned();
+    CourierPlan Planned() => CourierPlanner.Build(plan, [line],
         [new(source,null,new(source,5,[])),new(source,11,new(source,0,[new(1,false,7)])),
         new(destination,null,new(destination,5,[])),new(destination,22,new(destination,8,[]))],
         new(carrier, 4, [new(1, false, 10)]), cfg, id => new ItemMetadata(id, "Titanium Ore", null, false, null, null, null, null, null, null, null, false, true, null, null, 3), 1);
@@ -147,7 +147,7 @@ public sealed class CourierRunTests : IDisposable
     [InlineData(OperationStatuses.Succeeded, 2)]
     public async Task PendingJournaledConsolidationReconcilesJournalAndBagsBeforeResuming(string journalStatus, int bagDelta)
     {
-        line.Routing.Consolidate = true;
+        consolidate = true;
         owner.ConsolidationJournalStatus = journalStatus;
         owner.ConsolidationResult = new Result<bool>(CourierOutcome.Indeterminate, "ConsolidationUnverified", "fixture");
         var interrupted = await engine.StartAsync(Plan(), cfg);
