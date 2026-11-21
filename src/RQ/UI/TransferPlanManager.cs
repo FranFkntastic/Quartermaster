@@ -233,7 +233,8 @@ internal sealed class TransferPlanManager
         {
             var destinations = rows
                 .SelectMany(row => row.Rule.Courier is { } line
-                    ? line.Places.Where(place => place.Destination).Select(place => place.Character)
+                    ? line.Destinations.Select(place => place.Character)
+                        .Concat(line.LegacyPlaces.Where(place => place.Destination).Select(place => place.Character))
                         .DistinctBy(character => (character.LocalContentId, character.HomeWorldId))
                     : [])
                 .GroupBy(character => (character.LocalContentId, character.HomeWorldId))
