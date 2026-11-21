@@ -151,16 +151,33 @@ public sealed class CourierSession
         return known;
     }
 
+    /// <summary>Maps a World RowId to its FFXIV WorldRegionGroup RowId (1=JP, 2=NA, 3=EU, 4=OCE; 0=unknown).</summary>
+    public Func<uint, uint>? WorldRegion { get; set; }
+
+    /// <summary>
+    /// Whether the configured carrier (or logged-in character when no carrier is set) can travel to
+    /// <paramref name="character"/>'s home world region. JP/EU are ineligible from an NA carrier; OCE is reachable.
+    /// </summary>
+    internal bool IsRegionEligible(QuartermasterRuntimeSnapshot runtime, OwnerScope character)
+    {
+        if (WorldRegion is null)
+            return true;
+        var anchor = runtime.State.Courier.Carrier is { HasStableIdentity: true } carrier
+            ? carrier.HomeWorldId ?? 0
+            : runtime.Owner.HomeWorldId ?? 0;
+        return CourierPlanner.CanReachRegion(WorldRegion(anchor), WorldRegion(character.HomeWorldId ?? 0));
+    }
+
     /// <summary>
     /// Characters a courier line can deliver to from its source: from the logged-in character, every
-    /// other character; from another character, the logged-in one first, then the rest.
+    /// other reachable-region character; from another character, the logged-in one first, then the rest.
     /// </summary>
     internal IEnumerable<OwnerScope> Destinations(QuartermasterRuntimeSnapshot runtime, OwnerScope? source = null)
     {
-        var others = Characters(runtime).Where(owner => !owner.Matches(runtime.Owner) && !IsCarrier(runtime, owner));
+        var others = Characters(runtime).Where(owner => !owner.Matches(runtime.Owner) && !IsCarrier(runtime, owner) && IsRegionEligible(runtime, owner));
         if (source is null || source.Matches(runtime.Owner))
             return others;
-        var here = runtime.Owner.HasStableIdentity && !IsCarrier(runtime, runtime.Owner) ? new[] { runtime.Owner } : [];
+        var here = runtime.Owner.HasStableIdentity && !IsCarrier(runtime, runtime.Owner) && IsRegionEligible(runtime, runtime.Owner) ? new[] { runtime.Owner } : [];
         return here.Concat(others.Where(owner => !owner.Matches(source)));
     }
 
@@ -480,7 +497,7 @@ public sealed class CourierSession
             var carrier = peers.FirstOrDefault(peer => CourierPlanner.Exact(peer.Character, settings.Carrier))?.Bags;
             try
             {
-                built = CourierPlanner.Build(stowagePlan, rules, Locations(runtime), carrier, settings, metadata,testSlotCap);
+                built = CourierPlanner.Build(stowagePlan, rules, Locations(runtime), carrier, settings, metadata, testSlotCap, WorldRegion);
             }
             catch (Exception exception)
             {
@@ -573,6 +590,7 @@ public sealed class CourierSession
         "SourceShort" => "Source short",
         "BagSlotLimit" => "No bag room",
         "OutsideClientRoster" => "Not on this account",
+        "RegionUnreachable" => "Other region",
         "PlanningFailed" => "Courier plan failed",
         _ => Words(code),
     };
@@ -591,6 +609,7 @@ public sealed class CourierSession
             "CarrierNotConfigured" => "No carrier chosen",
             "CarrierUnreachable" => $"{carrier} is not running",
             "OutsideClientRoster" => $"{string.Join(" and ", named.Where(name => !settings.LocalRoster.Any(owner => Same(owner.CharacterName, name))).DefaultIfEmpty(source))} not on this account",
+            "RegionUnreachable" => $"{string.Join(" or ", named.DefaultIfEmpty(destination))} is in another region that {carrier} cannot travel to",
             "CharacterNotKnown" when Same(source, destination) => $"{refusal.Name} would go from {source} to {source}",
             "CharacterNotKnown" when named.FirstOrDefault(name => Same(name, settings.Carrier?.CharacterName)) is { } isCarrier => $"{isCarrier} is the carrier",
             "CharacterNotKnown" => $"Bags of {source} or {destination} not observed",

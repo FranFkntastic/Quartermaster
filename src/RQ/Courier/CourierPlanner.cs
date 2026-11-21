@@ -78,10 +78,17 @@ public static class CourierPlanner
         && b is { HasStableIdentity: true } && a.Matches(b) && !string.IsNullOrWhiteSpace(a.CharacterName)
         && string.Equals(a.CharacterName, b.CharacterName, StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// FFXIV DC Travel allows visiting any world in the carrier's own region or OCE (Materia, region 4).
+    /// JP (1) and EU (3) are unreachable from an NA (2) carrier. Zero means region unknown (do not block).
+    /// </summary>
+    internal static bool CanReachRegion(uint carrierRegion, uint targetRegion) =>
+        carrierRegion == 0 || targetRegion == 0 || targetRegion == carrierRegion || targetRegion == 4;
+
     // Owner locations must belong to the authenticated service-account roster; omit unknown containers.
     public static CourierPlan Build(StowagePlan plan, IEnumerable<TargetPlanItem> rules,
         IReadOnlyList<CourierLocation> locations, InventoryView? carrier, CourierSettings settings,
-        Func<uint, ItemMetadata> metadata, int? testSlotCap = null)
+        Func<uint, ItemMetadata> metadata, int? testSlotCap = null, Func<uint, uint>? worldRegion = null)
     {
         var trips = ImmutableArray.CreateBuilder<CourierTrip>();
         var refusals = ImmutableArray.CreateBuilder<Refusal>();
@@ -120,9 +127,13 @@ public static class CourierPlanner
                     if (send == 0) continue;
                 }
                 var targets = Destinations(r.Routing, destRetainers);
+                var carrierRegion = worldRegion != null && settings.Carrier is { HasStableIdentity: true } ? worldRegion(settings.Carrier.HomeWorldId ?? 0) : 0u;
+                var regionBlocked = worldRegion != null && carrierRegion != 0 &&
+                    (!CanReachRegion(carrierRegion, worldRegion(src.HomeWorldId ?? 0)) || !CanReachRegion(carrierRegion, worldRegion(dst.HomeWorldId ?? 0)));
                 string? code = settings.Carrier is not { HasStableIdentity: true } ? "CarrierNotConfigured"
                     : !Exact(carrier?.Character, settings.Carrier) ? "CarrierUnreachable"
                     : !settings.LocalRoster.Any(o=>Exact(o,src)) || !settings.LocalRoster.Any(o=>Exact(o,dst)) ? "OutsideClientRoster"
+                    : regionBlocked ? "RegionUnreachable"
                     : sourceBags == null || destBags == null || Exact(src, dst) || Exact(src, settings.Carrier) || Exact(dst, settings.Carrier) ? "CharacterNotKnown"
                     : pickup?.World != src.HomeWorldId || drop?.World != dst.HomeWorldId || pickup == null || drop == null ? "MeetingBellMissing"
                     : meta.IsTradable != true ? "ItemNotTradeable"
