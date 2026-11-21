@@ -129,8 +129,10 @@ public static class StowagePlanMigration
     /// in its source becomes that source with N typed. Every line's destination container (its single
     /// retainer, else its rank 1, else bags) is added as a destination that takes what is left, so a
     /// line that sent N moves nothing until a number is typed. Ranked fallbacks and Any space are
-    /// dropped. Quality is kept when the lines agree, otherwise Any. Returns whether anything changed;
-    /// running it again changes nothing.
+    /// dropped. Quality is kept when the lines agree, otherwise Any. Kept amounts carry over only when
+    /// the lines shared one destination, quality and enabled state; lines that differed fold into a
+    /// line with their destinations and no numbers. Returns whether anything changed; running it again
+    /// changes nothing.
     /// </summary>
     public static bool CollapseCourierLines(QuartermasterState state)
     {
@@ -150,17 +152,25 @@ public static class StowagePlanMigration
             }
             foreach (var line in lines.Where(rule => !rule.Courier!.IsLegacy).SelectMany(rule => rule.Courier!.Places))
                 Add(line);
-            foreach (var line in lines.Where(rule => rule.Courier!.IsLegacy))
-            {
-                var route = line.Courier!;
-                if (route.KeepInSource && (route.SourceCharacter ?? owner) is { } source)
-                    Add(new(source with { }, route.SourceRetainerId, Math.Max(0, line.TargetQuantity)));
-                var to = route.RetainerId ?? (line.Routing.PreferredRetainerIds.Count > 0 ? line.Routing.PreferredRetainerIds[0] : null);
-                Add(new(route.Character! with { }, to, Destination: true));
-            }
+            var legacy = lines.Where(rule => rule.Courier!.IsLegacy).ToList();
+            static ulong? To(TargetPlanItem line) =>
+                line.Courier!.RetainerId ?? (line.Routing.PreferredRetainerIds.Count > 0 ? line.Routing.PreferredRetainerIds[0] : null);
+            foreach (var line in legacy)
+                Add(new(line.Courier!.Character! with { }, To(line), Destination: true));
+            // Kept amounts carry over only when the folded line would move what the old lines moved: one
+            // destination for everything, one quality, one enabled state, and no kept source that is also
+            // that destination. Otherwise the destinations alone carry over and the line moves nothing
+            // until numbers are typed, rather than sending one line's surplus to another line's destination.
+            var faithful = places.Count(place => place.Destination) == 1 &&
+                lines.Select(rule => rule.Quality).Distinct().Count() == 1 &&
+                lines.Select(rule => rule.Enabled).Distinct().Count() == 1;
+            if (faithful)
+                foreach (var line in legacy.Where(rule => rule.Courier!.KeepInSource && rule.TargetQuantity >= 0))
+                    if ((line.Courier!.SourceCharacter ?? owner) is { } source && !places.Any(known => known.Is(source, line.Courier.SourceRetainerId)))
+                        places.Insert(0, new(source with { }, line.Courier.SourceRetainerId, line.TargetQuantity));
             survivor.Courier = new Courier.CourierLine { Places = [.. places] };
             survivor.Quality = lines.Select(rule => rule.Quality).Distinct().Count() == 1 ? survivor.Quality : ItemQualityPolicy.Any;
-            survivor.Enabled = lines.Any(rule => rule.Enabled);
+            survivor.Enabled = lines.All(rule => rule.Enabled);
             if (string.IsNullOrWhiteSpace(survivor.Notes))
                 survivor.Notes = lines.Select(rule => rule.Notes).FirstOrDefault(notes => !string.IsNullOrWhiteSpace(notes)) ?? survivor.Notes;
             survivor.TargetQuantity = 0;
