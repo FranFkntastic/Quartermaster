@@ -144,13 +144,26 @@ public static class StowagePlanMigration
             var lines = group.ToList();
             var owner = state.StowagePlans.FirstOrDefault(plan => plan.Id == group.Key.StowagePlanId)?.Owner;
             var survivor = lines.FirstOrDefault(rule => !rule.Courier!.IsLegacy) ?? lines[0];
-            var places = new List<Courier.CourierPlace>();
-            void Add(Courier.CourierPlace place)
+            // Lines that list sources and destinations keep them, in line order; a place keeps its first role.
+            var explicitLines = lines.Where(rule => !rule.Courier!.IsLegacy).Select(rule => rule.Courier!).ToList();
+            var sources = new List<Courier.CourierPlace>();
+            var destinations = new List<Courier.CourierPlace>();
+            bool Listed(OwnerScope who, ulong? retainer) =>
+                sources.Any(known => known.Is(who, retainer)) || destinations.Any(known => known.Is(who, retainer));
+            foreach (var line in explicitLines)
             {
-                if (!places.Any(known => known.Is(place.Character, place.Retainer)))
+                foreach (var place in line.Sources.Where(place => !Listed(place.Character, place.Retainer)))
+                    sources.Add(place);
+                foreach (var place in line.Destinations.Where(place => !Listed(place.Character, place.Retainer)))
+                    destinations.Add(place);
+            }
+            var places = new List<Courier.LegacyCourierPlace>();
+            void Add(Courier.LegacyCourierPlace place)
+            {
+                if (!places.Any(known => known.Is(place.Character, place.Retainer)) && !Listed(place.Character, place.Retainer))
                     places.Add(place);
             }
-            foreach (var line in lines.Where(rule => !rule.Courier!.IsLegacy).SelectMany(rule => rule.Courier!.Places))
+            foreach (var line in explicitLines.SelectMany(line => line.LegacyPlaces))
                 Add(line);
             var legacy = lines.Where(rule => rule.Courier!.IsLegacy).ToList();
             static ulong? To(TargetPlanItem line) =>
@@ -161,14 +174,22 @@ public static class StowagePlanMigration
             // destination for everything, one quality, one enabled state, and no kept source that is also
             // that destination. Otherwise the destinations alone carry over and the line moves nothing
             // until numbers are typed, rather than sending one line's surplus to another line's destination.
-            var faithful = places.Count(place => place.Destination) == 1 &&
+            var faithful = places.Count(place => place.Destination) + destinations.Count == 1 &&
                 lines.Select(rule => rule.Quality).Distinct().Count() == 1 &&
                 lines.Select(rule => rule.Enabled).Distinct().Count() == 1;
             if (faithful)
                 foreach (var line in legacy.Where(rule => rule.Courier!.KeepInSource && rule.TargetQuantity >= 0))
-                    if ((line.Courier!.SourceCharacter ?? owner) is { } source && !places.Any(known => known.Is(source, line.Courier.SourceRetainerId)))
+                    if ((line.Courier!.SourceCharacter ?? owner) is { } source && !places.Any(known => known.Is(source, line.Courier.SourceRetainerId)) &&
+                        !Listed(source, line.Courier.SourceRetainerId))
                         places.Insert(0, new(source with { }, line.Courier.SourceRetainerId, line.TargetQuantity));
-            survivor.Courier = new Courier.CourierLine { Places = [.. places] };
+            // Places in the older shape are converted once stock is known (CourierDistribution.Resolve).
+            survivor.Courier = new Courier.CourierLine
+            {
+                Sources = [.. sources],
+                Destinations = [.. destinations],
+                SuggestionDismissed = explicitLines.Any(line => line.SuggestionDismissed),
+                Places = places.Count > 0 ? [.. places] : default,
+            };
             survivor.Quality = lines.Select(rule => rule.Quality).Distinct().Count() == 1 ? survivor.Quality : ItemQualityPolicy.Any;
             survivor.Enabled = lines.All(rule => rule.Enabled);
             if (string.IsNullOrWhiteSpace(survivor.Notes))

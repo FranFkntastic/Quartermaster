@@ -263,7 +263,9 @@ internal sealed partial class TransferPlanWorkspace
         var affected = AddCourierLines(runtime, SelectPlanOfKind(runtime, StowagePlanKind.Courier),
             [.. items.Select(item => new PlanAddEntry(item.ItemId, item.ItemName, ItemQualityPolicy.Any))],
             selectAffected: items.Count > 1,
-            rule => rule.Courier = (rule.Courier ?? new CourierLine()).WithDestination(target, retainerId));
+            rule => rule.Courier = (rule.Courier is { HasLegacyPlaces: true }
+                ? courier.Allocation(runtime, runtime.Owner, rule).Line
+                : rule.Courier ?? new CourierLine()).WithDestination(target, retainerId));
         foreach (var id in affected)
             courierExpansion.SetExpanded(CourierKey(id), true);
     }
@@ -1142,14 +1144,14 @@ internal sealed partial class TransferPlanWorkspace
     {
         var items = projection.Rows.Count;
         clause($"{items:N0} item{(items == 1 ? string.Empty : "s")}", null);
-        var moving = projection.Rows.Where(row => row.Rule.Enabled).Sum(row => (long)(row.Distribution?.Moving ?? 0));
-        var stuck = projection.Rows.Count(row => row.Rule.Enabled && row.Distribution is { Stuck: > 0 });
+        var moving = projection.Rows.Where(row => row.Rule.Enabled).Sum(row => (long)(row.Distribution?.Runs ?? 0));
+        var attention = projection.Rows.Count(row => row.Rule.Enabled && row.Distribution is { Problem: not Courier.CourierProblem.None });
         if (moving > 0)
             clause($"{moving:N0} to move", TransferPresentation.SendColor);
-        else if (stuck == 0)
+        else if (attention == 0)
             clause("everything in place", null);
-        if (stuck > 0)
-            clause($"{stuck:N0} without a destination", AmberColor);
+        if (attention > 0)
+            clause($"{attention:N0} need{(attention == 1 ? "s" : string.Empty)} attention", AmberColor);
         if (projection.Courier is not { } courierPlan)
             return;
         if (courierPlan.Trips.Length > 1)

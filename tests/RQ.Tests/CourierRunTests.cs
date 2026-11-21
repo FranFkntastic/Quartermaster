@@ -33,7 +33,7 @@ public sealed class CourierRunTests : IDisposable
             ItemId = 1,
             ItemName = "Titanium Ore",
             Quality = ItemQualityPolicy.NqOnly,
-            Courier = new CourierLine { Places = [new(source, 11, After: 0), new(destination, 22, Destination: true)] },
+            Courier = new CourierLine { Sources = [new(source, 11, 0)], Destinations = [new(destination, 22)] },
         };
         mule.Quantities[carrier] = 10; // Private carrier stock must survive.
         follower = Follower(); wire.Handler = m => follower.HandleAsync(source, m, Deadline.After("Fixture", 30),started:wire.Started);
