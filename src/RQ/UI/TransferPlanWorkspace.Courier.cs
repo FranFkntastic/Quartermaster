@@ -171,8 +171,13 @@ internal sealed partial class TransferPlanWorkspace
     private static string CourierOutcome(TransferWorkbenchRow row) =>
         !row.Rule.Enabled ? "Paused"
         : row.CourierRefusal is { } refusal && !CourierSession.IsPlanWide(refusal.Code) ? CourierSession.RefusalLabel(refusal.Code)
+        : row.Distribution is { Stuck: > 0 } ? StuckLabel(row.Distribution)
         : row.Distribution is { Moving: > 0 and var moving } ? moving.ToString("N0")
         : "In place";
+
+    /// <summary>A line whose typed places give up units that have nowhere to go.</summary>
+    private static string StuckLabel(Courier.CourierAllocation distribution) =>
+        distribution.Moving > 0 ? $"{distribution.Moving:N0} · no destination" : "No destination";
 
     private void DrawCourierMoves(TransferWorkbenchRow row)
     {
@@ -184,6 +189,8 @@ internal sealed partial class TransferPlanWorkspace
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip(courier.RefusalDetail(row.Runtime, refusal));
         }
+        else if (row.Distribution is { Stuck: > 0 } stuck)
+            RightAligned(StuckLabel(stuck), AmberColor);
         else if (row.Distribution is { Moving: > 0 and var moving })
             RightAligned(moving.ToString("N0"), null);
         else

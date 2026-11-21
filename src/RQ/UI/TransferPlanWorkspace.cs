@@ -1143,7 +1143,13 @@ internal sealed partial class TransferPlanWorkspace
         var items = projection.Rows.Count;
         clause($"{items:N0} item{(items == 1 ? string.Empty : "s")}", null);
         var moving = projection.Rows.Where(row => row.Rule.Enabled).Sum(row => (long)(row.Distribution?.Moving ?? 0));
-        clause(moving > 0 ? $"{moving:N0} to move" : "everything in place", moving > 0 ? TransferPresentation.SendColor : null);
+        var stuck = projection.Rows.Count(row => row.Rule.Enabled && row.Distribution is { Stuck: > 0 });
+        if (moving > 0)
+            clause($"{moving:N0} to move", TransferPresentation.SendColor);
+        else if (stuck == 0)
+            clause("everything in place", null);
+        if (stuck > 0)
+            clause($"{stuck:N0} without a destination", AmberColor);
         if (projection.Courier is not { } courierPlan)
             return;
         if (courierPlan.Trips.Length > 1)

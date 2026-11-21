@@ -16,7 +16,8 @@ public sealed record CourierSpot(OwnerScope Character, ulong? Retainer, int? Has
 /// <summary>Units moving from one listed place to another, by index into the allocation's places.</summary>
 public readonly record struct CourierFlow(int From, int To, int Units);
 
-public sealed record CourierAllocation(ImmutableArray<CourierSpot> Places, ImmutableArray<CourierFlow> Flows)
+/// <summary>A line's solved moves. Stuck counts units a typed place gives up that have nowhere to go.</summary>
+public sealed record CourierAllocation(ImmutableArray<CourierSpot> Places, ImmutableArray<CourierFlow> Flows, int Stuck = 0)
 {
     public int Total => Places.Sum(p => p.Has ?? 0);
     public int Moving => Flows.Sum(f => f.Units);
@@ -34,9 +35,10 @@ public static class CourierDistribution
     /// (the plan owner's first, then in <paramref name="locations"/> order), stored typed places, then
     /// the added destinations in the order they were added.
     /// A typed place below what it has gives up the difference; above, it wants the difference. Given-up
-    /// units fill typed places that want more, in listed order, then go to the first empty destination.
-    /// A typed place that still wants more draws from untyped places holding the item. Nothing moves
-    /// between two containers of one character, and units with nowhere to go stay where they are.
+    /// units fill typed places that want more, in listed order, then go to the first empty destination,
+    /// else to the first untyped place on another character already holding the item. A typed place
+    /// that still wants more draws from untyped places holding the item. Nothing moves between two
+    /// containers of one character; units with nowhere to go stay where they are and count as Stuck.
     /// </summary>
     public static CourierAllocation Allocate(CourierLine line, uint item, ItemQualityPolicy quality, OwnerScope? owner,
         IReadOnlyList<CourierLocation> locations, Func<OwnerScope, bool> listable)
@@ -109,16 +111,17 @@ public static class CourierDistribution
                     Apart(spare, taker))
                     Move(spare, taker, Math.Min(held - sent[spare], want[taker]));
         }
+        bool Open(int to) => listed[to].Typed is null && listed[to].Has is not null;
         for (var giver = 0; giver < n; giver++)
         {
             if (give[giver] <= 0) continue;
-            for (var to = 0; to < n; to++)
-                if (listed[to].Destination && listed[to].Typed is null && Apart(giver, to))
-                {
-                    Move(giver, to, give[giver]);
-                    break;
-                }
+            var to = Enumerable.Range(0, n).FirstOrDefault(t => listed[t].Destination && listed[t].Typed is null && Apart(giver, t), -1);
+            if (to < 0)
+                to = Enumerable.Range(0, n).FirstOrDefault(t => t != giver && !listed[t].Destination && Open(t) && Apart(giver, t), -1);
+            if (to >= 0)
+                Move(giver, to, give[giver]);
         }
+        var stuck = Enumerable.Range(0, n).Where(Active).Sum(i => give[i]);
 
         var spots = ImmutableArray.CreateBuilder<CourierSpot>(n);
         for (var i = 0; i < n; i++)
@@ -127,6 +130,6 @@ public static class CourierDistribution
             var end = Active(i) ? Held(i) - sent[i] + received[i] : typed ?? 0;
             spots.Add(new(who, retainer, has, typed, destination, end));
         }
-        return new(spots.MoveToImmutable(), [.. flows]);
+        return new(spots.MoveToImmutable(), [.. flows], stuck);
     }
 }

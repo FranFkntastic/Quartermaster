@@ -336,7 +336,7 @@ internal sealed class TransferPlanManager
             ? StowTo(runtime, rule.Routing)
             : row.Distribution is { Moving: > 0 } distribution
                 ? CourierSession.RouteSummary(runtime, distribution)
-                : "In place";
+                : row.Distribution is { Stuck: > 0 } ? "No destination" : "In place";
         var shown = DalamudUiLayout.ElideText(destination, ImGui.GetContentRegionAvail().X);
         ImGui.TextUnformatted(shown);
         if (shown.Length != destination.Length && ImGui.IsItemHovered())
