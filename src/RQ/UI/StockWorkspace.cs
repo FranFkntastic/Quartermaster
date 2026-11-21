@@ -1533,34 +1533,54 @@ internal sealed class StockWorkspace
         }
         else
             flags |= ImGuiTreeNodeFlags.Leaf;
-        if (color is { } text)
-            ImGui.PushStyleColor(ImGuiCol.Text, text);
-        ImGui.TreeNodeEx(label, flags);
-        if (color is not null)
-            ImGui.PopStyleColor();
+        // The label is drawn by hand so it can be cut short before the right-aligned figure instead of
+        // running underneath it; the node itself only supplies the arrow, highlight and hit area.
+        var labelX = ImGui.GetCursorScreenPos().X + ImGui.GetTreeNodeToLabelSpacing();
+        ImGui.TreeNodeEx($"##{label}", flags);
         toggled = open is not null && ImGui.IsItemToggledOpen();
         var clicked = ImGui.IsItemClicked(ImGuiMouseButton.Left) && !toggled;
         var min = ImGui.GetItemRectMin();
         var max = ImGui.GetItemRectMax();
+        float Middle(float height) => min.Y + ((max.Y - min.Y - height) / 2f);
+        var draw = ImGui.GetWindowDrawList();
         var right = max.X - ImGui.GetStyle().FramePadding.X;
-        if (!string.IsNullOrEmpty(count))
+        // Containers show their free slots, never their item count: the two side by side read as one figure.
+        var figure = space is { } container
+            ? container.Free is { } free ? FreeSlotsBar.Text(free) : "—"
+            : count;
+        if (!string.IsNullOrEmpty(figure))
         {
-            var size = ImGui.CalcTextSize(count);
+            var size = ImGui.CalcTextSize(figure);
             right -= size.X;
-            ImGui.GetWindowDrawList().AddText(
-                new Vector2(right, min.Y + ((max.Y - min.Y - size.Y) / 2f)),
-                ImGui.GetColorU32(ImGuiCol.TextDisabled),
-                count);
-            right -= ImGui.GetStyle().ItemInnerSpacing.X;
+            var at = new Vector2(right, Middle(size.Y));
+            if (space is { Free: { } left })
+                FreeSlotsBar.PaintText(at, left, QuartermasterPalette.Dim);
+            else
+                draw.AddText(at, ImGui.GetColorU32(ImGuiCol.TextDisabled), figure);
+            right -= ImGui.GetStyle().ItemInnerSpacing.X * 2f;
         }
-        if (space is ({ } capacity, { } free))
-        {
-            var bar = new Vector2(22f, 4f) * ImGuiHelpers.GlobalScale;
-            FreeSlotsBar.Paint(new Vector2(right - bar.X, min.Y + ((max.Y - min.Y - bar.Y) / 2f)), bar, capacity, free);
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip($"{free:N0} free");
-        }
+        var shown = Fit(label, right - labelX);
+        draw.AddText(
+            new Vector2(labelX, Middle(ImGui.CalcTextSize(shown).Y)),
+            ImGui.GetColorU32(color ?? ImGui.GetStyle().Colors[(int)ImGuiCol.Text]),
+            shown);
+        if (shown.Length < label.Length && ImGui.IsItemHovered())
+            ImGui.SetTooltip(label);
         return clicked;
+    }
+
+    /// <summary>The label, shortened with an ellipsis when it would be wider than <paramref name="width"/>.</summary>
+    private static string Fit(string label, float width)
+    {
+        if (ImGui.CalcTextSize(label).X <= width)
+            return label;
+        for (var length = label.Length - 1; length > 0; length--)
+        {
+            var cut = string.Concat(label.AsSpan(0, length).TrimEnd(), "...");
+            if (ImGui.CalcTextSize(cut).X <= width)
+                return cut;
+        }
+        return "";
     }
 
     private RailCounts ResolveRailCounts(AccountStockProjection account)
