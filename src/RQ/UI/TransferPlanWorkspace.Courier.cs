@@ -415,6 +415,7 @@ internal sealed partial class TransferPlanWorkspace
         if (ImGui.BeginChild("##picker-containers", new Vector2(330f * scale, height)))
         {
             ImGui.SetNextItemWidth(-1);
+            ImGui.SetNextWindowBgAlpha(1f);
             if (ImGui.BeginCombo("##picker-character", CourierSession.CharacterLabel(current.Character)))
             {
                 // The picker re-raises itself above its owner every frame, which would bury this list under it.
