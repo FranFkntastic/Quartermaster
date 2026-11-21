@@ -348,6 +348,7 @@ public sealed class Plugin : IDalamudPlugin
         courierTrade = new(courierGame,tradeIo,automation,pluginInterface,externalUiSuppression,log,configDirectory);
         bool AutoRetainerLoaded()=>pluginInterface.InstalledPlugins.Any(p=>p.IsLoaded && p.InternalName=="AutoRetainer");
         courier.Warn = s => log.Warning(s);
+        courier.WorldRegion = worldId => dataManager.GetExcelSheet<Lumina.Excel.Sheets.World>()?.GetRowOrDefault(worldId)?.DataCenter.ValueNullable?.Region.RowId ?? 0;
         // Sibling XIVLauncher profiles' caches: read-only stock browser visibility, never courier stock.
         courier.LocalOwners = playerInventory.Owners;
         courier.ExternalStockCache = externalAccountStock = new ExternalAccountStockCache(configDirectory, s => log.Warning(s));

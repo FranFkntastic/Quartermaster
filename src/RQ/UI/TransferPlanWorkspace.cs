@@ -2269,7 +2269,7 @@ internal sealed class TransferPlanWorkspace
         Guid[] ids = [row.Rule.Id];
         var owner = row.Owner;
         var sources = courier.Characters(row.Runtime)
-            .Where(character => !CourierSession.IsCarrier(row.Runtime, character) && !character.Matches(route.Character));
+            .Where(character => !CourierSession.IsCarrier(row.Runtime, character) && !character.Matches(route.Character) && courier.IsRegionEligible(row.Runtime, character));
         DrawContainerMenus(row.Runtime, sources, (character, container) =>
         {
             var sourceCharacter = character.Matches(owner) ? null : character with { };
