@@ -2248,7 +2248,10 @@ internal sealed class StockWorkspace
     {
         if (!IsAccountMode)
             return (viewedCharacter, ResolveSelection(runtime).Stock.Where(CanSend).ToArray(), 0, 0);
+        // Picked rail sources narrow the holders exactly as the table shows them.
         var account = courier.AccountStock(runtime);
+        if (MultiSource)
+            account = SourceAccount(runtime, account);
         var resolved = new List<(OwnerScope Source, uint ItemId)>();
         var unresolved = 0;
         var external = 0;
