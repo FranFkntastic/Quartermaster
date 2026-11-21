@@ -21,6 +21,7 @@ internal sealed partial class TransferPlanWorkspace
 {
     private const string DestinationPickerPopup = "courier-destination-picker";
     private const string SourcePickerPopup = "courier-source-picker";
+    private float courierWhoWidth;
     private static readonly string ConfirmIcon = FontAwesomeIcon.Check.ToIconString();
     private static readonly string DismissIcon = FontAwesomeIcon.Times.ToIconString();
     private readonly DalamudExpandableRows courierExpansion = new();
@@ -229,6 +230,8 @@ internal sealed partial class TransferPlanWorkspace
             whoWidth = Math.Max(whoWidth, ImGui.CalcTextSize(CourierSession.CharacterLabel(spot.Character)).X);
         if (allocation.Suggestion is { } offered)
             whoWidth = Math.Max(whoWidth, ImGui.CalcTextSize(CourierSession.CharacterLabel(offered.Character)).X);
+        // The widest name seen so far, so containers line up across items rather than per item.
+        courierWhoWidth = whoWidth = Math.Max(courierWhoWidth, whoWidth);
         var layout = new PlaceLayout(indent, roleWidth, whoWidth);
         var sources = allocation.SourceCount;
         ImGui.PushID(CourierKey(rule.Id));
