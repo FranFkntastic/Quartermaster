@@ -653,17 +653,18 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                             {
                                 placement?.Check();
                                 movementAttempted = true;
+                                var currentStack = stack with { Quantity = stackRemaining };
                                 (bool Success, int Transferred, string Code, string Message) result;
                                 if (stack.Container == FFXIVClientStructs.FFXIV.Client.Game.InventoryType.Crystals)
                                 {
                                     var crystal = await DiagnoseMutationAsync(operationId, "Deposit", itemName, candidate.RetainerName,
-                                        () => driver.DepositCrystalAsync(stack, quantity, mutationToken)).ConfigureAwait(false);
+                                        () => driver.DepositCrystalAsync(currentStack, quantity, mutationToken)).ConfigureAwait(false);
                                     result = (crystal.Success, crystal.Transferred, crystal.Code, crystal.Message);
                                 }
                                 else
                                 {
                                     var item = await DiagnoseMutationAsync(operationId, "Deposit", itemName, candidate.RetainerName,
-                                        () => driver.DepositAsync(stack, quantity, mutationToken)).ConfigureAwait(false);
+                                        () => driver.DepositAsync(currentStack, quantity, mutationToken)).ConfigureAwait(false);
                                     result = (item.Success, item.Transferred, item.Code, item.Message);
                                 }
                                 if (!result.Success)
