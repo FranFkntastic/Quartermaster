@@ -366,7 +366,8 @@ public sealed class Plugin : IDalamudPlugin
             () => state.ReadConfiguration(s => s.Courier), () => courierPeer.LocalBags, courierGame.Bridge,
             courierWorldRegion,
             worldId => dataManager.GetExcelSheet<Lumina.Excel.Sheets.World>()?.GetRowOrDefault(worldId)?.Name.ToString() ?? "",
-            scanner.ResolveItemMetadata, s => log.Warning(s), () => courier.Locations(runtimeSnapshots.Current)));
+            scanner.ResolveItemMetadata, s => log.Warning(s), () => courier.Locations(runtimeSnapshots.Current),
+            retainerId => runtimeSnapshots.Current.Retainers.GetValueOrDefault(retainerId)?.RetainerName));
         int StackSize(uint id) => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.StackSize is > 0 and var stack
             ? checked((int)stack) : throw new InvalidOperationException($"Stack size unavailable for item {id}.");
         deliveredStow = new DeliveredStowService(providerInstanceId, state, workQueue, journal, cache.Snapshot, CurrentOwner,

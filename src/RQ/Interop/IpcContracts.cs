@@ -280,7 +280,9 @@ public sealed record DeliveredStowRequestItem
 /// <c>gooseworks-quartermaster-delivered-stow/v1</c>: stow goods a caller just delivered into the logged-in
 /// owner's bags into each item's home retainers (the owner's Listing Plan reserve "Goes to"). Quantities are
 /// upper bounds, capped by the owner's carried bags; items without a home stay in the bags. RequestId is the
-/// idempotency key.
+/// idempotency key. AllowForward (optional, capability deliveredStowForward.v1): carry what the owner's own homes
+/// leave on to the item's homes on another character with the courier; without it such items stay in the bags
+/// (NoHome) exactly as before forwarding existed.
 /// </summary>
 public sealed record DeliveredStowRequest
 {
@@ -289,6 +291,8 @@ public sealed record DeliveredStowRequest
     public string RequestId { get; init; } = string.Empty;
     public RequestOwner? Owner { get; init; }
     public IReadOnlyList<DeliveredStowRequestItem>? Items { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool AllowForward { get; init; }
 }
 
 /// <summary>

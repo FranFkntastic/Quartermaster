@@ -34,7 +34,7 @@ public static class CourierTransferPlanner
 {
     public static (CourierPlan? Plan, CourierTransferRefusal? Refusal) Build(CourierTransferOrder order, CourierSettings settings,
         InventoryView? carrier, InventoryView? sourceLive, Func<uint, ItemMetadata> metadata, Func<uint, uint> worldRegion, MeetingBell? bridge,
-        IReadOnlyList<CourierLocation>? locations = null)
+        IReadOnlyList<CourierLocation>? locations = null, Func<ulong, string?>? retainerName = null)
     {
         static (CourierPlan?, CourierTransferRefusal?) Refuse(string code, string message) => (null, new(code, message));
         var (source, destination) = (order.Source, order.Destination);
@@ -82,7 +82,7 @@ public static class CourierTransferPlanner
         if (!fromCarrier && GilRefusal(live?.Gil, carrier.Gil, order.Gil) is { } gilRefusal)
             return (null, gilRefusal);
 
-        if (RetainerRefusal(order, dropoff!, metadata, locations) is { } retainerRefusal)
+        if (RetainerRefusal(order, dropoff!, metadata, locations, retainerName) is { } retainerRefusal)
             return (null, retainerRefusal);
 
         var stacks = new List<Shipment>();
@@ -128,7 +128,7 @@ public static class CourierTransferPlanner
     /// free slot for the hand-in, or the retainer lacks room for what is named for it. Null when nothing names one.
     /// </summary>
     internal static CourierTransferRefusal? RetainerRefusal(CourierTransferOrder order, MeetingBell dropoff,
-        Func<uint, ItemMetadata> metadata, IReadOnlyList<CourierLocation>? locations)
+        Func<uint, ItemMetadata> metadata, IReadOnlyList<CourierLocation>? locations, Func<ulong, string?>? retainerName = null)
     {
         var named = (order.Items.IsDefault ? [] : order.Items).Where(i => i.RetainerId != null).ToArray();
         if (named.Length == 0)
@@ -144,8 +144,11 @@ public static class CourierTransferPlanner
             return new("DestinationBagsFull", $"{destination.CharacterName} has no free bag slot to receive the goods.");
         foreach (var retainer in named.GroupBy(i => i.RetainerId!.Value))
         {
+            // The cached name when there is one; the id only for a retainer this client never saw.
+            var label = retainerName?.Invoke(retainer.Key) is { Length: > 0 } name ? name : $"Retainer {retainer.Key}";
+            var items = string.Join(", ", retainer.Select(i => i.ItemName).Distinct(StringComparer.Ordinal));
             if (observed.FirstOrDefault(l => l.Retainer == retainer.Key && CourierPlanner.Exact(l.Character, destination)) is not { } place)
-                return new("DestinationRetainerUnknown", $"Retainer {retainer.Key} is not an observed retainer of {destination.CharacterName}.");
+                return new("DestinationRetainerUnknown", $"{label} is not an observed retainer of {destination.CharacterName}, so {items} cannot be deposited there.");
             // Partial stacks of the item take units first; the rest needs empty slots, as the courier planner counts room.
             var slots = 0L;
             foreach (var item in retainer.GroupBy(i => (i.ItemId, i.IsHq)))
@@ -160,7 +163,7 @@ public static class CourierTransferPlanner
             }
             if (slots > place.Inventory.FreeSlots)
                 return new("DestinationRetainerFull",
-                    $"{destination.CharacterName}'s retainer {retainer.Key} has {place.Inventory.FreeSlots} free slot(s) as last observed; the transfer needs {slots}.");
+                    $"{destination.CharacterName}'s retainer {label} has {place.Inventory.FreeSlots} free slot(s) as last observed; {items} need {slots}.");
         }
         return null;
     }

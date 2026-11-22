@@ -32,15 +32,18 @@ public sealed class CourierIpcService
     private readonly Func<uint, ItemMetadata> metadata;
     private readonly Action<string> warn;
     private readonly Func<IReadOnlyList<CourierLocation>>? locations;
+    private readonly Func<ulong, string?>? retainerName;
     private readonly object gate = new();
     private (string RequestId, Guid Run, string Hash)? launched;
 
     /// <param name="localBags">The logged-in character's latest bags, observed on the framework thread.</param>
     public CourierIpcService(string providerInstanceId, CourierSession session, Func<CourierSettings> settings,
         Func<InventoryView?> localBags, Func<MeetingBell?> bridge, Func<uint, uint> worldRegion, Func<uint, string> worldName,
-        Func<uint, ItemMetadata> metadata, Action<string> warn, Func<IReadOnlyList<CourierLocation>>? locations = null)
+        Func<uint, ItemMetadata> metadata, Action<string> warn, Func<IReadOnlyList<CourierLocation>>? locations = null,
+        Func<ulong, string?>? retainerName = null)
     {
         this.locations = locations;
+        this.retainerName = retainerName;
         this.providerInstanceId = providerInstanceId;
         this.session = session;
         this.settings = settings;
@@ -320,7 +323,7 @@ public sealed class CourierIpcService
             request.ReturnDestinationHome, requestId);
         var named = order.Items.Any(i => i.RetainerId != null);
         var (plan, refusal) = CourierTransferPlanner.Build(order, cfg, carrierPeer?.Bags, live, metadata, worldRegion, bridge(),
-            named ? locations?.Invoke() : null);
+            named ? locations?.Invoke() : null, retainerName);
         if (refusal != null || plan == null)
             return Ack(requestId, null, "rejected", refusal?.Code ?? "PlanningFailed", refusal?.Message ?? "No plan.");
         plan = plan with { RequestHash = hash };

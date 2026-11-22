@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Franthropy.Dalamud.Automation.Retainers;
 using RQ.Domain;
 using RQ.Operations;
@@ -15,12 +16,14 @@ namespace RQ.Interop;
 /// lists; items without a home stay in the bags. Execution reuses the stowage deposit path (one requested
 /// <see cref="OperationKinds.StowageSurplus"/> operation for the whole batch, so each retainer opens once),
 /// picked up by <see cref="AutomaticRetrievalQueue"/>. RequestId is the idempotency key.
-/// An item may also have homes on another character of this account (<see cref="ListingReserveRule.RemoteHomes"/>):
-/// once the owner's own stow settles, what its local homes did not take is carried there by the courier in one run
-/// (<see cref="Tick"/>), and the line's Forward says how that went. Only units still in the owner's bags are sent on,
+/// An item may also have homes on another character of this account (<see cref="ListingReserveRule.RemoteHomes"/>).
+/// When the request sets AllowForward, once the owner's own stow settles what its local homes did not take is carried
+/// there by the courier in one run (<see cref="Tick"/>), and the line's Forward says how that went; without it such
+/// items stay in the bags exactly as before forwarding existed. Only units still in the owner's bags are sent on,
 /// never more than the request delivered; units the caller already sent straight to those homes (SentDirect) are
-/// never forwarded. The forward is journaled in its own file before the local operation is created, so a request id
-/// is answered the same across reloads, and its courier run never starts twice.
+/// never forwarded. The forward is journaled in its own file before the local operation is created and a forward
+/// with no local operation is never pruned, so a request id is answered the same across reloads; its courier run is
+/// never started twice (an earlier run under the same courier request id is adopted).
 /// </summary>
 public sealed class DeliveredStowService
 {
@@ -50,6 +53,8 @@ public sealed class DeliveredStowService
     public const string ForwardNoRoom = "NoRoom";
     public const string ForwardNothingLeft = "NothingLeft";
     public const string ForwardSentDirect = "SentDirect";
+    public const string ForwardNotInRun = "NotInRun";
+    public const string ForwardJournalLost = "forward_journal_lost";
 
     private const string ForwardStatePending = "pending";
     private const string ForwardStateRunning = "running";
@@ -61,7 +66,15 @@ public sealed class DeliveredStowService
 
     /// <summary>How long a forward waits for another automation job to let go once the owner's own stow has settled.</summary>
     private static readonly TimeSpan AutomationWait = TimeSpan.FromSeconds(60);
+    /// <summary>
+    /// How long a forward waits for another courier run to end (or be resumed or cleared), including one that has the
+    /// owner logged out, before it refuses with that run's cause.
+    /// </summary>
+    private static readonly TimeSpan CourierWait = TimeSpan.FromMinutes(30);
+    /// <summary>Consecutive failed reads of a started run's progress before its forward settles as unverified.</summary>
+    private const int ProgressFailureLimit = 5;
     private static readonly TimeSpan TickInterval = TimeSpan.FromSeconds(1);
+    /// <summary>Kept this long after settling; forwards without a local operation are kept for good (their only record).</summary>
     private static readonly TimeSpan SettledRetention = TimeSpan.FromDays(14);
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -83,6 +96,15 @@ public sealed class DeliveredStowService
     private readonly AtomicDocumentStore<DeliveredStowForwardDocument>? forwardStore;
     private readonly List<DeliveredStowForwardRecord> forwards = [];
     private readonly Dictionary<string, DateTime> automationWaitSince = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DateTime> courierWaitSince = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> progressFailures = new(StringComparer.Ordinal);
+    /// <summary>Request ids (and hashes when known) of an unreadable forward journal that was moved aside.</summary>
+    private readonly List<DeliveredStowLostRequest> lost = [];
+    /// <summary>Set when an unreadable journal could not be moved aside: saving would overwrite it, so nothing is saved.</summary>
+    private string? forwardStoreBlocked;
+    /// <summary>The forward journal has changes not yet saved (a save failed); every tick tries again.</summary>
+    private bool forwardsDirty;
+    private int saveFailures;
     private DateTime nextTickAt;
 
     public event Action<string>? OperationChanged;
@@ -149,6 +171,13 @@ public sealed class DeliveredStowService
                     return Serialize(Reject(request.RequestId, "request_conflict", "Request ID was already used with a different canonical payload."));
                 return Serialize(StatusOf(request.RequestId) with { Schema = AckSchema, Message = "Idempotent replay returned the existing stow request." });
             }
+            if (lost.FirstOrDefault(entry => entry.RequestId == request.RequestId) is { } gone)
+            {
+                // Accepted before, but its forward journal became unreadable: refused rather than planned and sent again.
+                if (gone.CanonicalHash is { Length: > 0 } knownHash && knownHash != hash)
+                    return Serialize(Reject(request.RequestId, "request_conflict", "Request ID was already used with a different canonical payload."));
+                return Serialize(Reject(request.RequestId, ForwardJournalLost, LostMessage(gone)));
+            }
             if (pending.TryGetValue(request.RequestId, out var queued))
             {
                 return queued.CanonicalHash == hash
@@ -188,9 +217,11 @@ public sealed class DeliveredStowService
                     : operationId is null ? $"Courier forward of {forwardWanted:N0} unit(s) to other characters queued."
                     : $"Stow queued for persistence and automatic execution; {forwardWanted:N0} unit(s) then go to other characters by courier.",
                 Lines = lines,
-                Forward = lines.Any(line => line.Forward is not null)
+                Forward = forwardWanted > 0
                     ? new() { State = ForwardStatePending, Message = "Waiting for the owner's own stow to settle." }
-                    : null,
+                    : lines.Any(line => line.Forward is not null)
+                        ? new() { State = ForwardStateSettled, Message = NothingToForward }
+                        : null,
             };
             pending.Add(request.RequestId, new(hash, operationId, ack));
             workQueue.Enqueue(() => Apply(request, operationId, hash));
@@ -216,6 +247,18 @@ public sealed class DeliveredStowService
             : repository.Read(state => state.Operations.FirstOrDefault(record => record.OperationId == persisted.OperationId));
         if (forwards.FirstOrDefault(record => record.RequestId == requestId) is { } forward)
             return ForwardStatus(forward, operation);
+        if (operation is null && lost.FirstOrDefault(entry => entry.RequestId == requestId) is { } gone)
+        {
+            return new()
+            {
+                Schema = StatusSchema,
+                ProviderInstanceId = providerInstanceId,
+                RequestId = requestId,
+                Status = OperationStatuses.Indeterminate,
+                ErrorCode = ForwardJournalLost,
+                Message = LostMessage(gone),
+            };
+        }
         if (operation is null)
         {
             return new()
@@ -280,6 +323,10 @@ public sealed class DeliveredStowService
             var (batch, lines) = Plan(request, owner);
             if (operationId is not null && batch.PlannedQuantity <= 0)
                 throw new InvalidOperationException("Delivered items no longer have routable home-retainer room or are no longer carried.");
+            // Accepted as forward-only, but the owner's own homes have room now: those units are stowed here (the
+            // forward takes only what they leave), so none is left unplanned in the bags.
+            if (operationId is null && batch.PlannedQuantity > 0)
+                operationId = $"rq-dstow-{Guid.NewGuid():N}";
             if (operationId is null && !lines.Any(line => line.Forward is { Code: ForwardPending }))
                 throw new InvalidOperationException("Delivered items no longer have room in their homes on other characters or are no longer carried.");
             if (lines.Any(line => line.Forward is not null))
@@ -353,10 +400,11 @@ public sealed class DeliveredStowService
                 .ToArray();
             var planned = routes.Sum(route => route.RoutedQuantity);
             var held = Math.Min(item.Quantity, carried.GetValueOrDefault(item.Key));
-            var remote = plan is null ? null : RemoteHomesOf(plan, item.Key.ItemId, item.Key.IsHq);
+            // Remote homes matter only when the caller opted into forwarding, or reports units it sent there itself.
+            var remote = plan is null || !request.AllowForward && item.SentDirect <= 0 ? null : RemoteHomesOf(plan, item.Key.ItemId, item.Key.IsHq);
             var code = item.Quantity == 0 && item.SentDirect > 0 ? LineSentDirect
                 : held <= 0 ? LineNotCarried
-                : routes.Length == 0 ? remote is null ? LineNoHome : LineHomedElsewhere
+                : routes.Length == 0 ? remote is null || !request.AllowForward ? LineNoHome : LineHomedElsewhere
                 : planned <= 0 ? LineNoRoom
                 : LinePlanned;
             return new DeliveredStowLine
@@ -373,7 +421,7 @@ public sealed class DeliveredStowService
                 {
                     Character = Character(remote.Character),
                     Homes = Homes(remote.Character, remote.RetainerIds, retainers),
-                    Wanted = Math.Max(0, held - planned),
+                    Wanted = request.AllowForward ? Math.Max(0, held - planned) : 0,
                 },
             };
         }).ToArray();
@@ -436,33 +484,71 @@ public sealed class DeliveredStowService
         var changedOperations = new List<string>();
         lock (gate)
         {
-            if (!forwards.Any(record => record.State != ForwardStateSettled))
+            if (!forwardsDirty && !forwards.Any(record => record.State != ForwardStateSettled))
                 return;
             foreach (var record in forwards.Where(record => record.State != ForwardStateSettled).ToArray())
             {
+                bool changed;
                 try
                 {
-                    if (!Advance(record, now))
-                        continue;
-                    if (record.State == ForwardStateSettled && record.OperationId is { } operationId)
-                        changedOperations.Add(operationId);
-                    SaveForwards();
+                    changed = Advance(record, now);
+                    progressFailures.Remove(record.RequestId);
                 }
                 catch (Exception exception)
                 {
-                    warn($"[DeliveredStow] Forward of {record.RequestId} failed: {exception}");
-                    // A run that started is followed again next tick; one that never started cannot start safely now.
-                    if (record.Run is null)
-                    {
-                        Refuse(record, "ForwardFailed", $"Quartermaster could not forward: {exception.Message}", now);
-                        try { SaveForwards(); }
-                        catch (Exception save) { warn($"[DeliveredStow] Could not save the forward of {record.RequestId}: {save.Message}"); }
-                    }
+                    changed = Failed(record, exception, now);
+                }
+                if (!changed)
+                    continue;
+                forwardsDirty = true;
+                if (record.State == ForwardStateSettled && record.OperationId is { } operationId)
+                    changedOperations.Add(operationId);
+            }
+            if (forwardsDirty)
+            {
+                // A failed save keeps every change (and a started run's binding) in memory and is tried again each tick.
+                try
+                {
+                    SaveForwards();
+                    forwardsDirty = false;
+                    if (saveFailures > 0)
+                        warn($"[DeliveredStow] Forward journal saved after {saveFailures} failed attempt(s).");
+                    saveFailures = 0;
+                }
+                catch (Exception exception)
+                {
+                    if (saveFailures++ == 0)
+                        warn($"[DeliveredStow] ForwardJournalSaveFailed: could not save the forward journal ({exception.Message}); retrying every {TickInterval.TotalSeconds:N0}s with every change kept in memory.");
                 }
             }
         }
         foreach (var operationId in changedOperations)
             OperationChanged?.Invoke(operationId);
+    }
+
+    /// <summary>
+    /// A forward step threw. One that never started a run cannot start safely now and is refused; a started run's
+    /// progress is read again next tick, until <see cref="ProgressFailureLimit"/> reads in a row fail. True when the
+    /// record changed.
+    /// </summary>
+    private bool Failed(DeliveredStowForwardRecord record, Exception exception, DateTime now)
+    {
+        if (record.Run is not { } run)
+        {
+            warn($"[DeliveredStow] Forward of {record.RequestId} failed: {exception}");
+            return Refuse(record, "ForwardFailed", $"Quartermaster could not forward: {exception.Message}", now);
+        }
+        var count = progressFailures[record.RequestId] = progressFailures.GetValueOrDefault(record.RequestId) + 1;
+        if (count < ProgressFailureLimit)
+            return false;
+        progressFailures.Remove(record.RequestId);
+        var message = $"Quartermaster could not read courier run {run}'s progress {ProgressFailureLimit} times in a row " +
+            $"(last: {exception.Message}); where the goods are is unverified, check the run in Courier.";
+        foreach (var line in record.Lines.Where(line => line.Code == ForwardRunning))
+            SetLine(line, "RunIndeterminate", line.Delivered is > 0 ? $"{line.Delivered:N0} of {line.Planned:N0} deposited as last read. {message}" : message);
+        warn($"[DeliveredStow] {record.RequestId}: RunIndeterminate after {ProgressFailureLimit} failed progress reads of run {run}: {exception}");
+        Settle(record, "RunIndeterminate", message, now);
+        return true;
     }
 
     /// <summary>One step of a forward; true when its record changed.</summary>
@@ -491,11 +577,30 @@ public sealed class DeliveredStowService
         }
         if (courier is null)
             return Refuse(record, "CourierNotLoaded", "The courier is not loaded.", now);
+
+        // A run already started for this request (its binding was never saved, or Quartermaster reloaded) is
+        // followed, never started again.
+        var (adopted, historyLoading) = courier.Adopt(CourierRequestId(record.RequestId));
+        if (historyLoading)
+            return false;
+        if (adopted is not null)
+            return Bind(record, adopted, open);
+
         var owner = currentOwner();
+        var blocked = courier.Blocked();
         if (!owner.Matches(record.Owner))
+        {
+            // The courier logs characters in and out: a run under way waits; otherwise the owner left for good.
+            if (blocked is { Wait: true })
+                return WaitForCourier(record, "OwnerChanged",
+                    $"{record.Owner.CharacterName} is not logged in while a courier run is under way", now);
             return Refuse(record, "OwnerChanged", $"{record.Owner.CharacterName} is no longer the logged-in character; the goods stay in their bags.", now);
-        if (courier.Blocked() is { } blocked)
+        }
+        if (blocked is { Wait: true })
+            return WaitForCourier(record, blocked.Code, blocked.Message, now);
+        if (blocked is not null)
             return Refuse(record, blocked.Code, blocked.Message, now);
+        courierWaitSince.Remove(record.RequestId);
         if (courier.AutomationBlock is { } reason)
         {
             if (!automationWaitSince.TryGetValue(record.RequestId, out var since))
@@ -550,6 +655,12 @@ public sealed class DeliveredStowService
         }
 
         var (started, refusal, refused) = courier.Start(CourierRequestId(record.RequestId), record.CanonicalHash, owner, groups);
+        if (refusal is { Wait: true })
+        {
+            // The bound lines are still pending and are planned again once the courier is free.
+            WaitForCourier(record, refusal.Code, refusal.Message, now);
+            return true;
+        }
         foreach (var (line, units) in bound)
         {
             var key = line.Character!.LocalContentId ?? 0;
@@ -570,7 +681,58 @@ public sealed class DeliveredStowService
         }
         record.Run = runId;
         record.State = ForwardStateRunning;
+        record.Code = null;
         record.Message = $"Courier run carrying {bound.Where(entry => entry.Line.Code == ForwardRunning).Sum(entry => entry.Units):N0} unit(s) to other characters.";
+        return true;
+    }
+
+    /// <summary>Follows a run started earlier under this request's courier request id instead of starting one. Always true.</summary>
+    private bool Bind(DeliveredStowForwardRecord record, DeliveredStowAdoptedRun adopted, IEnumerable<DeliveredStowForwardRecordLine> open)
+    {
+        foreach (var line in open)
+        {
+            if (adopted.Planned is null)
+            {
+                // The run's plan could not be read: what it carries for this line is taken as at most what was wanted.
+                line.Planned = line.Wanted;
+                SetLine(line, ForwardRunning, $"Following courier run {adopted.Run} started earlier for this request; its plan could not be read.");
+            }
+            else if (adopted.Planned.TryGetValue(line.Line, out var units) && units > 0)
+            {
+                line.Planned = units;
+                SetLine(line, ForwardRunning, $"The courier is carrying {units:N0} to {line.Character!.CharacterName}.");
+            }
+            else
+            {
+                SetLine(line, ForwardNotInRun, $"The courier run started earlier for this request does not carry it; it stays in the bags.");
+            }
+        }
+        warn($"[DeliveredStow] {record.RequestId}: following courier run {adopted.Run} started earlier for this request instead of starting another.");
+        record.Run = adopted.Run;
+        record.State = ForwardStateRunning;
+        record.Code = null;
+        record.Message = $"Following courier run {adopted.Run} started earlier for this request.";
+        courierWaitSince.Remove(record.RequestId);
+        automationWaitSince.Remove(record.RequestId);
+        return true;
+    }
+
+    /// <summary>
+    /// Waits for another courier run, at most <see cref="CourierWait"/> from the first wait, then refuses with its
+    /// cause and the time waited. True when the record changed.
+    /// </summary>
+    private bool WaitForCourier(DeliveredStowForwardRecord record, string code, string message, DateTime now)
+    {
+        if (!courierWaitSince.TryGetValue(record.RequestId, out var since))
+            courierWaitSince[record.RequestId] = since = now;
+        if (now - since >= CourierWait)
+            return Refuse(record, code,
+                $"{message.TrimEnd('.')}. Waited {CourierWait.TotalMinutes:N0} min for it after the owner's own stow; nothing was forwarded.", now);
+        var waiting = $"Waiting for the courier: {message.TrimEnd('.')}.";
+        if (record.Code == code && record.Message == waiting)
+            return false;
+        record.Code = code;
+        record.Message = waiting;
         return true;
     }
 
@@ -579,7 +741,7 @@ public sealed class DeliveredStowService
     {
         if (courier is null)
             return false;
-        if (courier.Progress(run, CourierRequestId(record.RequestId)) is not { } progress)
+        if (courier.Progress(run) is not { } progress)
             return false;
         var running = record.Lines.Where(line => line.Code == ForwardRunning).ToArray();
         var changed = false;
@@ -596,18 +758,47 @@ public sealed class DeliveredStowService
             case "Starting":
             case "Running":
             case "Idle":
+                if (record.Code is not null)
+                {
+                    // Resumed after a stop: the run is carrying again.
+                    record.Code = null;
+                    record.Message = $"Courier run carrying {running.Sum(line => line.Planned):N0} unit(s) to other characters.";
+                    foreach (var line in running)
+                        SetLine(line, ForwardRunning, $"The courier is carrying {line.Planned:N0} to {line.Character!.CharacterName}.");
+                    changed = true;
+                }
                 return changed;
             case "Completed":
                 foreach (var line in running)
                 {
-                    // A completed run deposited every stack it carried; the journal's tally is used while it still has it.
-                    var delivered = line.Delivered ??= line.Planned;
+                    // The run's own tally (its current journal or its archive) says what was deposited.
+                    var delivered = line.Delivered ??= 0;
                     SetLine(line,
                         delivered >= line.Planned ? ForwardDelivered : delivered > 0 ? ForwardPartlyDelivered : ForwardNotDelivered,
                         $"{delivered:N0} of {line.Planned:N0} deposited on {line.Character!.CharacterName}.");
                 }
                 Settle(record, progress.Code is { Length: > 0 } code && code != "Succeeded" ? code : null, "Courier run completed.", now);
+                courier.Forget(run, CourierRequestId(record.RequestId));
                 return true;
+            case "Failed" or "Interrupted" or "Indeterminate" when progress.Current:
+            {
+                // Still the courier's current run: it can be resumed and may hold goods, so the forward stays open
+                // until it completes or is cleared (its archive then says what was deposited).
+                var (stall, why) = progress.State switch
+                {
+                    "Failed" => ("RunFailed", $"The courier run failed ({progress.Code}: {progress.Detail}); resume or clear it in Courier."),
+                    "Interrupted" => ("RunInterrupted", $"The courier run was interrupted ({progress.Code}: {progress.Detail}); resume or clear it in Courier."),
+                    _ => ("RunIndeterminate", $"The courier run stopped unverified ({progress.Code}: {progress.Detail}); check its custody in Courier, then resume or clear it."),
+                };
+                if (record.Code == stall && record.Message == why)
+                    return changed;
+                record.Code = stall;
+                record.Message = why;
+                foreach (var line in running)
+                    SetLine(line, ForwardRunning, line.Delivered is > 0 ? $"{line.Delivered:N0} of {line.Planned:N0} deposited so far. {why}" : why);
+                warn($"[DeliveredStow] {record.RequestId}: courier run {run} stopped {progress.State} ({progress.Code}: {progress.Detail}); the forward waits for it to be resumed or cleared.");
+                return true;
+            }
             default:
                 var (outcome, message) = progress.State switch
                 {
@@ -627,6 +818,7 @@ public sealed class DeliveredStowService
                 }
                 warn($"[DeliveredStow] {record.RequestId}: courier run {run} {progress.State} ({progress.Code}: {progress.Detail}).");
                 Settle(record, outcome, message, now);
+                courier.Forget(run, CourierRequestId(record.RequestId));
                 return true;
         }
     }
@@ -654,7 +846,15 @@ public sealed class DeliveredStowService
         record.Message = message;
         record.SettledUtc = now;
         automationWaitSince.Remove(record.RequestId);
+        courierWaitSince.Remove(record.RequestId);
+        progressFailures.Remove(record.RequestId);
     }
+
+    private const string NothingToForward = "Nothing to forward.";
+
+    private static string LostMessage(DeliveredStowLostRequest gone) =>
+        $"Request ID was accepted before, but Quartermaster's forward journal became unreadable and was moved aside to " +
+        $"{gone.Journal}; it is not planned or sent again. Check where its goods are before resubmitting under a new ID.";
 
     private DeliveredStowStatus ForwardStatus(DeliveredStowForwardRecord record, OperationRecord? operation)
     {
@@ -749,16 +949,25 @@ public sealed class DeliveredStowService
         return a == b && a is OperationStatuses.Succeeded or OperationStatuses.Failed ? a : OperationStatuses.PartiallySucceeded;
     }
 
-    private DeliveredStowForwardRecord Record(string requestId, string hash, string? operationId, OwnerScope owner, IEnumerable<DeliveredStowLine> lines) => new()
+    /// <summary>
+    /// The journaled forward of an accepted request. One with nothing to send (only lines the caller already sent
+    /// directly) is settled from the start and only keeps those lines answerable.
+    /// </summary>
+    private DeliveredStowForwardRecord Record(string requestId, string hash, string? operationId, OwnerScope owner, IReadOnlyList<DeliveredStowLine> lines)
+    {
+        var now = utcNow();
+        var sends = lines.Any(line => line.Forward is { Code: ForwardPending });
+        return new()
     {
         RequestId = requestId,
         CanonicalHash = hash,
         OperationId = operationId,
         PlanId = repository.Read(state => ListingPlanCatalog.OwnerPlan(state, owner))?.Id,
         Owner = owner with { },
-        CreatedUtc = utcNow(),
-        State = ForwardStatePending,
-        Message = "Waiting for the owner's own stow to settle.",
+        CreatedUtc = now,
+        State = sends ? ForwardStatePending : ForwardStateSettled,
+        Message = sends ? "Waiting for the owner's own stow to settle." : NothingToForward,
+        SettledUtc = sends ? null : now,
         Lines = lines.Select(line => new DeliveredStowForwardRecordLine
         {
             ItemId = line.ItemId,
@@ -775,6 +984,7 @@ public sealed class DeliveredStowService
             Message = line.Forward?.Message ?? string.Empty,
         }).ToList(),
     };
+    }
 
     // ---- Remote homes -------------------------------------------------------------------------
 
@@ -827,28 +1037,78 @@ public sealed class DeliveredStowService
     {
         try
         {
-            var cutoff = utcNow() - SettledRetention;
-            forwards.AddRange(forwardStore!.Load().Requests
-                .Where(record => record.State != ForwardStateSettled || record.SettledUtc is not { } at || at >= cutoff));
+            var document = forwardStore!.Load();
+            forwards.AddRange(document.Requests.Where(record => !Expired(record, utcNow())));
+            lost.AddRange(document.Lost);
         }
         catch (Exception exception)
         {
-            // An unreadable journal is moved aside so it is never overwritten; its forwards are no longer followed.
+            // An unreadable journal is moved aside so it is never overwritten. Its forwards are no longer followed, but
+            // every request id still legible in it is remembered and refused, so none is planned and sent again.
             var aside = $"{forwardStore!.Path}.unreadable-{utcNow():yyyyMMddHHmmss}";
-            warn($"[DeliveredStow] Forward journal unreadable ({exception.Message}); moved to {aside}.");
+            var salvaged = Salvage(forwardStore.Path, aside);
             try { File.Move(forwardStore.Path, aside); }
-            catch (Exception move) { warn($"[DeliveredStow] Could not move the unreadable forward journal: {move.Message}"); }
+            catch (Exception move)
+            {
+                forwardStoreBlocked = $"the unreadable forward journal could not be moved aside ({move.Message})";
+                warn($"[DeliveredStow] ForwardJournalUnreadable: {forwardStore.Path} is unreadable ({exception.Message}) and could not be moved aside ({move.Message}); new forwards are refused until it is fixed or removed.");
+                return;
+            }
+            lost.AddRange(salvaged);
+            warn($"[DeliveredStow] ForwardJournalUnreadable: {exception.Message}; moved to {aside}. {salvaged.Count} request id(s) recovered from it are refused if submitted again.");
+            try { forwardStore.Save(new() { Lost = [.. lost] }); }
+            catch (Exception save)
+            {
+                forwardsDirty = true;
+                warn($"[DeliveredStow] Could not record the recovered request ids yet ({save.Message}); retrying on the next tick.");
+            }
         }
     }
 
-    /// <summary>Writes the forward journal, dropping forwards settled longer ago than the retention. Under <see cref="gate"/>.</summary>
+    private static readonly Regex SalvagePattern = new(
+        "\"requestId\"\\s*:\\s*\"(?<id>(?:[^\"\\\\]|\\\\.)*)\"(?:\\s*,\\s*\"canonicalHash\"\\s*:\\s*\"(?<hash>[0-9a-fA-F]*)\")?",
+        RegexOptions.CultureInvariant);
+
+    /// <summary>Every request id (with its hash when it follows) still legible in an unreadable forward journal.</summary>
+    private List<DeliveredStowLostRequest> Salvage(string path, string aside)
+    {
+        var found = new List<DeliveredStowLostRequest>();
+        try
+        {
+            foreach (Match match in SalvagePattern.Matches(File.ReadAllText(path)))
+            {
+                string id;
+                try { id = JsonSerializer.Deserialize<string>($"\"{match.Groups["id"].Value}\"") ?? string.Empty; }
+                catch (JsonException) { continue; }
+                if (id.Length == 0 || found.Any(entry => entry.RequestId == id))
+                    continue;
+                found.Add(new() { RequestId = id, CanonicalHash = match.Groups["hash"].Success ? match.Groups["hash"].Value : null, Journal = aside, LostUtc = utcNow() });
+            }
+        }
+        catch (Exception exception)
+        {
+            warn($"[DeliveredStow] No request id could be recovered from the unreadable forward journal: {exception.Message}");
+        }
+        return found;
+    }
+
+    /// <summary>
+    /// A settled forward past the retention that has a local operation (whose request record keeps the id answered).
+    /// A forward with no local operation is its request's only memory and is kept for good.
+    /// </summary>
+    private static bool Expired(DeliveredStowForwardRecord record, DateTime now) =>
+        record.State == ForwardStateSettled && record.OperationId is not null && record.SettledUtc is { } at && at < now - SettledRetention;
+
+    /// <summary>Writes the forward journal, dropping expired forwards. Under <see cref="gate"/>.</summary>
     private void SaveForwards()
     {
         if (forwardStore is null)
             return;
-        var cutoff = utcNow() - SettledRetention;
-        forwards.RemoveAll(record => record.State == ForwardStateSettled && record.SettledUtc is { } at && at < cutoff);
-        forwardStore.Save(new() { Requests = [.. forwards] });
+        if (forwardStoreBlocked is { } why)
+            throw new InvalidOperationException($"The forward journal is not saved: {why}.");
+        var now = utcNow();
+        forwards.RemoveAll(record => Expired(record, now));
+        forwardStore.Save(new() { Requests = [.. forwards], Lost = [.. lost] });
     }
 
     // ---- Validation ---------------------------------------------------------------------------
@@ -891,6 +1151,9 @@ public sealed class DeliveredStowService
             if (item.SentDirect > 0)
                 canonical.Append("|d").Append(item.SentDirect);
         }
+        // Likewise absent unless the caller opts into forwarding.
+        if (request.AllowForward)
+            canonical.Append("|f1");
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical.ToString()))).ToLowerInvariant();
     }
 
@@ -913,6 +1176,17 @@ public sealed class DeliveredStowService
 public sealed class DeliveredStowForwardDocument
 {
     public List<DeliveredStowForwardRecord> Requests { get; set; } = [];
+    /// <summary>Requests of an unreadable journal that was moved aside: refused if submitted again. Never pruned.</summary>
+    public List<DeliveredStowLostRequest> Lost { get; set; } = [];
+}
+
+/// <summary>A request id recovered from an unreadable forward journal, with its hash when legible, and where that journal went.</summary>
+public sealed class DeliveredStowLostRequest
+{
+    public string RequestId { get; set; } = string.Empty;
+    public string? CanonicalHash { get; set; }
+    public string Journal { get; set; } = string.Empty;
+    public DateTime LostUtc { get; set; }
 }
 
 /// <summary>

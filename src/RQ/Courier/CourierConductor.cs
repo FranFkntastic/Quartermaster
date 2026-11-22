@@ -277,6 +277,34 @@ public sealed class CourierConductor
         [..units.GroupBy(s=>(s.Item,s.Hq)).Select(g=>new CustodyRow(g.First().Name,g.First().IsGil?"":g.Key.Hq?"HQ":"NQ",g.Sum(s=>s.Units),holder?.CharacterName??"Unknown"))];
     /// <summary>The full journal, for the IPC status projection (custody split into stacks and gil).</summary>
     internal CourierJournal Journal() => store.Load();
+    private readonly object polledGate = new();
+    private (DateTime Stamp, long Length, CourierJournal Journal)? polled;
+    /// <summary>
+    /// The current run's snapshot for a once-a-second poller: the journal is parsed again only when its file's write
+    /// time or length changed since the last parse (one file stat otherwise). The projection itself is in memory.
+    /// </summary>
+    internal CourierSnapshot PolledSnapshot()
+    {
+        var file = new FileInfo(Path.Combine(directory, "courier-run.json"));
+        var (stamp, length) = file.Exists ? (file.LastWriteTimeUtc, file.Length) : (DateTime.MinValue, -1L);
+        CourierJournal journal;
+        lock (polledGate)
+        {
+            if (polled is not { } cached || cached.Stamp != stamp || cached.Length != length)
+                polled = cached = (stamp, length, store.Load());
+            journal = cached.Journal;
+        }
+        return Project(journal);
+    }
+    /// <summary>A closed run's journal as it was archived, or null when there is no archive of it. Reads a file.</summary>
+    internal CourierJournal? Closed(Guid run)
+    {
+        lock (archiveGate)
+        {
+            var path = ArchiveFile(run);
+            return File.Exists(path) ? new CourierStore<CourierJournal>(path).Load() : null;
+        }
+    }
 
     private const string ArchivePattern = "courier-closed-*.json";
     private string ArchiveFile(Guid run) => Path.Combine(directory, $"courier-closed-{run:N}.json");

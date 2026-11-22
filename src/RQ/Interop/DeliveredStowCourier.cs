@@ -15,21 +15,35 @@ internal sealed record DeliveredStowForwardUnit(Guid Line, uint ItemId, string I
     public int Units => Homes.Sum(home => home.Units);
 }
 
-/// <summary>Why a forward (or one destination of it) cannot run: a stable code and the plain reason.</summary>
-internal sealed record DeliveredStowForwardRefusal(string Code, string Message);
+/// <summary>
+/// Why a forward (or one destination of it) cannot run: a stable code and the plain reason. Wait: the cause is
+/// another courier run that will end on its own (or be resumed or cleared), so the forward may wait for it.
+/// </summary>
+internal sealed record DeliveredStowForwardRefusal(string Code, string Message, bool Wait = false);
 
 /// <summary>
 /// How a forward's courier run stands. <c>Starting</c> while the launch has not journaled the run;
-/// <c>Missing</c> when it never did (Code and Detail then carry the reason the start reported).
+/// <c>Missing</c> when it never did (Code and Detail then carry the reason the start reported). Current: the run is
+/// still the courier's current run, so a stopped one can still be resumed and may hold goods; otherwise it was
+/// closed (cleared or replaced) and State and Delivered are its archived journal's.
 /// </summary>
-internal sealed record DeliveredStowForwardProgress(string State, string Code, string Detail, IReadOnlyDictionary<Guid, int> Delivered);
+internal sealed record DeliveredStowForwardProgress(string State, string Code, string Detail, IReadOnlyDictionary<Guid, int> Delivered, bool Current = false);
+
+/// <summary>
+/// A run started earlier under a forward's courier request id. Planned: units per forwarded line its plan carries,
+/// null when its journal could not be read.
+/// </summary>
+internal sealed record DeliveredStowAdoptedRun(Guid Run, IReadOnlyDictionary<Guid, int>? Planned);
 
 /// <summary>
 /// Forwards delivered goods from the owner's bags into retainers of other characters of this account with the
 /// courier: the owner is the source, each remote character a destination whose shipments name the home retainer,
 /// so the conductor deposits them there. The gates are the courier IPC's: one run at a time, an unresolved run
 /// holding custody blocks, the carrier must be opted in and paired with the owner, and the transfer planner's
-/// roster, region, meeting-bell and item checks apply per destination. Nothing here waits or retries.
+/// roster, region, meeting-bell and item checks apply per destination. Nothing here waits or retries; refusals
+/// caused by another courier run say so (<see cref="DeliveredStowForwardRefusal.Wait"/>) and the service waits.
+/// Run state comes from <see cref="CourierConductor.PolledSnapshot"/> (a file stat per call unless the journal
+/// changed); a closed run's archive is read once, off the framework thread.
 /// </summary>
 internal sealed class DeliveredStowCourier
 {
@@ -42,6 +56,9 @@ internal sealed class DeliveredStowCourier
     private readonly Func<QuartermasterRuntimeSnapshot> runtime;
     private readonly AutomationLease automation;
     private readonly ConcurrentDictionary<Guid, (CourierSnapshot? Outcome, Exception? Fault)> settled = new();
+    private readonly ConcurrentDictionary<string, DeliveredStowAdoptedRun> launched = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<Guid, Task<CourierJournal?>> closedReads = new();
+    private readonly HashSet<string> historyRead = new(StringComparer.Ordinal);
 
     public DeliveredStowCourier(CourierSession session, Func<CourierSettings> settings, Func<InventoryView?> localBags,
         Func<MeetingBell?> bridge, Func<uint, uint> worldRegion, Func<uint, ItemMetadata> metadata,
@@ -65,14 +82,14 @@ internal sealed class DeliveredStowCourier
     {
         if (session.Conductor is not { } conductor)
             return new("CourierNotLoaded", "The courier is not loaded.");
-        var journal = conductor.Journal();
-        if (session.IsActive)
-            return new("CourierBusy", "Another courier run is active.");
+        var current = conductor.PolledSnapshot();
+        if (session.IsStarting || current.State == "Running")
+            return new("CourierBusy", "Another courier run is active.", Wait: true);
         if (conductor.IsBusy)
-            return new("CourierBusy", "The previous courier run is still finishing cleanup.");
-        var unresolved = journal.Run != Guid.Empty && journal.State is "Failed" or "Interrupted" or "Indeterminate";
-        if (unresolved && (!journal.Custody.IsEmpty || !conductor.Snapshot().CanClear))
-            return new("CourierRunUnresolved", $"The previous courier run is {journal.State} ({journal.Code}); resume or clear it in Courier.");
+            return new("CourierBusy", "The previous courier run is still finishing cleanup.", Wait: true);
+        var unresolved = current.Run != Guid.Empty && current.State is "Failed" or "Interrupted" or "Indeterminate";
+        if (unresolved && (!current.Custody.IsEmpty || !current.CanClear))
+            return new("CourierRunUnresolved", $"The previous courier run is {current.State} ({current.Code}); resume or clear it in Courier.", Wait: true);
         var cfg = settings();
         if (cfg.Carrier is not { HasStableIdentity: true })
             return new("CarrierNotConfigured", "No carrier is chosen.");
@@ -104,7 +121,8 @@ internal sealed class DeliveredStowCourier
         if (fromCarrier && carrierPeer != null && carrierPeer.CarrierSourcing != true)
             return (null, new("CarrierSourceUnsupported", $"{cfg.Carrier!.CharacterName}'s Quartermaster cannot send stock it holds."), refused);
         var source = cfg.LocalRoster.FirstOrDefault(rostered => CourierPlanner.Exact(rostered, owner)) ?? owner;
-        var locations = session.Locations(runtime());
+        var snapshot = runtime();
+        var locations = session.Locations(snapshot);
 
         var trips = ImmutableArray.CreateBuilder<CourierTrip>();
         foreach (var (wanted, units) in groups)
@@ -116,7 +134,8 @@ internal sealed class DeliveredStowCourier
             var order = new CourierTransferOrder(source, destination, 0,
                 [.. units.SelectMany(unit => unit.Homes.Select(home => new CourierTransferItem(unit.ItemId, unit.ItemName, unit.IsHq, home.Units, home.RetainerId)))],
                 ReturnDestinationHome: true, courierRequestId);
-            var (built, refusal) = CourierTransferPlanner.Build(order, cfg, carrierPeer?.Bags, live, metadata, worldRegion, bridge(), locations);
+            var (built, refusal) = CourierTransferPlanner.Build(order, cfg, carrierPeer?.Bags, live, metadata, worldRegion, bridge(), locations,
+                retainerId => snapshot.Retainers.GetValueOrDefault(retainerId)?.RetainerName);
             if (refusal != null || built is not { Trips.Length: > 0 })
             {
                 refused[key] = new(refusal?.Code ?? "PlanningFailed", refusal?.Message ?? "The courier planned no trip.");
@@ -140,23 +159,78 @@ internal sealed class DeliveredStowCourier
         var run = Guid.NewGuid();
         // The owner asked for this stow: the run ends back on the owner.
         if (!session.StartPlan(plan, cfg with { ReturnOwner = true }, clear, run, (outcome, fault) => settled[run] = (outcome, fault)))
-            return (null, new("CourierBusy", "Another courier run is active."), refused);
+            return (null, new("CourierBusy", "Another courier run is active.", Wait: true), refused);
+        // Bound in memory at once: a forward whose journal save fails still finds this run instead of starting another.
+        launched[courierRequestId] = new(run, PlannedPerLine(plan.Trips));
         return (run, null, refused);
     }
 
-    /// <summary>The run's state, or null while the courier's request history is still loading.</summary>
-    public DeliveredStowForwardProgress? Progress(Guid run, string courierRequestId)
+    /// <summary>
+    /// The latest run already started under this courier request id, which a forward adopts instead of starting
+    /// another: one this session launched, the courier's current run, or the latest in the courier's request history
+    /// (read once per request id per session). Null when there is none; <c>Loading</c> while that history is still
+    /// being indexed.
+    /// </summary>
+    public (DeliveredStowAdoptedRun? Run, bool Loading) Adopt(string courierRequestId)
     {
+        if (launched.TryGetValue(courierRequestId, out var mine))
+            return (mine, false);
         if (session.Conductor is not { } conductor)
-            return new("Missing", "CourierNotLoaded", "The courier is not loaded.", ImmutableDictionary<Guid, int>.Empty);
-        var journal = conductor.Journal();
-        IReadOnlyDictionary<Guid, int> delivered = journal.Run == run ? new Dictionary<Guid, int>(journal.Delivered) : ImmutableDictionary<Guid, int>.Empty;
+            return (null, false);
+        var current = conductor.PolledSnapshot();
+        if (current.Run != Guid.Empty && current.RequestId == courierRequestId)
+            return (new(current.Run, current.Lines.ToDictionary(line => line.Line, line => line.Moved + line.Remaining)), false);
+        if (historyRead.Contains(courierRequestId))
+            return (null, false);
         if (conductor.RunsFor(courierRequestId) is not { } known)
-            return null;
-        if (known.FirstOrDefault(record => record.Run == run) is { } found)
-            return new(found.State, found.Code, found.Detail, delivered);
+            return (null, true);
+        historyRead.Add(courierRequestId);
+        if (known.OrderByDescending(record => record.At).FirstOrDefault() is not { } latest)
+            return (null, false);
+        IReadOnlyDictionary<Guid, int>? planned = null;
+        try { planned = conductor.Closed(latest.Run) is { } closed ? PlannedPerLine(closed.Plan.Trips) : null; }
+        catch (Exception) { /* Adopted without per-line plans; the caller reports those units as unverified. */ }
+        return (new(latest.Run, planned), false);
+    }
+
+    private static IReadOnlyDictionary<Guid, int> PlannedPerLine(IEnumerable<CourierTrip> trips) =>
+        trips.SelectMany(trip => trip.Manifest).GroupBy(stack => stack.Line).ToDictionary(group => group.Key, group => group.Sum(stack => stack.Units));
+
+    /// <summary>Drops what this adapter keeps about a run whose forward has settled.</summary>
+    public void Forget(Guid run, string courierRequestId)
+    {
+        closedReads.TryRemove(run, out _);
+        settled.TryRemove(run, out _);
+        launched.TryRemove(courierRequestId, out _);
+    }
+
+    /// <summary>
+    /// The run's state, or null while its archive is still being read. Throws when that archive is unreadable (the
+    /// read is tried again on the next call).
+    /// </summary>
+    public DeliveredStowForwardProgress? Progress(Guid run)
+    {
+        IReadOnlyDictionary<Guid, int> none = ImmutableDictionary<Guid, int>.Empty;
+        if (session.Conductor is not { } conductor)
+            return new("Missing", "CourierNotLoaded", "The courier is not loaded.", none);
+        var current = conductor.PolledSnapshot();
+        if (current.Run == run)
+            return new(current.State, current.Code, current.Detail, current.Lines.ToDictionary(line => line.Line, line => line.Moved), Current: true);
         if (!settled.ContainsKey(run) && session.IsStarting)
-            return new("Starting", "", "", delivered);
+            return new("Starting", "", "", none);
+        // No longer the current run: it was cleared or replaced, and its archive says how it ended.
+        var read = closedReads.GetOrAdd(run, id => Task.Run(() => conductor.Closed(id)));
+        if (!read.IsCompleted)
+            return null;
+        if (!read.IsCompletedSuccessfully)
+        {
+            closedReads.TryRemove(run, out _);
+            var cause = read.Exception?.GetBaseException();
+            throw new InvalidOperationException($"Courier run {run}'s archive could not be read: {cause?.Message ?? "cancelled"}", cause);
+        }
+        if (read.Result is { } closed)
+            return new(closed.State, closed.Code, closed.Detail, new Dictionary<Guid, int>(closed.Delivered));
+        var delivered = none;
         if (settled.TryGetValue(run, out var end))
             return end.Fault is { } fault
                 ? new("Missing", (fault as CourierFault)?.Code ?? "UnexpectedFailure", fault.Message, delivered)
