@@ -106,15 +106,17 @@ public sealed class OperationJournal
     }
 
     /// <summary>
-    /// Cancels externally requested automatic operations (shortages, elemental deposits, delivered stow) that
-    /// have not started within <paramref name="startWindow"/> of submission, so a stale request never runs later
-    /// (for example on the owner's next login). <paramref name="activeOperationId"/> is skipped.
+    /// Cancels externally requested delivered-stow operations that have not started within
+    /// <paramref name="startWindow"/> of submission, so a stale stow never deposits later (for example on the
+    /// owner's next login). Requested retrievals and elemental deposits keep waiting as before; their
+    /// requesters withdraw them through the cancel channel. <paramref name="activeOperationId"/> is skipped.
     /// </summary>
     public IReadOnlyList<OperationRecord> ExpireUnstartedRequestedOperations(TimeSpan startWindow, string? activeOperationId)
     {
         var cutoff = utcNow() - startWindow;
         var expired = repository.Read(state => state.Operations
             .Where(operation => operation.ExecuteImmediately &&
+                                operation.Kind == OperationKinds.StowageSurplus &&
                                 operation.Status == OperationStatuses.Accepted &&
                                 operation.OperationId != activeOperationId &&
                                 state.Requests.FirstOrDefault(record => record.OperationId == operation.OperationId) is { } request &&
