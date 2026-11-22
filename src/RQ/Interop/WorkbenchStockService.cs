@@ -280,11 +280,13 @@ public sealed class WorkbenchStockService
         var owner = current.Owner with { };
         workQueue.Enqueue(() => EditReserve(owner, request.ItemId, request.ItemName, quality, reserve =>
         {
-            if (reserve.Location.PreferredRetainerIds.SequenceEqual(homes)) return false;
+            // Staying in the bags means no home at all, including "any retainer with space".
+            var anySpace = homes.Count > 0 && reserve.Location.AnySpace;
+            if (reserve.Location.PreferredRetainerIds.SequenceEqual(homes) && reserve.Location.AnySpace == anySpace) return false;
             reserve.Location = new StowageRoutingPolicy
             {
                 PreferredRetainerIds = homes,
-                AnySpace = reserve.Location.AnySpace,
+                AnySpace = anySpace,
                 Consolidate = reserve.Location.Consolidate,
             };
             return true;
