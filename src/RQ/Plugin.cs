@@ -71,6 +71,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly ShortageSubmissionService submissions;
     private readonly ElementalDepositSubmissionService deposits;
     private readonly QuartermasterIpcProvider ipc;
+    private readonly DeliveredStowService deliveredStow;
     private readonly RQ.AgentBridge.AgentBridgeHost agentBridge;
     private readonly AgentBridgeViewportCaptureService agentBridgeViewportCapture;
     private readonly AgentBridgeUiReviewRegistry agentReviewRegistry = new();
@@ -321,6 +322,12 @@ public sealed class Plugin : IDalamudPlugin
         submissions = new ShortageSubmissionService(providerInstanceId, state, workQueue, CurrentOwner);
         deposits = new ElementalDepositSubmissionService(providerInstanceId, state, workQueue, journal, cache.Snapshot, CurrentOwner);
         ipc = new(new DalamudIpcRegistrar(pluginInterface), snapshots, submissions, deposits);
+        deliveredStow = new DeliveredStowService(providerInstanceId, state, workQueue, journal, cache.Snapshot, CurrentOwner,
+            owner => playerInventory.Snapshot(owner, CourierSession.PlayerBags).Bags,
+            id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.StackSize is > 0 and var stack
+                ? checked((int)stack) : throw new InvalidOperationException($"Stack size unavailable for item {id}."),
+            message => log.Warning(message));
+        ipc.AttachDeliveredStow(deliveredStow);
         window = new(
             state,
             runtimeSnapshots,
@@ -413,6 +420,7 @@ public sealed class Plugin : IDalamudPlugin
             journal.OperationChanged += OnOperationChanged;
             submissions.OperationChanged += OnSubmittedOperationChanged;
             deposits.OperationChanged += OnSubmittedOperationChanged;
+            deliveredStow.OperationChanged += OnSubmittedOperationChanged;
             var commandHelp = "Open Quartermaster.";
             commandHelp += " Use '/rq bridge on|off' to control the local agent bridge (off by default).";
             commands.AddHandler(Command, new CommandInfo((_, arguments) => HandleCommand(arguments)) { HelpMessage = commandHelp });
@@ -979,6 +987,7 @@ public sealed class Plugin : IDalamudPlugin
         commands.RemoveHandler(Command);
         submissions.OperationChanged -= OnSubmittedOperationChanged;
         deposits.OperationChanged -= OnSubmittedOperationChanged;
+        deliveredStow.OperationChanged -= OnSubmittedOperationChanged;
         state.Changed -= OnStateChanged;
         playerInventory.Changed -= OnPlayerInventoryChanged;
         cache.Changed -= OnCacheChanged;

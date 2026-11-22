@@ -161,3 +161,68 @@ public sealed class FrameworkWorkQueue : IFrameworkWorkQueue
         return count;
     }
 }
+
+// ---- Delivered stow (capability deliveredStow.v1) ------------------------------------------------
+// Kept as its own block so it merges independently of other contract additions.
+
+public static class DeliveredStowIpcChannels
+{
+    public const string SubmitDeliveredStow = "Quartermaster.v1.SubmitDeliveredStow";
+    public const string GetDeliveredStow = "Quartermaster.v1.GetDeliveredStow";
+}
+
+public sealed record DeliveredStowRequestItem
+{
+    public uint ItemId { get; init; }
+    public string ItemName { get; init; } = string.Empty;
+    public bool IsHq { get; init; }
+    public int Quantity { get; init; }
+}
+
+/// <summary>
+/// <c>gooseworks-quartermaster-delivered-stow/v1</c>: stow goods a caller just delivered into the logged-in
+/// owner's bags into each item's home retainers (the owner's Listing Plan reserve "Goes to"). Quantities are
+/// upper bounds, capped by the owner's carried bags; items without a home stay in the bags. RequestId is the
+/// idempotency key.
+/// </summary>
+public sealed record DeliveredStowRequest
+{
+    public string Schema { get; init; } = string.Empty;
+    public string ProviderInstanceId { get; init; } = string.Empty;
+    public string RequestId { get; init; } = string.Empty;
+    public RequestOwner? Owner { get; init; }
+    public IReadOnlyList<DeliveredStowRequestItem>? Items { get; init; }
+}
+
+/// <summary>
+/// One requested item variant. Code: Planned, NoHome, NoRoom, NotCarried, Stowed, PartlyStowed, NotStowed.
+/// </summary>
+public sealed record DeliveredStowLine
+{
+    public uint ItemId { get; init; }
+    public string ItemName { get; init; } = string.Empty;
+    public bool IsHq { get; init; }
+    public int Requested { get; init; }
+    public int Planned { get; init; }
+    public int Stowed { get; init; }
+    public string Code { get; init; } = string.Empty;
+    public IReadOnlyList<string> Destinations { get; init; } = [];
+}
+
+/// <summary>
+/// Acknowledgement (<c>gooseworks-quartermaster-delivered-stow-ack/v1</c>) and status
+/// (<c>gooseworks-quartermaster-delivered-stow-status/v1</c>). Status: queued, accepted, running, succeeded,
+/// partially_succeeded, indeterminate, failed, cancelled, nothing_to_stow, rejected (ErrorCode names why) or not_found.
+/// </summary>
+public sealed record DeliveredStowStatus
+{
+    public string Schema { get; init; } = string.Empty;
+    public string ProviderInstanceId { get; init; } = string.Empty;
+    public string RequestId { get; init; } = string.Empty;
+    public string? OperationId { get; init; }
+    public string Status { get; init; } = string.Empty;
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ErrorCode { get; init; }
+    public string Message { get; init; } = string.Empty;
+    public IReadOnlyList<DeliveredStowLine> Lines { get; init; } = [];
+}
