@@ -128,7 +128,7 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
             if (UiLayout.PrimaryButton("Resume##RQCourierResume", new Vector2(ImGui.CalcTextSize("Resume").X + 40, height)))
                 courier.Resume();
             reviewRegistry.RegisterLastButton("quartermaster.courier.run.resume", "Resume the courier run from its journal", true,
-                courier.Resume, $"{run.State}: {run.Code}");
+                () => courier.Resume(), $"{run.State}: {run.Code}");
             ImGui.SameLine(0, 16);
         }
         ImGui.BeginGroup();

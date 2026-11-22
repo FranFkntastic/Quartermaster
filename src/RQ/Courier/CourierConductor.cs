@@ -104,7 +104,15 @@ public sealed class CourierConductor
     private readonly CourierCalls calls;
     private readonly SemaphoreSlim gate = new(1);
     private volatile bool stop;
+    private volatile bool launchPrepared;
     private volatile bool unloaded;
+    /// <summary>True while a run (or its late calls after a fault or stop) still holds the gate.</summary>
+    internal bool IsBusy => gate.CurrentCount == 0;
+    /// <summary>
+    /// Clears a previous stop before a launch is scheduled, so a Stop arriving while the launch is still
+    /// archiving or starting is honored instead of reset by <see cref="StartAsync"/>.
+    /// </summary>
+    internal void PrepareLaunch() { if (IsBusy) return; stop = false; launchPrepared = true; }
     private Action? releaseOwner;
     internal void Unload(){unloaded=stop=true;}
     internal void DrainUnload()
@@ -337,7 +345,9 @@ public sealed class CourierConductor
         Volatile.Write(ref releaseOwner,ReleaseOwner);
         try
         {
-            stop = false;
+            // A prepared launch already cleared stop; any Stop since then stands.
+            if (!launchPrepared) stop = false;
+            launchPrepared = false;
             if(unloaded)throw new OperationCanceledException("Courier unloaded.");
             var resume = existingRun = r.State is not ("Idle" or "Completed" or "Refused");
             if (!resume)
@@ -631,8 +641,9 @@ public sealed class CourierConductor
                                 await calls.Call("SourceReturnHome", Deadline.DataCenterSeconds, worlds.ReturnHomeAsync);
                             await Switch(t.Destination); await Meet(t.Dropoff);
                         }
-                        await Task.WhenAll(OwnerToDestination(), t.Pickup.SamePlace(t.Dropoff) ? Task.CompletedTask :
-                            Send(r, CourierCommand.Travel, t.Destination, [], t.Dropoff,id:intent.Id)); break;
+                        // An owner leg that faults stops the carrier instead of waiting out its travel deadline.
+                        await await FirstFaultCancelsOther(r, OwnerToDestination(), t.Pickup.SamePlace(t.Dropoff) ? null :
+                            Send(r, CourierCommand.Travel, t.Destination, [], t.Dropoff,id:intent.Id), "SwitchToDestination"); break;
                     case CourierPhase.CarrierToSource:
                     case CourierPhase.CarrierToDestination:
                         // The carrier set out for the pickup in the background (in EnsureSource, or after the previous
@@ -934,6 +945,41 @@ public sealed class CourierConductor
         r.Evidence[^1]=r.Evidence[^1] with {Disposition="NotDelivered"};
         r.OwnerCheckpoint=owner;r.CarrierCheckpoint=receipt.Bags;r.Pending=null;store.Save(r);
     }
+    /// <summary>
+    /// Waits for the first of a paired owner/carrier operation. When it faults, the other side is told to stop
+    /// (carrier Stop for a local fault, local pre-lock cancel for a remote one) and gets a bounded drain. Returns
+    /// the task to await for the outcome: both tasks once drained, otherwise the first fault.
+    /// </summary>
+    private async Task<Task> FirstFaultCancelsOther(CourierJournal r, Task local, Task? remote, string name)
+    {
+        if (remote == null) return local;
+        var both = Task.WhenAll(local, remote);
+        var first = await Task.WhenAny(local, remote);
+        if (!(first.IsFaulted || first.IsCanceled)) return both;
+        if (first == local)
+        {
+            // The carrier cancels its pre-lock on receipt, but replies only after its active step drains,
+            // so the Stop is not awaited here; the bounded drain below covers the counterpart.
+            if (!Carrierless(r))
+                try
+                {
+                    _ = Send(r, CourierCommand.Stop, r.Start, []).ContinueWith(x => warning($"{name} carrier stop: {x.Exception?.GetBaseException().Message}"),
+                        CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                }
+                catch (Exception e) { warning($"{name} carrier stop: {e.Message}"); }
+        }
+        else
+        {
+            try { await calls.Call("LocalCancelPreLock", 10, trade.CancelPreLockAsync); }
+            catch (Exception e) { warning($"{name} local cancel: {e.Message}"); }
+        }
+        if (await Task.WhenAny(both, Task.Delay(TimeSpan.FromSeconds(30))) == both) return both;
+        warning($"{name}DrainDeadline: counterpart still running 30s after the first fault.");
+        // Observed so the abandoned counterpart never raises an unobserved exception.
+        _ = both.ContinueWith(static x => _ = x.Exception, CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        return first;
+    }
     private async Task HandOffAsync(CourierJournal r,RunIntent intent)
     {
         var step=intent.Action;var before=intent.OwnerBefore;
@@ -971,7 +1017,9 @@ public sealed class CourierConductor
             r.Pending=intent;store.Save(r);
         } finally {peer.Progress-=Started;}
         var local = calls.Call("OwnerTrade", Deadline.TradeSeconds(batch), d => send ? trade.SendAsync(r.Settings.Carrier!, batch, d) : trade.ReceiveAsync(r.Settings.Carrier!, batch, d));
-        try { await Task.WhenAll(local, remote); }
+        // A side that faults first cancels its counterpart so neither waits out its full trade deadline.
+        var settled = await FirstFaultCancelsOther(r, local, remote, "HandOff");
+        try { await settled; }
         catch (CourierFault) when (remote.Exception?.GetBaseException() is CourierFault { Outcome: CourierOutcome.Cancelled } && cancellationReceipt != null && local.Exception?.GetBaseException() is CourierFault { Outcome: CourierOutcome.Cancelled })
         {
             var ownerEvidence = new TradeEvidence(before, await Observe());
