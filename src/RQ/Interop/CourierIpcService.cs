@@ -303,14 +303,26 @@ public sealed class CourierIpcService
             if (carrierPeer.CarrierOptIn == false)
                 return Ack("", null, "rejected", "CarrierOptInOff",
                     $"{carrierScope.CharacterName} does not have 'Carry for another character' enabled in Quartermaster.");
+            var live = localBags()?.Character;
+            if (carrierPeer.PairedOwners is { } paired && (live is not { HasStableIdentity: true } || !paired.Any(p => CourierPlanner.Exact(p, live))))
+                return Ack("", null, "rejected", "OwnerNotPaired",
+                    $"{live?.CharacterName ?? "The logged-in character"} is not paired on {carrierScope.CharacterName}.");
             if (carrierPeer.PairedOwners?.Any(p => CourierPlanner.Exact(p, target)) == true)
                 return Ack("", null, "accepted", null, $"{target.CharacterName} is already paired on {carrierScope.CharacterName}.");
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            var result = session.Link.PairOwnerAsync(carrierScope, target, cts.Token).GetAwaiter().GetResult();
-            return result.Outcome == CourierOutcome.Succeeded
-                ? Ack("", null, "accepted", null, $"Paired {target.CharacterName} on {carrierScope.CharacterName}.")
-                : Ack("", null, "rejected", string.IsNullOrEmpty(result.Code) ? "PairFailed" : result.Code,
-                    string.IsNullOrEmpty(result.Detail) ? "Could not pair owner on carrier." : result.Detail);
+            // Never block the IPC callback thread (which may be the framework thread) on a peer round-trip;
+            // callers observe confirmation through GetCourierStatus once the carrier republishes presence.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    var result = await session.Link.PairOwnerAsync(carrierScope, target, cts.Token).ConfigureAwait(false);
+                    if (result.Outcome != CourierOutcome.Succeeded)
+                        warn($"CourierIpcPair {target.CharacterName}: {result.Code}: {result.Detail}");
+                }
+                catch (Exception ex) { warn($"CourierIpcPair {target.CharacterName}: {ex.Message}"); }
+            });
+            return Ack("", null, "accepted", null, $"Pairing {target.CharacterName} on {carrierScope.CharacterName}...");
         }
         catch (Exception e)
         {
