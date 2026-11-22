@@ -276,6 +276,61 @@ public sealed class CourierIpcService
             $"{plan.Trips[0].Pickup.Label} / {plan.Trips[^1].Dropoff.Label}.");
     }
 
+    // ---- PairCourierOwner ---------------------------------------------------------------------
+
+    /// <summary>
+    /// Pairs another character of this client's roster on the configured carrier. The carrier accepts it only
+    /// from a client that already has a paired character, and only while its carrier opt-in is on.
+    /// </summary>
+    public string PairOwner(string json)
+    {
+        CourierTransferCharacter? who;
+        try { who = JsonSerializer.Deserialize<CourierTransferCharacter>(json, JsonOptions); }
+        catch (JsonException e) { return Ack("", null, "rejected", "InvalidRequest", e.Message); }
+        if (who == null || who.LocalContentId == 0 || who.HomeWorldId == 0)
+            return Ack("", null, "rejected", "InvalidRequest", "A character with localContentId and homeWorldId is required.");
+        try
+        {
+            var cfg = settings();
+            if (cfg.Carrier is not { HasStableIdentity: true } carrierScope)
+                return Ack("", null, "rejected", "CarrierNotConfigured", "No carrier is configured on this client.");
+            var named = new OwnerScope { LocalContentId = who.LocalContentId, HomeWorldId = who.HomeWorldId, CharacterName = who.CharacterName, HomeWorldName = who.HomeWorldName };
+            if (cfg.LocalRoster.FirstOrDefault(o => CourierPlanner.Exact(o, named)) is not { } target)
+                return Ack("", null, "rejected", "OutsideClientRoster", $"{who.CharacterName} is not a character of this client's service account.");
+            var carrierPeer = CarrierPeer(cfg);
+            if (carrierPeer == null)
+                return Ack("", null, "rejected", "CarrierUnreachable", $"{carrierScope.CharacterName} is not online on a linked client.");
+            if (carrierPeer.CarrierOptIn == false)
+                return Ack("", null, "rejected", "CarrierOptInOff",
+                    $"{carrierScope.CharacterName} does not have 'Carry for another character' enabled in Quartermaster.");
+            var live = localBags()?.Character;
+            if (carrierPeer.PairedOwners is { } paired && (live is not { HasStableIdentity: true } || !paired.Any(p => CourierPlanner.Exact(p, live))))
+                return Ack("", null, "rejected", "OwnerNotPaired",
+                    $"{live?.CharacterName ?? "The logged-in character"} is not paired on {carrierScope.CharacterName}.");
+            if (carrierPeer.PairedOwners?.Any(p => CourierPlanner.Exact(p, target)) == true)
+                return Ack("", null, "accepted", null, $"{target.CharacterName} is already paired on {carrierScope.CharacterName}.");
+            // Never block the IPC callback thread (which may be the framework thread) on a peer round-trip;
+            // callers observe confirmation through GetCourierStatus once the carrier republishes presence.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    var result = await session.Link.PairOwnerAsync(carrierScope, target, cts.Token).ConfigureAwait(false);
+                    if (result.Outcome != CourierOutcome.Succeeded)
+                        warn($"CourierIpcPair {target.CharacterName}: {result.Code}: {result.Detail}");
+                }
+                catch (Exception ex) { warn($"CourierIpcPair {target.CharacterName}: {ex.Message}"); }
+            });
+            return Ack("", null, "accepted", null, $"Pairing {target.CharacterName} on {carrierScope.CharacterName}...");
+        }
+        catch (Exception e)
+        {
+            warn("CourierIpcPair: " + e);
+            return Ack("", null, "rejected", "PairFailed", e.Message);
+        }
+    }
+
     // ---- StopCourierRun / ResumeCourierRun ----------------------------------------------------
 
     private static Guid? RunOf(string json, out string? error)
