@@ -153,6 +153,12 @@ internal sealed class CourierFault(CourierOutcome outcome, string code, string d
 internal sealed class CourierCalls(Action<string> warning)
 {
     private readonly System.Collections.Concurrent.ConcurrentDictionary<Task, byte> late = new();
+    internal void Track(Task task)
+    {
+        if (task.IsCompleted) return;
+        late.TryAdd(task, 0);
+        _ = task.ContinueWith(t => { _ = t.Exception; late.TryRemove(t, out _); }, TaskScheduler.Default);
+    }
     internal void WhenSettled(Action release)
     {
         var tasks = late.Keys.ToArray();

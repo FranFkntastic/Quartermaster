@@ -970,11 +970,16 @@ public sealed class CourierConductor
         }
         else
         {
+            // Signal CanContinue=false so an in-flight local travel/navigation/switch stops promptly,
+            // and also cancel any pre-lock local trade.
+            stop = true;
             try { await calls.Call("LocalCancelPreLock", 10, trade.CancelPreLockAsync); }
             catch (Exception e) { warning($"{name} local cancel: {e.Message}"); }
         }
         if (await Task.WhenAny(both, Task.Delay(TimeSpan.FromSeconds(30))) == both) return both;
         warning($"{name}DrainDeadline: counterpart still running 30s after the first fault.");
+        // Retain automation lease and gate ownership until any still-running local counterpart settles.
+        if (!local.IsCompleted) calls.Track(local);
         // Observed so the abandoned counterpart never raises an unobserved exception.
         _ = both.ContinueWith(static x => _ = x.Exception, CancellationToken.None,
             TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
