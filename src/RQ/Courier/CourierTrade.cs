@@ -34,6 +34,9 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
     private readonly CourierStore<TradeCheckpoint> store=new(Path.Combine(directory,"courier-trade.json"));
     // Paces UI actions only; every slot and the final batch are still verified against the trade window and bags.
     private static TradeTimingOptions Timing => new(){ActionDelayMilliseconds=80};
+    // A partner window that opens and closes before either side locks moved nothing; retry it a few times.
+    private const int MaxTradeOpenBounces = 3;
+    private static readonly TimeSpan BounceBackoff = TimeSpan.FromSeconds(4);
     private TradeRunner? sender;
     private TradeReceiveOperation? receiver;
     private IDisposable? prompts;
@@ -70,8 +73,18 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
         if(!locked && !io.IsRemoteLocked){sender?.Stop();receiver?.Stop();}
         return Result<bool>.Ok(true);
     });
+    // A step credited nothing when no receive window is armed, no confirmation marker was ever persisted (the
+    // runner saves it before submitting confirmation) and every queued unit is still queued. Whether the step
+    // ended Cancelled, Failed or otherwise, a window that closed in that state moved nothing.
+    private static bool NothingCredited(TradeCheckpoint state) =>
+        state.Arm==null && state.Recovery.AwaitingVerification==null && !state.Recovery.CancellationPending &&
+        state.Items.Sum(i=>(long)i.Quantity)==state.Original.Sum(x=>(long)x.Units);
+    // Derived from the durable record too (when no trade runs here), so a step that ended before PreLockCancelled
+    // covered failures, or whose process died after the window closed, still proves it was never credited.
+    internal static bool NeverCredited(TradeCheckpoint record,Guid step,bool idle)=>
+        record.Step!=step || record.DispatchAuthorized==false || record.PreLockCancelled || idle && NothingCredited(record);
     public Task<Result<bool>> WasNotOpened(Guid step,Deadline d)=>game.Poll<bool>(d,()=>
-        Result<bool>.Ok(!io.IsTradeOpen && store.Load() is {} record && (record.Step!=step || record.DispatchAuthorized==false || record.PreLockCancelled)));
+        Result<bool>.Ok(!io.IsTradeOpen && NeverCredited(store.Load(),step,sender==null && receiver==null && !locked)));
     public Task<Result<bool>> SendAsync(OwnerScope p,ImmutableArray<Shipment> m,Deadline d)=>Execute(p,m,d,false);
     public Task<Result<bool>> ReceiveAsync(OwnerScope p,ImmutableArray<Shipment> m,Deadline d)=>Execute(p,m,d,true);
     private Task<Result<bool>> Execute(OwnerScope p,ImmutableArray<Shipment> manifest,Deadline d,bool receive)
@@ -79,7 +92,18 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
         var started=CourierGame.TradeStarted.Value;
         var step=CourierGame.Step.Value; TradePartner? partner=null;TradeCheckpoint? state=null;
         var allowed=CourierGame.CanContinue.Value;
+        int bounces=0; var retryAt=DateTimeOffset.MinValue;
         return game.Poll<bool>(d,()=>{
+            Result<bool>? StartSender()
+            {
+                sender=new(new Intent(store,state!),Timing,io,this,log);
+                sender.BatchLocking+=(_,_)=>locked=true;
+                sender.BatchVerified+=(_,_)=>locked=false;
+                var start=sender.Start(partner!);
+                if(!start.Success)return End(CourierOutcome.Failed,start.Code??"SenderRejected",start.Message);
+                started?.Invoke();started=null;
+                return null;
+            }
             Result<bool> End(CourierOutcome outcome,string code,string detail)
             {
                 if(outcome==CourierOutcome.Indeterminate && sender is {} sent)
@@ -88,9 +112,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                     game.WatchLate(d.Name,()=>{received.Tick(DateTimeOffset.UtcNow);return received.Evidence!=null;});
                 // Never opened only if no window was credited: a multi-window trade stopped after its first
                 // verified window has moved items, and must settle rather than read as never opened.
-                if(outcome==CourierOutcome.Cancelled && state!=null && !locked && !io.IsRemoteLocked && !io.IsTradeOpen &&
-                    state.Arm==null && state.Recovery.AwaitingVerification==null && !state.Recovery.CancellationPending &&
-                    state.Items.Sum(i=>(long)i.Quantity)==state.Original.Sum(x=>(long)x.Units))
+                if(outcome!=CourierOutcome.Succeeded && state!=null && !locked && !io.IsRemoteLocked && !io.IsTradeOpen && NothingCredited(state))
                 {state.PreLockCancelled=true;store.Save(state);}
                 sender?.Dispose();sender=null;receiver=null;locked=false;
                 if(state?.Recovery.CancellationPending!=true)RestoreTradeAutoConfirm();
@@ -127,13 +149,8 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                     store.Save(state);stopped=locked=false;
                     SuppressTradeAutoConfirm();
                     if(!receive){
-                        sender=new(new Intent(store,state),Timing,io,this,log);
-                        sender.BatchLocking+=(_,_)=>locked=true;
-                        sender.BatchVerified+=(_,_)=>locked=false;
                         state.DispatchAuthorized=true;store.Save(state);
-                        var start=sender.Start(partner);
-                        if(!start.Success)return End(CourierOutcome.Failed,start.Code??"SenderRejected",start.Message);
-                        started?.Invoke();started=null;
+                        if(StartSender() is {} rejected)return rejected;
                     }
                 }
                 OperationResult? result;
@@ -164,9 +181,36 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                         if(state.Items.Any(i=>i.Quantity>0))return End(CourierOutcome.Indeterminate,"PartialReceiveStopped",d.Name);
                     }else if(result.Code=="ClosedBeforeConfirm" && !stopped && DateTimeOffset.UtcNow<d.Expires){state.Arm=null;store.Save(state);receiver=null;return null;}
                 }else{
+                    if(sender==null){
+                        // Backing off after a bounced window; nothing is open and nothing was credited.
+                        if(stopped)return End(lost!=null?CourierOutcome.Indeterminate:CourierOutcome.Cancelled,lost?.Code??"SenderStopped",lost?.Message??d.Name);
+                        if(DateTimeOffset.UtcNow<retryAt)return null;
+                        if(StartSender() is {} rejected)return rejected;
+                    }
                     if(DateTimeOffset.UtcNow>=d.Expires && !stopped){stopped=true;sender!.Stop("Sender deadline "+d.Expires.ToString("O"));}
-                    sender!.Tick(); result=sender.Result;
+                    var phase=sender!.Snapshot.State;
+                    sender.Tick(); result=sender.Result;
                     if(sender.IsActive)return null;
+                    // The partner's window opened and closed again before this side locked anything (e.g. the
+                    // partner was still settling after a login). A fresh runner offers the same unchanged queue.
+                    if(result is {Status:OperationStatus.Failed} bounced && phase is TradeExecutionState.OfferingItems or TradeExecutionState.WaitingForPartner &&
+                        !locked && !io.IsRemoteLocked && !io.IsTradeOpen && NothingCredited(state))
+                    {
+                        var now=DateTimeOffset.UtcNow;
+                        if(bounces<MaxTradeOpenBounces && !stopped && allowed?.Invoke()!=false && now+BounceBackoff<d.Expires)
+                        {
+                            bounces++;
+                            log.Warning($"TradeOpenBounced: {d.Name} step {step} window closed in {phase} before lock ({bounced.Code}: {bounced.Message}); " +
+                                $"retry {bounces}/{MaxTradeOpenBounces} in {BounceBackoff.TotalSeconds:0}s.");
+                            // The finished runner released the auto-confirm suppression; keep it through the backoff.
+                            SuppressTradeAutoConfirm();
+                            sender=null;retryAt=now+BounceBackoff;return null;
+                        }
+                        var reason=bounces>=MaxTradeOpenBounces?$"retries exhausted ({bounces}/{MaxTradeOpenBounces})":
+                            stopped || allowed?.Invoke()==false?"stopped":$"deadline {d.Expires:O} leaves no {BounceBackoff.TotalSeconds:0}s backoff";
+                        log.Warning($"TradeOpenBounced: {d.Name} step {step} window closed in {phase} before lock ({bounced.Code}: {bounced.Message}); {reason}.");
+                        result=new(OperationStatus.Failed,"TradeOpenBounced",$"Trade window closed before lock {bounces+1} time(s); {reason}. Last: {bounced.Message}");
+                    }
                 }
                 if(result?.IsTerminal!=true)return null;
                 if (receive && result.Status==OperationStatus.Cancelled && state.Arm is {} cancelledArm) {

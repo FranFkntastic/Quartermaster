@@ -289,6 +289,21 @@ public sealed class CourierRunTests : IDisposable
         Assert.Null(checkpoint.Arm);Assert.Equal(3-delivered,checkpoint.Items.Single().Quantity);
     }
 
+    // Live 2026-11-22: the carrier's window closed before lock (the owner had just logged in), so its sender ended
+    // Failed rather than Cancelled. The run went indeterminate and every resume was refused TradeMayHaveOpened,
+    // stranding the carrier's custody. Nothing moved, so the step must fence NotDelivered and the run carry on.
+    [Fact]
+    public async Task CarrierSendFailedBeforeLockFencesNotDeliveredAndResumes()
+    {
+        mule.BounceSendRecord = Path.Combine(dir, "carrier-trade.json"); owner.CancelNextReceive = true;
+        var bounced = await engine.StartAsync(Plan(), cfg);
+        Assert.True(bounced is { State: "Interrupted", Code: "CancelledPreLock", CanResume: true }, bounced.State + " " + bounced.Code + ":" + bounced.Detail);
+        Assert.Contains(engine.Journal().Evidence, e => e.Disposition == "NotDelivered");
+        var resumed = await engine.StartAsync(Plan(), cfg);
+        Assert.True(resumed.State == "Completed", resumed.Code + ":" + resumed.Detail);
+        Assert.Equal(7, owner.Deposited); Assert.Equal(10, mule.Units); Assert.Empty(engine.Journal().Custody);
+    }
+
     sealed class AR : IAutoRetainerIpc
     {
         public bool IsAvailable => true; public bool IsBusy => false; public bool IsSuppressed { get; private set; }
@@ -348,7 +363,12 @@ public sealed class CourierRunTests : IDisposable
         public Task<Result<IDisposable>> BeginHold(Guid run,Deadline deadline)=>OK<IDisposable>(new MemoryStream());
         public void CheckHold(){}
         Guid? recoverable, openedStep;
-        public Task<Result<bool>> WasNotOpened(Guid step,Deadline d)=>OK(step!=openedStep);
+        // Set: the next send bounces like a partner window that closed before lock, persisting the real port's
+        // checkpoint shape (dispatched, unchanged queue, no lock or confirmation marker); never-opened is then
+        // proven from that record by the production predicate. The next receive likewise ends cancelled pre-lock.
+        public string? BounceSendRecord; public bool CancelNextReceive; bool bounced;
+        public Task<Result<bool>> WasNotOpened(Guid step,Deadline d)=>OK(BounceSendRecord is {} path
+            ? CourierTrade.NeverCredited(new CourierStore<TradeCheckpoint>(path).Load(),step,true) : step!=openedStep);
         public Task<Result<bool>> Settle(Guid step,OwnerScope partner,TradeEvidence peer,Deadline d){
             if(CheckpointDirectory!=null){
                 var store=ReceiveStore;var record=store.Load();
@@ -358,6 +378,13 @@ public sealed class CourierRunTests : IDisposable
             Task.FromResult(Result<bool>.Fail("NoVerifiedCheckpoint","No matching locked-window proof.")); }
         public Task<Result<bool>> SendAsync(OwnerScope partner, ImmutableArray<Shipment> m, Deadline d) {
             openedStep=CourierGame.Step.Value;CourierGame.TradeStarted.Value?.Invoke();
+            if(BounceSendRecord is {} record && !bounced){
+                bounced=true;
+                new CourierStore<TradeCheckpoint>(record).Save(new(){Step=CourierGame.Step.Value,DispatchAuthorized=true,
+                    Items=[..m.Select(x=>new Franthropy.Dalamud.Automation.Trades.TradeItem{ItemId=x.Item,Quantity=x.Units})],
+                    Original=[..m.Select(x=>new BagStock(x.Item,false,x.Units))]});
+                return Task.FromResult(Result<bool>.Fail("TradeOpenBounced","Window closed before lock."));
+            }
             Sends++; Log.Add($"Send:{who.CharacterName}@{World}");
             if (GilIn(m) > 0) SentGil.Add(GilIn(m));
             if (Partial(m, -1)) return Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate, "TradeClosureUnproven", "Partial gil."));
@@ -368,6 +395,8 @@ public sealed class CourierRunTests : IDisposable
         }
         public Task<Result<bool>> ReceiveAsync(OwnerScope partner, ImmutableArray<Shipment> m, Deadline d) {
             openedStep=CourierGame.Step.Value;CourierGame.TradeStarted.Value?.Invoke();
+            if(CancelNextReceive){CancelNextReceive=false;
+                return Task.FromResult(new Result<bool>(CourierOutcome.Cancelled,"ReceiveStopped","Stopped before lock."));}
             Receives++; Log.Add($"Receive:{who.CharacterName}@{World}");
             if (Partial(m, 1)) return Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate, "TradeClosureUnproven", "Partial gil."));
             if(CheckpointDirectory!=null){
