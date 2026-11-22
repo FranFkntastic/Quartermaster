@@ -283,7 +283,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                     : $"partner {seen.Distance:0.00} away, meeting range {MeetRange:0.0}";
                 if (close || seen.Distance>30 || now()-walkedAt<TimeSpan.FromSeconds(3) || !IdleCharacter()) return null;
                 bool busy;
-                try { busy=Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.Nav.PathfindInProgress"); }
+                try { busy=Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.SimpleMove.PathfindInProgress"); }
                 catch { return null; }
                 if (busy) return null;
                 var path=nav.TryMoveCloseTo(seen.Position,2f);
@@ -345,7 +345,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
             if (objects.FirstOrDefault(o => o.ObjectKind == ObjectKind.Aetheryte && o.BaseId == aetheryte) is not {} live) return null;
             if (Vector3.Distance(at,live.Position) <= PlazaArrivalRange) return Result<bool>.Ok(true);
             if (moving || !IdleCharacter()) return null;
-            if (Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.Nav.PathfindInProgress")) return null;
+            if (Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.SimpleMove.PathfindInProgress")) return null;
             pathMarker.Save();walkTarget=live.Position;
             var path=nav.TryMoveCloseTo(walkTarget,PlazaWalkRange);
             ownsPath=moving=path.Submitted;
@@ -366,7 +366,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         {
             var now=DateTimeOffset.UtcNow;var here=game.Position();bool idle=false;
             if(here!=null && game.IdleCharacter())
-                try { idle=!game.Busy("Lifestream.IsBusy") && (!path || !game.Busy("vnavmesh.Path.IsRunning") && !game.Busy("vnavmesh.Nav.PathfindInProgress")); }
+                try { idle=!game.Busy("Lifestream.IsBusy") && (!path || !game.Busy("vnavmesh.Path.IsRunning") && !game.Busy("vnavmesh.SimpleMove.PathfindInProgress")); }
                 catch { /* Missing IPC is unknown, not idle. */ }
             if(!idle || here!=last){last=here;since=now;return false;}
             if(now-since<TimeSpan.FromSeconds(5))return false;
@@ -504,7 +504,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 var pos=new Vector3(here.X,here.Y,here.Z);
                 if(walkingToShard)
                 {
-                    if(Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.Nav.PathfindInProgress") || !IdleCharacter())return null;
+                    if(Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.SimpleMove.PathfindInProgress") || !IdleCharacter())return null;
                     // Stopped beside the shard: hop on this tick. Stopping short retries the walk after a settled pause.
                     if(!(NearestShard(pos) is {} reached && Vector3.Distance(pos,reached.Position)<=10) && !shardIdle.Ready(this,true))return null;
                     walkingToShard=ownsPath=false;
@@ -530,7 +530,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                         wardOwned=true;hopIdle=new();return null;
                     }
                 }
-                if(Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.Nav.PathfindInProgress"))return null;
+                if(Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.SimpleMove.PathfindInProgress"))return null;
                 // A fresh replay walks the trail in order; only a resumed one continues from the nearest point,
                 // since a trail may pass close to its own start again.
                 var start=following ? Enumerable.Range(0,points.Length).MinBy(i=>Vector3.DistanceSquared(pos,points[i].Position)) : 0;
