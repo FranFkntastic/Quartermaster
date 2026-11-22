@@ -1024,6 +1024,7 @@ public sealed class CourierConductor
         var local = calls.Call("OwnerTrade", Deadline.TradeSeconds(batch), d => send ? trade.SendAsync(r.Settings.Carrier!, batch, d) : trade.ReceiveAsync(r.Settings.Carrier!, batch, d));
         // A side that faults first cancels its counterpart so neither waits out its full trade deadline.
         var settled = await FirstFaultCancelsOther(r, local, remote, "HandOff");
+        var fenced = false;
         try { await settled; }
         catch (CourierFault) when (remote.Exception?.GetBaseException() is CourierFault { Outcome: CourierOutcome.Cancelled } && cancellationReceipt != null && local.Exception?.GetBaseException() is CourierFault { Outcome: CourierOutcome.Cancelled })
         {
@@ -1036,11 +1037,32 @@ public sealed class CourierConductor
             }
             throw;
         }
+        catch (CourierFault) when (remote.Exception?.GetBaseException() is CourierFault { Outcome: not CourierOutcome.Cancelled } carrierFault &&
+            local.Exception?.GetBaseException() is CourierFault { Outcome: CourierOutcome.Cancelled })
+        {
+            // The carrier's trade failed rather than cancelled (e.g. its window closed before lock), and this side
+            // cancelled pre-lock. Its failure receipt is not a settlement: the carrier still holds the step
+            // unconfirmed. Fence it instead, so the carrier re-proves from its own trade record and fresh bags that
+            // nothing moved; any disagreement leaves the step pending for settlement as before.
+            var owner = await Observe();
+            if (!Custody.Matches(new TradeEvidence(before, owner), before.Character, batch, 0) ||
+                cancellationReceipt?.Evidence is { } reported && !Custody.Matches(reported, r.Settings.Carrier!, batch, 0))
+                throw;
+            try { await Fence(r, intent, owner); }
+            catch (Exception e) { warning($"{r.Run}/{id} NotDelivered after carrier {carrierFault.Code}: {e.Message}"); throw; }
+            fenced = true;
+            throw new CourierFault(CourierOutcome.Cancelled, "CancelledPreLock",
+                $"Carrier trade ended {carrierFault.Code} before lock; both clients' bags unchanged: {carrierFault.Message}");
+        }
         finally
         {
-            var e = new HandOff(id, new(before, await Observe()), remote.IsCompletedSuccessfully ? remote.Result.Evidence : cancellationReceipt?.Evidence,
-                local.IsCompletedSuccessfully && remote.IsCompletedSuccessfully,r.Pending==null?"NotDelivered":null);
-            r.Evidence.Add(e); store.Save(r);
+            // A fenced step already journaled its NotDelivered evidence.
+            if (!fenced)
+            {
+                var e = new HandOff(id, new(before, await Observe()), remote.IsCompletedSuccessfully ? remote.Result.Evidence : cancellationReceipt?.Evidence,
+                    local.IsCompletedSuccessfully && remote.IsCompletedSuccessfully,r.Pending==null?"NotDelivered":null);
+                r.Evidence.Add(e); store.Save(r);
+            }
         }
         var proof = r.Evidence[^1];
         if (!Custody.Matches(proof.Owner, before.Character, batch, send ? -1 : 1) ||
