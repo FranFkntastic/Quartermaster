@@ -276,8 +276,8 @@ public sealed class CourierConductor
     internal CourierJournal Journal() => store.Load();
 
     private const string ArchivePattern = "courier-closed-*.json";
-    // Closed journals kept on disk, newest first; the request index outlives them, up to its own bound.
-    private const int ArchivesKept = 200, RequestsKept = 2000;
+    // Closed journals stay on disk; only the request index is bounded.
+    private const int RequestsKept = 2000;
     private string ArchiveFile(Guid run) => Path.Combine(directory, $"courier-closed-{run:N}.json");
     private IEnumerable<string> Archives() => Directory.Exists(directory)
         ? Directory.GetFiles(directory, ArchivePattern).Where(p => Path.GetExtension(p).Equals(".json", StringComparison.OrdinalIgnoreCase))
@@ -308,7 +308,7 @@ public sealed class CourierConductor
     /// </summary>
     internal IReadOnlyList<CourierRequestRecord>? RunsFor(string requestId)
     {
-        if (!history.Wait(TimeSpan.FromSeconds(1))) return null;
+        if (!history.IsCompleted) return null;
         var found = new List<CourierRequestRecord>();
         var current = store.Load();
         if (current.Run != Guid.Empty && current.RequestId == requestId) found.Add(CourierRequestRecord.Of(current, DateTimeOffset.UtcNow));
@@ -364,16 +364,11 @@ public sealed class CourierConductor
             warning($"CourierHistoryQuarantineFailed: {Path.GetFileName(path)} is unreadable ({e.Message}) and could not be moved aside ({move.Message}); it is skipped.");
         }
     }
-    /// <summary>Keeps the newest closed journals and request records within their bounds; true when anything changed.</summary>
+    /// <summary>Forgets closed journals that are gone and keeps the request records within their bound; true when anything changed.</summary>
     private bool Prune(CourierRequestIndex index)
     {
-        var changed = false;
-        var files = Archives().Select(p => new FileInfo(p)).OrderByDescending(f => f.LastWriteTimeUtc).ToArray();
-        foreach (var old in files.Skip(ArchivesKept))
-            try { old.Delete(); changed = true; }
-            catch (Exception e) { warning($"CourierArchivePruneFailed: {old.Name}: {e.Message}"); }
-        var present = files.Take(ArchivesKept).Select(f => f.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        changed |= index.Files.RemoveWhere(name => !present.Contains(name)) > 0;
+        var present = Archives().Select(Path.GetFileName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var changed = index.Files.RemoveWhere(name => !present.Contains(name)) > 0;
         if (index.Runs.Count > RequestsKept)
         {
             index.Runs = [.. index.Runs.OrderByDescending(x => x.At).Take(RequestsKept)];
@@ -1176,7 +1171,14 @@ public sealed class CourierConductor
             {
                 // A claim's ledger entry and its receipt land together: the ledger shows whether it did. One that did not
                 // land is fenced, so the carrier never keeps an unsettled claim intent that would refuse the next claim.
-                if (SameCustody(held, Custody.Apply(r.Custody, claim.Action.Batch, 1))) { r.Custody = held; r.Pending = null; store.Save(r); }
+                if (SameCustody(held, Custody.Apply(r.Custody, claim.Action.Batch, 1)))
+                {
+                    // Adopted as the run loop would have: past the claim, so a failed release below resumes at the hand-in.
+                    r.Custody = held; r.Pending = null;
+                    if (r.Schedule.Skip(r.Cursor).FirstOrDefault() is { Phase: CourierPhase.Claim }) r.Cursor++;
+                    r.CarrierCheckpoint = status.Bags ?? r.CarrierCheckpoint;
+                    store.Save(r);
+                }
                 else if (SameCustody(held, r.Custody)) await Fence(r, claim, await Observe());
                 else
                 {
@@ -1186,24 +1188,33 @@ public sealed class CourierConductor
             }
             if (!r.Custody.IsEmpty)
             {
-                if (!SameCustody(held, r.Custody))
+                // An empty carrier ledger here is an earlier unclaim whose reply was lost: this custody is claim-only,
+                // so nothing else could have emptied it.
+                var receipt = status;
+                if (!held.IsEmpty)
                 {
-                    warning($"{r.Run} ClaimReleaseSkipped: the carrier's ledger differs from the run's custody.");
-                    return false;
-                }
-                var receipt = await Send(r, CourierCommand.Unclaim, r.Start, r.Custody);
-                if (!Held(receipt).IsEmpty)
-                {
-                    warning($"{r.Run} ClaimReleaseLedgerMismatch: the carrier's ledger is not empty after the unclaim.");
-                    return false;
+                    if (!SameCustody(held, r.Custody))
+                    {
+                        warning($"{r.Run} ClaimReleaseSkipped: the carrier's ledger differs from the run's custody.");
+                        return false;
+                    }
+                    receipt = await Send(r, CourierCommand.Unclaim, r.Start, r.Custody);
+                    if (!Held(receipt).IsEmpty)
+                    {
+                        warning($"{r.Run} ClaimReleaseLedgerMismatch: the carrier's ledger is not empty after the unclaim.");
+                        return false;
+                    }
                 }
                 r.Custody = [];
                 r.CarrierCheckpoint = receipt.Bags ?? r.CarrierCheckpoint;
             }
-            // The run resumes from the claim it released.
+            // The run resumes from the released claim's trip: both sides travel to the drop-off again before claiming.
             if (r.Schedule.Skip(r.Cursor).FirstOrDefault() is not { Phase: CourierPhase.Claim })
                 for (var i = Math.Min(r.Cursor, r.Schedule.Length) - 1; i >= 0; i--)
                     if (r.Schedule[i].Phase == CourierPhase.Claim) { r.Cursor = i; break; }
+            if (r.Cursor >= 2 && r.Cursor < r.Schedule.Length && r.Schedule[r.Cursor] is { Phase: CourierPhase.Claim } released &&
+                r.Schedule[r.Cursor - 2] is { Phase: CourierPhase.SwitchToDestination } travel && travel.Trip == released.Trip)
+                r.Cursor -= 2;
             store.Save(r);
             information?.Invoke($"{r.Run} ClaimReleased: the carrier's claimed stock is its own again.");
             return true;
