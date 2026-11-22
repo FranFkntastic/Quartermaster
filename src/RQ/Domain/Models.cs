@@ -274,8 +274,41 @@ public sealed class ListingReserveRule
     public string ItemName { get; set; } = string.Empty;
     public ItemQualityPolicy Quality { get; set; } = ItemQualityPolicy.NqOnly;
     public int ReserveUnits { get; set; }
+    /// <summary>Ranked homes among the owner's own retainers (and Any space). Never names another character's retainer.</summary>
     public StowageRoutingPolicy Location { get; set; } = new();
+    /// <summary>
+    /// Ranked homes on one other character of this service account, filled after <see cref="Location"/>:
+    /// units the owner's homes do not take are carried there by the courier. Absent (null) when the item
+    /// has none, which is how every rule written before remote homes reads.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ReserveRemoteHomes? RemoteHomes { get; set; }
     public bool Enabled { get; set; } = true;
+
+    /// <summary>Whether the rule names any home, here or on another character.</summary>
+    [JsonIgnore]
+    public bool HasAnyHome => Location.AnySpace || Location.PreferredRetainerIds.Count > 0 || RemoteHomes is { RetainerIds.Count: > 0 };
+}
+
+/// <summary>A reserve item's ranked home retainers on another character than the plan owner.</summary>
+public sealed class ReserveRemoteHomes
+{
+    public OwnerScope Character { get; set; } = new();
+    public List<ulong> RetainerIds { get; set; } = [];
+
+    public ReserveRemoteHomes Copy() => new() { Character = Character with { }, RetainerIds = RetainerIds.Distinct().ToList() };
+
+    public static ReserveRemoteHomes? CopyOf(ReserveRemoteHomes? source) =>
+        source is { RetainerIds.Count: > 0 } ? source.Copy() : null;
+
+    public static bool Same(ReserveRemoteHomes? left, ReserveRemoteHomes? right)
+    {
+        var a = left is { RetainerIds.Count: > 0 } ? left : null;
+        var b = right is { RetainerIds.Count: > 0 } ? right : null;
+        if (a is null || b is null)
+            return a is null && b is null;
+        return a.Character.Matches(b.Character) && a.RetainerIds.SequenceEqual(b.RetainerIds);
+    }
 }
 
 public sealed class ListingPlanAssignment

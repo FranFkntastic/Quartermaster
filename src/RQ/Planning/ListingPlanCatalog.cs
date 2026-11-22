@@ -224,6 +224,9 @@ public static class ListingPlanCatalog
                 issues.Add(new(reserve.Id, nameof(reserve.ReserveUnits), $"Reserve must be between 0 and {ListingReserveRule.MaxReserveUnits:N0} units."));
             if (reserve.Location is null || reserve.Location.PreferredRetainerIds.Any(id => !ownerRetainerIds.Contains(id)))
                 issues.Add(new(reserve.Id, nameof(reserve.Location), "Reserve location must name retainers owned by this character."));
+            if (reserve.RemoteHomes is { RetainerIds.Count: > 0 } remote &&
+                (!remote.Character.HasStableIdentity || remote.RetainerIds.Any(ownerRetainerIds.Contains)))
+                issues.Add(new(reserve.Id, nameof(reserve.RemoteHomes), "Remote homes must name another character's retainers."));
         }
         foreach (var duplicate in enabled.GroupBy(reserve => (reserve.ItemId, reserve.Quality)).Where(group => group.Count() > 1))
         {
@@ -324,6 +327,7 @@ public static class ListingPlanCatalog
         Quality = source.Quality,
         ReserveUnits = source.ReserveUnits,
         Location = CopyLocation(source.Location),
+        RemoteHomes = ReserveRemoteHomes.CopyOf(source.RemoteHomes),
         Enabled = source.Enabled,
     };
 
@@ -332,7 +336,8 @@ public static class ListingPlanCatalog
     public static bool ReserveEquals(ListingReserveRule left, ListingReserveRule right) =>
         left.Id == right.Id && left.ItemId == right.ItemId && left.ItemName == right.ItemName &&
         left.Quality == right.Quality && left.ReserveUnits == right.ReserveUnits &&
-        LocationComparer.Instance.Equals(left.Location, right.Location) && left.Enabled == right.Enabled;
+        LocationComparer.Instance.Equals(left.Location, right.Location) &&
+        ReserveRemoteHomes.Same(left.RemoteHomes, right.RemoteHomes) && left.Enabled == right.Enabled;
 
     private static IReadOnlyList<ListingPlanAssignment> MergeAssignments(
         IReadOnlyList<ListingPlanAssignment> baseline,
@@ -416,6 +421,8 @@ public static class ListingPlanCatalog
         result.Quality = Merge(original.Quality, edited.Quality, canonical.Quality, id, nameof(result.Quality), conflicts);
         result.ReserveUnits = Merge(original.ReserveUnits, edited.ReserveUnits, canonical.ReserveUnits, id, nameof(result.ReserveUnits), conflicts);
         result.Location = CopyLocation(Merge(original.Location, edited.Location, canonical.Location, id, nameof(result.Location), conflicts, LocationComparer.Instance));
+        result.RemoteHomes = ReserveRemoteHomes.CopyOf(Merge(original.RemoteHomes, edited.RemoteHomes, canonical.RemoteHomes, id,
+            nameof(result.RemoteHomes), conflicts, RemoteHomesComparer.Instance));
         result.Enabled = Merge(original.Enabled, edited.Enabled, canonical.Enabled, id, nameof(result.Enabled), conflicts);
         return result;
     }
@@ -474,5 +481,14 @@ public static class ListingPlanCatalog
             (left is not null && left.SameAs(right));
 
         public int GetHashCode(StowageRoutingPolicy value) => HashCode.Combine(value.AnySpace, value.PreferredRetainerIds.Count);
+    }
+
+    private sealed class RemoteHomesComparer : IEqualityComparer<ReserveRemoteHomes?>
+    {
+        public static readonly RemoteHomesComparer Instance = new();
+
+        public bool Equals(ReserveRemoteHomes? left, ReserveRemoteHomes? right) => ReserveRemoteHomes.Same(left, right);
+
+        public int GetHashCode(ReserveRemoteHomes? value) => value?.RetainerIds.Count ?? 0;
     }
 }

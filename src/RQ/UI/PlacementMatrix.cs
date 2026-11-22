@@ -150,6 +150,7 @@ internal sealed class PlacementMatrix<TKey>
     private TKey? anchor;
     private bool hasAnchor;
     private ulong target = PlacementEdits.AnySpace;
+    private bool showAnySpace = true;
     private readonly DalamudSelectionBar selectionBar;
 
     // Set by Draw each frame; bridge actions registered this frame use it too.
@@ -194,13 +195,16 @@ internal sealed class PlacementMatrix<TKey>
     /// <param name="visibleRows">Rows that pass the surface's filter, in display order.</param>
     /// <param name="columns">The shown character's retainers in display order; Any space follows them.</param>
     /// <param name="apply">Applies changed destinations through the surface's edit path; returns false when refused.</param>
+    /// <param name="anySpace">Whether the shown character offers Any space; without it the column and target are omitted.</param>
     public void Draw(
         IReadOnlyList<PlacementMatrixRow<TKey>> allRows,
         IReadOnlyList<PlacementMatrixRow<TKey>> visibleRows,
         IReadOnlyList<PlacementMatrixColumn> columns,
-        Func<IReadOnlyList<(TKey Key, StowageRoutingPolicy Routing)>, bool> apply)
+        Func<IReadOnlyList<(TKey Key, StowageRoutingPolicy Routing)>, bool> apply,
+        bool anySpace = true)
     {
         applyRouting = apply;
+        showAnySpace = anySpace;
         DrawCore(allRows, visibleRows, columns);
     }
 
@@ -216,6 +220,8 @@ internal sealed class PlacementMatrix<TKey>
         selected.RemoveWhere(key => !keys.Contains(key));
         if (target != PlacementEdits.AnySpace && columns.All(column => column.RetainerId != target))
             target = PlacementEdits.AnySpace;
+        if (!showAnySpace && target == PlacementEdits.AnySpace && columns.Count > 0)
+            target = columns[0].RetainerId;
         if (selected.Count > 0 && ImGui.IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows) &&
             !ImGui.GetIO().WantTextInput && ImGui.IsKeyPressed(ImGuiKey.Escape))
             ClearSelection();
@@ -252,7 +258,8 @@ internal sealed class PlacementMatrix<TKey>
 
         DrawTargetCombo(columns);
 
-        DrawRankedActions(allRows, hasSelection, TargetName(columns, target));
+        // Without Any space and without columns there is nothing to target.
+        DrawRankedActions(allRows, hasSelection && (showAnySpace || target != PlacementEdits.AnySpace), TargetName(columns, target));
 
         const string clearLabel = "Clear row selection";
         DalamudUiLayout.SameLineRight(DalamudUiLayout.ButtonWidth(clearLabel));
@@ -359,12 +366,12 @@ internal sealed class PlacementMatrix<TKey>
             foreach (var column in columns)
                 if (ImGui.Selectable($"{column.Name}##target-{column.RetainerId}", column.RetainerId == target))
                     target = column.RetainerId;
-            if (ImGui.Selectable($"{TransferPresentation.AnySpaceLabel}##target-any", target == PlacementEdits.AnySpace))
+            if (showAnySpace && ImGui.Selectable($"{TransferPresentation.AnySpaceLabel}##target-any", target == PlacementEdits.AnySpace))
                 target = PlacementEdits.AnySpace;
             ImGui.EndCombo();
         }
 
-        var names = columns.Select(column => column.Name).Append(TransferPresentation.AnySpaceLabel);
+        var names = showAnySpace ? columns.Select(column => column.Name).Append(TransferPresentation.AnySpaceLabel) : columns.Select(column => column.Name);
         registry.Register(
             $"{surfaceId}.target",
             "Choose the destination the selection-bar actions target",
@@ -381,7 +388,7 @@ internal sealed class PlacementMatrix<TKey>
             arguments =>
             {
                 var requested = arguments!.Value.GetProperty("target").GetString()?.Trim() ?? string.Empty;
-                if (string.Equals(requested, TransferPresentation.AnySpaceLabel, StringComparison.OrdinalIgnoreCase))
+                if (showAnySpace && string.Equals(requested, TransferPresentation.AnySpaceLabel, StringComparison.OrdinalIgnoreCase))
                 {
                     target = PlacementEdits.AnySpace;
                     return AgentBridgeUiActionResult.Ok("Selection-bar actions now target Any space.");
@@ -405,8 +412,8 @@ internal sealed class PlacementMatrix<TKey>
     /// <summary>Item, quantity, then the optional From column.</summary>
     private int FrozenColumns => fromHeader is null ? 2 : 3;
 
-    /// <summary>Retainer columns, then Any space.</summary>
-    private static int CellColumns(IReadOnlyList<PlacementMatrixColumn> columns) => columns.Count + 1;
+    /// <summary>Retainer columns, then Any space when the shown character offers it.</summary>
+    private int CellColumns(IReadOnlyList<PlacementMatrixColumn> columns) => columns.Count + (showAnySpace ? 1 : 0);
 
     private unsafe void DrawTable(
         IReadOnlyList<PlacementMatrixRow<TKey>> rows,
@@ -421,7 +428,7 @@ internal sealed class PlacementMatrix<TKey>
         var fromWidth = hasFrom ? (wide ? 200f : 150f) * scale : 0f;
         var cellWidth = (wide ? 64f : 50f) * scale;
         var lineHeight = ImGui.GetTextLineHeight();
-        var headers = columns.Select(column => column.Name).Append(TransferPresentation.AnySpaceLabel);
+        var headers = showAnySpace ? columns.Select(column => column.Name).Append(TransferPresentation.AnySpaceLabel) : columns.Select(column => column.Name);
         var longest = headers.Select(name => ImGui.CalcTextSize(name).X).DefaultIfEmpty(0f).Max();
         var headerHeight = Math.Clamp((longest * MathF.Sin(HeaderAngle)) + lineHeight + (8f * scale), 3f * lineHeight, 140f * scale);
         var spacerWidth = Math.Clamp(longest * MathF.Cos(HeaderAngle), 40f * scale, 140f * scale);
@@ -441,7 +448,8 @@ internal sealed class PlacementMatrix<TKey>
                 ImGui.TableSetupColumn(fromHeader, ImGuiTableColumnFlags.WidthFixed, fromWidth);
             foreach (var column in columns)
                 ImGui.TableSetupColumn($"##retainer-{column.RetainerId}", ImGuiTableColumnFlags.WidthFixed, cellWidth);
-            ImGui.TableSetupColumn("##any", ImGuiTableColumnFlags.WidthFixed, cellWidth);
+            if (showAnySpace)
+                ImGui.TableSetupColumn("##any", ImGuiTableColumnFlags.WidthFixed, cellWidth);
             ImGui.TableSetupColumn("##spacer", ImGuiTableColumnFlags.WidthFixed, spacerWidth);
 
             DrawNameHeader(columns, headerHeight, nameWidth + quantityWidth + fromWidth, lineHeight);
@@ -530,6 +538,8 @@ internal sealed class PlacementMatrix<TKey>
             var free = columns[index].FreeSlots;
             DalamudUiLayout.DrawRightAligned(free?.ToString("N0") ?? "—", free == 0 ? AmberColor : disabled);
         }
+        if (!showAnySpace)
+            return;
         ImGui.TableSetColumnIndex(FrozenColumns + columns.Count);
         DrawAnySeparator(rowTop, ImGui.GetTextLineHeight() + (style.CellPadding.Y * 2f));
         DalamudUiLayout.DrawRightAligned(columns.Sum(column => column.FreeSlots ?? 0).ToString("N0"), disabled);

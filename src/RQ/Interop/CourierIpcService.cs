@@ -19,6 +19,7 @@ public sealed class CourierIpcService
 {
     public const string StatusSchema = "gooseworks-quartermaster-courier-status/v1";
     public const string TransferSchema = "gooseworks-quartermaster-courier-transfer/v1";
+    public const string TransferToRetainerCapability = "courierTransferToRetainer.v1";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly string providerInstanceId;
@@ -30,14 +31,19 @@ public sealed class CourierIpcService
     private readonly Func<uint, string> worldName;
     private readonly Func<uint, ItemMetadata> metadata;
     private readonly Action<string> warn;
+    private readonly Func<IReadOnlyList<CourierLocation>>? locations;
+    private readonly Func<ulong, string?>? retainerName;
     private readonly object gate = new();
     private (string RequestId, Guid Run, string Hash)? launched;
 
     /// <param name="localBags">The logged-in character's latest bags, observed on the framework thread.</param>
     public CourierIpcService(string providerInstanceId, CourierSession session, Func<CourierSettings> settings,
         Func<InventoryView?> localBags, Func<MeetingBell?> bridge, Func<uint, uint> worldRegion, Func<uint, string> worldName,
-        Func<uint, ItemMetadata> metadata, Action<string> warn)
+        Func<uint, ItemMetadata> metadata, Action<string> warn, Func<IReadOnlyList<CourierLocation>>? locations = null,
+        Func<ulong, string?>? retainerName = null)
     {
+        this.locations = locations;
+        this.retainerName = retainerName;
         this.providerInstanceId = providerInstanceId;
         this.session = session;
         this.settings = settings;
@@ -232,8 +238,13 @@ public sealed class CourierIpcService
             .Append('|').Append(N((long)(request.Destination?.LocalContentId ?? 0))).Append('|').Append(N(request.Destination?.HomeWorldId ?? 0))
             .Append('|').Append(N(request.GilAmount))
             .Append('|').Append(request.ReturnOwner ? '1' : '0').Append(request.ReturnDestinationHome ? '1' : '0').Append(request.ReturnCarrier ? '1' : '0');
-        foreach (var item in (request.Items ?? []).GroupBy(i => (i.ItemId, i.IsHq)).OrderBy(g => g.Key.ItemId).ThenBy(g => g.Key.IsHq))
+        foreach (var item in (request.Items ?? []).GroupBy(i => (i.ItemId, i.IsHq, i.RetainerId)).OrderBy(g => g.Key.ItemId).ThenBy(g => g.Key.IsHq).ThenBy(g => g.Key.RetainerId))
+        {
             canonical.Append('|').Append(N(item.Key.ItemId)).Append('|').Append(item.Key.IsHq ? '1' : '0').Append('|').Append(N(item.Sum(i => (long)i.Quantity)));
+            // Absent before retainer targets existed: a request without them hashes exactly as it always did.
+            if (item.Key.RetainerId is { } retainer)
+                canonical.Append("|r").Append(retainer.ToString(CultureInfo.InvariantCulture));
+        }
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical.ToString()))).ToLowerInvariant();
     }
 
@@ -308,9 +319,11 @@ public sealed class CourierIpcService
             return Ack(requestId, null, "rejected", "OwnerNotPaired",
                 $"{initiator.CharacterName} is not paired as an owner on {cfg.Carrier!.CharacterName}'s Quartermaster Courier settings.");
         var order = new CourierTransferOrder(source, destination, request.GilAmount,
-            [.. (request.Items ?? []).Select(i => new CourierTransferItem(i.ItemId, i.ItemName, i.IsHq, i.Quantity))],
+            [.. (request.Items ?? []).Select(i => new CourierTransferItem(i.ItemId, i.ItemName, i.IsHq, i.Quantity, i.RetainerId))],
             request.ReturnDestinationHome, requestId);
-        var (plan, refusal) = CourierTransferPlanner.Build(order, cfg, carrierPeer?.Bags, live, metadata, worldRegion, bridge());
+        var named = order.Items.Any(i => i.RetainerId != null);
+        var (plan, refusal) = CourierTransferPlanner.Build(order, cfg, carrierPeer?.Bags, live, metadata, worldRegion, bridge(),
+            named ? locations?.Invoke() : null, retainerName);
         if (refusal != null || plan == null)
             return Ack(requestId, null, "rejected", refusal?.Code ?? "PlanningFailed", refusal?.Message ?? "No plan.");
         plan = plan with { RequestHash = hash };

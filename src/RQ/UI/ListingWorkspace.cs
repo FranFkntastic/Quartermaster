@@ -278,7 +278,13 @@ internal sealed class ListingWorkspace
                 $"{item.ItemName} {TransferPresentation.QualityLabel(item.Quality, anyLabel: "NQ")}",
                 MarketRunPresentation.Number(item.SpareUnits),
                 reserve?.Location ?? new StowageRoutingPolicy(),
-                PlacementMatrixData.Holdings(runtime, item.ItemId, item.Quality));
+                PlacementMatrixData.Holdings(runtime, item.ItemId, item.Quality))
+            {
+                // Homed only on another character: it goes there, not nowhere.
+                Elsewhere = reserve is { Location.AnySpace: false, Location.PreferredRetainerIds.Count: 0, RemoteHomes.RetainerIds.Count: > 0 }
+                    ? PlacementEditorWindow.RemoteSummary(runtime, reserve.RemoteHomes)
+                    : null,
+            };
         }).ToArray();
         var visible = rows.Where(row => string.IsNullOrWhiteSpace(search) ||
             row.Label.Contains(search.Trim(), StringComparison.OrdinalIgnoreCase)).ToArray();
