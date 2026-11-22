@@ -865,11 +865,14 @@ public sealed class CourierSession
         a.OrderBy(row => (row.Item, row.Quality, row.Holder)).SequenceEqual(b.OrderBy(row => (row.Item, row.Quality, row.Holder)));
 
     /// <summary>Resumes an interrupted run from its journal; the journal owns the plan and settings.</summary>
-    internal void Resume()
+    /// <returns>Whether a resume was launched (false when active, busy draining, or not resumable).</returns>
+    internal bool Resume()
     {
-        if (Conductor is not { } conductor || IsActive || Run?.CanResume!=true)
-            return;
+        Poll(force: true);
+        if (Conductor is not { } conductor || IsActive || conductor.IsBusy || Run?.CanResume!=true)
+            return false;
         Launch(async () => await conductor.StartAsync(new(Guid.Empty, 0, [], []), new()).ConfigureAwait(false));
+        return true;
     }
 
     /// <summary>
@@ -897,6 +900,7 @@ public sealed class CourierSession
         Error = null;
         ErrorDetail = null;
         var carrier = CarrierName();
+        Conductor?.PrepareLaunch();
         starting = Task.Run(async () =>
         {
             try

@@ -232,7 +232,12 @@ public sealed class CourierIpcService
             return Ack(requestId, pending.Run, "already_running", null, "This request's run is starting.");
         if (session.IsActive)
             return Ack(requestId, journal.Run, "rejected", "CourierAlreadyRunning", "Another courier run is active.");
-        if (journal.State is "Failed" or "Interrupted" or "Indeterminate")
+        if (conductor.IsBusy)
+            return Ack(requestId, journal.Run, "stopping", null, "Previous run is still finishing cleanup; retry shortly.");
+        // An unresolved previous run blocks only while it holds custody or an unverified trade; a zero-custody
+        // one is archived by the new run below, so starting again acknowledges it.
+        var unresolved = journal.Run != Guid.Empty && journal.State is "Failed" or "Interrupted" or "Indeterminate";
+        if (unresolved && (!journal.Custody.IsEmpty || !conductor.Snapshot().CanClear))
             return Ack(requestId, journal.Run, "rejected", "CourierRunUnresolved", $"The previous run is {journal.State} ({journal.Code}); resume or clear it first.");
 
         var cfg = settings();
@@ -262,8 +267,8 @@ public sealed class CourierIpcService
         var (plan, refusal) = CourierTransferPlanner.Build(order, cfg, carrierPeer?.Bags, live, metadata, worldRegion, bridge());
         if (refusal != null || plan == null)
             return Ack(requestId, null, "rejected", refusal?.Code ?? "PlanningFailed", refusal?.Message ?? "No plan.");
-        // A clean, finished previous run is archived first; an unresolved one was refused above.
-        Guid? clear = journal.Run != Guid.Empty && journal.State is "Completed" or "Refused" && journal.Custody.IsEmpty ? journal.Run : null;
+        // A finished or zero-custody unresolved previous run is archived first; one holding custody was refused above.
+        Guid? clear = journal.Run != Guid.Empty && (journal.State is "Completed" or "Refused" || unresolved) && journal.Custody.IsEmpty ? journal.Run : null;
         var run = Guid.NewGuid();
         var runSettings = cfg with { ReturnOwner = request.ReturnOwner, ReturnCarrier = request.ReturnCarrier };
         if (!session.StartPlan(plan, runSettings, clear, run))
@@ -379,9 +384,14 @@ public sealed class CourierIpcService
             return Ack("", journal.Run, "rejected", "RunMismatch", "That run is not the current courier run.");
         if (session.IsActive)
             return Ack(journal.RequestId ?? "", journal.Run, "rejected", "CourierAlreadyRunning", "The run is already active.");
+        if (conductor.IsBusy)
+            return Ack(journal.RequestId ?? "", journal.Run, "stopping", null, "Previous run is still finishing cleanup; retry shortly.");
         if (!conductor.Snapshot().CanResume)
             return Ack(journal.RequestId ?? "", journal.Run, "rejected", "RunNotResumable", $"The run is {journal.State} ({journal.Code}) and cannot resume.");
-        session.Resume();
+        if (!session.Resume())
+            return session.IsActive
+                ? Ack(journal.RequestId ?? "", journal.Run, "rejected", "CourierAlreadyRunning", "The run is already active.")
+                : Ack(journal.RequestId ?? "", journal.Run, "rejected", "RunNotResumable", $"The run is {journal.State} ({journal.Code}) and cannot resume.");
         return Ack(journal.RequestId ?? "", journal.Run, "accepted", null, "Resuming from the journal.");
     }
 }

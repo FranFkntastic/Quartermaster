@@ -43,7 +43,7 @@ public sealed record Deadline(string Name, DateTimeOffset Expires)
         var stacks = manifest.Count(s => !s.IsGil);
         var gil = manifest.Where(s => s.IsGil).Sum(s => (long)s.Units);
         var windows = (gil + Franthropy.Dalamud.Automation.Trades.TradePlanner.MaximumGilPerTrade - 1) / Franthropy.Dalamud.Automation.Trades.TradePlanner.MaximumGilPerTrade;
-        return (int)Math.Clamp(stacks * 30L + windows * 40L, 180, 1200);
+        return (int)Math.Clamp(stacks * 30L + windows * 40L, 180, 3600);
     }
     public static Deadline After(string name, int seconds) => new(name, DateTimeOffset.UtcNow.AddSeconds(seconds));
 }
@@ -153,6 +153,12 @@ internal sealed class CourierFault(CourierOutcome outcome, string code, string d
 internal sealed class CourierCalls(Action<string> warning)
 {
     private readonly System.Collections.Concurrent.ConcurrentDictionary<Task, byte> late = new();
+    internal void Track(Task task)
+    {
+        if (task.IsCompleted) return;
+        late.TryAdd(task, 0);
+        _ = task.ContinueWith(t => { _ = t.Exception; late.TryRemove(t, out _); }, TaskScheduler.Default);
+    }
     internal void WhenSettled(Action release)
     {
         var tasks = late.Keys.ToArray();
