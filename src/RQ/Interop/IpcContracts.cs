@@ -16,6 +16,61 @@ public static class IpcChannels
     public const string StopCourierRun = "Quartermaster.v1.StopCourierRun";
     public const string ResumeCourierRun = "Quartermaster.v1.ResumeCourierRun";
     public const string PairCourierOwner = "Quartermaster.v1.PairCourierOwner";
+    public const string GetStockSources = "Quartermaster.v1.GetStockSources";
+    public const string GetReserveItems = "Quartermaster.v1.GetReserveItems";
+    public const string SetItemHome = "Quartermaster.v1.SetItemHome";
+    public const string SetReserveLevel = "Quartermaster.v1.SetReserveLevel";
+}
+
+/// <summary><c>gooseworks-quartermaster-stock-sources-request/v1</c>: which items to count per source.</summary>
+public sealed record StockSourcesRequest
+{
+    public string Schema { get; init; } = string.Empty;
+    public IReadOnlyList<uint>? ItemIds { get; init; }
+}
+
+/// <summary>
+/// <c>gooseworks-quartermaster-item-home/v1</c>: the retainers an item's spare stock lives in. An empty
+/// list means it stays in the bags. Quality is <c>NqOnly</c> or <c>HqOnly</c>.
+/// </summary>
+public sealed record ItemHomeRequest
+{
+    public string Schema { get; init; } = string.Empty;
+    public string ProviderInstanceId { get; init; } = string.Empty;
+    public string RequestId { get; init; } = string.Empty;
+    public RequestOwner? Owner { get; init; }
+    public uint ItemId { get; init; }
+    public string ItemName { get; init; } = string.Empty;
+    public string Quality { get; init; } = string.Empty;
+    public IReadOnlyList<ulong>? RetainerIds { get; init; }
+}
+
+/// <summary><c>gooseworks-quartermaster-reserve-level/v1</c>: how many spare units of an item to keep.</summary>
+public sealed record ReserveLevelRequest
+{
+    public string Schema { get; init; } = string.Empty;
+    public string ProviderInstanceId { get; init; } = string.Empty;
+    public string RequestId { get; init; } = string.Empty;
+    public RequestOwner? Owner { get; init; }
+    public uint ItemId { get; init; }
+    public string ItemName { get; init; } = string.Empty;
+    public string Quality { get; init; } = string.Empty;
+    public int ReserveUnits { get; init; }
+}
+
+/// <summary>
+/// <c>gooseworks-quartermaster-reserve-edit-ack/v1</c>. Status: queued (applied on the next framework
+/// tick, then announced through Changed) or rejected (ErrorCode names why).
+/// </summary>
+public sealed record ReserveEditAcknowledgement
+{
+    public string Schema { get; init; } = "gooseworks-quartermaster-reserve-edit-ack/v1";
+    public string ProviderInstanceId { get; init; } = string.Empty;
+    public string RequestId { get; init; } = string.Empty;
+    public string Status { get; init; } = string.Empty;
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ErrorCode { get; init; }
+    public string Message { get; init; } = string.Empty;
 }
 
 /// <summary>A roster character named by an external courier request.</summary>

@@ -365,6 +365,8 @@ public sealed class Plugin : IDalamudPlugin
             courierWorldRegion,
             worldId => dataManager.GetExcelSheet<Lumina.Excel.Sheets.World>()?.GetRowOrDefault(worldId)?.Name.ToString() ?? "",
             scanner.ResolveItemMetadata, s => log.Warning(s)));
+        ipc.AttachWorkbench(new Interop.WorkbenchStockService(providerInstanceId, () => runtimeSnapshots.Current, playerInventory,
+            () => externalAccountStock.Current, state, workQueue, s => log.Warning(s)));
         var marketHistory = new MarketRunHistoryWindow(marketRunStore.History, CurrentOwner, window.DrawTimings)
         {
             Size = new System.Numerics.Vector2(780, 650),

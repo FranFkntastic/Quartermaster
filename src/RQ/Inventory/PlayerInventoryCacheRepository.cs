@@ -49,6 +49,13 @@ public sealed class PlayerInventoryCacheRepository : IDisposable
             return cache.Values.Select(entry => entry.Owner).ToArray();
     }
 
+    /// <summary>Reads every cached character under the cache lock; <paramref name="read"/> must not keep references.</summary>
+    public T Read<T>(Func<IReadOnlyCollection<CachedPlayerInventory>, T> read)
+    {
+        lock (gate)
+            return read(cache.Values);
+    }
+
     public PlayerStorageCapture Snapshot(OwnerScope owner, IReadOnlyList<string> requestedSources)
     {
         lock (gate)
