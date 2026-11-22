@@ -374,7 +374,13 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         }
     }
     private bool Busy(string gate)=>pi.GetIpcSubscriber<bool>(gate).InvokeFunc();
-    private bool IdleCharacter()=>CharacterSwitchPolicy.GetRefusal(CharacterSwitchGameState.Observe(client,objects,conditions,false,null))==null;
+    private bool IdleCharacter()
+    {
+        var state = CharacterSwitchGameState.Observe(client, objects, conditions, false, null);
+        // Movement and rendezvous run on visiting data centers too (e.g. Ravana cross-region bridge);
+        // only character-switch checks (IdleReasonAsync) require being on the home data center.
+        return CharacterSwitchPolicy.GetRefusal(state with { CurrentDataCenterId = state.HomeDataCenterId }) == null;
+    }
     private async Task<Result<bool>> Navigate(CourierPosition p, MeetingBell? bell, Deadline d)
     {
         var teleportMarker=Marker("Teleport",Step.Value);var pathMarker=Marker("Approach",Step.Value);
