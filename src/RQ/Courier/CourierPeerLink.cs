@@ -8,11 +8,12 @@ namespace RQ.Courier;
 
 internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposable
 {
-    private sealed record Wire(string Kind, Guid Run, Guid Step, CourierMessage? Command = null, Deadline? Limit = null);
+    private sealed record Wire(string Kind, Guid Run, Guid Step, CourierMessage? Command = null, Deadline? Limit = null, OwnerScope? Owner = null);
     private sealed record Reply(Result<CourierReceipt>? Result,CourierProgress? Progress);
     private sealed record Job(CourierMessage Message, string Fingerprint, Task<Result<CourierReceipt>> Task, DateTimeOffset Expires);
     private readonly Task<PeerEndpoint> endpoint;
     private readonly Func<CourierSettings> settings;
+    private readonly Func<Func<CourierSettings, CourierSettings>, bool> updateSettings;
     private readonly CourierGame game;
     private readonly CourierFollower follower;
     private readonly Action<string> warn;
@@ -43,9 +44,10 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     public event Action<CourierProgress>? Progress;
     public event Action? LinkLost;
     public event Action<Guid>? StopRequested;
-    internal CourierPeerLink(CourierGame game,CourierFollower follower,Func<Action,CancellationToken,Task> dispatch,Action<string> warn,Func<CourierSettings> settings)
+    internal CourierPeerLink(CourierGame game,CourierFollower follower,Func<Action,CancellationToken,Task> dispatch,Action<string> warn,Func<CourierSettings> settings,
+        Func<Func<CourierSettings, CourierSettings>, bool> updateSettings)
     {
-        this.settings=settings;this.game=game; this.follower=follower; this.warn=warn;
+        this.settings=settings;this.updateSettings=updateSettings;this.game=game; this.follower=follower; this.warn=warn;
         endpoint=PeerEndpoint.StartAsync(new("Quartermaster.Courier.v2",dispatch,Handle,warn),JsonSerializer.SerializeToElement<CourierPeer?>(null));
         follower.StopRequested+=NotifyStop;
     }
@@ -99,6 +101,7 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
         var sender=envelope.SenderInstanceId;
         if(w.Kind=="stop" && carriers.TryGetValue(w.Run,out var carrier) && carrier==sender)
         { StopRequested?.Invoke(w.Run);return Delivered(null); }
+        if(w.Kind=="pair") return Pair(sender,w.Owner);
         var key=(sender,w.Step);
         if(w.Kind=="query")
             return jobs.TryGetValue(key,out var j) && j.Message.Run==w.Run ? Delivered(j.Task.IsCompletedSuccessfully?j.Task.Result:
@@ -124,6 +127,43 @@ j.Task.IsFaulted?Result<CourierReceipt>.Fail("CarrierStepFault",j.Task.Exception
             return result;
         }),d.Expires.AddSeconds(30)));
         return job.Fingerprint==hash ? Delivered(null):new PeerResult.Refused("StepCollision","Step payload differs.");
+    }
+    // An owner client already paired here may pair another character of its own advertised roster. An unpaired
+    // client can never authorize itself, and only a carrier that has opted in accepts any pairing.
+    private PeerResult Pair(Guid sender,OwnerScope? owner)
+    {
+        if(owner is not { HasStableIdentity: true } requested)
+            return new PeerResult.Refused("InvalidOwner","A complete owner identity is required.");
+        var cfg=settings();
+        if(!(cfg.CarrierOptIn && cfg.Carrier is {} self && LocalBags?.Character is {} local && CourierPlanner.Exact(self,local)))
+            return new PeerResult.Refused("CarrierOptInOff","Carrier opt-in is not active on this character.");
+        var p=presences.FirstOrDefault(x=>x.InstanceId==sender);
+        CourierPeer? peer=null;
+        try{peer=p?.Identity.Deserialize<CourierPeer>();}catch(JsonException){}
+        if(peer?.Character is not { HasStableIdentity: true } senderChar || !cfg.IsPaired(senderChar))
+            return new PeerResult.Refused("OwnerNotPaired",$"{peer?.Character?.CharacterName ?? "The requesting character"} is not paired on this carrier.");
+        if(peer.Roster?.Any(o=>CourierPlanner.Exact(o,requested))!=true)
+            return new PeerResult.Refused("OutsideClientRoster",$"{requested.CharacterName} is not in the requesting client's roster.");
+        if(!updateSettings(current=>current.IsPaired(requested)?current:current with { PairedOwner=null,PairedOwners=[..current.Owners,requested with { }] }))
+            return new PeerResult.Refused("SettingsSaveFailed","Could not save carrier pairing.");
+        next=DateTimeOffset.MinValue;
+        return Delivered(null);
+    }
+    public async Task<Result<bool>> PairOwnerAsync(OwnerScope carrier,OwnerScope owner,CancellationToken ct=default)
+    {
+        var targets=presences.Where(p=>CourierPlanner.Exact(p.Identity.Deserialize<CourierPeer>()?.Character,carrier)).ToArray();
+        if(targets.Length!=1)return Result<bool>.Fail("CarrierEndpointAmbiguous",$"Matched {targets.Length} carriers.");
+        using var linked=CancellationTokenSource.CreateLinkedTokenSource(ct,unload.Token);
+        var conn=Connect(await endpoint.ConfigureAwait(false),targets[0]);
+        var json=JsonSerializer.SerializeToElement(new Wire("pair",Guid.Empty,Guid.Empty,Owner:owner));
+        var response=await conn.RequestAsync(Guid.NewGuid(),json,"PairOwner",TimeSpan.FromSeconds(5),linked.Token).ConfigureAwait(false);
+        if(response is PeerResult.Delivered){next=DateTimeOffset.MinValue;return Result<bool>.Ok(true);}
+        return response switch {
+            PeerResult.Refused refusal=>Result<bool>.Fail(refusal.Code,refusal.Reason),
+            PeerResult.TimedOut timeout=>Result<bool>.Fail(timeout.Threshold+"Deadline",timeout.Limit.ToString()),
+            PeerResult.Cancelled=>Result<bool>.Fail("PeerExchangeCancelled","PairOwner"),
+            _=>Result<bool>.Fail("PeerLinkLost",response.ToString()!)
+        };
     }
     private async void NotifyStop(Guid run)
     {

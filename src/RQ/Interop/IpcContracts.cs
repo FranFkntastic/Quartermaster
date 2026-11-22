@@ -15,6 +15,7 @@ public static class IpcChannels
     public const string SubmitCourierTransfer = "Quartermaster.v1.SubmitCourierTransfer";
     public const string StopCourierRun = "Quartermaster.v1.StopCourierRun";
     public const string ResumeCourierRun = "Quartermaster.v1.ResumeCourierRun";
+    public const string PairCourierOwner = "Quartermaster.v1.PairCourierOwner";
 }
 
 /// <summary>A roster character named by an external courier request.</summary>

@@ -48,6 +48,7 @@ public sealed class QuartermasterIpcProvider : IDisposable
         registrar.Register(IpcChannels.SubmitCourierTransfer, courier.Submit);
         registrar.Register(IpcChannels.StopCourierRun, courier.Stop);
         registrar.Register(IpcChannels.ResumeCourierRun, courier.Resume);
+        registrar.Register(IpcChannels.PairCourierOwner, courier.PairOwner);
     }
 
     public void PublishChanged(string json)
@@ -73,6 +74,7 @@ public sealed class QuartermasterIpcProvider : IDisposable
             registrar.Unregister(IpcChannels.SubmitCourierTransfer);
             registrar.Unregister(IpcChannels.StopCourierRun);
             registrar.Unregister(IpcChannels.ResumeCourierRun);
+            registrar.Unregister(IpcChannels.PairCourierOwner);
         }
     }
 }

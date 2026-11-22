@@ -52,6 +52,10 @@ public interface ICourierLink
     /// its bags change; the plan projection is cached on the list reference.
     /// </summary>
     IReadOnlyList<CourierPeer> Peers { get; }
+
+    /// <summary>Asks the carrier, over the authenticated peer link, to pair another character of this client's roster.</summary>
+    Task<Result<bool>> PairOwnerAsync(OwnerScope carrier, OwnerScope owner, CancellationToken ct = default) =>
+        Task.FromResult(Result<bool>.Fail("CarrierUnreachable", "No courier peer link is available."));
 }
 
 public sealed class NullCourierLink : ICourierLink

@@ -212,7 +212,7 @@ public sealed class SnapshotPublisher
         providerInstanceId,
         revision = Revision,
         channels = new[] { IpcChannels.GetCapabilities, IpcChannels.GetSnapshot, IpcChannels.SubmitShortages, IpcChannels.SubmitElementalDeposit, IpcChannels.GetOperation, IpcChannels.Changed,
-            IpcChannels.GetCourierStatus, IpcChannels.SubmitCourierTransfer, IpcChannels.StopCourierRun, IpcChannels.ResumeCourierRun },
+            IpcChannels.GetCourierStatus, IpcChannels.SubmitCourierTransfer, IpcChannels.StopCourierRun, IpcChannels.ResumeCourierRun, IpcChannels.PairCourierOwner },
         capabilities = new[] { AutomaticRetrievalCapability, AutomaticElementalDepositCapability, TransferPlansCapability, StowagePlansCapability, RestockPlansCapability, VendorProcurementCapability, CrossRegionCourierCapability },
         requestSchemas = new[] { ShortageSubmissionService.RequestSchema, ElementalDepositSubmissionService.RequestSchema, CourierIpcService.TransferSchema },
         statusVocabulary = new[] { OperationStatuses.Queued, OperationStatuses.Accepted, OperationStatuses.Running, OperationStatuses.Succeeded, OperationStatuses.PartiallySucceeded, OperationStatuses.Indeterminate, OperationStatuses.Failed, OperationStatuses.Cancelled, OperationStatuses.Rejected },
