@@ -323,7 +323,8 @@ public sealed class Plugin : IDalamudPlugin
         deposits = new ElementalDepositSubmissionService(providerInstanceId, state, workQueue, journal, cache.Snapshot, CurrentOwner);
         ipc = new(new DalamudIpcRegistrar(pluginInterface), snapshots, submissions, deposits);
         deliveredStow = new DeliveredStowService(providerInstanceId, state, workQueue, journal, cache.Snapshot, CurrentOwner,
-            owner => playerInventory.Snapshot(owner, CourierSession.PlayerBags).Bags,
+            // Live read: the cached snapshot can lag a delivery by a reconcile tick and omits the crystal pouch.
+            _ => scanner.ScanCarried(),
             id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.StackSize is > 0 and var stack
                 ? checked((int)stack) : throw new InvalidOperationException($"Stack size unavailable for item {id}."),
             message => log.Warning(message));
