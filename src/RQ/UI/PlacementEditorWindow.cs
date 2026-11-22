@@ -22,6 +22,7 @@ internal sealed class PlacementEditorWindow : Window
     private readonly WorkbenchStockService service;
     private readonly PlacementMatrix<(uint ItemId, ItemQualityPolicy Quality)> matrix;
     private readonly Dictionary<(uint ItemId, ItemQualityPolicy Quality), (StowageRoutingPolicy Routing, DateTime Until)> pending = [];
+    private readonly AgentBridgeUiReviewRegistry reviewRegistry = new();
     private OwnerScope? owner;
     private IReadOnlyList<WorkbenchStockService.PlacementEditorItem> items = [];
 
@@ -31,7 +32,8 @@ internal sealed class PlacementEditorWindow : Window
         this.runtime = runtime;
         this.service = service;
         // Not wired to the agent bridge: this window is opened by another plugin, not a reviewed surface.
-        matrix = new("quartermaster.placement-editor", "Bags", new AgentBridgeUiReviewRegistry());
+        // The matrix still registers its controls, so every draw opens and closes a frame on this registry.
+        matrix = new("quartermaster.placement-editor", "Bags", reviewRegistry);
         Size = new Vector2(720, 420);
         SizeCondition = ImGuiCond.FirstUseEver;
     }
@@ -55,6 +57,19 @@ internal sealed class PlacementEditorWindow : Window
     }
 
     public override void Draw()
+    {
+        reviewRegistry.BeginFrame();
+        try
+        {
+            DrawMatrix();
+        }
+        finally
+        {
+            reviewRegistry.EndFrame();
+        }
+    }
+
+    private void DrawMatrix()
     {
         var current = runtime();
         if (owner is not { } scope || !current.Owner.Matches(scope))
