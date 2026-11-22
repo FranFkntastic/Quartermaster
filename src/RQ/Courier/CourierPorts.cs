@@ -47,7 +47,9 @@ public sealed record Deadline(string Name, DateTimeOffset Expires)
     }
     public static Deadline After(string name, int seconds) => new(name, DateTimeOffset.UtcNow.AddSeconds(seconds));
 }
-public enum CourierCommand { Status, Travel, Receive, Send, Confirm, ReturnHome, Stop, Begin, Finish, Settle, Clear, VerifySettlement, NotDelivered }
+// Messages and ledgers store commands by number: new commands go last. Claim takes units the carrier already holds into
+// the run's custody (the carrier is the transfer's source); it changes only the carrier's ledger, never its bags.
+public enum CourierCommand { Status, Travel, Receive, Send, Confirm, ReturnHome, Stop, Begin, Finish, Settle, Clear, VerifySettlement, NotDelivered, Claim }
 public sealed record TradeEvidence(InventoryView Before, InventoryView After);
 public sealed record CourierMessage(int Version, Guid Run, Guid Step, CourierCommand Command, OwnerScope Owner,
     OwnerScope Partner, OwnerScope Carrier, ImmutableArray<Shipment> Manifest, MeetingBell? Bell = null,

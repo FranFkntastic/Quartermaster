@@ -92,11 +92,12 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             {
                 if(old.Fingerprint!=hash)return Refuse("StepCollision");
                 if(old.Result!=null)return old.Result;
-                travelResume=m.Command is CourierCommand.Travel or CourierCommand.ReturnHome;
+                // A claim's ledger change and its receipt are saved together: an intent without a receipt changed nothing.
+                travelResume=m.Command is CourierCommand.Travel or CourierCommand.ReturnHome or CourierCommand.Claim;
                 if(!travelResume)return new(CourierOutcome.Indeterminate,"StepUnsettled","Carrier intent has no receipt.");
             }
             if (!travelResume && ledger.Unconfirmed == null && ledger.Steps.Values.Any(x => x.Result == null && x.Command.Run == m.Run &&
-                !(m.Command==CourierCommand.Begin && x.Command.Command is CourierCommand.Travel or CourierCommand.ReturnHome) &&
+                !(m.Command==CourierCommand.Begin && x.Command.Command is CourierCommand.Travel or CourierCommand.ReturnHome or CourierCommand.Claim) &&
                 !(m.Command==CourierCommand.Finish && x.Command.Command==CourierCommand.ReturnHome))
                 && m.Command is not (CourierCommand.Stop or CourierCommand.Status or CourierCommand.Clear or CourierCommand.NotDelivered)) return Refuse("CarrierIntentUnsettled");
             if (m.Command == CourierCommand.Status)
@@ -213,6 +214,31 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                         refused = true; return uncertain;
                     }
                     evidence = new(before, await Observe()); break;
+                case CourierCommand.Claim:
+                    // The run's source is this carrier: units it already holds enter the run's custody so the hand-in
+                    // that follows trades only custody, as every send does. Nothing moves; only the ledger changes,
+                    // saved together with this step's receipt. A claim is taken only while the run holds no custody,
+                    // and only for units the fresh bags hold.
+                    Result<CourierReceipt> Unclaimed(string code)
+                    {
+                        var refusal = Refuse(code);
+                        ledger.Steps[m.Step] = step with { Result = refusal }; store.Save(ledger); return refusal;
+                    }
+                    if (m.Manifest.IsDefaultOrEmpty || m.Manifest.Any(s => s.Units <= 0 || s.Units > s.StackSize ||
+                            s.IsGil && (s.Hq || s.StackSize != CourierPlanner.GilCap)))
+                        return Unclaimed("InvalidManifest");
+                    if (m.Manifest.Any(s => !CourierPlanner.Exact(s.Source, m.Carrier) || !CourierPlanner.Exact(s.Destination, m.Partner)))
+                        return Unclaimed("ManifestPartnerMismatch");
+                    if (!ledger.Units.IsEmpty || ledger.Unconfirmed != null) return Unclaimed("ClaimCustodyNotEmpty");
+                    if (m.Manifest.GroupBy(s => (s.Item, s.Hq)).FirstOrDefault(g => before.Count(g.Key.Item, g.Key.Hq) < g.Sum(s => (long)s.Units)) is { } unheld)
+                    {
+                        warning($"{m.Run}/{m.Step} Claim: item {unheld.Key.Item}{(unheld.Key.Hq ? " HQ" : "")}: carrier holds {before.Count(unheld.Key.Item, unheld.Key.Hq):N0}, the claim needs {unheld.Sum(s => (long)s.Units):N0}.");
+                        return Unclaimed(unheld.Key.Item == CourierPlanner.GilItemId ? "CarrierGilShort" : "CarrierStockShort");
+                    }
+                    ledger.Units = Custody.Apply(ledger.Units, m.Manifest, 1);
+                    // The send that delivers the claim requires the bags to be unchanged since this point.
+                    ledger.LastConfirmedBags = before;
+                    break;
                 case CourierCommand.Confirm:
                 case CourierCommand.VerifySettlement:
                 case CourierCommand.Settle:

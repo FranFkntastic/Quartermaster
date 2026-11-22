@@ -304,6 +304,61 @@ public sealed class CourierRunTests : IDisposable
         Assert.Equal(7, owner.Deposited); Assert.Equal(10, mule.Units); Assert.Empty(engine.Journal().Custody);
     }
 
+    // A caller that crashed before saving its acknowledgement resubmits the same RequestId after other runs have
+    // replaced the journal. Starting it again would repeat a real cross-character transfer.
+    [Fact]
+    public async Task CompletedRequestResubmittedAfterLaterRunsStartsNothing()
+    {
+        owner.Quantities[source] = 10;
+        var session = new RQ.UI.CourierSession(new StateRepository(new QuartermasterStateStore(Path.Combine(dir, "state.json"))),
+            _ => throw new InvalidOperationException("Not used"), _ => throw new InvalidOperationException("Not used"))
+        { Conductor = engine, Link = new CarrierLink(new(carrier, new(carrier, 4, [new(Ore, false, mule.Units)]), [], true, [source], true)) };
+        var ipc = new RQ.Interop.CourierIpcService("fixture", session, () => cfg,
+            () => new InventoryView(owner.Who, 4, [new(Ore, false, owner.Units)], owner.GilHeld), () => null, Region, _ => "World",
+            id => new ItemMetadata(id, "Titanium Ore", null, false, null, null, null, null, null, null, null, false, true, null, null, 999), _ => { });
+        RQ.Interop.CourierTransferAcknowledgement Submit(string id, int quantity) => System.Text.Json.JsonSerializer.Deserialize<RQ.Interop.CourierTransferAcknowledgement>(
+            ipc.Submit(System.Text.Json.JsonSerializer.Serialize(new RQ.Interop.CourierTransferRequest
+            {
+                Schema = RQ.Interop.CourierIpcService.TransferSchema, RequestId = id, ReturnOwner = true, ReturnCarrier = true,
+                Source = new() { LocalContentId = 1, HomeWorldId = 1, CharacterName = source.CharacterName },
+                Destination = new() { LocalContentId = 2, HomeWorldId = 1, CharacterName = destination.CharacterName },
+                Items = [new() { ItemId = Ore, ItemName = "Titanium Ore", Quantity = quantity }],
+            }, new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web))),
+            new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web))!;
+        async Task<CourierJournal> Ran(string id, int quantity)
+        {
+            var ack = Submit(id, quantity);
+            Assert.True(ack.Status == "accepted", ack.Status + " " + ack.ErrorCode + ": " + ack.Message);
+            for (var waited = 0; session.IsStarting && waited < 500; waited++) await Task.Delay(10);
+            var done = engine.Journal();
+            Assert.True(done.State == "Completed" && done.RequestId == id, done.State + " " + done.Code + ": " + done.Detail);
+            return done;
+        }
+
+        var first = await Ran("transfer-a", 3);
+        var second = await Ran("transfer-b", 2); // The IPC archives the first run before starting.
+        var third = await engine.StartAsync(Transfer(source, destination, 0, false, new CourierTransferItem(Ore, "Titanium Ore", false, 1)), cfg);
+        Assert.True(third.State == "Completed", third.Code + ": " + third.Detail); // A non-IPC start replaces the second run.
+        int ownerSends = owner.Sends, carrierSends = mule.Sends;
+
+        foreach (var earlier in new[] { first, second })
+        {
+            var replay = Submit(earlier.RequestId!, earlier.RequestId == "transfer-a" ? 3 : 2);
+            Assert.True(replay.Status == "already_completed", replay.Status + " " + replay.ErrorCode + ": " + replay.Message);
+            Assert.Equal(earlier.Run.ToString(), replay.RunId);
+        }
+        Assert.False(session.IsStarting);
+        Assert.Equal(third.Run, engine.Journal().Run);
+        Assert.Equal((ownerSends, carrierSends), (owner.Sends, mule.Sends));
+        Assert.Equal(6, owner.Quantities[destination]); Assert.Equal(4, owner.Quantities[source]); Assert.Equal(10, mule.Units);
+    }
+    sealed class CarrierLink(RQ.UI.CourierPeer carrier) : RQ.UI.ICourierLink
+    {
+        public MeetingBell? StandingAt => null;
+        public string? BellBlock => null;
+        public IReadOnlyList<RQ.UI.CourierPeer> Peers { get; } = [carrier];
+    }
+
     sealed class AR : IAutoRetainerIpc
     {
         public bool IsAvailable => true; public bool IsBusy => false; public bool IsSuppressed { get; private set; }
