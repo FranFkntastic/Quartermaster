@@ -595,11 +595,12 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     public Task<Result<bool>> EnsureWorldAsync(uint world, Deadline d) => Visit(world,d);
     public Task<Result<bool>> ReturnHomeAsync(Deadline d) => Visit(null,d);
     /// <summary>
-    /// Whether a visit must return home first: world travel cannot hop straight from one visited data
-    /// center to a third one, so a character visiting another data center goes home before moving on.
+    /// Whether a visit must return home first: data-center travel starts only from the home world, so a
+    /// character visiting any other world (on its home data center or another one) that must cross to a
+    /// different data center goes home before moving on.
     /// </summary>
     private bool HomeFirst(uint here, uint destination, uint home) =>
-        here != home && destination != home && DataCenter(here) != DataCenter(home) && DataCenter(here) != DataCenter(destination);
+        here != home && destination != home && DataCenter(here) != DataCenter(destination);
     // Each leg keeps its own durable submission marker: a step that returns home and then visits a world
     // (or returns one character home and visits with the next) must not read one leg's submission as the other's.
     private Task<Result<bool>> Visit(uint? world,Deadline d)
