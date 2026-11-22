@@ -247,17 +247,19 @@ public sealed class CourierIpcService
         var destination = Roster(request.Destination);
         if (source == null || destination == null)
             return Ack(requestId, null, "rejected", "OutsideClientRoster", "Source and destination must both be characters of this client's service account.");
+        var live = localBags();
         var carrierPeer = CarrierPeer(cfg);
         if (carrierPeer?.CarrierOptIn == false)
             return Ack(requestId, null, "rejected", "CarrierOptInOff",
                 $"{cfg.Carrier!.CharacterName} does not have 'Carry for another character' enabled in Quartermaster.");
-        if (carrierPeer?.PairedOwners is { } paired && !paired.Any(p => CourierPlanner.Exact(p, source)))
+        var initiator = live?.Character is { HasStableIdentity: true } current ? current : source;
+        if (carrierPeer?.PairedOwners is { } paired && !paired.Any(p => CourierPlanner.Exact(p, initiator)))
             return Ack(requestId, null, "rejected", "OwnerNotPaired",
-                $"{source.CharacterName} is not paired as an owner on {cfg.Carrier!.CharacterName}'s Quartermaster Courier settings.");
+                $"{initiator.CharacterName} is not paired as an owner on {cfg.Carrier!.CharacterName}'s Quartermaster Courier settings.");
         var order = new CourierTransferOrder(source, destination, request.GilAmount,
             [.. (request.Items ?? []).Select(i => new CourierTransferItem(i.ItemId, i.ItemName, i.IsHq, i.Quantity))],
             request.ReturnDestinationHome, requestId);
-        var (plan, refusal) = CourierTransferPlanner.Build(order, cfg, carrierPeer?.Bags, localBags(), metadata, worldRegion, bridge());
+        var (plan, refusal) = CourierTransferPlanner.Build(order, cfg, carrierPeer?.Bags, live, metadata, worldRegion, bridge());
         if (refusal != null || plan == null)
             return Ack(requestId, null, "rejected", refusal?.Code ?? "PlanningFailed", refusal?.Message ?? "No plan.");
         // A clean, finished previous run is archived first; an unresolved one was refused above.
