@@ -17,12 +17,13 @@ public sealed class WorkbenchStockService
 {
     public const string StockSourcesCapability = "stockSources.v1";
     public const string ReserveItemsCapability = "reserveItems.v1";
-    public const string ItemHomesCapability = "itemHomes.v1";
+    public const string PlacementEditorCapability = "placementEditor.v1";
     public const string ReserveLevelsCapability = "reserveLevels.v1";
     public const string StockSourcesRequestSchema = "gooseworks-quartermaster-stock-sources-request/v1";
     public const string StockSourcesSchema = "gooseworks-quartermaster-stock-sources/v1";
     public const string ReserveItemsSchema = "gooseworks-quartermaster-reserve-items/v1";
-    public const string ItemHomeSchema = "gooseworks-quartermaster-item-home/v1";
+    public const string OpenPlacementSchema = "gooseworks-quartermaster-open-placement/v1";
+    public const int MaxPlacementItems = 500;
     public const string ReserveLevelSchema = "gooseworks-quartermaster-reserve-level/v1";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -41,6 +42,9 @@ public sealed class WorkbenchStockService
     private readonly object gate = new();
     private (long Runtime, long Players, long External, IReadOnlyList<SourceCharacter> Characters)? sources;
     private (long Runtime, string Json)? reserves;
+
+    /// <summary>Opens the placement editor for the owner and items; set once the window exists. Runs on the framework thread.</summary>
+    public Action<OwnerScope, IReadOnlyList<PlacementEditorItem>>? OpenPlacementEditor { get; set; }
 
     public WorkbenchStockService(
         string providerInstanceId,
@@ -61,7 +65,7 @@ public sealed class WorkbenchStockService
     }
 
     public static IReadOnlyList<string> Capabilities { get; } =
-        [StockSourcesCapability, ReserveItemsCapability, ItemHomesCapability, ReserveLevelsCapability];
+        [StockSourcesCapability, ReserveItemsCapability, PlacementEditorCapability, ReserveLevelsCapability];
 
     // ---- Stock sources ------------------------------------------------------------------------
 
@@ -260,39 +264,58 @@ public sealed class WorkbenchStockService
 
     // ---- Edits --------------------------------------------------------------------------------
 
-    public string SetItemHome(string requestJson)
+    /// <summary>
+    /// Opens the placement editor for the current character on the supplied items. Validated here; the
+    /// window opens on the framework thread.
+    /// </summary>
+    public string OpenPlacement(string requestJson)
     {
-        ItemHomeRequest? request;
-        try { request = JsonSerializer.Deserialize<ItemHomeRequest>(requestJson, JsonOptions); }
+        OpenPlacementRequest? request;
+        try { request = JsonSerializer.Deserialize<OpenPlacementRequest>(requestJson, JsonOptions); }
         catch (JsonException exception) { return Ack(string.Empty, "rejected", "invalid_json", exception.Message); }
         if (request is null)
             return Ack(string.Empty, "rejected", "invalid_json", "Request body is empty.");
-        if (request.Schema != ItemHomeSchema)
-            return Ack(request.RequestId, "rejected", "unsupported_schema", $"Expected {ItemHomeSchema}.");
+        if (request.Schema != OpenPlacementSchema)
+            return Ack(request.RequestId, "rejected", "unsupported_schema", $"Expected {OpenPlacementSchema}.");
+        if (OpenPlacementEditor is not { } open)
+            return Ack(request.RequestId, "rejected", "unavailable", "The placement editor is not available.");
         var current = runtime();
-        if (Validate(request.ProviderInstanceId, request.Owner, request.ItemId, request.Quality, current, out var quality) is { } error)
-            return Ack(request.RequestId, "rejected", error.Code, error.Message);
-        var homes = (request.RetainerIds ?? []).Distinct().ToList();
-        var owned = OwnerRetainers(current).Select(retainer => retainer.RetainerId).ToHashSet();
-        if (homes.Any(id => !owned.Contains(id)))
-            return Ack(request.RequestId, "rejected", "unknown_retainer", "Homes must be retainers of the current character.");
+        var items = new List<PlacementEditorItem>();
+        foreach (var item in request.Items ?? [])
+        {
+            if (Validate(request.ProviderInstanceId, request.Owner, item.ItemId, item.Quality, current, out var quality) is { } error)
+                return Ack(request.RequestId, "rejected", error.Code, error.Message);
+            if (items.All(existing => existing.ItemId != item.ItemId || existing.Quality != quality))
+                items.Add(new(item.ItemId, string.IsNullOrWhiteSpace(item.ItemName) ? $"Item {item.ItemId}" : item.ItemName.Trim(), quality));
+        }
+        if (items.Count == 0)
+            return Ack(request.RequestId, "rejected", "invalid_item", "Name at least one item.");
+        if (items.Count > MaxPlacementItems)
+            return Ack(request.RequestId, "rejected", "too_many_items", $"At most {MaxPlacementItems:N0} items.");
 
         var owner = current.Owner with { };
-        workQueue.Enqueue(() => EditReserve(owner, request.ItemId, request.ItemName, quality, reserve =>
-        {
-            // Staying in the bags means no home at all, including "any retainer with space".
-            var anySpace = homes.Count > 0 && reserve.Location.AnySpace;
-            if (reserve.Location.PreferredRetainerIds.SequenceEqual(homes) && reserve.Location.AnySpace == anySpace) return false;
-            reserve.Location = new StowageRoutingPolicy
-            {
-                PreferredRetainerIds = homes,
-                AnySpace = anySpace,
-                Consolidate = reserve.Location.Consolidate,
-            };
-            return true;
-        }, create: homes.Count > 0));
-        return Ack(request.RequestId, "queued", null, "Item home queued for the framework thread.");
+        workQueue.Enqueue(() => open(owner, items));
+        return Ack(request.RequestId, "queued", null, "Placement editor queued for the framework thread.");
     }
+
+    /// <summary>
+    /// Persists one item's ranked destinations to the owner's reserve rule, creating a level-0 rule when the
+    /// item has none and removing a level-0 rule left with no destination. Queued to the framework thread.
+    /// </summary>
+    public void SetPlacement(OwnerScope owner, PlacementEditorItem item, StowageRoutingPolicy routing)
+    {
+        var location = ListingPlanCatalog.CopyLocation(routing);
+        workQueue.Enqueue(() => EditReserve(owner, item.ItemId, item.ItemName, item.Quality, reserve =>
+        {
+            if (SameLocation(reserve.Location, location)) return false;
+            reserve.Location = ListingPlanCatalog.CopyLocation(location);
+            return true;
+        }, create: location.PreferredRetainerIds.Count > 0 || location.AnySpace));
+    }
+
+    public static bool SameLocation(StowageRoutingPolicy left, StowageRoutingPolicy right) =>
+        left.PreferredRetainerIds.SequenceEqual(right.PreferredRetainerIds) &&
+        left.AnySpace == right.AnySpace && left.Consolidate == right.Consolidate;
 
     public string SetReserveLevel(string requestJson)
     {
@@ -389,6 +412,8 @@ public sealed class WorkbenchStockService
             ErrorCode = errorCode,
             Message = message,
         }, JsonOptions);
+
+    public sealed record PlacementEditorItem(uint ItemId, string ItemName, ItemQualityPolicy Quality);
 
     private sealed record SourceContainer(DateTime ObservedAtUtc, IReadOnlyDictionary<(uint ItemId, bool Hq), long> Items);
 

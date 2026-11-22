@@ -59,7 +59,7 @@ public sealed class QuartermasterIpcProvider : IDisposable
         workbenchAttached = true;
         registrar.Register(IpcChannels.GetStockSources, workbench.GetStockSources);
         registrar.Register(IpcChannels.GetReserveItems, workbench.GetReserveItems);
-        registrar.Register(IpcChannels.SetItemHome, workbench.SetItemHome);
+        registrar.Register(IpcChannels.OpenPlacement, workbench.OpenPlacement);
         registrar.Register(IpcChannels.SetReserveLevel, workbench.SetReserveLevel);
     }
 
@@ -111,7 +111,7 @@ public sealed class QuartermasterIpcProvider : IDisposable
         {
             registrar.Unregister(IpcChannels.GetStockSources);
             registrar.Unregister(IpcChannels.GetReserveItems);
-            registrar.Unregister(IpcChannels.SetItemHome);
+            registrar.Unregister(IpcChannels.OpenPlacement);
             registrar.Unregister(IpcChannels.SetReserveLevel);
         }
         if (cancelAttached)

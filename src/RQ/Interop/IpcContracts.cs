@@ -18,7 +18,7 @@ public static class IpcChannels
     public const string PairCourierOwner = "Quartermaster.v1.PairCourierOwner";
     public const string GetStockSources = "Quartermaster.v1.GetStockSources";
     public const string GetReserveItems = "Quartermaster.v1.GetReserveItems";
-    public const string SetItemHome = "Quartermaster.v1.SetItemHome";
+    public const string OpenPlacement = "Quartermaster.v1.OpenPlacement";
     public const string SetReserveLevel = "Quartermaster.v1.SetReserveLevel";
 }
 
@@ -30,19 +30,23 @@ public sealed record StockSourcesRequest
 }
 
 /// <summary>
-/// <c>gooseworks-quartermaster-item-home/v1</c>: the retainers an item's spare stock lives in. An empty
-/// list means it stays in the bags. Quality is <c>NqOnly</c> or <c>HqOnly</c>.
+/// <c>gooseworks-quartermaster-open-placement/v1</c>: opens Quartermaster's placement editor for the current
+/// character with one row per item. Quality is <c>NqOnly</c> or <c>HqOnly</c>.
 /// </summary>
-public sealed record ItemHomeRequest
+public sealed record OpenPlacementRequest
 {
     public string Schema { get; init; } = string.Empty;
     public string ProviderInstanceId { get; init; } = string.Empty;
     public string RequestId { get; init; } = string.Empty;
     public RequestOwner? Owner { get; init; }
+    public IReadOnlyList<OpenPlacementItem>? Items { get; init; }
+}
+
+public sealed record OpenPlacementItem
+{
     public uint ItemId { get; init; }
     public string ItemName { get; init; } = string.Empty;
     public string Quality { get; init; } = string.Empty;
-    public IReadOnlyList<ulong>? RetainerIds { get; init; }
 }
 
 /// <summary><c>gooseworks-quartermaster-reserve-level/v1</c>: how many spare units of an item to keep.</summary>
