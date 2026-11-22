@@ -43,6 +43,9 @@ public sealed class CourierJournal
     /// <summary>The IPC request that started this run (its idempotency key); null for runs started in the UI.</summary>
     [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
     public string? RequestId { get; set; }
+    /// <summary>The step id of an unclaim that was sent and not yet confirmed; the same id is sent again until it is.</summary>
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public Guid? UnclaimStep { get; set; }
     public bool PeerClaimed { get; set; }
     public CourierSettings Settings { get; set; } = new();
     public CourierPlan Plan { get; set; } = new(Guid.Empty, 0, [], []);
@@ -276,8 +279,6 @@ public sealed class CourierConductor
     internal CourierJournal Journal() => store.Load();
 
     private const string ArchivePattern = "courier-closed-*.json";
-    // Closed journals stay on disk; only the request index is bounded.
-    private const int RequestsKept = 2000;
     private string ArchiveFile(Guid run) => Path.Combine(directory, $"courier-closed-{run:N}.json");
     private IEnumerable<string> Archives() => Directory.Exists(directory)
         ? Directory.GetFiles(directory, ArchivePattern).Where(p => Path.GetExtension(p).Equals(".json", StringComparison.OrdinalIgnoreCase))
@@ -364,16 +365,11 @@ public sealed class CourierConductor
             warning($"CourierHistoryQuarantineFailed: {Path.GetFileName(path)} is unreadable ({e.Message}) and could not be moved aside ({move.Message}); it is skipped.");
         }
     }
-    /// <summary>Forgets closed journals that are gone and keeps the request records within their bound; true when anything changed.</summary>
+    /// <summary>Forgets closed journals that are gone; request records are kept for good. True when anything changed.</summary>
     private bool Prune(CourierRequestIndex index)
     {
         var present = Archives().Select(Path.GetFileName).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var changed = index.Files.RemoveWhere(name => !present.Contains(name)) > 0;
-        if (index.Runs.Count > RequestsKept)
-        {
-            index.Runs = [.. index.Runs.OrderByDescending(x => x.At).Take(RequestsKept)];
-            changed = true;
-        }
         return changed;
     }
     public async Task<CourierSnapshot> ClearAsync(Guid expectedRun,string? acknowledgement)
@@ -1198,7 +1194,15 @@ public sealed class CourierConductor
                         warning($"{r.Run} ClaimReleaseSkipped: the carrier's ledger differs from the run's custody.");
                         return false;
                     }
-                    receipt = await Send(r, CourierCommand.Unclaim, r.Start, r.Custody);
+                    // Journaled first: a carrier that stopped mid-unclaim only settles a replay of the same step.
+                    if (r.UnclaimStep == null) { r.UnclaimStep = Guid.NewGuid(); store.Save(r); }
+                    try { receipt = await Send(r, CourierCommand.Unclaim, r.Start, r.Custody, id: r.UnclaimStep); }
+                    catch (CourierFault refused) when (refused.Code.StartsWith("Unclaim", StringComparison.Ordinal))
+                    {
+                        // The carrier answered and recorded its refusal under this step: the next attempt is a new step.
+                        r.UnclaimStep = null; store.Save(r);
+                        throw;
+                    }
                     if (!Held(receipt).IsEmpty)
                     {
                         warning($"{r.Run} ClaimReleaseLedgerMismatch: the carrier's ledger is not empty after the unclaim.");
@@ -1206,6 +1210,7 @@ public sealed class CourierConductor
                     }
                 }
                 r.Custody = [];
+                r.UnclaimStep = null;
                 r.CarrierCheckpoint = receipt.Bags ?? r.CarrierCheckpoint;
             }
             // The run resumes from the released claim's trip: both sides travel to the drop-off again before claiming.
