@@ -16,31 +16,31 @@
       },
       "Franthropy.Dalamud": {
         "type": "Direct",
-        "requested": "[0.1.0-commit.298b9b4f28920200f8ee25ee177ce260517d97ba, 0.1.0-commit.298b9b4f28920200f8ee25ee177ce260517d97ba]",
-        "resolved": "0.1.0-commit.298b9b4f28920200f8ee25ee177ce260517d97ba",
-        "contentHash": "1mAvQodqvgtlWF+6p6WzOsfBk5ZNl4Tdtb8MXFQqv3+4RgQcDShUq/e3XkxNLNBgW8Sz4nBtOV5J553DlxrhzQ==",
+        "requested": "[0.1.0-commit.1ba3b3b289c7fc7a6e7c2036adefa84e4c37721f, 0.1.0-commit.1ba3b3b289c7fc7a6e7c2036adefa84e4c37721f]",
+        "resolved": "0.1.0-commit.1ba3b3b289c7fc7a6e7c2036adefa84e4c37721f",
+        "contentHash": "73yWzIk69zQQPJLJC14680CwcKNDxsu5Sjjmku0iYatTtvTczjSvu66WEBDqS6B//XL3OOVkmYzDbBp4UPkE+A==",
         "dependencies": {
           "ECommons": "3.2.1.15",
-          "Franthropy.AgentBridge": "0.1.0-commit.298b9b4f28920200f8ee25ee177ce260517d97ba",
-          "Franthropy.Filtering": "0.1.0-commit.298b9b4f28920200f8ee25ee177ce260517d97ba",
-          "Franthropy.Observations": "0.1.0-commit.298b9b4f28920200f8ee25ee177ce260517d97ba",
+          "Franthropy.AgentBridge": "0.1.0-commit.1ba3b3b289c7fc7a6e7c2036adefa84e4c37721f",
+          "Franthropy.Filtering": "0.1.0-commit.1ba3b3b289c7fc7a6e7c2036adefa84e4c37721f",
+          "Franthropy.Observations": "0.1.0-commit.1ba3b3b289c7fc7a6e7c2036adefa84e4c37721f",
           "System.Security.Cryptography.ProtectedData": "9.0.0"
         }
       },
       "Franthropy.FFXIV": {
         "type": "Direct",
-        "requested": "[0.1.0-commit.298b9b4f28920200f8ee25ee177ce260517d97ba, 0.1.0-commit.298b9b4f28920200f8ee25ee177ce260517d97ba]",
-        "resolved": "0.1.0-commit.298b9b4f28920200f8ee25ee177ce260517d97ba",
-        "contentHash": "E+BJZbI98mg4fLFW6m2g6GWiApWOP5m1p1WWRRm3QvAedbDG3UKWj4o//2JYoWAmnol6tU6VO6Mfl6bTclgDjQ==",
+        "requested": "[0.1.0-commit.1ba3b3b289c7fc7a6e7c2036adefa84e4c37721f, 0.1.0-commit.1ba3b3b289c7fc7a6e7c2036adefa84e4c37721f]",
+        "resolved": "0.1.0-commit.1ba3b3b289c7fc7a6e7c2036adefa84e4c37721f",
+        "contentHash": "rqeSGZQ+yDPnBxBIyxrCuMVmQVlOJ0sZWX8rthVHIxMWDvAP4JkveVjYqKw2dG704r8smvU/A7aicBJCkukFSA==",
         "dependencies": {
-          "Franthropy.Filtering": "0.1.0-commit.298b9b4f28920200f8ee25ee177ce260517d97ba"
+          "Franthropy.Filtering": "0.1.0-commit.1ba3b3b289c7fc7a6e7c2036adefa84e4c37721f"
         }
       },
       "Franthropy.Observations": {
         "type": "Direct",
-        "requested": "[0.1.0-commit.298b9b4f28920200f8ee25ee177ce260517d97ba, 0.1.0-commit.298b9b4f28920200f8ee25ee177ce260517d97ba]",
-        "resolved": "0.1.0-commit.298b9b4f28920200f8ee25ee177ce260517d97ba",
-        "contentHash": "nubOfvkcgCOtDd9IkeVwBw0UTHcYufy3E7KsQfLWPtRoVo7EZIDEKUPYCCswu7E0SI4MZi4YSUaDr/uCw0c79w==",
+        "requested": "[0.1.0-commit.1ba3b3b289c7fc7a6e7c2036adefa84e4c37721f, 0.1.0-commit.1ba3b3b289c7fc7a6e7c2036adefa84e4c37721f]",
+        "resolved": "0.1.0-commit.1ba3b3b289c7fc7a6e7c2036adefa84e4c37721f",
+        "contentHash": "N591esTjd4N1KEQmtKynO1/StqS8THzh4Vj87QCBaxOURnD0Y5T4IcP8eYeYFZnPRZGuO0fHF2rz3r/YU3KZvA==",
         "dependencies": {
           "Microsoft.Data.Sqlite": "10.0.10",
           "SQLitePCLRaw.bundle_e_sqlite3": "3.0.5"
@@ -74,16 +74,16 @@
       },
       "Franthropy.AgentBridge": {
         "type": "Transitive",
-        "resolved": "0.1.0-commit.298b9b4f28920200f8ee25ee177ce260517d97ba",
-        "contentHash": "6F03INlVyrPoPLM0xYROJCNmbIE/tB5jtIJdmNHmQKKwx1wESUr1921G3ZoQg8KQsN0bnbSIgV7X3AbHyniLHA==",
+        "resolved": "0.1.0-commit.1ba3b3b289c7fc7a6e7c2036adefa84e4c37721f",
+        "contentHash": "LAp0MFB1BIbpke7PF0Z30xKr1vfrsPmv/pYhwOyyl5FKfeq5F1ocZEwIbbt3smTSYJvzUu2QXM2WGPbSNODeCA==",
         "dependencies": {
           "System.Security.Cryptography.ProtectedData": "9.0.0"
         }
       },
       "Franthropy.Filtering": {
         "type": "Transitive",
-        "resolved": "0.1.0-commit.298b9b4f28920200f8ee25ee177ce260517d97ba",
-        "contentHash": "zFx+4La3/yqKBjp/DwM3Sl7OUjWfHSdjJGZoOACS3P/zl60yaIPaT6bZ7Ja1tMs0ZKoKsjP9rjZUGJtGhg8hZQ=="
+        "resolved": "0.1.0-commit.1ba3b3b289c7fc7a6e7c2036adefa84e4c37721f",
+        "contentHash": "T/ETyB4m6xCA0lQDaRHtjR+7TJu5AidJcxCEbj8sKbr/zb/YQFWIoWLsOqVI0xKLnJRHDjNDWPr7F2l60t/HvQ=="
       },
       "Microsoft.Data.Sqlite.Core": {
         "type": "Transitive",
