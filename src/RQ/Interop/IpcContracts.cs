@@ -251,6 +251,9 @@ public sealed record DeliveredStowRequest
 
 /// <summary>
 /// One requested item variant. Code: Planned, NoHome, NoRoom, NotCarried, Stowed, PartlyStowed, NotStowed.
+/// Carried (acknowledgement only) is the requested quantity found in the bags; Planned is what fits the
+/// listed home retainers, so Planned &lt; Carried means part had no room and Carried &lt; Requested means
+/// part was not carried.
 /// </summary>
 public sealed record DeliveredStowLine
 {
@@ -258,6 +261,8 @@ public sealed record DeliveredStowLine
     public string ItemName { get; init; } = string.Empty;
     public bool IsHq { get; init; }
     public int Requested { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? Carried { get; init; }
     public int Planned { get; init; }
     public int Stowed { get; init; }
     public string Code { get; init; } = string.Empty;
