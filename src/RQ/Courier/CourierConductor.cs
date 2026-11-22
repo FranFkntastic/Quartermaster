@@ -14,7 +14,9 @@ public enum CourierPhase
     // after the last trip's deposits into a destination, while that destination is at its bell.
     Consolidate,
     // After the last deposit, a destination met off its home world (at the cross-region bridge) returns home.
-    ReturnDestinationHome
+    ReturnDestinationHome,
+    // A trip whose source is the carrier itself: the carrier's own units enter the run's custody in place of a pickup leg.
+    Claim
 }
 public sealed record CourierStep(CourierPhase Phase, int Trip, ImmutableArray<Shipment> Batch);
 /// <param name="RetainerBefore">Legacy single-stack placement baseline; batched placement settles from the journal and bags.</param>
@@ -41,6 +43,9 @@ public sealed class CourierJournal
     /// <summary>The IPC request that started this run (its idempotency key); null for runs started in the UI.</summary>
     [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
     public string? RequestId { get; set; }
+    /// <summary>The step id of an unclaim that was sent and not yet confirmed; the same id is sent again until it is.</summary>
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public Guid? UnclaimStep { get; set; }
     public bool PeerClaimed { get; set; }
     public CourierSettings Settings { get; set; } = new();
     public CourierPlan Plan { get; set; } = new(Guid.Empty, 0, [], []);
@@ -77,6 +82,22 @@ public sealed class CourierJournal
     public CourierCarrierMove? CarrierMove { get; set; }
 }
 public sealed record CourierCarrierMove(Guid Id, CourierCommand Command, OwnerScope Partner, MeetingBell? Bell);
+/// <summary>A run an IPC request started, as the request index keeps it (and the current journal projects).</summary>
+/// <param name="Untouched">The run provably moved nothing, so its request may run again.</param>
+public sealed record CourierRequestRecord(Guid Run, string RequestId, string State, string Code, string Detail, string? Hash, bool Untouched, DateTimeOffset At)
+{
+    internal static CourierRequestRecord Of(CourierJournal r, DateTimeOffset at) => new(r.Run, r.RequestId ?? "", r.State, r.Code,
+        r.Detail.Length > 300 ? r.Detail[..300] : r.Detail, r.Plan.RequestHash, CourierConductor.Untouched(r), at);
+}
+/// <summary>
+/// <c>courier-requests.json</c>: every closed run an IPC request started, so a resubmitted request id is answered without
+/// reading the closed journals. Files lists the closed journals already indexed.
+/// </summary>
+public sealed class CourierRequestIndex
+{
+    public List<CourierRequestRecord> Runs { get; set; } = [];
+    public HashSet<string> Files { get; set; } = [];
+}
 public sealed record LineProgress(Guid Line, string Name, int Moved, int Remaining, Shipment? Route = null, bool Nq = false, bool Hq = false);
 public sealed record CourierSnapshot(Guid Run, string State, string OwnerPhase, string CarrierPhase, int Trip, int Trips,
     string Code, string Detail, ImmutableArray<LineProgress> Lines, ImmutableArray<Refusal> Refusals,bool CanResume,bool CanClear,ImmutableArray<CustodyRow> Custody,
@@ -134,9 +155,15 @@ public sealed class CourierConductor
         this.information = information;
         this.needsSuppression=needsSuppression??(()=>true);
         this.directory = directory;
+        requests = new(Path.Combine(directory, RequestIndexName));
         var r = store.Load();
         if (r.State == "Running") { r.State = "Interrupted"; store.Save(r); }
+        // Built off the calling (framework) thread; only a first load after an upgrade has closed journals to read.
+        history = Task.Run(LoadHistory);
     }
+    private const string RequestIndexName = "courier-requests.json";
+    private readonly CourierStore<CourierRequestIndex> requests;
+    private readonly Task<CourierRequestIndex> history;
     private static IEnumerable<CourierStep> Steps(CourierJournal r)
     {
         for (int i = 0; i < r.Plan.Trips.Length; i++)
@@ -147,9 +174,21 @@ public sealed class CourierConductor
             // Retrieve and Deposit stay even for bag-only manifests: they verify bag stock, Retrieve
             // anchors the bag-slot split and Deposit credits delivery.
             // A local trip is the owner's own withdrawal and deposit at its bell: no carrier, no trade.
-            yield return new(CourierPhase.EnsureSource, i, []);
-            yield return new(CourierPhase.Retrieve, i, trip.Manifest);
-            if (!trip.Local)
+            if (FromCarrier(r, trip))
+            {
+                // The carrier is the source: no pickup leg. Once both sides are at the drop-off, its own units are
+                // claimed into custody (against its post-travel bags) and delivered exactly as any carried custody is.
+                yield return new(CourierPhase.SwitchToDestination, i, []);
+                yield return new(CourierPhase.CarrierToDestination, i, []);
+                yield return new(CourierPhase.Claim, i, trip.Manifest);
+                yield return new(CourierPhase.HandIn, i, trip.Manifest);
+            }
+            else
+            {
+                yield return new(CourierPhase.EnsureSource, i, []);
+                yield return new(CourierPhase.Retrieve, i, trip.Manifest);
+            }
+            if (!trip.Local && !FromCarrier(r, trip))
             {
                 yield return new(CourierPhase.CarrierToSource, i, []);
                 yield return new(CourierPhase.HandOut, i, trip.Manifest);
@@ -175,6 +214,23 @@ public sealed class CourierConductor
     /// journaled before that, which already claimed the carrier, keeps it until it finishes.
     /// </summary>
     private static bool Carrierless(CourierJournal r) => !r.PeerClaimed && r.Plan.Trips.All(t => t.Local);
+    /// <summary>Whether a trip's source is the run's carrier: it delivers stock the carrier already holds.</summary>
+    internal static bool FromCarrier(CourierJournal r, CourierTrip t) => !t.Local && CourierPlanner.Exact(t.Source, r.Settings.Carrier);
+    private static bool SameCustody(ImmutableArray<Shipment> a, ImmutableArray<Shipment> b) => Custody.Covers(a, b) && Custody.Covers(b, a);
+    private static ImmutableArray<Shipment> Held(CourierReceipt receipt) => receipt.Custody.IsDefault ? [] : receipt.Custody;
+    /// <summary>
+    /// Whether the run's custody can only be stock its carrier claimed that no hand-in reached: every carried trip is
+    /// sourced by the carrier, nothing is pending but a claim, and every hand-in on record proved nothing moved.
+    /// </summary>
+    private static bool ClaimOnly(CourierJournal r) =>
+        r.Plan.Trips.Any(t => FromCarrier(r, t)) && r.Plan.Trips.All(t => t.Local || FromCarrier(r, t)) &&
+        r.Pending is null or { Action.Phase: CourierPhase.Claim } && r.Evidence.All(e => e.Disposition == "NotDelivered");
+    /// <summary>
+    /// Whether a run provably moved nothing: nothing pending, held or delivered, and every hand-in on record proved
+    /// nothing moved. Its request may run again under the same id.
+    /// </summary>
+    internal static bool Untouched(CourierJournal r) => r.Pending == null && r.Custody.IsEmpty &&
+        r.Delivered.Values.All(units => units == 0) && r.Evidence.All(e => e.Disposition == "NotDelivered");
     /// <summary>The carrier trip nearest before or after trip <paramref name="i"/>, skipping local trips; null when none.</summary>
     private static CourierTrip? Carried(CourierJournal r, int i, int step)
     {
@@ -184,7 +240,7 @@ public sealed class CourierConductor
         return null;
     }
     /// <summary>Whether a phase runs inside a trip (before the closing returns), with the owner at a bell.</summary>
-    private static bool InTrip(CourierPhase phase) => phase < CourierPhase.ReturnOwner || phase == CourierPhase.Consolidate;
+    private static bool InTrip(CourierPhase phase) => phase < CourierPhase.ReturnOwner || phase is CourierPhase.Consolidate or CourierPhase.Claim;
     /// <summary>Only an unsettled trade blocks clearing a stopped run; travel and local placement have no cross-account custody in limbo.</summary>
     private static bool HasPendingTrade(CourierJournal r) => r.Pending?.Action.Phase is CourierPhase.HandOut or CourierPhase.HandIn;
     public CourierSnapshot Snapshot()=>Project(store.Load());
@@ -213,13 +269,109 @@ public sealed class CourierConductor
     {
         if(r.Pending is not {} p || p.Action.Batch.IsEmpty || r.State is not ("Failed" or "Interrupted" or "Indeterminate")) return null;
         var owner=p.OwnerBefore.Character; var carrier=r.Settings.Carrier;
-        var (from,to)=p.Action.Phase==CourierPhase.HandIn?(carrier,owner):p.Action.Phase==CourierPhase.HandOut?(owner,carrier):(owner,owner);
+        var (from,to)=p.Action.Phase==CourierPhase.HandIn?(carrier,owner):p.Action.Phase==CourierPhase.HandOut?(owner,carrier):
+            p.Action.Phase==CourierPhase.Claim?(carrier,carrier):(owner,owner);
         return new(p.Action.Phase.ToString(),from?.CharacterName??"Unknown",to?.CharacterName??"Unknown",Rows(p.Action.Batch,from));
     }
     internal static ImmutableArray<CustodyRow> Rows(IEnumerable<Shipment> units,OwnerScope? holder)=>
         [..units.GroupBy(s=>(s.Item,s.Hq)).Select(g=>new CustodyRow(g.First().Name,g.First().IsGil?"":g.Key.Hq?"HQ":"NQ",g.Sum(s=>s.Units),holder?.CharacterName??"Unknown"))];
     /// <summary>The full journal, for the IPC status projection (custody split into stacks and gil).</summary>
     internal CourierJournal Journal() => store.Load();
+
+    private const string ArchivePattern = "courier-closed-*.json";
+    private string ArchiveFile(Guid run) => Path.Combine(directory, $"courier-closed-{run:N}.json");
+    private IEnumerable<string> Archives() => Directory.Exists(directory)
+        ? Directory.GetFiles(directory, ArchivePattern).Where(p => Path.GetExtension(p).Equals(".json", StringComparison.OrdinalIgnoreCase))
+        : [];
+    private readonly object archiveGate = new();
+    /// <summary>
+    /// Keeps a finished journal beside the cleared ones (replacing an earlier archive of the same run only when asked),
+    /// then records it in the request index. The archive is written first: one the index missed is indexed on the next load.
+    /// </summary>
+    private async Task ArchiveAsync(CourierJournal r, bool replace)
+    {
+        var index = await history.ConfigureAwait(false);
+        lock (archiveGate)
+        {
+            var path = ArchiveFile(r.Run);
+            if (!replace && File.Exists(path)) return;
+            new CourierStore<CourierJournal>(path).Save(r);
+            index.Runs.RemoveAll(x => x.Run == r.Run);
+            if (r.RequestId is { Length: > 0 }) index.Runs.Add(CourierRequestRecord.Of(r, DateTimeOffset.UtcNow));
+            index.Files.Add(Path.GetFileName(path));
+            Prune(index);
+            requests.Save(index);
+        }
+    }
+    /// <summary>
+    /// Every persisted run the IPC request <paramref name="requestId"/> started: the current journal first, then the
+    /// request index. Null while the index is still being built (only on the first load after an upgrade).
+    /// </summary>
+    internal IReadOnlyList<CourierRequestRecord>? RunsFor(string requestId)
+    {
+        if (!history.IsCompleted) return null;
+        var found = new List<CourierRequestRecord>();
+        var current = store.Load();
+        if (current.Run != Guid.Empty && current.RequestId == requestId) found.Add(CourierRequestRecord.Of(current, DateTimeOffset.UtcNow));
+        lock (archiveGate)
+            found.AddRange(history.Result.Runs.Where(x => x.RequestId == requestId && x.Run != current.Run));
+        return found;
+    }
+    /// <summary>
+    /// Loads the request index, indexing any closed journal it does not list yet (all of them when the index is new). An
+    /// unreadable file is moved aside with a warning and the history goes on without it. Never throws.
+    /// </summary>
+    private CourierRequestIndex LoadHistory()
+    {
+        CourierRequestIndex index;
+        try { index = requests.Load(); }
+        catch (Exception e) { Quarantine(Path.Combine(directory, RequestIndexName), e); index = new(); }
+        try
+        {
+            var changed = false;
+            foreach (var path in Archives().ToArray())
+            {
+                var name = Path.GetFileName(path);
+                if (index.Files.Contains(name)) continue;
+                CourierJournal archived;
+                try { archived = new CourierStore<CourierJournal>(path).Load(); }
+                catch (Exception e) { Quarantine(path, e); continue; }
+                index.Files.Add(name); changed = true;
+                if (archived.RequestId is { Length: > 0 } && archived.Run != Guid.Empty && index.Runs.All(x => x.Run != archived.Run))
+                    index.Runs.Add(CourierRequestRecord.Of(archived, new DateTimeOffset(File.GetLastWriteTimeUtc(path), TimeSpan.Zero)));
+            }
+            lock (archiveGate)
+            {
+                changed |= Prune(index);
+                if (changed) requests.Save(index);
+            }
+        }
+        catch (Exception e) { warning($"CourierHistoryIndexIncomplete: {e.GetType().Name}: {e.Message}"); }
+        return index;
+    }
+    /// <summary>Moves an unreadable history file aside (never deletes it) and warns; the history goes on without it.</summary>
+    private void Quarantine(string path, Exception e)
+    {
+        var target = path + ".unreadable";
+        try
+        {
+            if (File.Exists(target)) target = $"{path}.{DateTime.UtcNow:yyyyMMddHHmmss}.unreadable";
+            File.Move(path, target);
+            warning($"CourierHistoryQuarantined: {Path.GetFileName(path)} is unreadable ({e.Message}); moved aside as {Path.GetFileName(target)}. " +
+                "A request id only it recorded is no longer recognised as a duplicate.");
+        }
+        catch (Exception move)
+        {
+            warning($"CourierHistoryQuarantineFailed: {Path.GetFileName(path)} is unreadable ({e.Message}) and could not be moved aside ({move.Message}); it is skipped.");
+        }
+    }
+    /// <summary>Forgets closed journals that are gone; request records are kept for good. True when anything changed.</summary>
+    private bool Prune(CourierRequestIndex index)
+    {
+        var present = Archives().Select(Path.GetFileName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var changed = index.Files.RemoveWhere(name => !present.Contains(name)) > 0;
+        return changed;
+    }
     public async Task<CourierSnapshot> ClearAsync(Guid expectedRun,string? acknowledgement)
     {
         if(!await gate.WaitAsync(0)) throw new InvalidOperationException("CourierAlreadyRunning");
@@ -230,9 +382,13 @@ public sealed class CourierConductor
                 throw new InvalidOperationException("RunNotClearable");
             if(HasPendingTrade(r))
                 throw new InvalidOperationException("Settle the pending trade before clearing custody.");
-            // Completed includes a durable empty-ledger Finish acknowledgement.
+            // A carrier-sourced run's unhanded claim goes back to the carrier's own stock without an acknowledgement.
+            if(r.State is not ("Completed" or "Refused") && (!r.Custody.IsEmpty || r.Pending is {Action.Phase:CourierPhase.Claim}))
+                await ReleaseClaimAsync(r);
+            // Completed includes a durable empty-ledger Finish acknowledgement. A run refused after its carrier joined it
+            // still closes the carrier's side.
             CourierReceipt? receipt=null;
-            if (r.State is not ("Completed" or "Refused") && r.Start.HasStableIdentity && !Carrierless(r))
+            if (r.State != "Completed" && (r.State != "Refused" || r.PeerClaimed) && r.Start.HasStableIdentity && !Carrierless(r))
                 try { receipt=await Send(r,CourierCommand.Status,r.Start,[]); }
                 catch(CourierFault e) when(r.Custody.IsEmpty && e.Code is "CarrierEndpointAmbiguous" or "PeerLinkLost")
                 { warning($"OfflineClear {r.Run}: {e.Message}"); }
@@ -251,7 +407,7 @@ public sealed class CourierConductor
                 r.ClearAcknowledgement=required;store.Save(r);
             }
             if(receipt?.ActiveRun==r.Run)await Send(r,CourierCommand.Clear,r.Start,held);
-            new CourierStore<CourierJournal>(Path.Combine(directory,$"courier-closed-{r.Run:N}.json")).Save(r);
+            await ArchiveAsync(r,replace:true);
             store.Save(new()); return Snapshot();
         }
         finally{gate.Release();}
@@ -310,6 +466,8 @@ public sealed class CourierConductor
         void RemoteStop(Guid run) { if (run == r.Run) { stop = true; _ = CancelLocal(); } }
         void Progress(CourierProgress p) { if (p.Run == r.Run) peerPhase = p.Phase; }
         bool beginAttempted = false, existingRun=false, carrierless=false;
+        // A carrier-sourced run that cannot claim what it must deliver ends Refused: nothing held, not resumable.
+        bool refusedRun = false;
         // A carrier-less run has no carrier to ask: it stands in an empty bag view and ledger for one.
         Task<CourierReceipt> CarrierStatus() => carrierless
             ? Task.FromResult(new CourierReceipt(r.Run, Guid.Empty, new(r.Settings.Carrier ?? new(), 0, []), Custody: []))
@@ -352,6 +510,8 @@ public sealed class CourierConductor
             var resume = existingRun = r.State is not ("Idle" or "Completed" or "Refused");
             if (!resume)
             {
+                // A finished run a new one replaces is kept with the cleared ones, so its request id stays answerable.
+                if (r.Run != Guid.Empty) await ArchiveAsync(r, replace: false);
                 r = new() { Run = runId ?? Guid.NewGuid(), Plan = plan, Settings = settings, RequestId = plan.RequestId,
                     RunKey=Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)) };
                 if (!plan.Refusals.IsEmpty || plan.Trips.IsEmpty) { r.State = "Refused"; r.Code = "PlanRefused"; warning($"{r.Run} PlanRefused"); return Project(r) with {CanClear=false}; }
@@ -496,8 +656,15 @@ public sealed class CourierConductor
                 }
                 var travel=r.Pending?.Action.Phase is CourierPhase.EnsureSource or CourierPhase.SwitchToDestination or CourierPhase.ReturnOwner
                     or CourierPhase.ReturnCarrier or CourierPhase.CarrierToSource or CourierPhase.CarrierToDestination or CourierPhase.ReturnDestinationHome;
-                var unstartedTrade=r.Pending==null && r.Schedule.Skip(r.Cursor).FirstOrDefault()?.Phase is CourierPhase.HandIn or CourierPhase.HandOut;
-                if (r.Pending != null && !travel || status.Unconfirmed != null || !Custody.Covers(status.Custody, r.Custody) || !Custody.Covers(r.Custody, status.Custody)
+                // An unstarted claim moves nothing and re-checks the carrier's fresh bags itself; a released claim resumes
+                // here as its hand-in would have.
+                var unstartedTrade=r.Pending==null && r.Schedule.Skip(r.Cursor).FirstOrDefault()?.Phase is CourierPhase.HandIn or CourierPhase.HandOut or CourierPhase.Claim;
+                // A pending claim wrote at most the carrier's ledger, never its bags: the loop re-sends it under its
+                // id and the carrier answers with its recorded receipt or runs it once. Its ledger may hold the claim.
+                var claiming=r.Pending is {Action.Phase:CourierPhase.Claim} claim ? claim : null;
+                var custodyAgrees=SameCustody(status.Custody,r.Custody) ||
+                    claiming!=null && SameCustody(status.Custody,Custody.Apply(r.Custody,claiming.Action.Batch,1));
+                if (r.Pending != null && !travel && claiming==null || status.Unconfirmed != null || !custodyAgrees
                     || (!travel && !unstartedTrade && r.Cursor != 0 && (!Agrees(r.OwnerCheckpoint, owner, r) || !carrierless && !Agrees(r.CarrierCheckpoint, carrier, r))))
                     throw Fault("ResumeUnsettled", "Journal intent, ledger or bags cannot prove a forward checkpoint.");
             }
@@ -597,10 +764,25 @@ public sealed class CourierConductor
                         s = steps[r.Cursor]; store.Save(r);
                     }
                 }
+                // A claim takes only units the carrier's fresh bags hold beyond the custody it already carries; a
+                // shortfall fails before anything is journaled. Bag counts never change in a claim, so a re-sent
+                // claim whose ledger entry already landed passes the same check.
+                // The claim follows the carrier's travel, so its fees are already spent: a carrier left short refuses
+                // the run here, holding nothing, rather than claiming what a hand-in could never deliver.
+                if (s.Phase == CourierPhase.Claim && Custody.Apply(r.Custody, s.Batch, 1).GroupBy(x => (x.Item, x.Hq))
+                        .FirstOrDefault(g => carrier.Count(g.Key.Item, g.Key.Hq) < g.Sum(x => (long)x.Units)) is { } unheld)
+                {
+                    refusedRun = r.Pending == null && r.Custody.IsEmpty && Held(status).IsEmpty && status.Unconfirmed == null;
+                    throw new CourierFault(CourierOutcome.Failed, unheld.Key.Item == CourierPlanner.GilItemId ? "CarrierGilShort" : "CarrierStockShort",
+                        $"{unheld.First().Name}: {carrier.Character.CharacterName} holds {carrier.Count(unheld.Key.Item, unheld.Key.Hq):N0}, the run needs {unheld.Sum(x => (long)x.Units):N0}.");
+                }
+                // A re-sent claim (resumed with its intent pending) may already be in the carrier's ledger.
+                var claimLanded = s.Phase == CourierPhase.Claim && r.Pending?.Action.Phase == CourierPhase.Claim &&
+                    SameCustody(status.Custody, Custody.Apply(r.Custody, s.Batch, 1));
                 // No five-slot pre-split: one trade step runs every window back to back (the trade runner
                 // packs fragmented bag slots into successive windows and credits each before the next).
                 if (!carrierless && !CourierPlanner.Exact(carrier.Character, r.Settings.Carrier) ||
-                    !Custody.Covers(status.Custody, r.Custody) || !Custody.Covers(r.Custody, status.Custody))
+                    !SameCustody(status.Custody, r.Custody) && !claimLanded)
                     throw Fault("CustodyMismatch", "Carrier identity or custody changed.");
                 if (s.Phase is CourierPhase.Retrieve or CourierPhase.CarrierToSource or CourierPhase.HandOut &&
                     !CourierPlanner.Exact(owner.Character, t.Source) ||
@@ -641,9 +823,39 @@ public sealed class CourierConductor
                                 await calls.Call("SourceReturnHome", Deadline.DataCenterSeconds, worlds.ReturnHomeAsync);
                             await Switch(t.Destination); await Meet(t.Dropoff);
                         }
-                        // An owner leg that faults stops the carrier instead of waiting out its travel deadline.
-                        await await FirstFaultCancelsOther(r, OwnerToDestination(), t.Pickup.SamePlace(t.Dropoff) ? null :
+                        // An owner leg that faults stops the carrier instead of waiting out its travel deadline. A carrier
+                        // that is itself the source was never at a pickup: it always travels (arriving at once if already there).
+                        await await FirstFaultCancelsOther(r, OwnerToDestination(), !FromCarrier(r, t) && t.Pickup.SamePlace(t.Dropoff) ? null :
                             Send(r, CourierCommand.Travel, t.Destination, [], t.Dropoff,id:intent.Id), "SwitchToDestination"); break;
+                    case CourierPhase.Claim:
+                        // The carrier's own units enter this run's custody; nothing moves. A refused claim whose absence
+                        // the carrier's ledger proves leaves nothing pending, so a resume claims anew; otherwise the
+                        // intent stays and a resume re-sends it under the same id.
+                        try { finished = await Send(r, CourierCommand.Claim, t.Destination, s.Batch, id: intent.Id); }
+                        catch (CourierFault refused) when (refused.Outcome == CourierOutcome.Failed)
+                        {
+                            var unknown = refused.Code == "UnknownCommand";
+                            try
+                            {
+                                if (!SameCustody(Held(await Send(r, CourierCommand.Status, r.Start, [])), r.Custody))
+                                    warning($"{r.Run}/{intent.Id} ClaimRefusedLedgerChanged: {refused.Code}: the carrier's ledger no longer equals the run's custody.");
+                                // A carrier without claims (one downgraded mid-run) never records its refusal: fencing the step
+                                // with a bilateral not-delivered receipt settles its intent, so later commands are not refused.
+                                else if (unknown) await Fence(r, intent, await Observe());
+                                else { r.Pending = null; store.Save(r); }
+                            }
+                            catch (Exception e) { warning($"{r.Run}/{intent.Id} ClaimRefusalStatus: {e.Message}"); }
+                            refusedRun = r.Pending == null && r.Custody.IsEmpty && (unknown || refused.Code is "CarrierGilShort" or "CarrierStockShort");
+                            if (unknown)
+                                throw new CourierFault(CourierOutcome.Failed, "CarrierSourceUnsupported",
+                                    $"{r.Settings.Carrier?.CharacterName}'s Quartermaster cannot claim its own stock: {refused.Message}");
+                            throw;
+                        }
+                        var claimed = Custody.Apply(r.Custody, s.Batch, 1);
+                        if (!SameCustody(Held(finished), claimed))
+                            throw Fault("ClaimLedgerMismatch", "The carrier's ledger after the claim differs from the run's custody plus the claim.");
+                        r.Custody = claimed;
+                        break;
                     case CourierPhase.CarrierToSource:
                     case CourierPhase.CarrierToDestination:
                         // The carrier set out for the pickup in the background (in EnsureSource, or after the previous
@@ -785,8 +997,9 @@ public sealed class CourierConductor
         catch (Exception e)
         {
             r.Code = (e as CourierFault)?.Code ?? "UnexpectedFailure"; r.Detail = e.Message;
-            r.State = r.Pending != null ? "Indeterminate" :
+            string Settled() => r.Pending != null ? "Indeterminate" :
                 e is CourierFault { Outcome: CourierOutcome.Cancelled } ? "Interrupted" : "Failed";
+            r.State = refusedRun && r.Pending == null && r.Custody.IsEmpty ? "Refused" : Settled();
             warning($"{r.Run}/{r.Pending?.Id} {r.State} {r.Code}: {e.Message}");
             if(!existingRun && !beginAttempted)return Project(r) with {CanResume=false,CanClear=false};
             store.Save(r);
@@ -796,6 +1009,12 @@ public sealed class CourierConductor
             if (Interlocked.Exchange(ref carrierMove, null) is { } abandoned &&
                 await Task.WhenAny(abandoned, Task.Delay(TimeSpan.FromSeconds(15))) != abandoned)
                 warning($"{r.Run} CarrierMoveStopDeadline: 15s elapsed after Stop.");
+            // A stopped or failed carrier-sourced run hands its unhanded claim back to the carrier's own stock, so nothing
+            // is left held for acknowledgement; a resume claims again.
+            if (!carrierless && (!r.Custody.IsEmpty || r.Pending is { Action.Phase: CourierPhase.Claim }) && await ReleaseClaimAsync(r) && r.State == "Indeterminate")
+            {
+                r.State = Settled(); store.Save(r);
+            }
         }
         finally { peer.LinkLost -= Lost; peer.Progress -= Progress; peer.StopRequested -= RemoteStop; calls.WhenSettled(() => { try { ReleaseOwner(); } finally { Volatile.Write(ref releaseOwner,null);gate.Release(); } }); }
         return Snapshot();
@@ -926,6 +1145,91 @@ public sealed class CourierConductor
     private static bool Agrees(InventoryView? checkpoint, InventoryView fresh, CourierJournal r) =>
         checkpoint != null && CourierPlanner.Exact(checkpoint.Character, fresh.Character) &&
         r.Plan.Trips.SelectMany(t => t.Manifest).Where(s => !s.IsGil).All(s => checkpoint.Count(s.Item, s.Hq) == fresh.Count(s.Item, s.Hq));
+    /// <summary>
+    /// Hands a stopped, failed or cleared carrier-sourced run's unhanded claim back to the carrier's own stock: both
+    /// ledgers end empty and the run resumes from its claim. A pending claim first settles from the carrier's ledger
+    /// (landed or not). Anything the carrier's ledger or bags leave ambiguous stays custody for acknowledgement.
+    /// Never throws; true when the run holds nothing afterwards.
+    /// </summary>
+    private async Task<bool> ReleaseClaimAsync(CourierJournal r)
+    {
+        if (!ClaimOnly(r) || Carrierless(r)) return false;
+        try
+        {
+            var status = await Send(r, CourierCommand.Status, r.Start, []);
+            if (status.ActiveRun != r.Run || status.Unconfirmed != null)
+            {
+                warning($"{r.Run} ClaimReleaseSkipped: the carrier {(status.ActiveRun != r.Run ? "does not hold this run" : "has an unconfirmed hand-off")}.");
+                return false;
+            }
+            var held = Held(status);
+            if (r.Pending is { Action.Phase: CourierPhase.Claim } claim)
+            {
+                // A claim's ledger entry and its receipt land together: the ledger shows whether it did. One that did not
+                // land is fenced, so the carrier never keeps an unsettled claim intent that would refuse the next claim.
+                if (SameCustody(held, Custody.Apply(r.Custody, claim.Action.Batch, 1)))
+                {
+                    // Adopted as the run loop would have: past the claim, so a failed release below resumes at the hand-in.
+                    r.Custody = held; r.Pending = null;
+                    if (r.Schedule.Skip(r.Cursor).FirstOrDefault() is { Phase: CourierPhase.Claim }) r.Cursor++;
+                    r.CarrierCheckpoint = status.Bags ?? r.CarrierCheckpoint;
+                    store.Save(r);
+                }
+                else if (SameCustody(held, r.Custody)) await Fence(r, claim, await Observe());
+                else
+                {
+                    warning($"{r.Run}/{claim.Id} ClaimReleaseSkipped: the carrier's ledger matches neither the run's custody nor it plus the pending claim.");
+                    return false;
+                }
+            }
+            if (!r.Custody.IsEmpty)
+            {
+                // An empty carrier ledger here is an earlier unclaim whose reply was lost: this custody is claim-only,
+                // so nothing else could have emptied it.
+                var receipt = status;
+                if (!held.IsEmpty)
+                {
+                    if (!SameCustody(held, r.Custody))
+                    {
+                        warning($"{r.Run} ClaimReleaseSkipped: the carrier's ledger differs from the run's custody.");
+                        return false;
+                    }
+                    // Journaled first: a carrier that stopped mid-unclaim only settles a replay of the same step.
+                    if (r.UnclaimStep == null) { r.UnclaimStep = Guid.NewGuid(); store.Save(r); }
+                    try { receipt = await Send(r, CourierCommand.Unclaim, r.Start, r.Custody, id: r.UnclaimStep); }
+                    catch (CourierFault refused) when (refused.Code.StartsWith("Unclaim", StringComparison.Ordinal))
+                    {
+                        // The carrier answered and recorded its refusal under this step: the next attempt is a new step.
+                        r.UnclaimStep = null; store.Save(r);
+                        throw;
+                    }
+                    if (!Held(receipt).IsEmpty)
+                    {
+                        warning($"{r.Run} ClaimReleaseLedgerMismatch: the carrier's ledger is not empty after the unclaim.");
+                        return false;
+                    }
+                }
+                r.Custody = [];
+                r.UnclaimStep = null;
+                r.CarrierCheckpoint = receipt.Bags ?? r.CarrierCheckpoint;
+            }
+            // The run resumes from the released claim's trip: both sides travel to the drop-off again before claiming.
+            if (r.Schedule.Skip(r.Cursor).FirstOrDefault() is not { Phase: CourierPhase.Claim })
+                for (var i = Math.Min(r.Cursor, r.Schedule.Length) - 1; i >= 0; i--)
+                    if (r.Schedule[i].Phase == CourierPhase.Claim) { r.Cursor = i; break; }
+            if (r.Cursor >= 2 && r.Cursor < r.Schedule.Length && r.Schedule[r.Cursor] is { Phase: CourierPhase.Claim } released &&
+                r.Schedule[r.Cursor - 2] is { Phase: CourierPhase.SwitchToDestination } travel && travel.Trip == released.Trip)
+                r.Cursor -= 2;
+            store.Save(r);
+            information?.Invoke($"{r.Run} ClaimReleased: the carrier's claimed stock is its own again.");
+            return true;
+        }
+        catch (Exception e)
+        {
+            warning($"{r.Run} ClaimReleaseFailed: {(e as CourierFault)?.Code ?? e.GetType().Name}: {e.Message}");
+            return false;
+        }
+    }
     private async Task Meet(MeetingBell bell)
     {
         if ((await calls.Call("OwnerPosition", 15, bells.PositionAsync)).World != bell.World)

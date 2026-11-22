@@ -208,7 +208,9 @@ public sealed record Shipment(Guid Line, uint Item, string Name, bool Hq, int Un
 }
 /// <summary>
 /// One carrier round from Source to Destination. A Local trip moves between containers of one character:
-/// the owner withdraws and deposits at its own bell with no carrier and no trade.
+/// the owner withdraws and deposits at its own bell with no carrier and no trade. A trip whose Source is the
+/// run's carrier has no pickup leg: the carrier's own units are claimed into custody and delivered (its Pickup
+/// is its Dropoff).
 /// </summary>
 public sealed record CourierTrip(OwnerScope Source, OwnerScope Destination, MeetingBell Pickup, MeetingBell Dropoff,
     ImmutableArray<Shipment> Manifest)
@@ -230,6 +232,13 @@ public sealed record CourierPlan(Guid PlanId, long Revision, ImmutableArray<Cour
 {
     /// <summary>Absent in journals written before destination consolidation, which read as none.</summary>
     public ImmutableArray<CourierConsolidation> Consolidations { get; init; } = [];
+
+    /// <summary>
+    /// The canonical payload hash of the IPC request behind <see cref="RequestId"/>; a later request under the same id
+    /// with another payload is a conflict. Absent for UI plans and in journals written before it was recorded.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? RequestHash { get; init; }
 }
 
 public static class CourierPlanner

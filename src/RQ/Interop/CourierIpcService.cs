@@ -1,4 +1,7 @@
 using System.Collections.Immutable;
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using RQ.Courier;
 using RQ.Domain;
@@ -28,7 +31,7 @@ public sealed class CourierIpcService
     private readonly Func<uint, ItemMetadata> metadata;
     private readonly Action<string> warn;
     private readonly object gate = new();
-    private (string RequestId, Guid Run)? launched;
+    private (string RequestId, Guid Run, string Hash)? launched;
 
     /// <param name="localBags">The logged-in character's latest bags, observed on the framework thread.</param>
     public CourierIpcService(string providerInstanceId, CourierSession session, Func<CourierSettings> settings,
@@ -109,6 +112,8 @@ public sealed class CourierIpcService
                 carriedGil = carrierBags?.Gil,
                 freeBagSlots = carrierBags?.FreeSlots,
                 carrierOptIn = carrierPeer?.CarrierOptIn,
+                // Whether a transfer may name the carrier itself as its source (sending stock it already holds).
+                canSendOwnStock = carrierPeer?.CarrierSourcing == true,
             };
             var bridgeBell = bridge();
             object? bridgeView = bridgeBell == null ? null : new
@@ -152,6 +157,8 @@ public sealed class CourierIpcService
                     canClear = snapshot.CanClear,
                     custodyUnits = journal.Custody.Where(s => !s.IsGil).Sum(s => (long)s.Units),
                     custodyGil = journal.Custody.Where(s => s.IsGil).Sum(s => (long)s.Units),
+                    // The carrier itself is the source: one delivery leg, no pickup.
+                    fromCarrier = journal.Plan.Trips.Any(t => CourierConductor.FromCarrier(journal, t)),
                 };
             }
             return JsonSerializer.Serialize(new
@@ -213,21 +220,58 @@ public sealed class CourierIpcService
         }
     }
 
+    /// <summary>
+    /// The request's identity-relevant payload: participants by id, gil, items merged by item and quality, and the
+    /// return flags. A later request under the same id must hash the same or it is a conflict.
+    /// </summary>
+    internal static string CanonicalHash(CourierTransferRequest request, string requestId)
+    {
+        static string N(long value) => value.ToString(CultureInfo.InvariantCulture);
+        var canonical = new StringBuilder().Append(TransferSchema).Append('|').Append(requestId)
+            .Append('|').Append(N((long)(request.Source?.LocalContentId ?? 0))).Append('|').Append(N(request.Source?.HomeWorldId ?? 0))
+            .Append('|').Append(N((long)(request.Destination?.LocalContentId ?? 0))).Append('|').Append(N(request.Destination?.HomeWorldId ?? 0))
+            .Append('|').Append(N(request.GilAmount))
+            .Append('|').Append(request.ReturnOwner ? '1' : '0').Append(request.ReturnDestinationHome ? '1' : '0').Append(request.ReturnCarrier ? '1' : '0');
+        foreach (var item in (request.Items ?? []).GroupBy(i => (i.ItemId, i.IsHq)).OrderBy(g => g.Key.ItemId).ThenBy(g => g.Key.IsHq))
+            canonical.Append('|').Append(N(item.Key.ItemId)).Append('|').Append(item.Key.IsHq ? '1' : '0').Append('|').Append(N(item.Sum(i => (long)i.Quantity)));
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical.ToString()))).ToLowerInvariant();
+    }
+
     private string SubmitLocked(CourierTransferRequest request, string requestId)
     {
         if (session.Conductor is not { } conductor)
             return Ack(requestId, null, "rejected", "CourierNotLoaded", "The courier is not loaded.");
+        var hash = CanonicalHash(request, requestId);
         var journal = conductor.Journal();
-        // Idempotency: a request already journaled (or still starting) never starts a second run.
-        if (journal.Run != Guid.Empty && journal.RequestId == requestId)
-            return journal.State switch
+        // Idempotency covers every persisted run this request started (the current journal and the request index of closed
+        // runs), so a request resubmitted after other runs never starts a second transfer. A different payload conflicts.
+        if (conductor.RunsFor(requestId) is not { } known)
+            return Ack(requestId, null, "rejected", "CourierHistoryIndexing", "The courier's request history is still loading; retry shortly.");
+        if (known.FirstOrDefault(j => j.Hash is { } stored && stored != hash) is { } conflicting)
+            return Ack(requestId, conflicting.Run, "rejected", "RequestConflict", "Request ID was already used with a different canonical payload.");
+        if (launched is { } starting && starting.RequestId == requestId && starting.Hash != hash)
+            return Ack(requestId, starting.Run, "rejected", "RequestConflict", "Request ID is starting with a different canonical payload.");
+        // A run that provably moved nothing (refused, or stopped before any hand-in) runs again under the same id;
+        // the current one is archived by the new run below.
+        if (known.FirstOrDefault(j => j.Run == journal.Run) is { } current)
+        {
+            var answer = current.State switch
             {
-                "Running" => Ack(requestId, journal.Run, "already_running", null, "This request's run is in progress."),
-                "Completed" => Ack(requestId, journal.Run, "already_completed", null, "This request's run completed."),
-                "Refused" => Ack(requestId, journal.Run, "rejected", journal.Code, journal.Detail),
-                _ when session.IsStarting => Ack(requestId, journal.Run, "already_running", null, "This request's run is starting."),
-                _ => Ack(requestId, journal.Run, "rejected", "CourierRunUnresolved", $"This request's run is {journal.State} ({journal.Code}); resume or clear it."),
+                "Running" => Ack(requestId, current.Run, "already_running", null, "This request's run is in progress."),
+                "Completed" => Ack(requestId, current.Run, "already_completed", null, "This request's run completed."),
+                _ when session.IsStarting => Ack(requestId, current.Run, "already_running", null, "This request's run is starting."),
+                _ when current.Untouched => null,
+                _ => Ack(requestId, current.Run, "rejected", "CourierRunUnresolved", $"This request's run is {current.State} ({current.Code}); resume or clear it."),
             };
+            if (answer != null)
+                return answer;
+        }
+        if (known.FirstOrDefault(j => j.State == "Completed") is { } completed)
+            return Ack(requestId, completed.Run, "already_completed", null, "This request's run completed.");
+        // A cleared run that may have moved anything could have delivered part of the transfer: sending it again could repeat that.
+        if (known.FirstOrDefault(j => !j.Untouched) is { } cleared)
+            return Ack(requestId, cleared.Run, "rejected", "CourierRunCleared",
+                $"This request's run ended {cleared.State} ({cleared.Code}) and was cleared; it may have delivered part of the transfer. Submit what remains under a new request id.");
         if (launched is { } pending && pending.RequestId == requestId && session.IsStarting)
             return Ack(requestId, pending.Run, "already_running", null, "This request's run is starting.");
         if (session.IsActive)
@@ -241,23 +285,25 @@ public sealed class CourierIpcService
             return Ack(requestId, journal.Run, "rejected", "CourierRunUnresolved", $"The previous run is {journal.State} ({journal.Code}); resume or clear it first.");
 
         var cfg = settings();
-        OwnerScope? Roster(CourierTransferCharacter? who)
-        {
-            if (who == null)
-                return null;
-            var named = new OwnerScope { LocalContentId = who.LocalContentId, HomeWorldId = who.HomeWorldId, CharacterName = who.CharacterName, HomeWorldName = who.HomeWorldName };
-            return cfg.LocalRoster.FirstOrDefault(o => CourierPlanner.Exact(o, named));
-        }
-        var source = Roster(request.Source);
+        static OwnerScope? Named(CourierTransferCharacter? who) => who == null ? null :
+            new OwnerScope { LocalContentId = who.LocalContentId, HomeWorldId = who.HomeWorldId, CharacterName = who.CharacterName, HomeWorldName = who.HomeWorldName };
+        OwnerScope? Roster(CourierTransferCharacter? who) => Named(who) is { } named ? cfg.LocalRoster.FirstOrDefault(o => CourierPlanner.Exact(o, named)) : null;
+        // The configured carrier may be the source: it then delivers stock it already holds.
+        var fromCarrier = cfg.Carrier is { HasStableIdentity: true } && CourierPlanner.Exact(Named(request.Source), cfg.Carrier);
+        var source = fromCarrier ? cfg.Carrier : Roster(request.Source);
         var destination = Roster(request.Destination);
         if (source == null || destination == null)
-            return Ack(requestId, null, "rejected", "OutsideClientRoster", "Source and destination must both be characters of this client's service account.");
+            return Ack(requestId, null, "rejected", "OutsideClientRoster",
+                "The destination, and a source other than the carrier, must be characters of this client's service account.");
         var live = localBags();
         var carrierPeer = CarrierPeer(cfg);
         if (carrierPeer?.CarrierOptIn == false)
             return Ack(requestId, null, "rejected", "CarrierOptInOff",
                 $"{cfg.Carrier!.CharacterName} does not have 'Carry for another character' enabled in Quartermaster.");
-        var initiator = live?.Character is { HasStableIdentity: true } current ? current : source;
+        if (fromCarrier && carrierPeer != null && carrierPeer.CarrierSourcing != true)
+            return Ack(requestId, null, "rejected", "CarrierSourceUnsupported",
+                $"{cfg.Carrier!.CharacterName}'s Quartermaster cannot send stock it holds; it needs the version this client runs.");
+        var initiator = live?.Character is { HasStableIdentity: true } logged ? logged : fromCarrier ? destination : source;
         if (carrierPeer?.PairedOwners is { } paired && !paired.Any(p => CourierPlanner.Exact(p, initiator)))
             return Ack(requestId, null, "rejected", "OwnerNotPaired",
                 $"{initiator.CharacterName} is not paired as an owner on {cfg.Carrier!.CharacterName}'s Quartermaster Courier settings.");
@@ -267,18 +313,20 @@ public sealed class CourierIpcService
         var (plan, refusal) = CourierTransferPlanner.Build(order, cfg, carrierPeer?.Bags, live, metadata, worldRegion, bridge());
         if (refusal != null || plan == null)
             return Ack(requestId, null, "rejected", refusal?.Code ?? "PlanningFailed", refusal?.Message ?? "No plan.");
+        plan = plan with { RequestHash = hash };
         // A finished or zero-custody unresolved previous run is archived first; one holding custody was refused above.
         Guid? clear = journal.Run != Guid.Empty && (journal.State is "Completed" or "Refused" || unresolved) && journal.Custody.IsEmpty ? journal.Run : null;
         var run = Guid.NewGuid();
         var runSettings = cfg with { ReturnOwner = request.ReturnOwner, ReturnCarrier = request.ReturnCarrier };
         if (!session.StartPlan(plan, runSettings, clear, run))
             return Ack(requestId, null, "rejected", "CourierAlreadyRunning", "Another courier run is active.");
-        launched = (requestId, run);
+        launched = (requestId, run, hash);
         var gil = plan.Trips.SelectMany(t => t.Manifest).Where(s => s.IsGil).Sum(s => (long)s.Units);
         var stacks = plan.Trips.SelectMany(t => t.Manifest).Count(s => !s.IsGil);
-        return Ack(requestId, run, "accepted", null,
-            $"{source.CharacterName} → {destination.CharacterName}: {gil:N0} gil, {stacks} stack(s) in {plan.Trips.Length} trip(s) via " +
-            $"{plan.Trips[0].Pickup.Label} / {plan.Trips[^1].Dropoff.Label}.");
+        return Ack(requestId, run, "accepted", null, fromCarrier
+            ? $"{source.CharacterName} → {destination.CharacterName}: {gil:N0} gil, {stacks} stack(s) from the carrier's bags via {plan.Trips[^1].Dropoff.Label}."
+            : $"{source.CharacterName} → {destination.CharacterName}: {gil:N0} gil, {stacks} stack(s) in {plan.Trips.Length} trip(s) via " +
+              $"{plan.Trips[0].Pickup.Label} / {plan.Trips[^1].Dropoff.Label}.");
     }
 
     // ---- PairCourierOwner ---------------------------------------------------------------------

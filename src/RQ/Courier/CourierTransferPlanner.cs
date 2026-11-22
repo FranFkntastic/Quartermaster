@@ -8,8 +8,8 @@ namespace RQ.Courier;
 public sealed record CourierTransferItem(uint ItemId, string ItemName, bool IsHq, int Quantity);
 
 /// <summary>
-/// A direct carried transfer between two roster characters: carried gil and bag-held items only, never a
-/// retainer. Source and Destination are the roster's own identities.
+/// A direct carried transfer to a roster character: carried gil and bag-held items only, never a retainer.
+/// Destination is a roster identity; Source is another roster identity or the configured carrier itself.
 /// </summary>
 public sealed record CourierTransferOrder(OwnerScope Source, OwnerScope Destination, int Gil,
     ImmutableArray<CourierTransferItem> Items, bool ReturnDestinationHome, string RequestId);
@@ -21,7 +21,8 @@ public sealed record CourierTransferRefusal(string Code, string Message);
 /// Builds a <see cref="CourierPlan"/> for a direct carried transfer. Each side meets the carrier at its own
 /// home-world meeting bell when the carrier's region can reach it, otherwise at the cross-region bridge
 /// (a plaza every region reaches by data-center travel). Gil takes no bag slot; item stacks are packed
-/// into as many trips as the carrier's free slots need.
+/// into as many trips as the carrier's free slots need. When the source is the carrier itself, one trip delivers
+/// stock it already carries, with no pickup leg.
 /// </summary>
 public static class CourierTransferPlanner
 {
@@ -34,10 +35,12 @@ public static class CourierTransferPlanner
             return Refuse("CarrierNotConfigured", "No carrier is chosen.");
         if (carrier == null || !CourierPlanner.Exact(carrier.Character, carrierScope))
             return Refuse("CarrierUnreachable", $"{carrierScope.CharacterName} is not logged in on a linked client.");
-        if (!settings.LocalRoster.Any(o => CourierPlanner.Exact(o, source)) || !settings.LocalRoster.Any(o => CourierPlanner.Exact(o, destination)))
-            return Refuse("OutsideClientRoster", "Source and destination must both be characters of this client's service account.");
-        if (CourierPlanner.Exact(source, destination) || CourierPlanner.Exact(source, carrierScope) || CourierPlanner.Exact(destination, carrierScope))
-            return Refuse("InvalidParticipants", "Source, destination and carrier must be three different characters.");
+        // The carrier may itself be the source: it then delivers stock it already holds, with no pickup leg.
+        var fromCarrier = CourierPlanner.Exact(source, carrierScope);
+        if (!fromCarrier && !settings.LocalRoster.Any(o => CourierPlanner.Exact(o, source)) || !settings.LocalRoster.Any(o => CourierPlanner.Exact(o, destination)))
+            return Refuse("OutsideClientRoster", "The destination, and a source other than the carrier, must be characters of this client's service account.");
+        if (CourierPlanner.Exact(source, destination) || CourierPlanner.Exact(destination, carrierScope))
+            return Refuse("InvalidParticipants", "The destination must be a different character from the source and from the carrier.");
         if (order.Gil < 0 || order.Items.Any(i => i.Quantity <= 0 || i.ItemId == 0 || i.ItemId == CourierPlanner.GilItemId))
             return Refuse("InvalidManifest", "Gil must not be negative and every item needs a positive quantity.");
         if (order.Gil == 0 && order.Items.IsDefaultOrEmpty)
@@ -56,13 +59,20 @@ public static class CourierTransferPlanner
                 ? (bridge, null)
                 : (null, new("RegionUnreachable", $"{carrierScope.CharacterName} cannot reach {side.CharacterName}'s region and no bridge is available."));
         }
-        var (pickup, pickupRefusal) = Rendezvous(source);
-        if (pickupRefusal != null) return (null, pickupRefusal);
         var (dropoff, dropoffRefusal) = Rendezvous(destination);
         if (dropoffRefusal != null) return (null, dropoffRefusal);
+        MeetingBell? pickup = dropoff;
+        if (!fromCarrier)
+        {
+            (pickup, var pickupRefusal) = Rendezvous(source);
+            if (pickupRefusal != null) return (null, pickupRefusal);
+        }
 
-        var live = sourceLive != null && CourierPlanner.Exact(sourceLive.Character, source) ? sourceLive : null;
-        if (GilRefusal(live?.Gil, carrier.Gil, order.Gil) is { } gilRefusal)
+        // The carrier's own bags are the source's live bags when it sends its own stock.
+        var live = fromCarrier ? carrier : sourceLive != null && CourierPlanner.Exact(sourceLive.Character, source) ? sourceLive : null;
+        if (fromCarrier && order.Gil > carrier.Gil)
+            return Refuse("CarrierGilShort", $"{carrierScope.CharacterName} carries {carrier.Gil:N0} gil; the transfer needs {order.Gil:N0}.");
+        if (!fromCarrier && GilRefusal(live?.Gil, carrier.Gil, order.Gil) is { } gilRefusal)
             return (null, gilRefusal);
 
         var stacks = new List<Shipment>();
@@ -80,7 +90,8 @@ public static class CourierTransferPlanner
             if (meta.IsUnique == true && units != 1)
                 return Refuse("UniqueConflict", $"{name} is unique: one at a time.");
             if (live != null && live.Count(group.Key.ItemId, group.Key.IsHq) < units)
-                return Refuse("SourceShort", $"{source.CharacterName} carries {live.Count(group.Key.ItemId, group.Key.IsHq):N0} {name}; the transfer needs {units:N0}.");
+                return Refuse(fromCarrier ? "CarrierStockShort" : "SourceShort",
+                    $"{source.CharacterName} carries {live.Count(group.Key.ItemId, group.Key.IsHq):N0} {name}; the transfer needs {units:N0}.");
             if (units > int.MaxValue)
                 return Refuse("InvalidManifest", $"{name}: quantity too large.");
             var size = (int)meta.MaxStackSize.Value;
@@ -88,6 +99,10 @@ public static class CourierTransferPlanner
             for (var left = (int)units; left > 0; left -= Math.Min(size, left))
                 stacks.Add(new(line, group.Key.ItemId, name, group.Key.IsHq, Math.Min(size, left), size, null, null, source, destination));
         }
+        // Stock the carrier already holds takes no free slot of its own: one trip delivers all of it.
+        if (fromCarrier)
+            return (new CourierPlan(Guid.NewGuid(), 0, [new CourierTrip(source, destination, dropoff!, dropoff!, [.. stacks])], [],
+                order.ReturnDestinationHome, order.RequestId), null);
         if (stacks.Any(s => !s.IsGil) && carrier.FreeSlots <= 0)
             return Refuse("BagSlotLimit", $"{carrierScope.CharacterName} has no free bag slot.");
         var trips = CourierPlanner.Pack(stacks, Math.Max(1, carrier.FreeSlots), int.MaxValue)

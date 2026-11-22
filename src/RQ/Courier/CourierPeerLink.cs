@@ -75,7 +75,7 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     {
         var cfg=settings();
         var carrying=cfg.CarrierOptIn && cfg.Carrier is {} self && CourierPlanner.Exact(self,who);
-        return new CourierPeer(who,bags,cfg.LocalRoster,carrying,carrying?[..cfg.Owners]:Array.Empty<OwnerScope>());
+        return new CourierPeer(who,bags,cfg.LocalRoster,carrying,carrying?[..cfg.Owners]:Array.Empty<OwnerScope>(),carrying?true:null);
     }
     private bool CarryingRun()
     {

@@ -21,8 +21,10 @@ internal sealed record CourierContainer(ulong? Retainer, string Name, int Capaci
     internal int? Stacks => Free is { } free ? Capacity - free : null;
 }
 
+/// <param name="CarrierSourcing">True when this carrier can send stock it already holds (the claim command); null from
+/// carriers built before it.</param>
 public sealed record CourierPeer(OwnerScope Character, InventoryView? Bags,IReadOnlyList<OwnerScope>? Roster=null,
-    bool? CarrierOptIn=null,IReadOnlyList<OwnerScope>? PairedOwners=null);
+    bool? CarrierOptIn=null,IReadOnlyList<OwnerScope>? PairedOwners=null,bool? CarrierSourcing=null);
 
 /// <summary>
 /// The live facts only the courier wiring can supply to the UI. Both members are read on the
@@ -975,6 +977,11 @@ public sealed class CourierSession
             "SenderStockShort" => "Items no longer at the source",
             "CustodyInsufficient" => $"{who} holds fewer items than expected",
             "CustodyRemaining" => $"{who} still holds items",
+            // The carrier's ledger already holds its own claimed stock for this run; nothing left its bags.
+            "ClaimCustodyNotEmpty" => $"{who}'s stock is already reserved",
+            "CarrierSourceUnsupported" => $"{who} cannot send its own stock",
+            "CarrierStockShort" => $"{who} holds too few items",
+            "CarrierGilShort" => $"{who} carries too little gil",
             "CarrierBagsMissing" => $"{who} did not report bags",
             "CarrierIdentityMismatch" => "A different character is carrying",
             "OwnerIdentityMismatch" or "SwitchIdentityMismatch" => "Wrong character logged in",
@@ -982,7 +989,7 @@ public sealed class CourierSession
             "TradeStartNotAcknowledged" => $"{who} did not accept the trade",
             "TradeHoldLost" or "TradeHoldRefused" or "TradeHoldUnavailable" => "Trade hold unavailable",
             "HandOffDeltaMismatch" or "LedgerMismatch" or "SettlementDeltaMismatch" or "SettlementLedgerMismatch" or "CustodyMismatch"
-                or "ReceiptMismatch" or "NotDeliveredDeltaMismatch" or "PlacementSettlementMismatch" or "PlacementSettlementIdentity"
+                or "ReceiptMismatch" or "NotDeliveredDeltaMismatch" or "PlacementSettlementMismatch" or "PlacementSettlementIdentity" or "ClaimLedgerMismatch"
                 => "Hand-off did not match the plan",
             "TradeClosureUnproven" or "ResumeUnsettled" => "Hand-off unverified",
             _ when code.EndsWith("Deadline", StringComparison.Ordinal) => "Timed out",
@@ -996,6 +1003,7 @@ public sealed class CourierSession
         nameof(CourierPhase.HandOut) or nameof(CourierPhase.HandIn) => $"Trade {step.From} → {step.To} unverified",
         nameof(CourierPhase.Retrieve) => $"Retrieval for {step.From} unverified",
         nameof(CourierPhase.Deposit) => $"Deposit for {step.From} unverified",
+        nameof(CourierPhase.Claim) => $"Reservation on {step.From} unverified",
         _ => $"{PhaseLabel(step.Step)} unverified",
     };
 
@@ -1014,6 +1022,7 @@ public sealed class CourierSession
         nameof(CourierPhase.ReturnCarrier) => "Carrier returning",
         nameof(CourierPhase.ReturnDestinationHome) => "Returning home",
         nameof(CourierPhase.Finish) => "Finishing",
+        nameof(CourierPhase.Claim) => "Reserving carrier stock",
         nameof(CourierCommand.Travel) => "Traveling to the meeting bell",
         nameof(CourierCommand.Receive) => "Receiving a trade",
         nameof(CourierCommand.Send) => "Trading back",
