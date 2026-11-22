@@ -355,7 +355,7 @@ public sealed class Plugin : IDalamudPlugin
         courier.Follower = new(configDirectory,()=>state.ReadConfiguration(s=>s.Courier),automation,autoRetainerSuppression,courierTrade,
             courierGame,courierGame,courierGame,s=>log.Warning(s),s=>log.Information(s),AutoRetainerLoaded);
         courier.Follower.RestoreCustodyHold();
-        courier.Link = courierPeer = new(courierGame,courier.Follower,DispatchOnFramework,s=>log.Warning(s),()=>state.ReadConfiguration(s=>s.Courier.LocalRoster));
+        courier.Link = courierPeer = new(courierGame,courier.Follower,DispatchOnFramework,s=>log.Warning(s),()=>state.ReadConfiguration(s=>s.Courier));
         courier.Conductor = new(configDirectory,courierPeer,courierTrade,courierGame,courierGame,courierGame,courierGame,
             transfers,automation,autoRetainerSuppression,s=>log.Warning(s),s=>log.Information(s),AutoRetainerLoaded);
         var courierWorldRegion = courier.WorldRegion!;

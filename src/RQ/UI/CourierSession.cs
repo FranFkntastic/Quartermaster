@@ -21,7 +21,8 @@ internal sealed record CourierContainer(ulong? Retainer, string Name, int Capaci
     internal int? Stacks => Free is { } free ? Capacity - free : null;
 }
 
-public sealed record CourierPeer(OwnerScope Character, InventoryView? Bags,IReadOnlyList<OwnerScope>? Roster=null);
+public sealed record CourierPeer(OwnerScope Character, InventoryView? Bags,IReadOnlyList<OwnerScope>? Roster=null,
+    bool? CarrierOptIn=null,IReadOnlyList<OwnerScope>? PairedOwners=null);
 
 /// <summary>
 /// The live facts only the courier wiring can supply to the UI. Both members are read on the

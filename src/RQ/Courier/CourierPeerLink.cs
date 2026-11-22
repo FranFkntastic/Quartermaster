@@ -12,7 +12,7 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     private sealed record Reply(Result<CourierReceipt>? Result,CourierProgress? Progress);
     private sealed record Job(CourierMessage Message, string Fingerprint, Task<Result<CourierReceipt>> Task, DateTimeOffset Expires);
     private readonly Task<PeerEndpoint> endpoint;
-    private readonly Func<IReadOnlyList<OwnerScope>> roster;
+    private readonly Func<CourierSettings> settings;
     private readonly CourierGame game;
     private readonly CourierFollower follower;
     private readonly Action<string> warn;
@@ -43,9 +43,9 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     public event Action<CourierProgress>? Progress;
     public event Action? LinkLost;
     public event Action<Guid>? StopRequested;
-    internal CourierPeerLink(CourierGame game,CourierFollower follower,Func<Action,CancellationToken,Task> dispatch,Action<string> warn,Func<IReadOnlyList<OwnerScope>> roster)
+    internal CourierPeerLink(CourierGame game,CourierFollower follower,Func<Action,CancellationToken,Task> dispatch,Action<string> warn,Func<CourierSettings> settings)
     {
-        this.roster=roster;this.game=game; this.follower=follower; this.warn=warn;
+        this.settings=settings;this.game=game; this.follower=follower; this.warn=warn;
         endpoint=PeerEndpoint.StartAsync(new("Quartermaster.Courier.v2",dispatch,Handle,warn),JsonSerializer.SerializeToElement<CourierPeer?>(null));
         follower.StopRequested+=NotifyStop;
     }
@@ -62,10 +62,18 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
         LocalBags=bags;
         if(bags!=null)lastCharacter=bags.Character;
         else if(lastCharacter!=null && !CarryingRun())lastCharacter=null;
-        var identity=JsonSerializer.SerializeToElement(bags!=null ? new CourierPeer(bags.Character,bags,roster()) :
-            lastCharacter!=null ? new CourierPeer(lastCharacter,null,roster()) : null);
+        var who=bags?.Character ?? lastCharacter;
+        var identity=JsonSerializer.SerializeToElement(who!=null ? Identity(who,bags) : null);
         refresh=Refresh(identity);
         foreach(var p in jobs.Where(e=>e.Value.Task.IsCompleted && e.Value.Expires<now)){ jobs.TryRemove(p.Key,out _); acknowledgements.TryRemove(p.Key,out _); }
+    }
+    // Pairing rides on every identity (including the bag-less one published mid data-center travel) so owners
+    // see whether this character carries for them without the status flickering while it travels.
+    private CourierPeer Identity(OwnerScope who,InventoryView? bags)
+    {
+        var cfg=settings();
+        var carrying=cfg.CarrierOptIn && cfg.Carrier is {} self && CourierPlanner.Exact(self,who);
+        return new CourierPeer(who,bags,cfg.LocalRoster,carrying,carrying?[..cfg.Owners]:Array.Empty<OwnerScope>());
     }
     private bool CarryingRun()
     {
