@@ -4,12 +4,16 @@ using RQ.Inventory;
 
 namespace RQ.Courier;
 
-/// <summary>One carried item stack group an external request asks the courier to move.</summary>
-public sealed record CourierTransferItem(uint ItemId, string ItemName, bool IsHq, int Quantity);
+/// <summary>
+/// One carried item stack group an external request asks the courier to move. RetainerId, when set, names the
+/// destination's retainer the units are deposited into after the hand-in; otherwise they stay in its bags.
+/// </summary>
+public sealed record CourierTransferItem(uint ItemId, string ItemName, bool IsHq, int Quantity, ulong? RetainerId = null);
 
 /// <summary>
-/// A direct carried transfer to a roster character: carried gil and bag-held items only, never a retainer.
-/// Destination is a roster identity; Source is another roster identity or the configured carrier itself.
+/// A direct carried transfer to a roster character: carried gil and bag-held items, never drawn from a retainer.
+/// Items may name a destination retainer to be deposited into. Destination is a roster identity; Source is another
+/// roster identity or the configured carrier itself.
 /// </summary>
 public sealed record CourierTransferOrder(OwnerScope Source, OwnerScope Destination, int Gil,
     ImmutableArray<CourierTransferItem> Items, bool ReturnDestinationHome, string RequestId);
@@ -22,12 +26,15 @@ public sealed record CourierTransferRefusal(string Code, string Message);
 /// home-world meeting bell when the carrier's region can reach it, otherwise at the cross-region bridge
 /// (a plaza every region reaches by data-center travel). Gil takes no bag slot; item stacks are packed
 /// into as many trips as the carrier's free slots need. When the source is the carrier itself, one trip delivers
-/// stock it already carries, with no pickup leg.
+/// stock it already carries, with no pickup leg. Items naming a destination retainer are deposited there after the
+/// hand-in, which needs the destination at its own summoning bell (never the bridge plaza), one free bag slot, and
+/// room in that retainer, all as last observed (<paramref name="locations"/>).
 /// </summary>
 public static class CourierTransferPlanner
 {
     public static (CourierPlan? Plan, CourierTransferRefusal? Refusal) Build(CourierTransferOrder order, CourierSettings settings,
-        InventoryView? carrier, InventoryView? sourceLive, Func<uint, ItemMetadata> metadata, Func<uint, uint> worldRegion, MeetingBell? bridge)
+        InventoryView? carrier, InventoryView? sourceLive, Func<uint, ItemMetadata> metadata, Func<uint, uint> worldRegion, MeetingBell? bridge,
+        IReadOnlyList<CourierLocation>? locations = null)
     {
         static (CourierPlan?, CourierTransferRefusal?) Refuse(string code, string message) => (null, new(code, message));
         var (source, destination) = (order.Source, order.Destination);
@@ -75,6 +82,9 @@ public static class CourierTransferPlanner
         if (!fromCarrier && GilRefusal(live?.Gil, carrier.Gil, order.Gil) is { } gilRefusal)
             return (null, gilRefusal);
 
+        if (RetainerRefusal(order, dropoff!, metadata, locations) is { } retainerRefusal)
+            return (null, retainerRefusal);
+
         var stacks = new List<Shipment>();
         if (order.Gil > 0)
             stacks.Add(new(Guid.NewGuid(), CourierPlanner.GilItemId, "Gil", false, order.Gil, CourierPlanner.GilCap, null, null, source, destination));
@@ -96,8 +106,10 @@ public static class CourierTransferPlanner
                 return Refuse("InvalidManifest", $"{name}: quantity too large.");
             var size = (int)meta.MaxStackSize.Value;
             var line = Guid.NewGuid();
-            for (var left = (int)units; left > 0; left -= Math.Min(size, left))
-                stacks.Add(new(line, group.Key.ItemId, name, group.Key.IsHq, Math.Min(size, left), size, null, null, source, destination));
+            // Bag-bound units first, then each named retainer's, in request order.
+            foreach (var part in group.GroupBy(i => i.RetainerId).OrderBy(part => part.Key.HasValue))
+                for (var left = part.Sum(i => i.Quantity); left > 0; left -= Math.Min(size, left))
+                    stacks.Add(new(line, group.Key.ItemId, name, group.Key.IsHq, Math.Min(size, left), size, null, part.Key, source, destination));
         }
         // Stock the carrier already holds takes no free slot of its own: one trip delivers all of it.
         if (fromCarrier)
@@ -108,6 +120,49 @@ public static class CourierTransferPlanner
         var trips = CourierPlanner.Pack(stacks, Math.Max(1, carrier.FreeSlots), int.MaxValue)
             .Select(batch => new CourierTrip(source, destination, pickup!, dropoff!, batch)).ToImmutableArray();
         return (new CourierPlan(Guid.NewGuid(), 0, trips, [], order.ReturnDestinationHome, order.RequestId), null);
+    }
+
+    /// <summary>
+    /// Why the units naming a destination retainer cannot be deposited there: the destination meets the carrier at a
+    /// plaza (no retainer can be reached), the retainer or the destination's bags were never observed, its bags have no
+    /// free slot for the hand-in, or the retainer lacks room for what is named for it. Null when nothing names one.
+    /// </summary>
+    internal static CourierTransferRefusal? RetainerRefusal(CourierTransferOrder order, MeetingBell dropoff,
+        Func<uint, ItemMetadata> metadata, IReadOnlyList<CourierLocation>? locations)
+    {
+        var named = (order.Items.IsDefault ? [] : order.Items).Where(i => i.RetainerId != null).ToArray();
+        if (named.Length == 0)
+            return null;
+        var destination = order.Destination;
+        if (dropoff.IsPlaza)
+            return new("RetainerUnreachableAtPlaza",
+                $"{destination.CharacterName} meets the carrier at {dropoff.Label}, where no retainer can be reached; deliver to its bags instead.");
+        var observed = locations ?? [];
+        if (observed.FirstOrDefault(l => l.Retainer == null && CourierPlanner.Exact(l.Character, destination)) is not { } bags)
+            return new("DestinationBagsUnobserved", $"{destination.CharacterName}'s bags have not been observed on this client.");
+        if (bags.Inventory.FreeSlots <= 0)
+            return new("DestinationBagsFull", $"{destination.CharacterName} has no free bag slot to receive the goods.");
+        foreach (var retainer in named.GroupBy(i => i.RetainerId!.Value))
+        {
+            if (observed.FirstOrDefault(l => l.Retainer == retainer.Key && CourierPlanner.Exact(l.Character, destination)) is not { } place)
+                return new("DestinationRetainerUnknown", $"Retainer {retainer.Key} is not an observed retainer of {destination.CharacterName}.");
+            // Partial stacks of the item take units first; the rest needs empty slots, as the courier planner counts room.
+            var slots = 0L;
+            foreach (var item in retainer.GroupBy(i => (i.ItemId, i.IsHq)))
+            {
+                // An item without a known stack size is refused as ItemMetadataUnknown by the item checks.
+                if (metadata(item.Key.ItemId).MaxStackSize is not { } max || max is <= 0 or > int.MaxValue)
+                    continue;
+                var size = (long)max;
+                var partial = place.Inventory.Stock.Where(s => s.ItemId == item.Key.ItemId && s.Hq == item.Key.IsHq && s.Units > 0)
+                    .Sum(s => (size - s.Units % size) % size);
+                slots += (Math.Max(0L, item.Sum(i => (long)i.Quantity) - partial) + size - 1) / size;
+            }
+            if (slots > place.Inventory.FreeSlots)
+                return new("DestinationRetainerFull",
+                    $"{destination.CharacterName}'s retainer {retainer.Key} has {place.Inventory.FreeSlots} free slot(s) as last observed; the transfer needs {slots}.");
+        }
+        return null;
     }
 
     /// <summary>

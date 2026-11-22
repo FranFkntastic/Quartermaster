@@ -19,6 +19,11 @@ public sealed class WorkbenchStockService
     public const string ReserveItemsCapability = "reserveItems.v1";
     public const string PlacementEditorCapability = "placementEditor.v1";
     public const string ReserveLevelsCapability = "reserveLevels.v1";
+    /// <summary>Reserve items carry <c>remoteHomes</c> (homes on another character) and the placement editor can set them.</summary>
+    public const string RemoteHomesCapability = "reserveRemoteHomes.v1";
+    public const string ArrivalPlanCapability = "arrivalPlan.v1";
+    public const string ArrivalPlanRequestSchema = "gooseworks-quartermaster-arrival-plan-request/v1";
+    public const string ArrivalPlanSchema = "gooseworks-quartermaster-arrival-plan/v1";
     public const string StockSourcesRequestSchema = "gooseworks-quartermaster-stock-sources-request/v1";
     public const string StockSourcesSchema = "gooseworks-quartermaster-stock-sources/v1";
     public const string ReserveItemsSchema = "gooseworks-quartermaster-reserve-items/v1";
@@ -39,6 +44,7 @@ public sealed class WorkbenchStockService
     private readonly StateRepository state;
     private readonly IFrameworkWorkQueue workQueue;
     private readonly Action<string>? warn;
+    private readonly Func<uint, int>? maxStackSize;
     private readonly object gate = new();
     private (long Runtime, long Players, long External, IReadOnlyList<SourceCharacter> Characters)? sources;
     private (long Runtime, string Json)? reserves;
@@ -53,8 +59,10 @@ public sealed class WorkbenchStockService
         Func<ExternalAccountSnapshot> external,
         StateRepository state,
         IFrameworkWorkQueue workQueue,
-        Action<string>? warn = null)
+        Action<string>? warn = null,
+        Func<uint, int>? maxStackSize = null)
     {
+        this.maxStackSize = maxStackSize;
         this.providerInstanceId = providerInstanceId;
         this.runtime = runtime;
         this.playerInventory = playerInventory;
@@ -65,7 +73,7 @@ public sealed class WorkbenchStockService
     }
 
     public static IReadOnlyList<string> Capabilities { get; } =
-        [StockSourcesCapability, ReserveItemsCapability, PlacementEditorCapability, ReserveLevelsCapability];
+        [StockSourcesCapability, ReserveItemsCapability, PlacementEditorCapability, ReserveLevelsCapability, RemoteHomesCapability, ArrivalPlanCapability];
 
     // ---- Stock sources ------------------------------------------------------------------------
 
@@ -249,6 +257,8 @@ public sealed class WorkbenchStockService
                         countedUnits = counted is { IsKnown: true } known ? known.Value : (int?)null,
                         homes = reserve.Location.PreferredRetainerIds.Distinct().ToArray(),
                         anySpace = reserve.Location.AnySpace,
+                        // Additive: ranked homes on another character, filled after homes/anySpace. Null when none.
+                        remoteHomes = RemoteHomesView(reserve.RemoteHomes, current),
                     };
                 }),
         }, JsonOptions);
@@ -256,6 +266,127 @@ public sealed class WorkbenchStockService
             reserves = (current.Revision, json);
         return json;
     }
+
+    // ---- Arrival plan -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Where units arriving in an owner's bags would go now, by the same routing a delivered stow uses: the owner's
+    /// ranked homes (then any space when the reserve allows it) by observed room, then the reserve's ranked homes on
+    /// another character for what is left, also by observed room. Unplaced units stay in the bags. Room is as last
+    /// observed, so the answer is a plan, not a promise; a delivered stow re-plans against the room it finds.
+    /// </summary>
+    public string PlanArrival(string requestJson)
+    {
+        object Rejected(string code, string message) => new { schema = ArrivalPlanSchema, providerInstanceId, status = "rejected", errorCode = code, message };
+        ArrivalPlanRequest? request;
+        try { request = JsonSerializer.Deserialize<ArrivalPlanRequest>(requestJson, JsonOptions); }
+        catch (JsonException exception) { return JsonSerializer.Serialize(Rejected("invalid_json", exception.Message), JsonOptions); }
+        if (request is null)
+            return JsonSerializer.Serialize(Rejected("invalid_json", "Request body is empty."), JsonOptions);
+        if (request.Schema != ArrivalPlanRequestSchema)
+            return JsonSerializer.Serialize(Rejected("unsupported_schema", $"Expected schema '{ArrivalPlanRequestSchema}'."), JsonOptions);
+        if (request.Items is not { Count: > 0 and <= MaxPlacementItems } items)
+            return JsonSerializer.Serialize(Rejected("invalid_items", $"Between 1 and {MaxPlacementItems} items are required."), JsonOptions);
+        if (items.Any(item => item.ItemId == 0 || item.Quantity <= 0) || items.GroupBy(item => (item.ItemId, item.IsHq)).Any(group => group.Count() > 1))
+            return JsonSerializer.Serialize(Rejected("invalid_items", "Each item needs an itemId and a positive quantity, once per quality."), JsonOptions);
+        if (maxStackSize is null)
+            return JsonSerializer.Serialize(Rejected("unavailable", "Item stack sizes are unavailable."), JsonOptions);
+
+        var current = runtime();
+        var asked = request.Owner is { LocalContentId: > 0, HomeWorldId: > 0 } named
+            ? new OwnerScope { LocalContentId = named.LocalContentId, HomeWorldId = named.HomeWorldId, CharacterName = named.CharacterName }
+            : current.Owner;
+        if (!asked.HasStableIdentity)
+            return JsonSerializer.Serialize(Rejected("missing_owner_scope", "No owner was named and no character is logged in."), JsonOptions);
+        var plan = ListingPlanCatalog.OwnerPlan(current.State, asked);
+        var owner = asked.Matches(current.Owner) ? current.Owner : plan?.Owner ?? asked;
+        var now = DateTime.UtcNow;
+        try
+        {
+            var local = StowageRouter.BuildBatch(
+                plan is null ? [] : MarketRunPlanner.StowRequests(plan.Id, plan.Reserves, items.Select(item => (item.ItemId, item.IsHq, item.Quantity))),
+                current.Retainers, owner, maxStackSize, now);
+            int LocalUnits(ArrivalPlanRequestItem item) => local.Routes
+                .Where(route => route.Request.ItemId == item.ItemId && route.Request.IsHighQuality == item.IsHq).Sum(route => route.RoutedQuantity);
+            ReserveRemoteHomes? Remote(ArrivalPlanRequestItem item) => plan?.Reserves.FirstOrDefault(reserve => reserve.Enabled &&
+                    reserve.ItemId == item.ItemId && (reserve.Quality == ItemQualityPolicy.Any || reserve.Quality == ItemQualityPolicy.HqOnly == item.IsHq) &&
+                    reserve.RemoteHomes is { RetainerIds.Count: > 0, Character.HasStableIdentity: true })
+                ?.RemoteHomes;
+            // Each other character's homes are routed together, so items sharing a retainer share its room.
+            var remote = items
+                .Select(item => (Item: item, Homes: Remote(item), Units: item.Quantity - LocalUnits(item)))
+                .Where(entry => entry.Homes is not null && entry.Units > 0)
+                .GroupBy(entry => (entry.Homes!.Character.LocalContentId, entry.Homes.Character.HomeWorldId))
+                .SelectMany(group => StowageRouter.BuildBatch(
+                        group.Select(entry => new StowageDepositRequest(plan!.Id, null, entry.Item.ItemId, $"Item {entry.Item.ItemId}", entry.Item.IsHq, entry.Units,
+                            new StowageRoutingPolicy { PreferredRetainerIds = [.. entry.Homes!.RetainerIds] })),
+                        current.Retainers, group.First().Homes!.Character, maxStackSize, now).Routes
+                    .Select(route => (Character: group.First().Homes!.Character, Route: route)))
+                .ToArray();
+            object Placed(IEnumerable<StowageAllocation> allocations) => allocations.Where(allocation => allocation.Quantity > 0)
+                .Select(allocation => new { allocation.RetainerId, allocation.RetainerName, units = allocation.Quantity }).ToArray();
+            return JsonSerializer.Serialize(new
+            {
+                schema = ArrivalPlanSchema,
+                providerInstanceId,
+                status = "planned",
+                revision = current.Revision,
+                generatedAtUtc = now,
+                owner = new { owner.LocalContentId, owner.HomeWorldId, owner.CharacterName, owner.HomeWorldName },
+                items = items.Select(item =>
+                {
+                    var localRoutes = local.Routes.Where(route => route.Request.ItemId == item.ItemId && route.Request.IsHighQuality == item.IsHq).ToArray();
+                    var homes = Remote(item);
+                    var remoteRoutes = remote.Where(entry => entry.Route.Request.ItemId == item.ItemId && entry.Route.Request.IsHighQuality == item.IsHq).ToArray();
+                    var localUnits = localRoutes.Sum(route => route.RoutedQuantity);
+                    var remoteUnits = remoteRoutes.Sum(entry => entry.Route.RoutedQuantity);
+                    var unplaced = item.Quantity - localUnits - remoteUnits;
+                    return new
+                    {
+                        item.ItemId,
+                        item.IsHq,
+                        item.Quantity,
+                        local = new { units = localUnits, retainers = Placed(localRoutes.SelectMany(route => route.Allocations)) },
+                        // Null when the item has no homes on another character.
+                        remote = homes is null ? null : new
+                        {
+                            character = new { homes.Character.LocalContentId, homes.Character.HomeWorldId, homes.Character.CharacterName, homes.Character.HomeWorldName },
+                            units = remoteUnits,
+                            retainers = Placed(remoteRoutes.SelectMany(entry => entry.Route.Allocations)),
+                        },
+                        unplaced,
+                        // NoHome: no home anywhere. NoRoom: homes exist but their observed room is short.
+                        unplacedReason = unplaced <= 0 ? null : localRoutes.Length == 0 && homes is null ? "NoHome" : "NoRoom",
+                    };
+                }),
+            }, JsonOptions);
+        }
+        catch (Exception exception)
+        {
+            warn?.Invoke($"Quartermaster could not plan an arrival: {exception}");
+            return JsonSerializer.Serialize(Rejected("planning_failed", exception.Message), JsonOptions);
+        }
+    }
+
+    private static object? RemoteHomesView(ReserveRemoteHomes? remote, QuartermasterRuntimeSnapshot current) =>
+        remote is not { RetainerIds.Count: > 0 } ? null : new
+        {
+            character = new
+            {
+                remote.Character.LocalContentId,
+                remote.Character.HomeWorldId,
+                remote.Character.CharacterName,
+                remote.Character.HomeWorldName,
+            },
+            retainers = remote.RetainerIds.Distinct().Select(id => new
+            {
+                retainerId = id,
+                // Null while this client has not observed the retainer under that character.
+                retainerName = current.Retainers.TryGetValue(id, out var retainer) && retainer.Owner.Matches(remote.Character)
+                    ? retainer.RetainerName
+                    : null,
+            }),
+        };
 
     private static IEnumerable<CachedRetainer> OwnerRetainers(QuartermasterRuntimeSnapshot current) => current.Retainers.Values
         .Where(retainer => retainer.Owner.Matches(current.Owner) && retainer.IsCurrentlyAssigned is not false)
@@ -311,6 +442,23 @@ public sealed class WorkbenchStockService
             reserve.Location = ListingPlanCatalog.CopyLocation(location);
             return true;
         }, create: location.PreferredRetainerIds.Count > 0 || location.AnySpace));
+    }
+
+    /// <summary>
+    /// Persists one item's ranked homes on another character (none clears them), creating a level-0 rule when
+    /// the item has none. Local homes are left as they are. Queued to the framework thread.
+    /// </summary>
+    public void SetRemotePlacement(OwnerScope owner, PlacementEditorItem item, OwnerScope character, IReadOnlyList<ulong> retainerIds)
+    {
+        if (character.Matches(owner))
+            throw new ArgumentException("Remote homes belong to another character than the owner.", nameof(character));
+        var remote = retainerIds.Count == 0 ? null : new ReserveRemoteHomes { Character = character with { }, RetainerIds = retainerIds.Distinct().ToList() };
+        workQueue.Enqueue(() => EditReserve(owner, item.ItemId, item.ItemName, item.Quality, reserve =>
+        {
+            if (ReserveRemoteHomes.Same(reserve.RemoteHomes, remote)) return false;
+            reserve.RemoteHomes = ReserveRemoteHomes.CopyOf(remote);
+            return true;
+        }, create: remote is not null));
     }
 
     public static bool SameLocation(StowageRoutingPolicy left, StowageRoutingPolicy right) =>
@@ -390,7 +538,7 @@ public sealed class WorkbenchStockService
                 if (string.IsNullOrWhiteSpace(reserve.ItemName))
                     reserve.ItemName = itemName;
                 edit(reserve);
-                if (reserve.ReserveUnits == 0 && reserve.Location.PreferredRetainerIds.Count == 0 && !reserve.Location.AnySpace)
+                if (reserve.ReserveUnits == 0 && !reserve.HasAnyHome)
                     target.Reserves.Remove(reserve);
                 target.UpdatedAtUtc = DateTime.UtcNow;
                 target.Revision = checked(target.Revision + 1);

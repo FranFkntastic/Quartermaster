@@ -422,7 +422,12 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
             DrawReserve(item, reserve, session, layout);
             ImGui.TableNextColumn();
             DrawCraft(item, noProject.Contains((item.ItemId, item.Quality)));
-            var goesTo = reserve is null ? string.Empty : TransferPresentation.RouteSummary(reserve.Location, runtime.Retainers, runtime.Owner);
+            var goesTo = reserve is null ? string.Empty : string.Join(" → ", new[]
+            {
+                TransferPresentation.RouteSummary(reserve.Location, runtime.Retainers, runtime.Owner),
+                // Homes on another character take what the owner's own homes leave.
+                reserve.RemoteHomes is { RetainerIds.Count: > 0 } remote ? PlacementEditorWindow.RemoteSummary(runtime, remote) : string.Empty,
+            }.Where(part => part.Length > 0));
             if (showGoesTo) { ImGui.TableNextColumn(); DrawGoesTo(item, goesTo, "column"); }
             if (open)
             {

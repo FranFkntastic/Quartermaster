@@ -879,9 +879,12 @@ public sealed class CourierSession
 
     /// <summary>
     /// Starts a plan built outside the stowage view (the courier IPC). A clean, settled previous run
-    /// is archived first. False when a run is already active.
+    /// is archived first. False when a run is already active. <paramref name="settled"/>, when given, hears how the
+    /// start ended on the background thread: the conductor's last snapshot, or the exception it threw. A start that
+    /// failed before the run began is not journaled, so this is the only place its reason survives.
     /// </summary>
-    internal bool StartPlan(CourierPlan courierPlan, CourierSettings settings, Guid? clearFirst, Guid runId)
+    internal bool StartPlan(CourierPlan courierPlan, CourierSettings settings, Guid? clearFirst, Guid runId,
+        Action<CourierSnapshot?, Exception?>? settled = null)
     {
         Poll(force: true);
         if (Conductor is not { } conductor || IsActive)
@@ -891,13 +894,13 @@ public sealed class CourierSession
             if (clearFirst is { } previous)
                 await conductor.ClearAsync(previous, null).ConfigureAwait(false);
             return await conductor.StartAsync(courierPlan, settings, runId).ConfigureAwait(false);
-        });
+        }, settled);
         return true;
     }
 
     private string? CarrierName() => state.ReadConfiguration(document => document.Courier.Carrier?.CharacterName);
 
-    private void Launch(Func<Task<CourierSnapshot?>> start)
+    private void Launch(Func<Task<CourierSnapshot?>> start, Action<CourierSnapshot?, Exception?>? settled = null)
     {
         Error = null;
         ErrorDetail = null;
@@ -905,14 +908,21 @@ public sealed class CourierSession
         Conductor?.PrepareLaunch();
         starting = Task.Run(async () =>
         {
+            CourierSnapshot? outcome = null;
+            Exception? fault = null;
             try
             {
                 // Failed, interrupted and indeterminate runs are journaled; the run pane shows those.
-                if (await start().ConfigureAwait(false) is { State: "Refused" } refused)
+                if ((outcome = await start().ConfigureAwait(false)) is { State: "Refused" } refused)
                     Fail(OutcomeLabel(refused.Code, carrier), $"{refused.Code}: {refused.Detail}");
             }
-            catch (Exception exception) { Fail(FailureLabel(exception, carrier), exception.ToString()); }
-            finally { polledAt = 0; }
+            catch (Exception exception) { fault = exception; Fail(FailureLabel(exception, carrier), exception.ToString()); }
+            finally
+            {
+                polledAt = 0;
+                try { settled?.Invoke(outcome, fault); }
+                catch (Exception exception) { Warn?.Invoke($"Courier: start listener failed ({exception.Message})"); }
+            }
         });
         polledAt = 0;
     }
