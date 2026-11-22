@@ -98,7 +98,9 @@ public sealed record CourierTransferRequestItem
 /// <c>gooseworks-quartermaster-courier-transfer/v1</c>: move carried gil and bag-held items from one roster
 /// character to another through the carrier. Source may also be the carrier itself (as GetCourierStatus names it):
 /// it then delivers stock it already carries in one leg. RequestId is the idempotency key across every run this
-/// client has journaled; reusing it with a different payload is refused as RequestConflict.
+/// client has journaled; reusing it with a different payload is refused as RequestConflict. A run that provably moved
+/// nothing (refused, or stopped before any hand-in) may run again under its RequestId; one that may have delivered part
+/// is refused as CourierRunCleared once cleared.
 /// </summary>
 public sealed record CourierTransferRequest
 {

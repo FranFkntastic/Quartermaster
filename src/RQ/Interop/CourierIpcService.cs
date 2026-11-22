@@ -243,34 +243,33 @@ public sealed class CourierIpcService
             return Ack(requestId, null, "rejected", "CourierNotLoaded", "The courier is not loaded.");
         var hash = CanonicalHash(request, requestId);
         var journal = conductor.Journal();
-        // Idempotency covers every persisted run this request started (the current journal and every archived run), so a
-        // request resubmitted after other runs never starts a second transfer. A different payload under the id conflicts.
-        IReadOnlyList<CourierJournal> known;
-        try { known = conductor.RunsFor(requestId); }
-        catch (Exception e)
-        {
-            return Ack(requestId, null, "rejected", "CourierHistoryUnreadable",
-                $"Whether this request already ran cannot be determined: {e.Message}");
-        }
-        if (known.FirstOrDefault(j => j.Plan.RequestHash is { } stored && stored != hash) is { } conflicting)
+        // Idempotency covers every persisted run this request started (the current journal and the request index of closed
+        // runs), so a request resubmitted after other runs never starts a second transfer. A different payload conflicts.
+        if (conductor.RunsFor(requestId) is not { } known)
+            return Ack(requestId, null, "rejected", "CourierHistoryIndexing", "The courier's request history is still loading; retry shortly.");
+        if (known.FirstOrDefault(j => j.Hash is { } stored && stored != hash) is { } conflicting)
             return Ack(requestId, conflicting.Run, "rejected", "RequestConflict", "Request ID was already used with a different canonical payload.");
         if (launched is { } starting && starting.RequestId == requestId && starting.Hash != hash)
             return Ack(requestId, starting.Run, "rejected", "RequestConflict", "Request ID is starting with a different canonical payload.");
+        // A run that provably moved nothing (refused, or stopped before any hand-in) runs again under the same id;
+        // the current one is archived by the new run below.
         if (known.FirstOrDefault(j => j.Run == journal.Run) is { } current)
-            return current.State switch
+        {
+            var answer = current.State switch
             {
                 "Running" => Ack(requestId, current.Run, "already_running", null, "This request's run is in progress."),
                 "Completed" => Ack(requestId, current.Run, "already_completed", null, "This request's run completed."),
-                "Refused" => Ack(requestId, current.Run, "rejected", current.Code, current.Detail),
                 _ when session.IsStarting => Ack(requestId, current.Run, "already_running", null, "This request's run is starting."),
+                _ when current.Untouched => null,
                 _ => Ack(requestId, current.Run, "rejected", "CourierRunUnresolved", $"This request's run is {current.State} ({current.Code}); resume or clear it."),
             };
+            if (answer != null)
+                return answer;
+        }
         if (known.FirstOrDefault(j => j.State == "Completed") is { } completed)
             return Ack(requestId, completed.Run, "already_completed", null, "This request's run completed.");
-        if (known.Count > 0 && known.All(j => j.State == "Refused"))
-            return Ack(requestId, known[0].Run, "rejected", known[0].Code, known[0].Detail);
-        // A cleared run that did not complete may have delivered part of its transfer: sending it again could repeat that.
-        if (known.FirstOrDefault(j => j.State != "Refused") is { } cleared)
+        // A cleared run that may have moved anything could have delivered part of the transfer: sending it again could repeat that.
+        if (known.FirstOrDefault(j => !j.Untouched) is { } cleared)
             return Ack(requestId, cleared.Run, "rejected", "CourierRunCleared",
                 $"This request's run ended {cleared.State} ({cleared.Code}) and was cleared; it may have delivered part of the transfer. Submit what remains under a new request id.");
         if (launched is { } pending && pending.RequestId == requestId && session.IsStarting)

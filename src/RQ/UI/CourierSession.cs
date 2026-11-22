@@ -976,7 +976,10 @@ public sealed class CourierSession
             "DestinationBagsFull" => "Destination bags full",
             "SenderStockShort" => "Items no longer at the source",
             "CustodyInsufficient" => $"{who} holds fewer items than expected",
-            "CustodyRemaining" or "ClaimCustodyNotEmpty" => $"{who} still holds items",
+            "CustodyRemaining" => $"{who} still holds items",
+            // The carrier's ledger already holds its own claimed stock for this run; nothing left its bags.
+            "ClaimCustodyNotEmpty" => $"{who}'s stock is already reserved",
+            "CarrierSourceUnsupported" => $"{who} cannot send its own stock",
             "CarrierStockShort" => $"{who} holds too few items",
             "CarrierGilShort" => $"{who} carries too little gil",
             "CarrierBagsMissing" => $"{who} did not report bags",
