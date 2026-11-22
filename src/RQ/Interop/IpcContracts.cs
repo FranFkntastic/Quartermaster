@@ -16,6 +16,65 @@ public static class IpcChannels
     public const string StopCourierRun = "Quartermaster.v1.StopCourierRun";
     public const string ResumeCourierRun = "Quartermaster.v1.ResumeCourierRun";
     public const string PairCourierOwner = "Quartermaster.v1.PairCourierOwner";
+    public const string GetStockSources = "Quartermaster.v1.GetStockSources";
+    public const string GetReserveItems = "Quartermaster.v1.GetReserveItems";
+    public const string OpenPlacement = "Quartermaster.v1.OpenPlacement";
+    public const string SetReserveLevel = "Quartermaster.v1.SetReserveLevel";
+}
+
+/// <summary><c>gooseworks-quartermaster-stock-sources-request/v1</c>: which items to count per source.</summary>
+public sealed record StockSourcesRequest
+{
+    public string Schema { get; init; } = string.Empty;
+    public IReadOnlyList<uint>? ItemIds { get; init; }
+}
+
+/// <summary>
+/// <c>gooseworks-quartermaster-open-placement/v1</c>: opens Quartermaster's placement editor for the current
+/// character with one row per item. Quality is <c>NqOnly</c> or <c>HqOnly</c>.
+/// </summary>
+public sealed record OpenPlacementRequest
+{
+    public string Schema { get; init; } = string.Empty;
+    public string ProviderInstanceId { get; init; } = string.Empty;
+    public string RequestId { get; init; } = string.Empty;
+    public RequestOwner? Owner { get; init; }
+    public IReadOnlyList<OpenPlacementItem>? Items { get; init; }
+}
+
+public sealed record OpenPlacementItem
+{
+    public uint ItemId { get; init; }
+    public string ItemName { get; init; } = string.Empty;
+    public string Quality { get; init; } = string.Empty;
+}
+
+/// <summary><c>gooseworks-quartermaster-reserve-level/v1</c>: how many spare units of an item to keep.</summary>
+public sealed record ReserveLevelRequest
+{
+    public string Schema { get; init; } = string.Empty;
+    public string ProviderInstanceId { get; init; } = string.Empty;
+    public string RequestId { get; init; } = string.Empty;
+    public RequestOwner? Owner { get; init; }
+    public uint ItemId { get; init; }
+    public string ItemName { get; init; } = string.Empty;
+    public string Quality { get; init; } = string.Empty;
+    public int ReserveUnits { get; init; }
+}
+
+/// <summary>
+/// <c>gooseworks-quartermaster-reserve-edit-ack/v1</c>. Status: queued (applied on the next framework
+/// tick, then announced through Changed) or rejected (ErrorCode names why).
+/// </summary>
+public sealed record ReserveEditAcknowledgement
+{
+    public string Schema { get; init; } = "gooseworks-quartermaster-reserve-edit-ack/v1";
+    public string ProviderInstanceId { get; init; } = string.Empty;
+    public string RequestId { get; init; } = string.Empty;
+    public string Status { get; init; } = string.Empty;
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ErrorCode { get; init; }
+    public string Message { get; init; } = string.Empty;
 }
 
 /// <summary>A roster character named by an external courier request.</summary>
@@ -160,4 +219,74 @@ public sealed class FrameworkWorkQueue : IFrameworkWorkQueue
         }
         return count;
     }
+}
+
+// ---- Delivered stow (capability deliveredStow.v1) ------------------------------------------------
+// Kept as its own block so it merges independently of other contract additions.
+
+public static class DeliveredStowIpcChannels
+{
+    public const string SubmitDeliveredStow = "Quartermaster.v1.SubmitDeliveredStow";
+    public const string GetDeliveredStow = "Quartermaster.v1.GetDeliveredStow";
+}
+
+public sealed record DeliveredStowRequestItem
+{
+    public uint ItemId { get; init; }
+    public string ItemName { get; init; } = string.Empty;
+    public bool IsHq { get; init; }
+    public int Quantity { get; init; }
+}
+
+/// <summary>
+/// <c>gooseworks-quartermaster-delivered-stow/v1</c>: stow goods a caller just delivered into the logged-in
+/// owner's bags into each item's home retainers (the owner's Listing Plan reserve "Goes to"). Quantities are
+/// upper bounds, capped by the owner's carried bags; items without a home stay in the bags. RequestId is the
+/// idempotency key.
+/// </summary>
+public sealed record DeliveredStowRequest
+{
+    public string Schema { get; init; } = string.Empty;
+    public string ProviderInstanceId { get; init; } = string.Empty;
+    public string RequestId { get; init; } = string.Empty;
+    public RequestOwner? Owner { get; init; }
+    public IReadOnlyList<DeliveredStowRequestItem>? Items { get; init; }
+}
+
+/// <summary>
+/// One requested item variant. Code: Planned, NoHome, NoRoom, NotCarried, Stowed, PartlyStowed, NotStowed.
+/// Carried (acknowledgement only) is the requested quantity found in the bags; Planned is what fits the
+/// listed home retainers, so Planned &lt; Carried means part had no room and Carried &lt; Requested means
+/// part was not carried.
+/// </summary>
+public sealed record DeliveredStowLine
+{
+    public uint ItemId { get; init; }
+    public string ItemName { get; init; } = string.Empty;
+    public bool IsHq { get; init; }
+    public int Requested { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? Carried { get; init; }
+    public int Planned { get; init; }
+    public int Stowed { get; init; }
+    public string Code { get; init; } = string.Empty;
+    public IReadOnlyList<string> Destinations { get; init; } = [];
+}
+
+/// <summary>
+/// Acknowledgement (<c>gooseworks-quartermaster-delivered-stow-ack/v1</c>) and status
+/// (<c>gooseworks-quartermaster-delivered-stow-status/v1</c>). Status: queued, accepted, running, succeeded,
+/// partially_succeeded, indeterminate, failed, cancelled, nothing_to_stow, rejected (ErrorCode names why) or not_found.
+/// </summary>
+public sealed record DeliveredStowStatus
+{
+    public string Schema { get; init; } = string.Empty;
+    public string ProviderInstanceId { get; init; } = string.Empty;
+    public string RequestId { get; init; } = string.Empty;
+    public string? OperationId { get; init; }
+    public string Status { get; init; } = string.Empty;
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ErrorCode { get; init; }
+    public string Message { get; init; } = string.Empty;
+    public IReadOnlyList<DeliveredStowLine> Lines { get; init; } = [];
 }

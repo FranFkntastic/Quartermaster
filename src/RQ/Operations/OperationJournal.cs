@@ -58,6 +58,87 @@ public sealed class OperationJournal
             .FirstOrDefault());
     }
 
+    // ---- Requester cancellation and unstarted expiry ------------------------------------------
+    // Stop requests for running operations live in memory only: a reload already settles every running
+    // operation as indeterminate, and accepted operations are cancelled durably below.
+    private readonly object stopGate = new();
+    private readonly HashSet<string> stopRequests = new(StringComparer.Ordinal);
+
+    /// <summary>True when the requester asked a running operation to stop after its current retainer.</summary>
+    public bool IsStopRequested(string operationId)
+    {
+        lock (stopGate)
+            return stopRequests.Contains(operationId);
+    }
+
+    /// <summary>
+    /// Cancels the operation an external request id created: an accepted operation is cancelled durably; a
+    /// running one finishes the retainer it is on and stops. Null when the request id is unknown.
+    /// </summary>
+    public (string Outcome, OperationRecord Operation)? CancelRequested(string requestId, string message)
+    {
+        var operation = repository.Read(state =>
+            state.Requests.FirstOrDefault(record => record.RequestId == requestId) is { } request &&
+            state.Operations.FirstOrDefault(candidate => candidate.OperationId == request.OperationId) is { } found
+                ? Copy(found)
+                : null);
+        if (operation is null)
+            return null;
+        if (operation.Status == OperationStatuses.Accepted)
+        {
+            try
+            {
+                return ("cancelled", Transition(operation.OperationId, OperationStatuses.Cancelled, "CancelledByRequester", message));
+            }
+            catch (InvalidOperationException)
+            {
+                // Started between the read and the transition: fall through to the running case.
+                operation = Get(operation.OperationId) ?? operation;
+            }
+        }
+        if (operation.Status == OperationStatuses.Running)
+        {
+            lock (stopGate)
+                stopRequests.Add(operation.OperationId);
+            return ("stopping", operation);
+        }
+        return ("already_terminal", operation);
+    }
+
+    /// <summary>
+    /// Cancels externally requested delivered-stow operations that have not started within
+    /// <paramref name="startWindow"/> of submission, so a stale stow never deposits later (for example on the
+    /// owner's next login). Requested retrievals and elemental deposits keep waiting as before; their
+    /// requesters withdraw them through the cancel channel. <paramref name="activeOperationId"/> is skipped.
+    /// </summary>
+    public IReadOnlyList<OperationRecord> ExpireUnstartedRequestedOperations(TimeSpan startWindow, string? activeOperationId)
+    {
+        var cutoff = utcNow() - startWindow;
+        var expired = repository.Read(state => state.Operations
+            .Where(operation => operation.ExecuteImmediately &&
+                                operation.Kind == OperationKinds.StowageSurplus &&
+                                operation.Status == OperationStatuses.Accepted &&
+                                operation.OperationId != activeOperationId &&
+                                state.Requests.FirstOrDefault(record => record.OperationId == operation.OperationId) is { } request &&
+                                (request.AcceptedAtUtc == default ? operation.CreatedAtUtc : request.AcceptedAtUtc) < cutoff)
+            .Select(operation => operation.OperationId)
+            .ToArray());
+        var cancelled = new List<OperationRecord>();
+        foreach (var operationId in expired)
+        {
+            try
+            {
+                cancelled.Add(Transition(operationId, OperationStatuses.Cancelled, "ExpiredBeforeStart",
+                    $"Not started within {startWindow.TotalMinutes:N0} minutes of submission; cancelled instead of running later."));
+            }
+            catch (InvalidOperationException)
+            {
+                // Started or settled concurrently; nothing to expire.
+            }
+        }
+        return cancelled;
+    }
+
     public IReadOnlyList<OperationRecord> ReconcileInterruptedOperations()
     {
         if (!repository.Read(state => state.Operations.Any(operation => operation.Status == OperationStatuses.Running)))
@@ -245,11 +326,24 @@ public sealed class OperationJournal
         StowageDepositBatch batch) =>
         CreateDeposit(owner, batch, OperationKinds.StowageSurplus, plan);
 
+    /// <summary>
+    /// An externally requested stowage deposit (delivered-stow IPC): the request id is persisted with its
+    /// canonical hash in the same mutation as the operation, so a replay can never create a second deposit.
+    /// </summary>
+    public OperationRecord CreateRequestedDeposit(
+        OwnerScope owner,
+        StowageDepositBatch batch,
+        string requestId,
+        string operationId,
+        string canonicalHash) =>
+        CreateDeposit(owner, batch, OperationKinds.StowageSurplus, null, (requestId, operationId, canonicalHash));
+
     private OperationRecord CreateDeposit(
         OwnerScope owner,
         StowageDepositBatch batch,
         string kind,
-        StowagePlan? sourcePlan)
+        StowagePlan? sourcePlan,
+        (string RequestId, string OperationId, string CanonicalHash)? requested = null)
     {
         if (!owner.HasStableIdentity)
             throw new InvalidOperationException("Deposit operations require stable owner identity.");
@@ -263,14 +357,17 @@ public sealed class OperationJournal
             .ToArray();
         var operation = new OperationRecord
         {
-            OperationId = $"rq-{Guid.NewGuid():N}",
+            OperationId = requested?.OperationId ?? $"rq-{Guid.NewGuid():N}",
             Kind = kind,
+            ExecuteImmediately = requested is not null,
             Owner = owner with { },
             Status = OperationStatuses.Accepted,
             Revision = 1,
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
-            Message = "Reviewed stowage authorization is ready for explicit execution.",
+            Message = requested is null
+                ? "Reviewed stowage authorization is ready for explicit execution."
+                : "Delivered-stow authorization is ready for automatic execution.",
             SourcePlanId = sourcePlan?.Id,
             SourcePlanRevision = sourcePlan?.Revision,
             SourcePlanName = sourcePlan?.Name,
@@ -333,12 +430,26 @@ public sealed class OperationJournal
                 })
                 .ToList(),
         };
-        operation.RequestId = operation.OperationId;
+        operation.RequestId = requested?.RequestId ?? operation.OperationId;
         if (operation.Lines.Count == 0 || operation.DepositCandidates.Count == 0)
             throw new InvalidOperationException("Stowage batch has no executable reviewed authorization.");
 
         repository.Mutate(StateChangeKind.Operations, state =>
         {
+            if (requested is { } ids)
+            {
+                if (state.Operations.Any(candidate => candidate.OperationId == operation.OperationId))
+                    throw new InvalidOperationException($"Operation ID '{operation.OperationId}' is already in use.");
+                if (state.Requests.Any(candidate => candidate.RequestId == ids.RequestId))
+                    throw new InvalidOperationException($"Request ID '{ids.RequestId}' is already in use.");
+                state.Requests.Add(new SubmittedRequestRecord
+                {
+                    RequestId = ids.RequestId,
+                    OperationId = operation.OperationId,
+                    CanonicalHash = ids.CanonicalHash,
+                    AcceptedAtUtc = now,
+                });
+            }
             state.Operations.Add(operation);
             AddReceipt(state, operation, "StowageAuthorizationPersisted", operation.Message);
         });
@@ -379,6 +490,9 @@ public sealed class OperationJournal
             AddReceipt(state, operation, code, message);
             changed = Copy(operation);
         });
+        if (OperationStatuses.IsTerminal(status))
+            lock (stopGate)
+                stopRequests.Remove(operationId);
         OperationChanged?.Invoke(changed);
         return changed;
     }

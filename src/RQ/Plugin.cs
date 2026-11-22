@@ -71,6 +71,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly ShortageSubmissionService submissions;
     private readonly ElementalDepositSubmissionService deposits;
     private readonly QuartermasterIpcProvider ipc;
+    private readonly DeliveredStowService deliveredStow;
     private readonly RQ.AgentBridge.AgentBridgeHost agentBridge;
     private readonly AgentBridgeViewportCaptureService agentBridgeViewportCapture;
     private readonly AgentBridgeUiReviewRegistry agentReviewRegistry = new();
@@ -249,7 +250,7 @@ public sealed class Plugin : IDalamudPlugin
             information: message => log.Information(message));
         marketRuns.Restore(marketRunStore.Load());
         activeMarketRuns = marketRuns;
-        automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerSuppression);
+        automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerSuppression, message => log.Warning(message));
         runtimeSnapshots = new(scanner, playerInventory, cache, state, CurrentOwner);
         var vendorAccess = new DalamudGilVendorAccessReader(
             clientState,
@@ -321,6 +322,14 @@ public sealed class Plugin : IDalamudPlugin
         submissions = new ShortageSubmissionService(providerInstanceId, state, workQueue, CurrentOwner);
         deposits = new ElementalDepositSubmissionService(providerInstanceId, state, workQueue, journal, cache.Snapshot, CurrentOwner);
         ipc = new(new DalamudIpcRegistrar(pluginInterface), snapshots, submissions, deposits);
+        deliveredStow = new DeliveredStowService(providerInstanceId, state, workQueue, journal, cache.Snapshot, CurrentOwner,
+            // Live read: the cached snapshot can lag a delivery by a reconcile tick and omits the crystal pouch.
+            _ => scanner.ScanCarried(),
+            id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.StackSize is > 0 and var stack
+                ? checked((int)stack) : throw new InvalidOperationException($"Stack size unavailable for item {id}."),
+            message => log.Warning(message));
+        ipc.AttachDeliveredStow(deliveredStow);
+        ipc.AttachRequestedOperationCancel(new RequestedOperationCancelService(providerInstanceId, journal, workQueue, message => log.Warning(message)));
         window = new(
             state,
             runtimeSnapshots,
@@ -365,6 +374,12 @@ public sealed class Plugin : IDalamudPlugin
             courierWorldRegion,
             worldId => dataManager.GetExcelSheet<Lumina.Excel.Sheets.World>()?.GetRowOrDefault(worldId)?.Name.ToString() ?? "",
             scanner.ResolveItemMetadata, s => log.Warning(s)));
+        var workbenchStock = new Interop.WorkbenchStockService(providerInstanceId, () => runtimeSnapshots.Current, playerInventory,
+            () => externalAccountStock.Current, state, workQueue, s => log.Warning(s));
+        var placementEditor = new PlacementEditorWindow(() => runtimeSnapshots.Current, workbenchStock);
+        windows.AddWindow(placementEditor);
+        workbenchStock.OpenPlacementEditor = placementEditor.Open;
+        ipc.AttachWorkbench(workbenchStock);
         var marketHistory = new MarketRunHistoryWindow(marketRunStore.History, CurrentOwner, window.DrawTimings)
         {
             Size = new System.Numerics.Vector2(780, 650),
@@ -413,6 +428,7 @@ public sealed class Plugin : IDalamudPlugin
             journal.OperationChanged += OnOperationChanged;
             submissions.OperationChanged += OnSubmittedOperationChanged;
             deposits.OperationChanged += OnSubmittedOperationChanged;
+            deliveredStow.OperationChanged += OnSubmittedOperationChanged;
             var commandHelp = "Open Quartermaster.";
             commandHelp += " Use '/rq bridge on|off' to control the local agent bridge (off by default).";
             commands.AddHandler(Command, new CommandInfo((_, arguments) => HandleCommand(arguments)) { HelpMessage = commandHelp });
@@ -979,6 +995,7 @@ public sealed class Plugin : IDalamudPlugin
         commands.RemoveHandler(Command);
         submissions.OperationChanged -= OnSubmittedOperationChanged;
         deposits.OperationChanged -= OnSubmittedOperationChanged;
+        deliveredStow.OperationChanged -= OnSubmittedOperationChanged;
         state.Changed -= OnStateChanged;
         playerInventory.Changed -= OnPlayerInventoryChanged;
         cache.Changed -= OnCacheChanged;

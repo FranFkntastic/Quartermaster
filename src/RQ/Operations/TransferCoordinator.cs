@@ -304,6 +304,8 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
             var inventoryFull = false;
             foreach (var candidate in candidates)
             {
+                if (StopRequested(operationId))
+                    break;
                 if (!retainerSessionOpen)
                 {
                     try
@@ -573,6 +575,8 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
             var remainingCandidateIds = orderedSources.Select(source => source.RetainerId).ToHashSet();
             foreach (var source in orderedSources)
             {
+                if (StopRequested(operationId))
+                    break;
                 var candidateCapacity = legacyCrystalDeposit
                     ? source.CapacityByItem.ToDictionary(
                         entry => OperationJournal.VariantKey(entry.Key, false),
@@ -897,6 +901,20 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
             activeCancellation?.Cancel();
         }
         driver.CancelActive();
+    }
+
+    /// <summary>
+    /// The requester asked this operation to stop (Quartermaster.v1.CancelRequestedOperation): the retainer
+    /// already open has finished, so no further retainer is opened and the operation settles normally.
+    /// </summary>
+    private bool StopRequested(string operationId)
+    {
+        if (!journal.IsStopRequested(operationId))
+            return false;
+        const string message = "Stopped by its requester after the current retainer; remaining units were not moved.";
+        warning?.Invoke($"{operationId}: StoppedByRequester: {message}");
+        journal.RecordWarning(operationId, "StoppedByRequester", message);
+        return true;
     }
 
     private void MarkCancelled(string operationId)

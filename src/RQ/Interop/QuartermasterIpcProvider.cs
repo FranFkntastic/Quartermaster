@@ -15,7 +15,7 @@ public sealed class QuartermasterIpcProvider : IDisposable
     private readonly SnapshotPublisher snapshots;
     private readonly ShortageSubmissionService submissions;
     private readonly ElementalDepositSubmissionService deposits;
-    private bool disposed, courierAttached;
+    private bool disposed, courierAttached, workbenchAttached, deliveredStowAttached, cancelAttached;
 
     public QuartermasterIpcProvider(
         IIpcRegistrar registrar,
@@ -51,6 +51,37 @@ public sealed class QuartermasterIpcProvider : IDisposable
         registrar.Register(IpcChannels.PairCourierOwner, courier.PairOwner);
     }
 
+    /// <summary>Registers the stock-source and reserve-item channels for external buy-list builders.</summary>
+    public void AttachWorkbench(WorkbenchStockService workbench)
+    {
+        if (disposed || workbenchAttached)
+            return;
+        workbenchAttached = true;
+        registrar.Register(IpcChannels.GetStockSources, workbench.GetStockSources);
+        registrar.Register(IpcChannels.GetReserveItems, workbench.GetReserveItems);
+        registrar.Register(IpcChannels.OpenPlacement, workbench.OpenPlacement);
+        registrar.Register(IpcChannels.SetReserveLevel, workbench.SetReserveLevel);
+    }
+
+    /// <summary>Registers the delivered-stow channels (capability deliveredStow.v1).</summary>
+    public void AttachDeliveredStow(DeliveredStowService deliveredStow)
+    {
+        if (disposed || deliveredStowAttached)
+            return;
+        deliveredStowAttached = true;
+        registrar.Register(DeliveredStowIpcChannels.SubmitDeliveredStow, deliveredStow.Submit);
+        registrar.Register(DeliveredStowIpcChannels.GetDeliveredStow, deliveredStow.Get);
+    }
+
+    /// <summary>Registers the requester cancel channel (capability requestedOperationCancel.v1).</summary>
+    public void AttachRequestedOperationCancel(RequestedOperationCancelService cancel)
+    {
+        if (disposed || cancelAttached)
+            return;
+        cancelAttached = true;
+        registrar.Register(RequestedOperationCancelService.Channel, cancel.Cancel);
+    }
+
     public void PublishChanged(string json)
     {
         if (!disposed)
@@ -75,6 +106,20 @@ public sealed class QuartermasterIpcProvider : IDisposable
             registrar.Unregister(IpcChannels.StopCourierRun);
             registrar.Unregister(IpcChannels.ResumeCourierRun);
             registrar.Unregister(IpcChannels.PairCourierOwner);
+        }
+        if (workbenchAttached)
+        {
+            registrar.Unregister(IpcChannels.GetStockSources);
+            registrar.Unregister(IpcChannels.GetReserveItems);
+            registrar.Unregister(IpcChannels.OpenPlacement);
+            registrar.Unregister(IpcChannels.SetReserveLevel);
+        }
+        if (cancelAttached)
+            registrar.Unregister(RequestedOperationCancelService.Channel);
+        if (deliveredStowAttached)
+        {
+            registrar.Unregister(DeliveredStowIpcChannels.SubmitDeliveredStow);
+            registrar.Unregister(DeliveredStowIpcChannels.GetDeliveredStow);
         }
     }
 }

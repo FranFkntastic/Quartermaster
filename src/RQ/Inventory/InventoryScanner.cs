@@ -73,10 +73,17 @@ public sealed class InventoryScanner
 
     public IReadOnlyList<InventoryBag> ScanPlayerBags() => CapturePlayerStorage().Bags;
 
-    public unsafe PlayerStorageCapture CapturePlayerStorage()
+    /// <summary>
+    /// A live read of what the character carries for trading and stowing: the four bags and the crystal
+    /// pouch, whatever the storage options are. Framework thread only.
+    /// </summary>
+    public IReadOnlyList<InventoryBag> ScanCarried() =>
+        Capture(PlayerBags.Append(InventoryType.Crystals).ToArray()).Bags;
+
+    public PlayerStorageCapture CapturePlayerStorage() => Capture(PlayerStorageTypes(storageOptions()));
+
+    private unsafe PlayerStorageCapture Capture(InventoryType[] types)
     {
-        var options = storageOptions();
-        var types = PlayerStorageTypes(options);
         var manager = InventoryManager.Instance();
         if (manager is null)
             return new([], types.Select(type => type.ToString()).ToArray(), []);
