@@ -259,14 +259,9 @@ public sealed class DeliveredStowService
             .ToArray();
 
         var plan = repository.Read(state => ListingPlanCatalog.OwnerPlan(state, owner));
-        // Delivered goods go only to the retainers the user listed for the item. "Any space" (including the
-        // legacy shape that loads as any-space) is ignored here; what does not fit stays in the bags (NoRoom).
-        // The market run's own stow keeps honouring any-space.
         var stowRequests = plan is null
             ? []
-            : MarketRunPlanner.StowRequests(plan.Id, plan.Reserves.Where(reserve => reserve.Location.PreferredRetainerIds.Count > 0), stowable)
-                .Select(stow => stow with { Routing = ListedRetainersOnly(stow.Routing) })
-                .ToArray();
+            : MarketRunPlanner.StowRequests(plan.Id, plan.Reserves, stowable);
         var batch = StowageRouter.BuildBatch(stowRequests, cache(), owner, maxStackSize, utcNow());
 
         var lines = requested.Select(item =>
@@ -292,13 +287,6 @@ public sealed class DeliveredStowService
             };
         }).ToArray();
         return (batch, lines);
-    }
-
-    private static StowageRoutingPolicy ListedRetainersOnly(StowageRoutingPolicy routing)
-    {
-        var copy = StowageRoutingPolicy.CopyOf(routing);
-        copy.AnySpace = false;
-        return copy;
     }
 
     private (string Code, string Message)? Validate(DeliveredStowRequest request, OwnerScope owner)
