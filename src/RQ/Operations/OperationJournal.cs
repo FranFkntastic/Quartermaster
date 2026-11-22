@@ -245,11 +245,24 @@ public sealed class OperationJournal
         StowageDepositBatch batch) =>
         CreateDeposit(owner, batch, OperationKinds.StowageSurplus, plan);
 
+    /// <summary>
+    /// An externally requested stowage deposit (delivered-stow IPC): the request id is persisted with its
+    /// canonical hash in the same mutation as the operation, so a replay can never create a second deposit.
+    /// </summary>
+    public OperationRecord CreateRequestedDeposit(
+        OwnerScope owner,
+        StowageDepositBatch batch,
+        string requestId,
+        string operationId,
+        string canonicalHash) =>
+        CreateDeposit(owner, batch, OperationKinds.StowageSurplus, null, (requestId, operationId, canonicalHash));
+
     private OperationRecord CreateDeposit(
         OwnerScope owner,
         StowageDepositBatch batch,
         string kind,
-        StowagePlan? sourcePlan)
+        StowagePlan? sourcePlan,
+        (string RequestId, string OperationId, string CanonicalHash)? requested = null)
     {
         if (!owner.HasStableIdentity)
             throw new InvalidOperationException("Deposit operations require stable owner identity.");
@@ -263,14 +276,17 @@ public sealed class OperationJournal
             .ToArray();
         var operation = new OperationRecord
         {
-            OperationId = $"rq-{Guid.NewGuid():N}",
+            OperationId = requested?.OperationId ?? $"rq-{Guid.NewGuid():N}",
             Kind = kind,
+            ExecuteImmediately = requested is not null,
             Owner = owner with { },
             Status = OperationStatuses.Accepted,
             Revision = 1,
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
-            Message = "Reviewed stowage authorization is ready for explicit execution.",
+            Message = requested is null
+                ? "Reviewed stowage authorization is ready for explicit execution."
+                : "Delivered-stow authorization is ready for automatic execution.",
             SourcePlanId = sourcePlan?.Id,
             SourcePlanRevision = sourcePlan?.Revision,
             SourcePlanName = sourcePlan?.Name,
@@ -333,12 +349,26 @@ public sealed class OperationJournal
                 })
                 .ToList(),
         };
-        operation.RequestId = operation.OperationId;
+        operation.RequestId = requested?.RequestId ?? operation.OperationId;
         if (operation.Lines.Count == 0 || operation.DepositCandidates.Count == 0)
             throw new InvalidOperationException("Stowage batch has no executable reviewed authorization.");
 
         repository.Mutate(StateChangeKind.Operations, state =>
         {
+            if (requested is { } ids)
+            {
+                if (state.Operations.Any(candidate => candidate.OperationId == operation.OperationId))
+                    throw new InvalidOperationException($"Operation ID '{operation.OperationId}' is already in use.");
+                if (state.Requests.Any(candidate => candidate.RequestId == ids.RequestId))
+                    throw new InvalidOperationException($"Request ID '{ids.RequestId}' is already in use.");
+                state.Requests.Add(new SubmittedRequestRecord
+                {
+                    RequestId = ids.RequestId,
+                    OperationId = operation.OperationId,
+                    CanonicalHash = ids.CanonicalHash,
+                    AcceptedAtUtc = now,
+                });
+            }
             state.Operations.Add(operation);
             AddReceipt(state, operation, "StowageAuthorizationPersisted", operation.Message);
         });

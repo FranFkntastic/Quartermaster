@@ -15,7 +15,7 @@ public sealed class QuartermasterIpcProvider : IDisposable
     private readonly SnapshotPublisher snapshots;
     private readonly ShortageSubmissionService submissions;
     private readonly ElementalDepositSubmissionService deposits;
-    private bool disposed, courierAttached, workbenchAttached;
+    private bool disposed, courierAttached, workbenchAttached, deliveredStowAttached;
 
     public QuartermasterIpcProvider(
         IIpcRegistrar registrar,
@@ -63,6 +63,16 @@ public sealed class QuartermasterIpcProvider : IDisposable
         registrar.Register(IpcChannels.SetReserveLevel, workbench.SetReserveLevel);
     }
 
+    /// <summary>Registers the delivered-stow channels (capability deliveredStow.v1).</summary>
+    public void AttachDeliveredStow(DeliveredStowService deliveredStow)
+    {
+        if (disposed || deliveredStowAttached)
+            return;
+        deliveredStowAttached = true;
+        registrar.Register(DeliveredStowIpcChannels.SubmitDeliveredStow, deliveredStow.Submit);
+        registrar.Register(DeliveredStowIpcChannels.GetDeliveredStow, deliveredStow.Get);
+    }
+
     public void PublishChanged(string json)
     {
         if (!disposed)
@@ -94,6 +104,11 @@ public sealed class QuartermasterIpcProvider : IDisposable
             registrar.Unregister(IpcChannels.GetReserveItems);
             registrar.Unregister(IpcChannels.SetItemHome);
             registrar.Unregister(IpcChannels.SetReserveLevel);
+        }
+        if (deliveredStowAttached)
+        {
+            registrar.Unregister(DeliveredStowIpcChannels.SubmitDeliveredStow);
+            registrar.Unregister(DeliveredStowIpcChannels.GetDeliveredStow);
         }
     }
 }

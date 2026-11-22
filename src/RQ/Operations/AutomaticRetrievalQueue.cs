@@ -62,7 +62,8 @@ public sealed class AutomaticRetrievalQueue : IDisposable
         ActiveOperationId = operation.OperationId;
         try
         {
-            activeTask = operation.Kind == OperationKinds.Deposit
+            // Requested stowage deposits (delivered-stow IPC) execute through the same deposit path.
+            activeTask = operation.Kind is OperationKinds.Deposit or OperationKinds.QuickDeposit or OperationKinds.StowageSurplus
                 ? executor.ExecuteDepositAsync(operation.OperationId, lifetime.Token)
                 : executor.ExecuteRetrievalAsync(operation.OperationId, lifetime.Token);
         }
