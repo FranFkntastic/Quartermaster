@@ -15,7 +15,7 @@ public sealed class QuartermasterIpcProvider : IDisposable
     private readonly SnapshotPublisher snapshots;
     private readonly ShortageSubmissionService submissions;
     private readonly ElementalDepositSubmissionService deposits;
-    private bool disposed, courierAttached, workbenchAttached, deliveredStowAttached;
+    private bool disposed, courierAttached, workbenchAttached, deliveredStowAttached, cancelAttached;
 
     public QuartermasterIpcProvider(
         IIpcRegistrar registrar,
@@ -73,6 +73,15 @@ public sealed class QuartermasterIpcProvider : IDisposable
         registrar.Register(DeliveredStowIpcChannels.GetDeliveredStow, deliveredStow.Get);
     }
 
+    /// <summary>Registers the requester cancel channel (capability requestedOperationCancel.v1).</summary>
+    public void AttachRequestedOperationCancel(RequestedOperationCancelService cancel)
+    {
+        if (disposed || cancelAttached)
+            return;
+        cancelAttached = true;
+        registrar.Register(RequestedOperationCancelService.Channel, cancel.Cancel);
+    }
+
     public void PublishChanged(string json)
     {
         if (!disposed)
@@ -105,6 +114,8 @@ public sealed class QuartermasterIpcProvider : IDisposable
             registrar.Unregister(IpcChannels.SetItemHome);
             registrar.Unregister(IpcChannels.SetReserveLevel);
         }
+        if (cancelAttached)
+            registrar.Unregister(RequestedOperationCancelService.Channel);
         if (deliveredStowAttached)
         {
             registrar.Unregister(DeliveredStowIpcChannels.SubmitDeliveredStow);

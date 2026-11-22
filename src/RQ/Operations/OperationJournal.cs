@@ -58,6 +58,85 @@ public sealed class OperationJournal
             .FirstOrDefault());
     }
 
+    // ---- Requester cancellation and unstarted expiry ------------------------------------------
+    // Stop requests for running operations live in memory only: a reload already settles every running
+    // operation as indeterminate, and accepted operations are cancelled durably below.
+    private readonly object stopGate = new();
+    private readonly HashSet<string> stopRequests = new(StringComparer.Ordinal);
+
+    /// <summary>True when the requester asked a running operation to stop after its current retainer.</summary>
+    public bool IsStopRequested(string operationId)
+    {
+        lock (stopGate)
+            return stopRequests.Contains(operationId);
+    }
+
+    /// <summary>
+    /// Cancels the operation an external request id created: an accepted operation is cancelled durably; a
+    /// running one finishes the retainer it is on and stops. Null when the request id is unknown.
+    /// </summary>
+    public (string Outcome, OperationRecord Operation)? CancelRequested(string requestId, string message)
+    {
+        var operation = repository.Read(state =>
+            state.Requests.FirstOrDefault(record => record.RequestId == requestId) is { } request &&
+            state.Operations.FirstOrDefault(candidate => candidate.OperationId == request.OperationId) is { } found
+                ? Copy(found)
+                : null);
+        if (operation is null)
+            return null;
+        if (operation.Status == OperationStatuses.Accepted)
+        {
+            try
+            {
+                return ("cancelled", Transition(operation.OperationId, OperationStatuses.Cancelled, "CancelledByRequester", message));
+            }
+            catch (InvalidOperationException)
+            {
+                // Started between the read and the transition: fall through to the running case.
+                operation = Get(operation.OperationId) ?? operation;
+            }
+        }
+        if (operation.Status == OperationStatuses.Running)
+        {
+            lock (stopGate)
+                stopRequests.Add(operation.OperationId);
+            return ("stopping", operation);
+        }
+        return ("already_terminal", operation);
+    }
+
+    /// <summary>
+    /// Cancels externally requested automatic operations (shortages, elemental deposits, delivered stow) that
+    /// have not started within <paramref name="startWindow"/> of submission, so a stale request never runs later
+    /// (for example on the owner's next login). <paramref name="activeOperationId"/> is skipped.
+    /// </summary>
+    public IReadOnlyList<OperationRecord> ExpireUnstartedRequestedOperations(TimeSpan startWindow, string? activeOperationId)
+    {
+        var cutoff = utcNow() - startWindow;
+        var expired = repository.Read(state => state.Operations
+            .Where(operation => operation.ExecuteImmediately &&
+                                operation.Status == OperationStatuses.Accepted &&
+                                operation.OperationId != activeOperationId &&
+                                state.Requests.FirstOrDefault(record => record.OperationId == operation.OperationId) is { } request &&
+                                (request.AcceptedAtUtc == default ? operation.CreatedAtUtc : request.AcceptedAtUtc) < cutoff)
+            .Select(operation => operation.OperationId)
+            .ToArray());
+        var cancelled = new List<OperationRecord>();
+        foreach (var operationId in expired)
+        {
+            try
+            {
+                cancelled.Add(Transition(operationId, OperationStatuses.Cancelled, "ExpiredBeforeStart",
+                    $"Not started within {startWindow.TotalMinutes:N0} minutes of submission; cancelled instead of running later."));
+            }
+            catch (InvalidOperationException)
+            {
+                // Started or settled concurrently; nothing to expire.
+            }
+        }
+        return cancelled;
+    }
+
     public IReadOnlyList<OperationRecord> ReconcileInterruptedOperations()
     {
         if (!repository.Read(state => state.Operations.Any(operation => operation.Status == OperationStatuses.Running)))
@@ -409,6 +488,9 @@ public sealed class OperationJournal
             AddReceipt(state, operation, code, message);
             changed = Copy(operation);
         });
+        if (OperationStatuses.IsTerminal(status))
+            lock (stopGate)
+                stopRequests.Remove(operationId);
         OperationChanged?.Invoke(changed);
         return changed;
     }

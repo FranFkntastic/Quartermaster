@@ -250,7 +250,7 @@ public sealed class Plugin : IDalamudPlugin
             information: message => log.Information(message));
         marketRuns.Restore(marketRunStore.Load());
         activeMarketRuns = marketRuns;
-        automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerSuppression);
+        automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerSuppression, message => log.Warning(message));
         runtimeSnapshots = new(scanner, playerInventory, cache, state, CurrentOwner);
         var vendorAccess = new DalamudGilVendorAccessReader(
             clientState,
@@ -328,6 +328,7 @@ public sealed class Plugin : IDalamudPlugin
                 ? checked((int)stack) : throw new InvalidOperationException($"Stack size unavailable for item {id}."),
             message => log.Warning(message));
         ipc.AttachDeliveredStow(deliveredStow);
+        ipc.AttachRequestedOperationCancel(new RequestedOperationCancelService(providerInstanceId, journal, workQueue, message => log.Warning(message)));
         window = new(
             state,
             runtimeSnapshots,
