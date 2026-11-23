@@ -256,6 +256,7 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                         (borrowedLease is null || automation.Owns(borrowedLease)) && (placement?.Authorized() ?? true) && (callerAuthority?.Invoke() ?? true),
                     token).ConfigureAwait(false);
                 movementAttempted = leg.Dispatched;
+                saddlebagReachable &= leg.SaddlebagObserved;
                 transferred = leg.VerifiedRetrieved;
                 if (leg.Unreconciled is { } unreconciled)
                 {
