@@ -55,6 +55,48 @@ public static class ListingPlanCatalog
     public static ListingPlan? OwnerPlan(QuartermasterState state, OwnerScope owner) =>
         state.ListingPlans.SingleOrDefault(plan => plan.Owner.Matches(owner));
 
+    /// <summary>
+    /// The current roster name of <paramref name="retainerId"/> for <paramref name="owner"/>, or null when the
+    /// retainer is not assigned to that character in the latest roster observation. Retainer selection uses only
+    /// this; a plan's saved <see cref="ListingPlanAssignment.RetainerName"/> is a display fallback.
+    /// </summary>
+    public static string? CurrentRetainerName(IReadOnlyDictionary<ulong, CachedRetainer> roster, OwnerScope owner, ulong retainerId) =>
+        roster.GetValueOrDefault(retainerId) is { } retainer && retainer.Owner.Matches(owner) &&
+        retainer.IsCurrentlyAssigned != false && !string.IsNullOrWhiteSpace(retainer.RetainerName)
+            ? retainer.RetainerName
+            : null;
+
+    /// <summary>True when any plan's saved retainer name differs from the current roster name for the same ID.</summary>
+    public static bool HasStaleRetainerNames(QuartermasterState state, IReadOnlyDictionary<ulong, CachedRetainer> roster) =>
+        state.ListingPlans.Any(plan => plan.Owner.HasStableIdentity && plan.Assignments.Any(assignment =>
+            CurrentRetainerName(roster, plan.Owner, assignment.RetainerId) is { } current && current != assignment.RetainerName));
+
+    /// <summary>
+    /// Rewrites stale retainer-name snapshots from the current roster, bumping each changed plan's revision.
+    /// Retainers missing from the roster keep their saved name. Returns the number of assignments renamed.
+    /// </summary>
+    public static int RefreshRetainerNames(QuartermasterState state, IReadOnlyDictionary<ulong, CachedRetainer> roster, DateTime nowUtc)
+    {
+        var renamed = 0;
+        foreach (var plan in state.ListingPlans.Where(plan => plan.Owner.HasStableIdentity))
+        {
+            var changed = 0;
+            foreach (var assignment in plan.Assignments)
+            {
+                if (CurrentRetainerName(roster, plan.Owner, assignment.RetainerId) is not { } current || current == assignment.RetainerName)
+                    continue;
+                assignment.RetainerName = current;
+                changed++;
+            }
+            if (changed == 0)
+                continue;
+            plan.Revision = checked(plan.Revision + 1);
+            plan.UpdatedAtUtc = nowUtc;
+            renamed += changed;
+        }
+        return renamed;
+    }
+
     public static ListingPlanDraft Draft(
         QuartermasterState state,
         OwnerScope owner,
@@ -439,7 +481,11 @@ public static class ListingPlanCatalog
         result.ItemName = Merge(original.ItemName, edited.ItemName, canonical.ItemName, id, nameof(result.ItemName), conflicts);
         result.Quality = Merge(original.Quality, edited.Quality, canonical.Quality, id, nameof(result.Quality), conflicts);
         result.RetainerId = Merge(original.RetainerId, edited.RetainerId, canonical.RetainerId, id, nameof(result.RetainerId), conflicts);
-        result.RetainerName = Merge(original.RetainerName, edited.RetainerName, canonical.RetainerName, id, nameof(result.RetainerName), conflicts);
+        // The name is a display snapshot of the retainer ID, never an edit of its own: it follows whichever ID won,
+        // preferring the canonical (roster-refreshed) name for the same ID so a rename never conflicts a draft.
+        result.RetainerName = result.RetainerId == canonical.RetainerId && !string.IsNullOrWhiteSpace(canonical.RetainerName)
+            ? canonical.RetainerName
+            : result.RetainerId == edited.RetainerId ? edited.RetainerName : original.RetainerName;
         result.ListingCount = Merge(original.ListingCount, edited.ListingCount, canonical.ListingCount, id, nameof(result.ListingCount), conflicts);
         result.QuantityPerListing = Merge(original.QuantityPerListing, edited.QuantityPerListing, canonical.QuantityPerListing, id, nameof(result.QuantityPerListing), conflicts);
         result.UnitPrice = Merge(original.UnitPrice, edited.UnitPrice, canonical.UnitPrice, id, nameof(result.UnitPrice), conflicts);

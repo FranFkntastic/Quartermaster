@@ -38,6 +38,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
     private bool stowKnown;
     private string? status;
     private bool reorganizeRetainers;
+    private bool placementOnlyOpen;
     private DateTime? startAfterSave;
     private IReadOnlyList<MarketRunItem> items = [];
     internal MarketRunExecutor? Executor { get; set; }
@@ -403,61 +404,96 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         DrawHeaders(showListed, showGoesTo);
         var selected = retainers.FirstOrDefault(r => r.RetainerId == selectedRetainerId);
         var noProject = export.WithoutWorkshopProject.Select(l => (l.ItemId, l.Quality)).ToHashSet();
+        var rows = new TableRows(runtime, session, draft, selected, noProject, layout, listedBar, showListed, showGoesTo,
+            width, paneClipMin, paneClipMax);
+        var placementOnly = new List<MarketRunItem>();
         foreach (var item in items)
         {
-            ImGui.PushID($"{item.ItemId}:{item.Quality}");
+            if (IsPlacementOnly(draft, item)) placementOnly.Add(item);
+            else DrawRow(item, rows);
+        }
+        if (placementOnly.Count > 0)
+        {
             ImGui.TableNextRow(); ImGui.TableNextColumn();
-            var sells = selected?.PlanRows.Any(r => r.Assignment.Enabled && r.Assignment.ItemId == item.ItemId && r.Assignment.Quality == item.Quality) == true ||
-                selected?.ObservedGroups.Any(g => g.ItemId == item.ItemId && g.Quality == item.Quality) == true;
-            if (sells) ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0, ImGui.GetColorU32(new Vector4(.12f, .18f, .24f, .65f)));
-            var label = Label(item.ItemName, item.Quality);
             ImGui.AlignTextToFramePadding();
-            var open = ImGui.TreeNodeEx(label + "###item", ImGuiTreeNodeFlags.NoTreePushOnOpen | ImGuiTreeNodeFlags.SpanAvailWidth);
-            if (ImGui.IsItemClicked(ImGuiMouseButton.Right)) OpenItem?.Invoke(item.ItemId);
-            if (ImGui.IsItemHovered() && ImGui.CalcTextSize(label).X + ImGui.GetTreeNodeToLabelSpacing() > ImGui.GetItemRectSize().X)
-                ImGui.SetTooltip(label);
-            if (showListed) { ImGui.TableNextColumn(); DrawListed(item, listedBar); }
-            ImGui.TableNextColumn();
-            var reserve = draft.Reserves.FirstOrDefault(r => r.ItemId == item.ItemId && r.Quality == item.Quality);
-            DrawReserve(item, reserve, session, layout);
-            ImGui.TableNextColumn();
-            DrawCraft(item, noProject.Contains((item.ItemId, item.Quality)));
-            var goesTo = reserve is null ? string.Empty : string.Join(" → ", new[]
-            {
-                TransferPresentation.RouteSummary(reserve.Location, runtime.Retainers, runtime.Owner),
-                // Homes on another character take what the owner's own homes leave.
-                reserve.RemoteHomes is { RetainerIds.Count: > 0 } remote ? PlacementEditorWindow.RemoteSummary(runtime, remote) : string.Empty,
-            }.Where(part => part.Length > 0));
-            if (showGoesTo) { ImGui.TableNextColumn(); DrawGoesTo(item, goesTo, "column"); }
-            if (open)
-            {
-                ImGui.TableNextRow(); ImGui.TableSetColumnIndex(0);
-                // Span columns without escaping the run pane's scrolling clip rectangle.
-                ImGui.PushClipRect(paneClipMin, paneClipMax, false);
-                var frames = (showGoesTo ? 0 : 1) + (reserve is null ? 0 : 1) + (showListed ? 0 : 1);
-                if (ImGui.BeginChild("detail", new Vector2(width - 8, (ImGui.GetFrameHeightWithSpacing() * frames) + 4), false))
-                {
-                    if (!showListed)
-                    {
-                        ImGui.AlignTextToFramePadding();
-                        ImGui.TextDisabled("Listed");
-                        ImGui.SameLine();
-                        DrawListed(item, listedBar);
-                    }
-                    if (!showGoesTo) DrawGoesTo(item, goesTo, "detail");
-                    if (reserve is not null)
-                    {
-                        var enabled = reserve.Enabled;
-                        if (ImGui.Checkbox("Reserve enabled", ref enabled)) session.SetReserveEnabled(reserve.Id, enabled);
-                        ImGui.SameLine();
-                        if (ImGui.SmallButton("Remove reserve rule")) session.RemoveReserve(reserve.Id);
-                    }
-                }
-                ImGui.EndChild(); ImGui.PopClipRect();
-            }
-            ImGui.PopID();
+            ImGui.SetNextItemOpen(placementOnlyOpen);
+            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+            placementOnlyOpen = ImGui.TreeNodeEx($"Placement only ({placementOnly.Count:N0})###RQMarketRunPlacementOnly",
+                ImGuiTreeNodeFlags.NoTreePushOnOpen | ImGuiTreeNodeFlags.SpanAvailWidth);
+            ImGui.PopStyleColor();
+            Registry?.RegisterLastItem("quartermaster.listings.market-run.placement-only", "Placement only items",
+                AgentBridgeUiControlKind.Toggle, true, placementOnlyOpen, $"{(placementOnlyOpen ? "open" : "closed")}, items={placementOnly.Count:N0}",
+                () => placementOnlyOpen = !placementOnlyOpen);
+            if (placementOnlyOpen)
+                foreach (var item in placementOnly) DrawRow(item, rows);
         }
         ImGui.EndTable();
+    }
+
+    /// <summary>No enabled listing assignment and no reserve units: the rule only records where the item lives.</summary>
+    private static bool IsPlacementOnly(ListingPlanDraft draft, MarketRunItem item) =>
+        item.ListedUnits is not { IsKnown: true, Value: > 0 } &&
+        !draft.Assignments.Any(a => a.Enabled && a.ItemId == item.ItemId && a.Quality == item.Quality) &&
+        !draft.Reserves.Any(r => r.ItemId == item.ItemId && r.Quality == item.Quality && r.ReserveUnits > 0);
+
+    private sealed record TableRows(QuartermasterRuntimeSnapshot Runtime, ListingPlanDraftSession Session, ListingPlanDraft Draft,
+        ListingRetainerRow? Selected, HashSet<(uint ItemId, ItemQualityPolicy Quality)> NoProject, RowLayout Layout,
+        float ListedBar, bool ShowListed, bool ShowGoesTo, float Width, Vector2 PaneClipMin, Vector2 PaneClipMax);
+
+    private void DrawRow(MarketRunItem item, TableRows rows)
+    {
+        var (runtime, session, draft, selected, noProject, layout, listedBar, showListed, showGoesTo, width, paneClipMin, paneClipMax) = rows;
+        ImGui.PushID($"{item.ItemId}:{item.Quality}");
+        ImGui.TableNextRow(); ImGui.TableNextColumn();
+        var sells = selected?.PlanRows.Any(r => r.Assignment.Enabled && r.Assignment.ItemId == item.ItemId && r.Assignment.Quality == item.Quality) == true ||
+            selected?.ObservedGroups.Any(g => g.ItemId == item.ItemId && g.Quality == item.Quality) == true;
+        if (sells) ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0, ImGui.GetColorU32(new Vector4(.12f, .18f, .24f, .65f)));
+        var label = Label(item.ItemName, item.Quality);
+        ImGui.AlignTextToFramePadding();
+        var open = ImGui.TreeNodeEx(label + "###item", ImGuiTreeNodeFlags.NoTreePushOnOpen | ImGuiTreeNodeFlags.SpanAvailWidth);
+        if (ImGui.IsItemClicked(ImGuiMouseButton.Right)) OpenItem?.Invoke(item.ItemId);
+        if (ImGui.IsItemHovered() && ImGui.CalcTextSize(label).X + ImGui.GetTreeNodeToLabelSpacing() > ImGui.GetItemRectSize().X)
+            ImGui.SetTooltip(label);
+        if (showListed) { ImGui.TableNextColumn(); DrawListed(item, listedBar); }
+        ImGui.TableNextColumn();
+        var reserve = draft.Reserves.FirstOrDefault(r => r.ItemId == item.ItemId && r.Quality == item.Quality);
+        DrawReserve(item, reserve, session, layout);
+        ImGui.TableNextColumn();
+        DrawCraft(item, noProject.Contains((item.ItemId, item.Quality)));
+        var goesTo = reserve is null ? string.Empty : string.Join(" → ", new[]
+        {
+            TransferPresentation.RouteSummary(reserve.Location, runtime.Retainers, runtime.Owner),
+            // Homes on another character take what the owner's own homes leave.
+            reserve.RemoteHomes is { RetainerIds.Count: > 0 } remote ? PlacementEditorWindow.RemoteSummary(runtime, remote) : string.Empty,
+        }.Where(part => part.Length > 0));
+        if (showGoesTo) { ImGui.TableNextColumn(); DrawGoesTo(item, goesTo, "column"); }
+        if (open)
+        {
+            ImGui.TableNextRow(); ImGui.TableSetColumnIndex(0);
+            // Span columns without escaping the run pane's scrolling clip rectangle.
+            ImGui.PushClipRect(paneClipMin, paneClipMax, false);
+            var frames = (showGoesTo ? 0 : 1) + (reserve is null ? 0 : 1) + (showListed ? 0 : 1);
+            if (ImGui.BeginChild("detail", new Vector2(width - 8, (ImGui.GetFrameHeightWithSpacing() * frames) + 4), false))
+            {
+                if (!showListed)
+                {
+                    ImGui.AlignTextToFramePadding();
+                    ImGui.TextDisabled("Listed");
+                    ImGui.SameLine();
+                    DrawListed(item, listedBar);
+                }
+                if (!showGoesTo) DrawGoesTo(item, goesTo, "detail");
+                if (reserve is not null)
+                {
+                    var enabled = reserve.Enabled;
+                    if (ImGui.Checkbox("Reserve enabled", ref enabled)) session.SetReserveEnabled(reserve.Id, enabled);
+                    ImGui.SameLine();
+                    if (ImGui.SmallButton("Remove reserve rule")) session.RemoveReserve(reserve.Id);
+                }
+            }
+            ImGui.EndChild(); ImGui.PopClipRect();
+        }
+        ImGui.PopID();
     }
 
     private void DrawHeaders(bool showListed, bool showGoesTo)
