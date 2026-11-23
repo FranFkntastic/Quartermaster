@@ -364,5 +364,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
             catch(Exception e){log.Warning($"CourierTradeForget {e.GetType().Name}: {e.Message}");}
         });
     }
-    public void Dispose(){try{hold?.Dispose();sender?.Dispose();if(!locked && !io.IsRemoteLocked)receiver?.Stop();}finally{if(!retainSuppression)RestoreTradeAutoConfirm();}}
+    // Unloading keeps the auto-confirm suppression while a trade window is open, locked or unreadable, whatever holds
+    // it; the next load lifts it once the window is closed.
+    public void Dispose(){try{hold?.Dispose();sender?.Dispose();if(!locked && !io.IsRemoteLocked)receiver?.Stop();}finally{if(WindowClosed())RestoreTradeAutoConfirm();}}
 }
