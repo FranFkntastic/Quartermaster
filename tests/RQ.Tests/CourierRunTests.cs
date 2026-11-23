@@ -136,8 +136,11 @@ public sealed class CourierRunTests : IDisposable
         Assert.Equal(7,owner.Deposited);Assert.Equal(7,owner.Retrieved);
         Assert.Equal(10,mule.Units);
     }
+    // Live 2026-11-23: a stopped carrier kept MarketMafioso's trade hold, its automation lease and AutoRetainer
+    // suppression for as long as its ledger held custody, locking trading until Quartermaster reloaded. A paused run
+    // releases every lock; the ledger alone keeps the custody, and commands re-take the locks on demand.
     [Fact]
-    public async Task StoppedCarrierKeepsLeaseAcrossUnconfirmedAndCreditedCustody()
+    public async Task StoppedCarrierReleasesLocksWhileLedgerKeepsCustody()
     {
         follower.Dispose();var lease=new AutomationLease();var ar=new AR();
         follower=new(dir,()=>cfg,lease,new(ar),mule,mule,mule,mule,_=>{});
@@ -146,14 +149,39 @@ public sealed class CourierRunTests : IDisposable
         Assert.Equal(CourierOutcome.Succeeded,(await Send(m)).Outcome);
         var recv=m with {Step=Guid.NewGuid(),Command=CourierCommand.Receive,Manifest=Plan().Trips[0].Manifest};
         Assert.Equal(CourierOutcome.Succeeded,(await Send(recv)).Outcome);
-        await follower.StopLocalAsync();Assert.True(ar.IsSuppressed);Assert.False(lease.CanAcquire);
+        await follower.StopLocalAsync();Assert.False(ar.IsSuppressed);Assert.True(lease.CanAcquire);
         InventoryView Bags(int n)=>new(source,5,[new(Ore,false,n)]);
         Assert.Equal(CourierOutcome.Succeeded,(await Send(m with {Step=Guid.NewGuid(),Command=CourierCommand.Confirm,
             ConfirmStep=recv.Step,OwnerEvidence=new(Bags(3),Bags(0))})).Outcome);
         var status=await Send(m with {Step=Guid.NewGuid(),Run=Guid.NewGuid(),Command=CourierCommand.Status});
         Assert.Equal(m.Run,status.Value?.ActiveRun);Assert.Equal(3,status.Value!.Custody.Sum(x=>x.Units));
-        Assert.True(ar.IsSuppressed);Assert.False(lease.CanAcquire);
+        Assert.False(ar.IsSuppressed);Assert.True(lease.CanAcquire);
         follower.Dispose();Assert.False(ar.IsSuppressed);Assert.True(lease.CanAcquire);
+    }
+    // Live 2026-11-23: every trade window completed but the owner's receive never proved it, and before anyone resumed,
+    // an ordinary placement stowed part of the delivery. The fresh bags no longer showed the hand-in, so resume refused
+    // ResumeUnsettled forever. The owner's journaled placements since the hand-in account for the difference exactly:
+    // resume settles both ledgers once, and the deposit stows only what is still in the bags.
+    [Fact]
+    public async Task UnconfirmedHandInStowedSinceSettlesFromJournalAndDepositsOnlyTheRemainder()
+    {
+        owner.UncertainTrade = true;
+        var stalled = await engine.StartAsync(Plan(), cfg);
+        Assert.True(stalled is { State: "Indeterminate", CanSettleDelivered: true }, stalled.State + " " + stalled.Code);
+        Assert.Equal(3, owner.Quantities[destination]); Assert.Equal(10, mule.Units);
+        owner.Quantities[destination] -= 2; // A Quartermaster placement stowed two of the three since.
+        owner.Placed = new([new(null, Ore, false, -2)], ["stow-after-hand-in"], null);
+        owner.UncertainTrade = false;
+        engine = Conductor();
+        var resumed = await engine.StartAsync(Plan(), cfg);
+        Assert.True(resumed.State == "Completed", resumed.Code + ":" + resumed.Detail);
+        // Three trips of the seven units, each received once; of the first trip's three, two were stowed outside the run.
+        Assert.Equal((3, 7 - 2, 10), (owner.Receives, owner.Deposited, mule.Units));
+        Assert.Equal(["DeliveredThenPlaced"], owner.Attested);
+        var r = engine.Journal();
+        var placed = Assert.Single(r.PlacedOutside);
+        Assert.Equal((2, "DeliveredThenPlaced", "stow-after-hand-in"), (placed.Units.Sum(x => x.Units), placed.Disposition, placed.Operations.Single()));
+        Assert.Equal(7, Assert.Single(resumed.Lines).Moved); Assert.Empty(r.Custody);
     }
     public void Dispose() { follower.Dispose(); Directory.Delete(dir, true); }
 
@@ -385,8 +413,15 @@ public sealed class CourierRunTests : IDisposable
             return result;
         }
     }
-    sealed class Client(OwnerScope initial) : ICourierPlacementPort, ICourierTradePort, ICourierDispatchEvidence, ICourierSettlement, ICourierHoldPort, ICharacterSwitchPort, IInventoryObservationPort, IWorldVisitPort, IMeetingBellPort
+    sealed class Client(OwnerScope initial) : ICourierPlacementPort, ICourierTradePort, ICourierDispatchEvidence, ICourierSettlement, ICourierHoldPort,
+        ICourierReceiveAttestation, ICharacterSwitchPort, IInventoryObservationPort, IWorldVisitPort, IMeetingBellPort
     {
+        // The owner's journaled placements since a hand-in, and the dispositions its receive checkpoint was closed under.
+        public CourierPlacedSince? Placed;
+        public CourierPlacedSince? PlacedSince(OwnerScope owner, DateTimeOffset since) => Placed;
+        public readonly List<string> Attested = [];
+        public Task<Result<bool>> AttestReceived(Guid step, OwnerScope partner, TradeEvidence sender, string disposition, Deadline d)
+        { Attested.Add(disposition); return OK(true); }
         OwnerScope who = initial;
         public OwnerScope Who => who;
         public Dictionary<OwnerScope, int> Quantities = new(); public int Units => Quantities.GetValueOrDefault(who);

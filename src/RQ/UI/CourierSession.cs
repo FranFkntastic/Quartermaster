@@ -866,6 +866,39 @@ public sealed class CourierSession
         a.Length == b.Length &&
         a.OrderBy(row => (row.Item, row.Quality, row.Holder)).SequenceEqual(b.OrderBy(row => (row.Item, row.Quality, row.Holder)));
 
+    /// <summary>What the carrier's send receipt proves for the run's unverified hand-in, once the operator asked.</summary>
+    internal CourierSentProof? SentProof { get; private set; }
+    internal bool SentProofLoading { get; private set; }
+
+    /// <summary>Asks the carrier for its send receipt of the pending hand-in. Moves nothing.</summary>
+    internal void ReviewSettleDelivered(Guid expectedRun)
+    {
+        if (Conductor is not { } conductor || IsActive || conductor.IsBusy || SentProofLoading)
+            return;
+        SentProofLoading = true;
+        var carrier = CarrierName();
+        _ = Task.Run(async () =>
+        {
+            try { SentProof = await conductor.SentProofAsync(expectedRun).ConfigureAwait(false); }
+            catch (Exception exception) { Fail(FailureLabel(exception, carrier), exception.ToString()); }
+            finally { SentProofLoading = false; polledAt = 0; }
+        });
+    }
+
+    internal void DismissSentProof() => SentProof = null;
+
+    /// <summary>The operator's attestation: settles the pending hand-in from the carrier's send receipt; the run stays resumable.</summary>
+    internal void SettleDelivered(Guid expectedRun)
+    {
+        if (Conductor is not { } conductor || IsActive || conductor.IsBusy || SentProof is not { Complete: true } proof || proof.Run != expectedRun)
+            return;
+        Launch(async () =>
+        {
+            try { return await conductor.SettleDeliveredAsync(expectedRun).ConfigureAwait(false); }
+            finally { SentProof = null; }
+        });
+    }
+
     /// <summary>Resumes an interrupted run from its journal; the journal owns the plan and settings.</summary>
     /// <returns>Whether a resume was launched (false when active, busy draining, or not resumable).</returns>
     internal bool Resume()
@@ -962,6 +995,7 @@ public sealed class CourierSession
         InvalidOperationException { Message: "Settle the pending trade before clearing custody." } => "A hand-off is still unverified",
         InvalidOperationException { Message: "Carrier does not acknowledge this run's custody." } => $"{carrier ?? "The carrier"} does not report holding this run's items",
         InvalidOperationException { Message: "Carrier trade is unsettled." } => $"{carrier ?? "The carrier"} has an unconfirmed trade",
+        InvalidOperationException { Message: "RunNotSettleable" or "NoPendingHandIn" } => "No unverified hand-in to settle",
         _ => "Courier request failed",
     };
 
@@ -1002,6 +1036,16 @@ public sealed class CourierSession
                 or "ReceiptMismatch" or "NotDeliveredDeltaMismatch" or "PlacementSettlementMismatch" or "PlacementSettlementIdentity" or "ClaimLedgerMismatch"
                 => "Hand-off did not match the plan",
             "TradeClosureUnproven" or "ResumeUnsettled" => "Hand-off unverified",
+            "HandInNeedsSettlement" => "Hand-in unproven: settle it as delivered",
+            "OwnerReceiveStalledAfterSenderFinished" => $"Receive stalled after {who} finished",
+            "OwnerUnloaded" => "Quartermaster unloaded mid-run",
+            "HandOffEvidenceUnavailable" => "Bags unreadable after the trade",
+            "SettledAsDelivered" => "Hand-in settled as delivered",
+            "CarrierHandOffNotPending" => $"{who} has no unconfirmed hand-in",
+            "CarrierSendUnproven" or "CarrierSendIncomplete" or "SettleSentEvidenceMismatch" or "SettleSentUnproven"
+                => $"{who}'s trade receipt does not show the full hand-in",
+            "SettleSentBagsChanged" => $"{who}'s bags changed since the trade",
+            "CarrierRunConflict" => $"{who} is holding another run",
             _ when code.EndsWith("Deadline", StringComparison.Ordinal) => "Timed out",
             _ => "Run stopped",
         };

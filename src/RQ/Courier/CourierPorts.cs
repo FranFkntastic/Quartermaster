@@ -50,7 +50,10 @@ public sealed record Deadline(string Name, DateTimeOffset Expires)
 // Messages and ledgers store commands by number: new commands go last. Claim takes units the carrier already holds into
 // the run's custody (the carrier is the transfer's source); it changes only the carrier's ledger, never its bags.
 // Unclaim returns claimed units no hand-in ever reached to the carrier's own stock, again by ledger alone.
-public enum CourierCommand { Status, Travel, Receive, Send, Confirm, ReturnHome, Stop, Begin, Finish, Settle, Clear, VerifySettlement, NotDelivered, Claim, Unclaim }
+// Persisted by number in carrier ledgers: new commands go last.
+public enum CourierCommand { Status, Travel, Receive, Send, Confirm, ReturnHome, Stop, Begin, Finish, Settle, Clear, VerifySettlement, NotDelivered, Claim, Unclaim,
+    // Settles a hand-in from the carrier's own completed send alone, for an owner whose receive cannot prove it.
+    SettleSent }
 public sealed record TradeEvidence(InventoryView Before, InventoryView After);
 public sealed record CourierMessage(int Version, Guid Run, Guid Step, CourierCommand Command, OwnerScope Owner,
     OwnerScope Partner, OwnerScope Carrier, ImmutableArray<Shipment> Manifest, MeetingBell? Bell = null,
@@ -80,6 +83,20 @@ internal interface ICourierDispatchEvidence
 internal interface ICourierSettlement
 {
     Task<Result<bool>> Settle(Guid step,OwnerScope partner,TradeEvidence peer,Deadline deadline);
+}
+/// <summary>Ends an owner receive that no longer tracks a trade its sender already finished; its armed window stays for settlement.</summary>
+internal interface ICourierReceiveStall
+{
+    Task<Result<bool>> EndStalledReceiveAsync(Guid step,Deadline deadline);
+}
+/// <summary>
+/// Closes the owner's receive checkpoint for a hand-in settled from evidence other than its own trade record:
+/// goods the owner placed since the trade (QM-journaled), or the operator's attestation. Only for a checkpoint
+/// with no trade open, whose sender proved the full manifest left its bags.
+/// </summary>
+internal interface ICourierReceiveAttestation
+{
+    Task<Result<bool>> AttestReceived(Guid step,OwnerScope partner,TradeEvidence sender,string disposition,Deadline deadline);
 }
 public interface ICharacterSwitchPort
 {

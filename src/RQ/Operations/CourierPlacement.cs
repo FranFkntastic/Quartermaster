@@ -9,6 +9,14 @@ namespace RQ.Operations;
 public sealed record PlacementTally(Guid? Line, uint Item, bool Hq, int Units);
 
 /// <summary>
+/// The owner's net bag change from every Quartermaster-journaled transfer created at or after a moment: deposits
+/// count negative, retrievals positive (Line is null). <paramref name="Unusable"/> names why the journal cannot
+/// account for that window exactly (an operation still running or unverified, a retrieval of ambiguous quality);
+/// the units are then incomplete and must not be used.
+/// </summary>
+public sealed record CourierPlacedSince(ImmutableArray<PlacementTally> Units, ImmutableArray<string> Operations, string? Unusable);
+
+/// <summary>
 /// The one grouping both the placement port and the courier's resume settlement use, so a
 /// journaled operation can be attributed back to the shipments it served.
 /// </summary>
@@ -48,6 +56,8 @@ public interface ICourierPlacementPort
     /// </summary>
     Task<Result<bool>> ConsolidateAsync(StowagePlan plan, ImmutableArray<CourierConsolidation> lines, IDisposable lease,
         Func<bool> authorized, Deadline deadline, Action<string> recordOperation);
+    /// <summary>The owner's journaled transfers since <paramref name="since"/>; null when this port keeps no journal.</summary>
+    CourierPlacedSince? PlacedSince(OwnerScope owner, DateTimeOffset since) => null;
 }
 
 public sealed partial class TransferCoordinator : ICourierPlacementPort
@@ -58,6 +68,41 @@ public sealed partial class TransferCoordinator : ICourierPlacementPort
             : null;
     string? ICourierPlacementPort.OperationStatus(string id, OwnerScope owner) =>
         journal.Get(id) is { } record && CourierPlanner.Exact(record.Owner, owner) ? record.Status : null;
+    CourierPlacedSince? ICourierPlacementPort.PlacedSince(OwnerScope owner, DateTimeOffset since)
+    {
+        var cutoff = since.UtcDateTime;
+        var units = new List<PlacementTally>();
+        var ids = new List<string>();
+        string? unusable = null;
+        // A placement's parent record only plans; its child retrieval and deposit records carry the verified moves.
+        foreach (var record in journal.History(owner, int.MaxValue)
+                     .Where(o => o.CreatedAtUtc >= cutoff && CourierPlanner.Exact(o.Owner, owner) && o.Kind != OperationKinds.Placement)
+                     .OrderBy(o => o.CreatedAtUtc))
+        {
+            int sign = record.Kind switch
+            {
+                OperationKinds.Retrieval => 1,
+                OperationKinds.Deposit or OperationKinds.QuickDeposit or OperationKinds.StowageSurplus => -1,
+                _ => 0,
+            };
+            ids.Add(record.OperationId);
+            if (sign == 0) unusable ??= $"PlacedSinceUnknownKind: {record.OperationId} ({record.Kind})";
+            else if (!OperationStatuses.IsTerminal(record.Status)) unusable ??= $"PlacedSinceRunning: {record.OperationId} is {record.Status}";
+            else if (record.Status == OperationStatuses.Indeterminate) unusable ??= $"PlacedSinceUnverified: {record.OperationId} is indeterminate";
+            foreach (var line in record.Lines.Where(l => l.TransferredQuantity > 0))
+            {
+                bool? hq = sign < 0 ? line.IsHighQuality : line.Quality switch
+                {
+                    ItemQualityPolicy.HqOnly => true,
+                    ItemQualityPolicy.NqOnly => false,
+                    _ => null,
+                };
+                if (hq is null) { unusable ??= $"PlacedSinceQualityAmbiguous: {record.OperationId} retrieved item {line.ItemId} of any quality"; continue; }
+                units.Add(new(null, line.ItemId, hq.Value, sign * line.TransferredQuantity));
+            }
+        }
+        return new([.. units], [.. ids], unusable);
+    }
     async Task<Result<bool>> ICourierPlacementPort.MoveBatchAsync(StowagePlan plan, ImmutableArray<Shipment> batch, bool deposit,
         IDisposable lease, Func<bool> authorized, Deadline deadline, Action<string> recordOperation)
     {

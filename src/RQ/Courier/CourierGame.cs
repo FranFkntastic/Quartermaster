@@ -35,7 +35,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     internal static readonly AsyncLocal<Action?> TradeStarted=new();
     internal static readonly AsyncLocal<Guid> Step = new();
     internal static readonly AsyncLocal<Func<bool>?> CanContinue = new();
-    private readonly CourierStore<Dictionary<string,Guid>> submissions = new(Path.Combine(directory,"courier-travel.json"));
+    private readonly CourierStore<Dictionary<string,Guid>> submissions = new(Path.Combine(directory,"courier-travel.json"), warn);
     // Trade operations step through several UI states per slot; a coarse poll would add its full interval to each one.
     internal const int TradePollMilliseconds = 16;
     internal async Task<Result<T>> Poll<T>(Deadline d, Func<Result<T>?> tick, bool primitiveDeadline = false, int pollMilliseconds = 100)
