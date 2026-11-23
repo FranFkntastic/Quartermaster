@@ -39,6 +39,8 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     public void CancelRoute()=>game.CancelRoute();
     public MeetingBell? CaptureHere(ulong character)=>game.CaptureHere(character);
     public IReadOnlyList<CourierPeer> Peers => peers;
+    /// <summary>The run this client's owner journal holds (<see cref="Guid.Empty"/> for none), advertised so a carrier forgets a run cleared here.</summary>
+    internal Func<Guid?>? OwnerRun { get; set; }
     /// <summary>The logged-in character's bags as last observed by the presence tick; null when logged out.</summary>
     public InventoryView? LocalBags {get;private set;}
     public event Action<CourierProgress>? Progress;
@@ -66,7 +68,7 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
         else if(lastCharacter!=null && !CarryingRun())lastCharacter=null;
         var who=bags?.Character ?? lastCharacter;
         var identity=JsonSerializer.SerializeToElement(who!=null ? Identity(who,bags) : null);
-        refresh=Refresh(identity);
+        refresh=Refresh(identity,who);
         foreach(var p in jobs.Where(e=>e.Value.Task.IsCompleted && e.Value.Expires<now)){ jobs.TryRemove(p.Key,out _); acknowledgements.TryRemove(p.Key,out _); }
     }
     // Pairing rides on every identity (including the bag-less one published mid data-center travel) so owners
@@ -75,23 +77,29 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     {
         var cfg=settings();
         var carrying=cfg.CarrierOptIn && cfg.Carrier is {} self && CourierPlanner.Exact(self,who);
-        return new CourierPeer(who,bags,cfg.LocalRoster,carrying,carrying?[..cfg.Owners]:Array.Empty<OwnerScope>(),carrying?true:null);
+        Guid? run=null;
+        try{run=OwnerRun?.Invoke();}catch(Exception e){warn("CourierPresenceRun: "+e.Message);}
+        return new CourierPeer(who,bags,cfg.LocalRoster,carrying,carrying?[..cfg.Owners]:Array.Empty<OwnerScope>(),carrying?true:null,run);
     }
     private bool CarryingRun()
     {
         try { return follower.View().Run != null; }
         catch (Exception e) { warn("CourierPresenceLedger: " + e.Message); return false; }
     }
-    private async Task Refresh(JsonElement identity)
+    private async Task Refresh(JsonElement identity,OwnerScope? self)
     {
+        CourierPeer[] view; (Guid,CourierPeer)[] seen;
         try{
             var ep=await endpoint.ConfigureAwait(false);
             if(published!=identity.GetRawText()){await ep.UpdateIdentityAsync(identity);published=identity.GetRawText();}
             var list=(await ep.DiscoverAsync()).OrderBy(p=>p.InstanceId).ToArray();
-            var view=list.Select(p=>p.Identity.Deserialize<CourierPeer>()).OfType<CourierPeer>().ToArray();
+            seen=list.Select(p=>(p.InstanceId,Peer:p.Identity.Deserialize<CourierPeer>())).Where(x=>x.Peer!=null).Select(x=>(x.InstanceId,x.Peer!)).ToArray();
+            view=seen.Select(x=>x.Item2).ToArray();
             presences=list; var json=JsonSerializer.Serialize(view);
             if(json!=projected){ peers=view; projected=json; }
-        }catch(Exception e){presences=[];peers=[];projected=""; if(!unload.IsCancellationRequested)warn("PeerDiscovery: "+e.Message);}
+        }catch(Exception e){presences=[];peers=[];projected=""; if(!unload.IsCancellationRequested)warn("PeerDiscovery: "+e.Message);return;}
+        // A run its owner client cleared while this carrier was unreachable is forgotten once that client is linked again.
+        follower.ForgetOrphaned(seen.Where(x=>!CourierPlanner.Exact(x.Item2.Character,self)));
     }
     private PeerResult Delivered(Result<CourierReceipt>? result,CourierProgress? ack=null)=>new PeerResult.Delivered(JsonSerializer.SerializeToElement(new Reply(result,ack??follower.Progress)));
     private PeerResult Handle(PeerMessage envelope)
@@ -112,7 +120,8 @@ j.Task.IsFaulted?Result<CourierReceipt>.Fail("CarrierStepFault",j.Task.Exception
             return new PeerResult.Refused("InvalidEnvelope","Invalid or expired courier step.");
         var p=presences.FirstOrDefault(p=>p.InstanceId==sender);
         if(p==null) return new PeerResult.Refused("UnknownOwnerEndpoint","No matching peer presence.");
-        var who=p.Identity.Deserialize<CourierPeer>()?.Character ?? new OwnerScope();
+        var presence=p.Identity.Deserialize<CourierPeer>();
+        var who=presence?.Character ?? new OwnerScope();
         var hash=JsonSerializer.Serialize(m);
         // A resumed step reuses its id. A finished attempt that did not succeed must not answer for the new one;
         // the follower's ledger decides whether the step may run again.

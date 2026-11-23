@@ -9,7 +9,7 @@ namespace RQ.UI;
 
 /// <summary>
 /// The courier run bar above the plan pane: the owner client's run (phases, trip, per-line
-/// progress, Stop/Resume) and, on a carrier client, what the carrier is doing and holding.
+/// progress, Stop/Resume/Clear) and, on a carrier client, what the carrier is doing and holding.
 /// Renders nothing while neither side has anything to show.
 /// </summary>
 internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReviewRegistry reviewRegistry)
@@ -44,16 +44,7 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
         if (courier.IsUnresolved)
         {
             DrawUnresolved(run, carrier);
-            if (run.CanSettleDelivered)
-                DrawSentProof(run, carrier);
-            if (run.CanClear)
-                DrawClear(run, false);
-            else if (!run.CanResume && run.Unverified is { } step)
-                DrawCustody("##RQCourierUnverified", step.Rows);
-            else if (!run.CanResume && !run.Custody.IsEmpty)
-                DrawCustody("##RQCourierRunCustody", run.Custody);
-            if (!run.CanClear && run.ClearBlocked is { } blocked)
-                DrawClearBlocked(blocked, carrier);
+            DrawClear(run, false);
             DrawLines(run);
             return true;
         }
@@ -108,35 +99,23 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
         ImGui.Dummy(new Vector2(width, height));
     }
 
-    /// <summary>What the run still holds, then a plain Clear: the table is what Clear acknowledges.</summary>
+    /// <summary>
+    /// What the run still holds, then Clear: always enabled, one click. Clear forgets the run; the goods stay wherever
+    /// they are, and the carrier keeps what it holds as its own.
+    /// </summary>
     private void DrawClear(CourierSnapshot run, bool sameLine)
     {
-        var rows = courier.ClearLedger.IsEmpty ? run.Custody : courier.ClearLedger;
+        var rows = run.Custody;
         if (!rows.IsEmpty)
             DrawCustody("##RQCourierRunCustody", rows);
         else if (sameLine)
             ImGui.SameLine(0, 16);
-        void Clear() => courier.Clear(run.Run, rows);
+        void Clear() => courier.Clear(run.Run);
         if (ImGui.SmallButton("Clear##RQCourierClear"))
             Clear();
         var units = rows.Sum(row => row.Quantity);
         reviewRegistry.RegisterLastButton("quartermaster.courier.run.clear", "Clear the courier run", true, Clear,
             units > 0 ? $"{units:N0} held by {string.Join(", ", rows.Select(row => row.Holder).Distinct())}" : "Nothing held");
-    }
-
-    /// <summary>A stopped run always shows how it ends: Clear stays visible, disabled, naming what it waits for.</summary>
-    private static void DrawClearBlocked(string blocked, string? carrier)
-    {
-        ImGui.BeginDisabled();
-        ImGui.SmallButton("Clear##RQCourierClearBlocked");
-        ImGui.EndDisabled();
-        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-            ImGui.SetTooltip(blocked switch
-            {
-                "HandOffUnverified" => "Needs the hand-off settled",
-                "CarrierNotConnected" => $"Needs {carrier ?? "the carrier"} connected",
-                _ => blocked,
-            });
     }
 
     private void DrawUnresolved(CourierSnapshot run, string? carrier)
@@ -150,67 +129,14 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
                 () => courier.Resume(), $"{run.State}: {run.Code}");
             ImGui.SameLine(0, 16);
         }
-        // An unverified hand-in's way out sits beside Resume (or in its place once a resume proved it cannot settle it).
-        if (run.CanSettleDelivered && courier.SentProof?.Run != run.Run)
-        {
-            const string label = "Settle as delivered…";
-            var checking = courier.SentProofLoading;
-            if (checking)
-                ImGui.BeginDisabled();
-            if (ImGui.Button($"{label}##RQCourierSettleReview", new Vector2(ImGui.CalcTextSize(label).X + 40, height)))
-                courier.ReviewSettleDelivered(run.Run);
-            if (checking)
-                ImGui.EndDisabled();
-            if (checking && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-                ImGui.SetTooltip($"Reading {carrier ?? "the carrier"}'s trade receipt");
-            reviewRegistry.RegisterLastButton("quartermaster.courier.run.settle-review", "Show the carrier's trade receipt for the unverified hand-in",
-                !checking, () => courier.ReviewSettleDelivered(run.Run), checking ? "Reading receipt" : $"{run.State}: {run.Code}");
-            ImGui.SameLine(0, 16);
-        }
         ImGui.BeginGroup();
         var top = ImGui.GetCursorPosY();
         ImGui.SetCursorPosY(top + Math.Max(0, (height - (ImGui.GetTextLineHeight() * 2) - ImGui.GetStyle().ItemSpacing.Y) / 2));
-        var amber = QuartermasterPalette.Amber;
-        if (!run.CanResume && !run.CanClear && run.Unverified is { } step)
-        {
-            ImGui.TextColored(amber, CourierSession.UnverifiedLabel(step));
-        }
-        else if (!run.CanResume && !run.CanClear && !run.Custody.IsEmpty)
-        {
-            ImGui.TextColored(amber, $"{run.Custody[0].Holder} not connected");
-        }
-        else
-        {
-            ImGui.TextColored(amber, StateLabel(run.State));
-            var outcome = CourierSession.OutcomeLabel(run.Code, carrier);
-            ImGui.TextDisabled(run.Trips > 0 ? $"{outcome} · Trip {Math.Max(1, run.Trip):N0} of {run.Trips:N0}" : outcome);
-        }
+        ImGui.TextColored(QuartermasterPalette.Amber, !run.CanResume && run.Unverified is { } step ? CourierSession.UnverifiedLabel(step) : StateLabel(run.State));
+        // A refused Resume reads as a quiet note here, not as an error.
+        var outcome = courier.ResumeNote is { } note ? $"Resume: {note}" : CourierSession.OutcomeLabel(run.Code, carrier);
+        ImGui.TextDisabled(run.Trips > 0 ? $"{outcome} · Trip {Math.Max(1, run.Trip):N0} of {run.Trips:N0}" : outcome);
         ImGui.EndGroup();
-    }
-
-    /// <summary>
-    /// The operator's attestation for an unverified hand-in, once the carrier's send receipt was read: what left its
-    /// bags, then the settle itself, enabled only when that receipt shows the whole hand-in left.
-    /// </summary>
-    private void DrawSentProof(CourierSnapshot run, string? carrier)
-    {
-        if (courier.SentProof is not { } proof || proof.Run != run.Run)
-            return;
-        DrawCustody("##RQCourierSentProof", proof.Left, "Left");
-        if (!proof.Complete)
-            ImGui.BeginDisabled();
-        if (ImGui.SmallButton($"Settle as delivered to {proof.To}##RQCourierSettle"))
-            courier.SettleDelivered(run.Run);
-        if (!proof.Complete)
-            ImGui.EndDisabled();
-        if (!proof.Complete && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-            ImGui.SetTooltip(CourierSession.OutcomeLabel(proof.Refusal ?? "", carrier));
-        var units = proof.Left.Sum(row => (long)row.Quantity);
-        reviewRegistry.RegisterLastButton("quartermaster.courier.run.settle", "Settle the unverified hand-in as delivered", proof.Complete,
-            () => courier.SettleDelivered(run.Run), proof.Complete ? $"{units:N0} left {proof.From}" : proof.Refusal ?? "Unproven");
-        ImGui.SameLine(0, 12);
-        if (ImGui.SmallButton("Cancel##RQCourierSettleCancel"))
-            courier.DismissSentProof();
     }
 
     /// <summary>The finished run's outcome; the line counts sit in the tooltip.</summary>
@@ -300,7 +226,7 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
 
     private bool DrawCarrier()
     {
-        if (courier.Carried is not { } view || (view.Active is null && view.Custody.IsEmpty && !view.Paused && !view.Unconfirmed && !view.Locked))
+        if (courier.Carried is not { } view || (view.Run is null && view.Active is null && view.Custody.IsEmpty && !view.Paused && !view.Unconfirmed && !view.Locked))
             return false;
         var height = BarHeight;
         // Between commands a live run still holds the trade, automation and AutoRetainer locks; Stop releases them.
@@ -312,6 +238,12 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
                 courier.StopCarrier, view.Active is { } running ? CourierSession.PhaseLabel(running.ToString()) : "Holding locks");
             ImGui.SameLine(0, 16);
         }
+        // Always enabled: this client forgets the carried run; what it holds stays in its bags as its own.
+        if (ImGui.Button("Clear##RQCourierCarrierClear", new Vector2(ImGui.CalcTextSize("Clear").X + 40, height)))
+            courier.ClearCarrier();
+        reviewRegistry.RegisterLastButton("quartermaster.courier.carrier.clear", "Forget the carried run on this client", true,
+            courier.ClearCarrier, HoldingSummary(view.Custody) ?? "Holding nothing");
+        ImGui.SameLine(0, 16);
         ImGui.BeginGroup();
         var top = ImGui.GetCursorPosY();
         ImGui.SetCursorPosY(top + Math.Max(0, (height - (ImGui.GetTextLineHeight() * 2) - ImGui.GetStyle().ItemSpacing.Y) / 2));

@@ -167,7 +167,7 @@ public sealed class CourierRunTests : IDisposable
     {
         owner.UncertainTrade = true;
         var stalled = await engine.StartAsync(Plan(), cfg);
-        Assert.True(stalled is { State: "Indeterminate", CanSettleDelivered: true }, stalled.State + " " + stalled.Code);
+        Assert.True(stalled is { State: "Indeterminate" }, stalled.State + " " + stalled.Code);
         Assert.Equal(3, owner.Quantities[destination]); Assert.Equal(10, mule.Units);
         owner.Quantities[destination] -= 2; // A Quartermaster placement stowed two of the three since.
         owner.Placed = new([new(null, Ore, false, -2)], ["stow-after-hand-in"], null);
