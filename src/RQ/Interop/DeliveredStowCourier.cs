@@ -88,7 +88,7 @@ internal sealed class DeliveredStowCourier
         if (conductor.IsBusy)
             return new("CourierBusy", "The previous courier run is still finishing cleanup.", Wait: true);
         var unresolved = current.Run != Guid.Empty && current.State is "Failed" or "Interrupted" or "Indeterminate";
-        if (unresolved && (!current.Custody.IsEmpty || !current.CanClear))
+        if (unresolved && (!current.Custody.IsEmpty || current.Unverified?.Step is nameof(CourierPhase.HandOut) or nameof(CourierPhase.HandIn)))
             return new("CourierRunUnresolved", $"The previous courier run is {current.State} ({current.Code}); resume or clear it in Courier.", Wait: true);
         var cfg = settings();
         if (cfg.Carrier is not { HasStableIdentity: true })

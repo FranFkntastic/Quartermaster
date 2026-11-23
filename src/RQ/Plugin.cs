@@ -368,6 +368,7 @@ public sealed class Plugin : IDalamudPlugin
             change=>courier.UpdateSettings(change));
         courier.Conductor = new(configDirectory,courierPeer,courierTrade,courierGame,courierGame,courierGame,courierGame,
             transfers,automation,autoRetainerSuppression,s=>log.Warning(s),s=>log.Information(s),AutoRetainerLoaded);
+        courierPeer.OwnerRun = courier.Conductor.CurrentRun;
         var courierWorldRegion = courier.WorldRegion!;
         ipc.AttachCourier(new Interop.CourierIpcService(providerInstanceId, courier,
             () => state.ReadConfiguration(s => s.Courier), () => courierPeer.LocalBags, courierGame.Bridge,

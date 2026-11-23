@@ -292,7 +292,7 @@ public sealed class CourierIpcService
         // An unresolved previous run blocks only while it holds custody or an unverified trade; a zero-custody
         // one is archived by the new run below, so starting again acknowledges it.
         var unresolved = journal.Run != Guid.Empty && journal.State is "Failed" or "Interrupted" or "Indeterminate";
-        if (unresolved && (!journal.Custody.IsEmpty || !conductor.Snapshot().CanClear))
+        if (unresolved && (!journal.Custody.IsEmpty || journal.Pending?.Action.Phase is CourierPhase.HandOut or CourierPhase.HandIn))
             return Ack(requestId, journal.Run, "rejected", "CourierRunUnresolved", $"The previous run is {journal.State} ({journal.Code}); resume or clear it first.");
 
         var cfg = settings();

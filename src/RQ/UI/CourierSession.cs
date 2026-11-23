@@ -23,8 +23,10 @@ internal sealed record CourierContainer(ulong? Retainer, string Name, int Capaci
 
 /// <param name="CarrierSourcing">True when this carrier can send stock it already holds (the claim command); null from
 /// carriers built before it.</param>
+/// <param name="OwnerRun">The run this client's owner journal holds (<see cref="Guid.Empty"/> for none); null from clients
+/// built before it. A carrier forgets a held run its owner client no longer has.</param>
 public sealed record CourierPeer(OwnerScope Character, InventoryView? Bags,IReadOnlyList<OwnerScope>? Roster=null,
-    bool? CarrierOptIn=null,IReadOnlyList<OwnerScope>? PairedOwners=null,bool? CarrierSourcing=null);
+    bool? CarrierOptIn=null,IReadOnlyList<OwnerScope>? PairedOwners=null,bool? CarrierSourcing=null,Guid? OwnerRun=null);
 
 /// <summary>
 /// The live facts only the courier wiring can supply to the UI. Both members are read on the
@@ -92,9 +94,6 @@ public sealed class CourierSession
     private CarrierView? carried;
     private long polledAt;
     private Task? starting;
-    internal string? ClearAcknowledgement { get; private set; }
-    /// <summary>The carrier's confirmed ledger behind <see cref="ClearAcknowledgement"/>.</summary>
-    internal ImmutableArray<CustodyRow> ClearLedger { get; private set; } = [];
     private long? settingsRequestedAt;
     private int? testSlotCap;
     internal void SetTestSlotCap(int? value)
@@ -828,75 +827,11 @@ public sealed class CourierSession
         Launch(async () => await conductor.StartAsync(courierPlan!, settings).ConfigureAwait(false));
     }
 
-    /// <summary>
-    /// Clears a settled run. When the carrier's confirmed ledger equals the custody the pane showed,
-    /// that view was the acknowledgement; otherwise the carrier's ledger replaces it on the pane and
-    /// the next Clear acknowledges that.
-    /// </summary>
-    internal void Clear(Guid expectedRun, ImmutableArray<CustodyRow> shown)
+    /// <summary>Clears the run, whatever it holds or awaits: the escape hatch. One click, no acknowledgement.</summary>
+    internal void Clear(Guid expectedRun)
     {
         if (Conductor is not { } conductor || IsActive) return;
-        var acknowledgement = ClearAcknowledgement;
-        Launch(async () =>
-        {
-            try
-            {
-                var snapshot = await conductor.ClearAsync(expectedRun, acknowledgement).ConfigureAwait(false);
-                ClearAcknowledgement = null;
-                ClearLedger = [];
-                return snapshot;
-            }
-            catch (CourierConductor.CustodyAcknowledgementRequired required) when (acknowledgement is null && SameRows(required.CarrierRows, shown))
-            {
-                var snapshot = await conductor.ClearAsync(expectedRun, required.Message).ConfigureAwait(false);
-                ClearAcknowledgement = null;
-                ClearLedger = [];
-                return snapshot;
-            }
-            catch (CourierConductor.CustodyAcknowledgementRequired required)
-            {
-                ClearAcknowledgement = required.Message;
-                ClearLedger = required.CarrierRows;
-                return null;
-            }
-        });
-    }
-
-    private static bool SameRows(ImmutableArray<CustodyRow> a, ImmutableArray<CustodyRow> b) =>
-        a.Length == b.Length &&
-        a.OrderBy(row => (row.Item, row.Quality, row.Holder)).SequenceEqual(b.OrderBy(row => (row.Item, row.Quality, row.Holder)));
-
-    /// <summary>What the carrier's send receipt proves for the run's unverified hand-in, once the operator asked.</summary>
-    internal CourierSentProof? SentProof { get; private set; }
-    internal bool SentProofLoading { get; private set; }
-
-    /// <summary>Asks the carrier for its send receipt of the pending hand-in. Moves nothing.</summary>
-    internal void ReviewSettleDelivered(Guid expectedRun)
-    {
-        if (Conductor is not { } conductor || IsActive || conductor.IsBusy || SentProofLoading)
-            return;
-        SentProofLoading = true;
-        var carrier = CarrierName();
-        _ = Task.Run(async () =>
-        {
-            try { SentProof = await conductor.SentProofAsync(expectedRun).ConfigureAwait(false); }
-            catch (Exception exception) { Fail(FailureLabel(exception, carrier), exception.ToString()); }
-            finally { SentProofLoading = false; polledAt = 0; }
-        });
-    }
-
-    internal void DismissSentProof() => SentProof = null;
-
-    /// <summary>The operator's attestation: settles the pending hand-in from the carrier's send receipt; the run stays resumable.</summary>
-    internal void SettleDelivered(Guid expectedRun)
-    {
-        if (Conductor is not { } conductor || IsActive || conductor.IsBusy || SentProof is not { Complete: true } proof || proof.Run != expectedRun)
-            return;
-        Launch(async () =>
-        {
-            try { return await conductor.SettleDeliveredAsync(expectedRun).ConfigureAwait(false); }
-            finally { SentProof = null; }
-        });
+        Launch(async () => await conductor.ClearAsync(expectedRun).ConfigureAwait(false));
     }
 
     /// <summary>Resumes an interrupted run from its journal; the journal owns the plan and settings.</summary>
@@ -906,7 +841,7 @@ public sealed class CourierSession
         Poll(force: true);
         if (Conductor is not { } conductor || IsActive || conductor.IsBusy || Run?.CanResume!=true)
             return false;
-        Launch(async () => await conductor.StartAsync(new(Guid.Empty, 0, [], []), new()).ConfigureAwait(false));
+        Launch(async () => await conductor.StartAsync(new(Guid.Empty, 0, [], []), new()).ConfigureAwait(false), quiet: true);
         return true;
     }
 
@@ -925,7 +860,7 @@ public sealed class CourierSession
         Launch(async () =>
         {
             if (clearFirst is { } previous)
-                await conductor.ClearAsync(previous, null).ConfigureAwait(false);
+                await conductor.ClearAsync(previous).ConfigureAwait(false);
             return await conductor.StartAsync(courierPlan, settings, runId).ConfigureAwait(false);
         }, settled);
         return true;
@@ -933,10 +868,14 @@ public sealed class CourierSession
 
     private string? CarrierName() => state.ReadConfiguration(document => document.Courier.Carrier?.CharacterName);
 
-    private void Launch(Func<Task<CourierSnapshot?>> start, Action<CourierSnapshot?, Exception?>? settled = null)
+    /// <summary>Why the last Resume could not start, in plain words: a quiet note beside Resume, not an error.</summary>
+    internal string? ResumeNote { get; private set; }
+
+    private void Launch(Func<Task<CourierSnapshot?>> start, Action<CourierSnapshot?, Exception?>? settled = null, bool quiet = false)
     {
         Error = null;
         ErrorDetail = null;
+        ResumeNote = null;
         var carrier = CarrierName();
         Conductor?.PrepareLaunch();
         starting = Task.Run(async () =>
@@ -949,7 +888,17 @@ public sealed class CourierSession
                 if ((outcome = await start().ConfigureAwait(false)) is { State: "Refused" } refused)
                     Fail(OutcomeLabel(refused.Code, carrier), $"{refused.Code}: {refused.Detail}");
             }
-            catch (Exception exception) { fault = exception; Fail(FailureLabel(exception, carrier), exception.ToString()); }
+            catch (Exception exception)
+            {
+                fault = exception;
+                if (quiet)
+                {
+                    ResumeNote = FailureLabel(exception, carrier);
+                    Warn?.Invoke($"Courier: {ResumeNote}: {exception}");
+                }
+                else
+                    Fail(FailureLabel(exception, carrier), exception.ToString());
+            }
             finally
             {
                 polledAt = 0;
@@ -985,17 +934,26 @@ public sealed class CourierSession
         });
     }
 
+    /// <summary>The carrier pane's Clear: this client forgets the run it carries, whatever it holds or awaits.</summary>
+    internal void ClearCarrier()
+    {
+        if (Follower is not { } follower)
+            return;
+        _ = Task.Run(async () =>
+        {
+            try { await follower.ForgetLocalAsync().ConfigureAwait(false); }
+            catch (Exception exception) { Fail("Could not clear the carried run", exception.ToString()); }
+            finally { polledAt = 0; }
+        });
+    }
+
     /// <summary>A failed request in plain words; unknown failures stay generic and their detail goes to the log.</summary>
     private static string FailureLabel(Exception exception, string? carrier) => exception switch
     {
         CourierFault fault => OutcomeLabel(fault.Code, carrier),
         OperationCanceledException => "Courier unloaded",
         InvalidOperationException { Message: "CourierAlreadyRunning" } => "A courier run is already active",
-        InvalidOperationException { Message: "RunNotClearable" } => "This run can no longer be cleared",
-        InvalidOperationException { Message: "Settle the pending trade before clearing custody." } => "A hand-off is still unverified",
-        InvalidOperationException { Message: "Carrier does not acknowledge this run's custody." } => $"{carrier ?? "The carrier"} does not report holding this run's items",
-        InvalidOperationException { Message: "Carrier trade is unsettled." } => $"{carrier ?? "The carrier"} has an unconfirmed trade",
-        InvalidOperationException { Message: "RunNotSettleable" or "NoPendingHandIn" } => "No unverified hand-in to settle",
+        InvalidOperationException { Message: "RunNotClearable" } => "This run was already cleared",
         _ => "Courier request failed",
     };
 
@@ -1036,13 +994,11 @@ public sealed class CourierSession
                 or "ReceiptMismatch" or "NotDeliveredDeltaMismatch" or "PlacementSettlementMismatch" or "PlacementSettlementIdentity" or "ClaimLedgerMismatch"
                 => "Hand-off did not match the plan",
             "TradeClosureUnproven" or "ResumeUnsettled" => "Hand-off unverified",
-            "HandInNeedsSettlement" => "Hand-in unproven: settle it as delivered",
+            "HandInNeedsSettlement" => "Hand-in unproven",
             "OwnerReceiveStalledAfterSenderFinished" => $"Receive stalled after {who} finished",
             "OwnerUnloaded" => "Quartermaster unloaded mid-run",
             "HandOffEvidenceUnavailable" => "Bags unreadable after the trade",
-            "SettledAsDelivered" => "Hand-in settled as delivered",
-            "CarrierHandOffNotPending" => $"{who} has no unconfirmed hand-in",
-            "CarrierSendUnproven" or "CarrierSendIncomplete" or "SettleSentEvidenceMismatch" or "SettleSentUnproven"
+            "SettleSentEvidenceMismatch" or "SettleSentUnproven"
                 => $"{who}'s trade receipt does not show the full hand-in",
             "SettleSentBagsChanged" => $"{who}'s bags changed since the trade",
             "CarrierRunConflict" => $"{who} is holding another run",

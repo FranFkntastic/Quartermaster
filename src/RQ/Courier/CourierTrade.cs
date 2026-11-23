@@ -17,7 +17,7 @@ internal sealed class TradeCheckpoint
     public CourierReceiveArm? LastSettledArm {get;set;}
     public InventoryView? ReceiveAfter {get;set;}
     public TradeEvidence? SenderEvidence {get;set;}
-    /// <summary>Set when the receive was closed by attestation rather than its own trade record (DeliveredThenPlaced, OperatorAttested).</summary>
+    /// <summary>Set when the receive was closed by attestation rather than its own trade record (DeliveredThenPlaced; OperatorAttested in older checkpoints).</summary>
     public string? Disposition {get;set;}
     public List<BagStock> Original {get;set;}=[];
     public bool Receiving {get;set;}
@@ -26,7 +26,7 @@ internal sealed class TradeCheckpoint
 }
 internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease lease,IDalamudPluginInterface pi,
     DalamudExternalUiAutomationSuppression external,IPluginLog log,string directory) : ICourierTradePort, ICourierDispatchEvidence, ICourierSettlement, ICourierHoldPort,
-    ICourierReceiveStall, ICourierReceiveAttestation, ITradeSuppression, IDisposable
+    ICourierReceiveStall, ICourierReceiveAttestation, ICourierTradeForget, ITradeSuppression, IDisposable
 {
     private sealed class Intent(CourierStore<TradeCheckpoint> store, TradeCheckpoint current) : ITradeIntentStore
     {
@@ -294,5 +294,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
         return !state.Recovery.CancellationPending && accounted ? Result<bool>.Ok(true) :
             new(CourierOutcome.Indeterminate,"TradeManifestUnsettled",step.ToString());
     });
+    // A cleared run's checkpoint goes with it, so no later trade waits on its pending trade or receive arm.
+    public void Forget()=>store.Save(new());
     public void Dispose(){try{hold?.Dispose();sender?.Dispose();if(!locked && !io.IsRemoteLocked)receiver?.Stop();}finally{RestoreTradeAutoConfirm();}}
 }
