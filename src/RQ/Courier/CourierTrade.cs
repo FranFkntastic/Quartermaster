@@ -175,7 +175,9 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                 if(outcome!=CourierOutcome.Succeeded && state!=null && !locked && !io.IsRemoteLocked && !io.IsTradeOpen && NothingCredited(state))
                 {state.PreLockCancelled=true;store.Save(state);}
                 sender?.Dispose();sender=null;receiver=null;locked=false;inFlight=false;
-                if(state?.Recovery.CancellationPending!=true)RestoreTradeAutoConfirm();
+                // A trade can end (closure deadline, partial stop, adapter fault) with the window still open and our
+                // items in it: keep YesAlready/Dropbox paused until it closes instead of releasing them here.
+                if(state?.Recovery.CancellationPending!=true){if(WindowClosed())RestoreTradeAutoConfirm();else RestoreLeftoverSuppression();}
                 return new(outcome,code,detail,outcome==CourierOutcome.Succeeded);
             }
             try{
