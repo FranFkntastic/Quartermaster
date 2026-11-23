@@ -56,6 +56,9 @@ public sealed class Plugin : IDalamudPlugin
     private readonly RetainerCacheRepository cache;
     private readonly StateRepository state;
     private readonly RetainerRefreshCoordinator retainerRefresh;
+    private readonly AutomationLease automation;
+    private readonly IPluginLog pluginLog;
+    private (long Cache, long State) retainerNameRefreshRevisions = (-1, -1);
     private readonly RetainerBellRoute retainerBellRoute;
     private readonly OperationJournal journal;
     private readonly TransferCoordinator transfers;
@@ -107,6 +110,7 @@ public sealed class Plugin : IDalamudPlugin
         this.pluginInterface = pluginInterface;
         this.commands = commands;
         this.framework = framework;
+        pluginLog = log;
         updateTimings = new(log, "OnFrameworkUpdate", 50);
         this.playerState = playerState;
         configuration = pluginInterface.GetPluginConfig() as PluginConfiguration ?? new PluginConfiguration();
@@ -199,7 +203,7 @@ public sealed class Plugin : IDalamudPlugin
         StowagePlanMigration.EnsureOwnerPlan(state, CurrentOwner());
         TransferPlanMigration.EnsureOwnerPlans(state, CurrentOwner());
         MarketRunExecutor? activeMarketRuns = null;
-        var automation = new AutomationLease(() => activeMarketRuns?.Result?.RequiresAcknowledgement == true
+        automation = new AutomationLease(() => activeMarketRuns?.Result?.RequiresAcknowledgement == true
             ? "Unresolved market run; review its result in Market before clearing it." : null);
         // Keep retrieval verification bound to the exact inventory changes emitted
         // while its native command is in flight; this survives retainer slot compaction.
@@ -248,7 +252,7 @@ public sealed class Plugin : IDalamudPlugin
                 id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.StackSize is > 0 and var size
                     ? checked((int)size) : throw new InvalidOperationException($"Stack size unavailable for item {id}.")),
             automation, () => state.Read(s => ListingPlanCatalog.OwnerPlan(s, CurrentOwner())), marketRunStore.Save, autoRetainerSuppression, clear: marketRunStore.Clear, warning: message => log.Warning(message),
-            information: message => log.Information(message));
+            information: message => log.Information(message), retainerRoster: cache.Snapshot);
         marketRuns.Restore(marketRunStore.Load());
         activeMarketRuns = marketRuns;
         automaticRetrievals = new(journal, transfers, CurrentOwner, autoRetainerSuppression, message => log.Warning(message));
@@ -508,6 +512,21 @@ public sealed class Plugin : IDalamudPlugin
         return fallback;
     }
 
+    /// <summary>
+    /// Keeps Listing Plan retainer-name snapshots in step with renames seen on the roster, through the plan store with a
+    /// revision bump. Never while automation holds the lease: a plan revision change stops a running market run.
+    /// </summary>
+    private void RefreshListingPlanRetainerNames()
+    {
+        var revisions = (cache.Revision, state.ReadConfiguration(s => s.Revision));
+        if (revisions == retainerNameRefreshRevisions || automation.IsHeld) return;
+        retainerNameRefreshRevisions = revisions;
+        var roster = cache.Snapshot();
+        if (!state.ReadConfiguration(s => ListingPlanCatalog.HasStaleRetainerNames(s, roster))) return;
+        var renamed = state.Mutate(StateChangeKind.Listings, s => ListingPlanCatalog.RefreshRetainerNames(s, roster, DateTime.UtcNow));
+        if (renamed > 0) pluginLog.Information($"ListingPlanRetainerNamesRefreshed: {renamed} assignment(s) now use the current roster name for their retainer ID.");
+    }
+
     private void OnFrameworkUpdate(IFramework _)
     {
         var actor=playerState.IsLoaded?playerState.ContentId:0;
@@ -520,6 +539,7 @@ public sealed class Plugin : IDalamudPlugin
         var liveOwner = CurrentOwner();
         StowagePlanMigration.EnsureOwnerPlan(state, liveOwner);
         TransferPlanMigration.EnsureOwnerPlans(state, liveOwner);
+        RefreshListingPlanRetainerNames();
         // Courier lines written before sources and destinations were listed apart need observed stock to convert.
         courier.MigrateRoles(runtimeSnapshots.Current);
         if (RuntimeOwnerTransition.RequiresReconciliation(runtimeSnapshots.Current.Owner, liveOwner))

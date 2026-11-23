@@ -149,7 +149,8 @@ public sealed class MarketRunExecutor(
     IMarketRunDriver driver, AutomationLease automation, Func<ListingPlan?> currentPlan,
     Action<MarketRunRecord> persist, AutoRetainerSuppression? suppression = null,
     IMarketRunDeadline? deadlines = null, Action? clear = null, IMarketRunDeadline? routeDeadlines = null,
-    Action<string>? warning = null, Action<string>? information = null, IMarketRunDeadline? repriceDeadlines = null)
+    Action<string>? warning = null, Action<string>? information = null, IMarketRunDeadline? repriceDeadlines = null,
+    Func<IReadOnlyDictionary<ulong, CachedRetainer>>? retainerRoster = null)
 {
     private readonly IMarketRunDeadline deadline = deadlines ?? new MarketRunDeadline(TimeSpan.FromSeconds(15));
     // A caller-supplied deadline (tests) also governs reprices unless one is given for them.
@@ -165,6 +166,8 @@ public sealed class MarketRunExecutor(
     private readonly Dictionary<Guid, int> shortByAssignment = [];
     private readonly Dictionary<ulong, IReadOnlyList<RetainerMarketListingTarget>> freshListings = [];
     private bool topUpActive;
+    // Retainer IDs in the plan that the current roster no longer assigns to this character.
+    private readonly HashSet<ulong> missingRetainers = [];
     private readonly object persistenceGate = new();
     public bool IsRunning => Volatile.Read(ref running) != 0;
     private bool disposed;
@@ -241,6 +244,7 @@ public sealed class MarketRunExecutor(
             ListingTarget = evaluation.Retainers.Sum(r => r.RefillListings.IsKnown ? r.RefillListings.Value : 0);
             var record = new MarketRunRecord { ForceReorganize = reorganizeRetainers, StartedAtUtc = DateTime.UtcNow, PlanId = plan.Id, PlanRevision = plan.Revision, Owner = plan.Owner with { },
                 Assignments = plan.Assignments.Where(a => a.Enabled).Select(ListingPlanCatalog.Copy).ToList() };
+            ResolveRetainerNames(record);
             AutoRetainerSuppression.Scope? scope = null;
             var sessionStarted = false;
             var scannedRetainers = new HashSet<ulong>();
@@ -272,7 +276,15 @@ public sealed class MarketRunExecutor(
                     await GatherAsync(record, targets).ConfigureAwait(false);
                     Check(record);
                     await routeDeadline.RunAsync(async t => { await driver.RequireRetainerListAsync(t).ConfigureAwait(false); return true; }).ConfigureAwait(false);
-                    var visits = record.Assignments.GroupBy(a => a.RetainerId)
+                    foreach (var id in missingRetainers)
+                    {
+                        var stale = record.Assignments.Where(a => a.RetainerId == id).ToArray();
+                        var message = $"MarketRunRetainerMissing: retainer ID {id} (saved in the plan as '{stale.Select(a => a.RetainerName).FirstOrDefault(n => !string.IsNullOrWhiteSpace(n)) ?? "unnamed"}') " +
+                            $"is not on {record.Owner.CharacterName}'s current retainer roster; its {stale.Length} assignment(s) were not listed. Reassign them in the Listing Plan.";
+                        warning?.Invoke(message);
+                        Add(record, message);
+                    }
+                    var visits = record.Assignments.Where(a => !missingRetainers.Contains(a.RetainerId)).GroupBy(a => a.RetainerId)
                         .Select(g => new RetainerVisit(g.Key, g.Select(a => a.RetainerName).FirstOrDefault(n => !string.IsNullOrWhiteSpace(n)) ?? $"Retainer {g.Key}", g.ToArray()))
                         .OrderBy(g => g.Name, StringComparer.OrdinalIgnoreCase).ThenBy(g => g.Id).ToArray();
                     foreach (var visit in visits)
@@ -903,6 +915,22 @@ public sealed class MarketRunExecutor(
             if (disposed) return;
             try { persist(record); }
             catch (Exception e) { persistenceFailed = true; PersistenceError = $"Market run persistence failed: {e.Message}"; throw; }
+        }
+    }
+    /// <summary>
+    /// Selection is by retainer ID: the run's assignment copies take the current roster name for each ID, so visits,
+    /// receipts and history name the retainer as the game shows it now. A plan's saved name is only a display fallback.
+    /// </summary>
+    private void ResolveRetainerNames(MarketRunRecord record)
+    {
+        missingRetainers.Clear();
+        if (retainerRoster?.Invoke() is not { } roster) return;
+        foreach (var group in record.Assignments.GroupBy(a => a.RetainerId))
+        {
+            if (ListingPlanCatalog.CurrentRetainerName(roster, record.Owner, group.Key) is { } current)
+                foreach (var assignment in group) assignment.RetainerName = current;
+            else
+                missingRetainers.Add(group.Key);
         }
     }
     private void Add(MarketRunRecord record, string message) => record.Results.Add(topUpActive ? $"Top-up · {message}" : message);
