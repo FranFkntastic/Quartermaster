@@ -88,17 +88,18 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     }
     private async Task Refresh(JsonElement identity,OwnerScope? self)
     {
-        CourierPeer[] view;
+        CourierPeer[] view; (Guid,CourierPeer)[] seen;
         try{
             var ep=await endpoint.ConfigureAwait(false);
             if(published!=identity.GetRawText()){await ep.UpdateIdentityAsync(identity);published=identity.GetRawText();}
             var list=(await ep.DiscoverAsync()).OrderBy(p=>p.InstanceId).ToArray();
-            view=list.Select(p=>p.Identity.Deserialize<CourierPeer>()).OfType<CourierPeer>().ToArray();
+            seen=list.Select(p=>(p.InstanceId,Peer:p.Identity.Deserialize<CourierPeer>())).Where(x=>x.Peer!=null).Select(x=>(x.InstanceId,x.Peer!)).ToArray();
+            view=seen.Select(x=>x.Item2).ToArray();
             presences=list; var json=JsonSerializer.Serialize(view);
             if(json!=projected){ peers=view; projected=json; }
         }catch(Exception e){presences=[];peers=[];projected=""; if(!unload.IsCancellationRequested)warn("PeerDiscovery: "+e.Message);return;}
         // A run its owner client cleared while this carrier was unreachable is forgotten once that client is linked again.
-        follower.ForgetOrphaned(view.Where(p=>!CourierPlanner.Exact(p.Character,self)));
+        follower.ForgetOrphaned(seen.Where(x=>!CourierPlanner.Exact(x.Item2.Character,self)));
     }
     private PeerResult Delivered(Result<CourierReceipt>? result,CourierProgress? ack=null)=>new PeerResult.Delivered(JsonSerializer.SerializeToElement(new Reply(result,ack??follower.Progress)));
     private PeerResult Handle(PeerMessage envelope)
@@ -129,7 +130,7 @@ j.Task.IsFaulted?Result<CourierReceipt>.Fail("CarrierStepFault",j.Task.Exception
             jobs.TryRemove(new KeyValuePair<(Guid,Guid),Job>(key,done)))
             acknowledgements.TryRemove(key,out _);
         var job=jobs.GetOrAdd(key,unused=>new(m,hash,Task.Run(async ()=>{
-            var result=await follower.HandleAsync(who,m,d,sender,p=>acknowledgements[key]=p,presence?.Roster);
+            var result=await follower.HandleAsync(who,m,d,sender,p=>acknowledgements[key]=p);
             if(m.Command==CourierCommand.Begin && result.Outcome==CourierOutcome.Succeeded){owners[m.Run]=sender;Connect(await endpoint,p);}
             if(m.Command is CourierCommand.Finish or CourierCommand.Clear && result.Outcome==CourierOutcome.Succeeded)owners.TryRemove(m.Run,out _);
             return result;

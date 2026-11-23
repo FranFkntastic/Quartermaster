@@ -64,9 +64,8 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             Volatile.Read(ref lease) != null || Volatile.Read(ref tradeHold) != null || Volatile.Read(ref suppress) != null);
     }
 
-    // peerOwner (and senderRoster, the sending client's advertised roster) come from the authenticated session, never from the message body.
-    public async Task<Result<CourierReceipt>> HandleAsync(OwnerScope peerOwner, CourierMessage m, Deadline deadline, Guid? endpoint = null, Action<CourierProgress>? started = null,
-        IReadOnlyList<OwnerScope>? senderRoster = null)
+    // peerOwner comes from the authenticated session, never from the message body.
+    public async Task<Result<CourierReceipt>> HandleAsync(OwnerScope peerOwner, CourierMessage m, Deadline deadline, Guid? endpoint = null, Action<CourierProgress>? started = null)
     {
         var cfg = settings();
         var refused = false;
@@ -128,7 +127,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             if (ledger.Run != null && ledger.Run != m.Run)
             {
                 // An owner client runs one run at a time: its Begin of another run means it no longer has the one held here.
-                if (m.Command != CourierCommand.Begin || !SameOwnerClient(ledger, m.Owner, peerOwner, senderRoster)) return Refuse("CarrierRunConflict");
+                if (m.Command != CourierCommand.Begin || !SameOwnerClient(ledger, m.Owner, peerOwner, endpoint)) return Refuse("CarrierRunConflict");
                 Forget(ledger, $"the owner began run {m.Run} instead");
             }
             if (m.Command == CourierCommand.NotDelivered && m.ConfirmStep is {} fence && ledger.Run == m.Run)
@@ -447,7 +446,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         ledger.Paused = false; ledger.Steps.Clear(); ledger.NotDelivered.Clear(); ledger.Completed.Add(run);
         store.Save(ledger);
         try { (trade as ICourierTradeForget)?.Forget(); }
-        finally { Release(force: true); }
+        finally { ReleaseNow(); }
         var units = held.Where(s => !s.IsGil).Sum(s => (long)s.Units);
         var gil = held.Where(s => s.IsGil).Sum(s => (long)s.Units);
         (information ?? warning)($"{run} CarrierRunForgotten: {why}; " +
@@ -470,7 +469,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             var ledger = store.Load();
             forgotten = ledger.Run;
             Forget(ledger, "cleared on this client");
-            Release(force: true);
+            ReleaseNow();
         }
         finally { if (entered) gate.Release(); }
         if (entered || forgotten is not { } run) return;
@@ -488,14 +487,18 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     /// advertises that it no longer has it (it cleared the run while this carrier was unreachable). Only between
     /// commands and after a quiet spell, so a presence published just before a Begin never counts.
     /// </summary>
-    internal void ForgetOrphaned(IEnumerable<CourierPeer> owners)
+    internal void ForgetOrphaned(IEnumerable<(Guid Instance, CourierPeer Peer)> owners)
     {
         if (disposed || active != null || DateTimeOffset.UtcNow - lastCommand < OrphanQuiet || !gate.Wait(0)) return;
         try
         {
             var ledger = store.Load();
-            if (ledger.Run is not { } run || RunOwner(ledger) is not { } owner) return;
-            var linked = owners.Where(p => p.OwnerRun != null && (CourierPlanner.Exact(p.Character, owner) || p.Roster?.Any(o => CourierPlanner.Exact(o, owner)) == true)).ToArray();
+            if (ledger.Run is not { } run) return;
+            // The owner client is the endpoint that began the run; failing that (it restarted), the run owner logged in.
+            var advertising = owners.Where(o => o.Peer.OwnerRun != null).ToArray();
+            var linked = advertising.Where(o => ledger.OwnerEndpoint is { } ep && o.Instance == ep).Select(o => o.Peer).ToArray();
+            if (linked.Length == 0 && RunOwner(ledger) is { } owner)
+                linked = advertising.Where(o => CourierPlanner.Exact(o.Peer.Character, owner)).Select(o => o.Peer).ToArray();
             if (linked.Length == 0 || linked.Any(p => p.OwnerRun == run)) return;
             Forget(ledger, $"{linked[0].Character.CharacterName}'s client no longer has this run");
         }
@@ -505,14 +508,21 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     /// <summary>The character that owns the held run, from the commands it sent.</summary>
     private static OwnerScope? RunOwner(CarrierLedger ledger) =>
         ledger.Steps.Values.Select(s => s.Command).FirstOrDefault(c => c.Run == ledger.Run)?.Owner;
-    /// <summary>Whether a command comes from the owner client of the held run: its owner, its sender or its sender's roster names that run's owner.</summary>
-    private static bool SameOwnerClient(CarrierLedger ledger, OwnerScope owner, OwnerScope sender, IReadOnlyList<OwnerScope>? roster) =>
-        RunOwner(ledger) is { } held && (CourierPlanner.Exact(held, owner) || CourierPlanner.Exact(held, sender) || roster?.Any(o => CourierPlanner.Exact(o, held)) == true);
+    /// <summary>Whether a command comes from the owner client of the held run: the endpoint that began it, or the run owner itself.</summary>
+    private static bool SameOwnerClient(CarrierLedger ledger, OwnerScope owner, OwnerScope sender, Guid? endpoint) =>
+        endpoint != null && endpoint == ledger.OwnerEndpoint ||
+        RunOwner(ledger) is { } held && (CourierPlanner.Exact(held, owner) || CourierPlanner.Exact(held, sender));
     private bool PausedRun(){try{return store.Load() is {Run:not null,Paused:true};}catch(Exception e){warning($"CarrierLedgerUnreadable: {e.Message}");return false;}}
     // Locks outlive a refused command only while a live (unpaused) run holds custody: the owner's next step needs them.
     // A paused or stopped run never keeps them; the ledger and the last confirmed bags still guard every unit, and the
     // owner's Begin or settlement re-takes them.
-    private void Release(bool force=false)
+    // A forgotten run's locks go now, not behind late calls that may never settle; a release already queued becomes a no-op.
+    private void ReleaseNow()
+    {
+        Release(force: true, now: true);
+        foreach (var release in deferredReleases.Keys) if (deferredReleases.TryRemove(release, out _)) release();
+    }
+    private void Release(bool force=false, bool now=false)
     {
         if (!force && store.Load() is {Paused:false} held && (!held.Units.IsEmpty || held.Unconfirmed!=null)) return;
         var heldSuppression=Interlocked.Exchange(ref suppress,null);
@@ -521,7 +531,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         void Drop(){try{heldTrade?.Dispose();}finally{try{heldSuppression?.Dispose();}finally{heldLease?.Dispose();}}}
         deferredReleases.TryAdd(Drop,0);
         void Once(){if(deferredReleases.TryRemove(Drop,out _))Drop();}
-        if(disposed)Once();else calls.WhenSettled(Once);
+        if(disposed||now)Once();else calls.WhenSettled(Once);
     }
     public void Dispose()
     {

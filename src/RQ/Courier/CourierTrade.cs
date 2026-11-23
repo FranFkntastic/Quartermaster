@@ -28,11 +28,12 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
     DalamudExternalUiAutomationSuppression external,IPluginLog log,string directory) : ICourierTradePort, ICourierDispatchEvidence, ICourierSettlement, ICourierHoldPort,
     ICourierReceiveStall, ICourierReceiveAttestation, ICourierTradeForget, ITradeSuppression, IDisposable
 {
-    private sealed class Intent(CourierStore<TradeCheckpoint> store, TradeCheckpoint current) : ITradeIntentStore
+    // live is false once the checkpoint was forgotten: a stopped trade's late record never writes it back.
+    private sealed class Intent(CourierStore<TradeCheckpoint> store, TradeCheckpoint current, Func<bool>? live = null) : ITradeIntentStore
     {
         public IList<TradeItem> Remaining => current.Items;
         public TradeRecoveryState Recovery => current.Recovery;
-        public void Save()=>store.Save(current);
+        public void Save(){if(live?.Invoke()!=false)store.Save(current);}
     }
     private readonly CourierStore<TradeCheckpoint> store=new(Path.Combine(directory,"courier-trade.json"),s=>log.Warning(s));
     // Paces UI actions only; every slot and the final batch are still verified against the trade window and bags.
@@ -45,6 +46,8 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
     private IDisposable? prompts;
     private HashSet<string>? dropbox;
     private bool stopped,locked;
+    // Bumped by Forget; a trade started under an older generation ends without touching the checkpoint or this side's trade.
+    private int generation, operation;
     private Guid stalledStep;
     private CourierTradeHold? hold;
     public Task<Result<IDisposable>> BeginHold(Guid run, Deadline deadline) => game.Poll<IDisposable>(deadline, () => {
@@ -104,10 +107,13 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
         var step=CourierGame.Step.Value; TradePartner? partner=null;TradeCheckpoint? state=null;
         var allowed=CourierGame.CanContinue.Value;
         int bounces=0; var retryAt=DateTimeOffset.MinValue;
+        var gen=Volatile.Read(ref generation);
+        bool Live()=>gen==Volatile.Read(ref generation);
         return game.Poll<bool>(d,()=>{
+            if(!Live())return new(CourierOutcome.Cancelled,"TradeForgotten",d.Name);
             Result<bool>? StartSender()
             {
-                sender=new(new Intent(store,state!),Timing,io,this,log);
+                sender=new(new Intent(store,state!,Live),Timing,io,this,log);
                 sender.BatchLocking+=(_,_)=>locked=true;
                 sender.BatchVerified+=(_,_)=>locked=false;
                 var start=sender.Start(partner!);
@@ -157,7 +163,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                     state=new(){Step=step,DispatchAuthorized=false,Receiving=receive,Items=[..manifest.GroupBy(s=>(s.Item,s.Hq)).Select(g=>new TradeItem{
                         ItemId=g.Key.Item,IsHighQuality=g.Key.Hq,Quantity=g.Sum(s=>s.Units),ItemName=g.First().Name})]};
                     state.Original=[..state.Items.Select(i=>new BagStock(i.ItemId,i.IsHighQuality,i.Quantity))];
-                    store.Save(state);stopped=locked=false;stalledStep=Guid.Empty;
+                    store.Save(state);stopped=locked=false;stalledStep=Guid.Empty;operation=gen;
                     SuppressTradeAutoConfirm();
                     if(!receive){
                         state.DispatchAuthorized=true;store.Save(state);
@@ -294,7 +300,29 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
         return !state.Recovery.CancellationPending && accounted ? Result<bool>.Ok(true) :
             new(CourierOutcome.Indeterminate,"TradeManifestUnsettled",step.ToString());
     });
-    // A cleared run's checkpoint goes with it, so no later trade waits on its pending trade or receive arm.
-    public void Forget()=>store.Save(new());
+    // A cleared run's checkpoint goes with it, so no later trade waits on its pending trade or receive arm. The bump
+    // ends every trade started before it on its next tick without a write; the empty checkpoint is saved now, and again
+    // on the framework thread once that side's sender and receiver are stopped and the auto-confirm suppression
+    // (kept on a pending cancellation) is lifted, so no tick in flight can write the old one back.
+    public void Forget()
+    {
+        var g=Interlocked.Increment(ref generation);
+        store.Save(new());
+        _=Task.Run(async()=>{
+            try{
+                await game.Poll<bool>(new("CourierTradeForget",DateTimeOffset.UtcNow.AddSeconds(10)),()=>{
+                    if(Volatile.Read(ref generation)!=g)return Result<bool>.Ok(true);
+                    if(operation<g){
+                        stopped=true;
+                        if(!locked && !io.IsRemoteLocked){sender?.Stop();receiver?.Stop();}
+                        sender?.Dispose();sender=null;receiver=null;locked=false;
+                        RestoreTradeAutoConfirm();
+                    }
+                    store.Save(new());
+                    return Result<bool>.Ok(true);
+                });
+            }catch(Exception e){log.Warning($"CourierTradeForget: {e.Message}");}
+        });
+    }
     public void Dispose(){try{hold?.Dispose();sender?.Dispose();if(!locked && !io.IsRemoteLocked)receiver?.Stop();}finally{RestoreTradeAutoConfirm();}}
 }
