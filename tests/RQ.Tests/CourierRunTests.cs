@@ -420,8 +420,8 @@ public sealed class CourierRunTests : IDisposable
         public CourierPlacedSince? Placed;
         public CourierPlacedSince? PlacedSince(OwnerScope owner, DateTimeOffset since) => Placed;
         public readonly List<string> Attested = [];
-        public Task<Result<bool>> AttestReceived(Guid step, OwnerScope partner, TradeEvidence sender, string disposition, Deadline d)
-        { Attested.Add(disposition); return OK(true); }
+        public Task<Result<bool>> AttestReceived(Guid step, OwnerScope partner, TradeEvidence sender, string disposition, Deadline d, bool commit = true)
+        { if (commit) Attested.Add(disposition); return OK(true); }
         OwnerScope who = initial;
         public OwnerScope Who => who;
         public Dictionary<OwnerScope, int> Quantities = new(); public int Units => Quantities.GetValueOrDefault(who);

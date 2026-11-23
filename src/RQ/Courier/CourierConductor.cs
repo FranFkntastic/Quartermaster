@@ -1346,13 +1346,31 @@ public sealed class CourierConductor
         store.Save(r);
         if (trade is not ICourierReceiveAttestation attest) throw Fault("ReceiveAttestationUnavailable", "This client cannot close its receive checkpoint.");
         var batch = u.Action.Batch;
+        // Preflight every owner-side precondition before the carrier drops custody: once SettleSent commits, a refusal
+        // here could no longer be undone and the run could neither settle nor clear.
+        var preflight = await Send(r, CourierCommand.Status, r.Start, []);
+        if (preflight.Evidence is not { } proof || !Custody.Matches(proof, r.Settings.Carrier!, batch, -1))
+            throw Fault("SettleSentEvidenceMismatch", "The carrier's send receipt does not show exactly the hand-in left its bags.");
+        await calls.Call("OwnerReceiveAttestationPreflight", 15, d => attest.AttestReceived(u.Id, r.Settings.Carrier!, proof, o.Disposition, d, commit: false));
+        if (batch.GroupBy(x => (x.Item, x.Hq)).Any(g => !g.First().IsGil &&
+                (long)owner.Count(g.Key.Item, g.Key.Hq) - u.OwnerBefore.Count(g.Key.Item, g.Key.Hq) < g.Sum(x => (long)x.Units)))
+            DepositsFor(r.Schedule, r.Cursor, batch); // throws ScheduleShapeMismatch before anything settles
         CourierReceipt settled;
         try { settled = await Send(r, CourierCommand.SettleSent, u.OwnerBefore.Character, batch, id: o.Command, confirm: u.Id, evidence: o.Owner); }
         catch (CourierFault refused) when (refused.Outcome == CourierOutcome.Failed)
         {
-            // The carrier recorded its refusal under this id; a later attempt is a new request.
-            r.OutsideSettlement = null; store.Save(r);
-            warning($"{r.Run}/{u.Id} SettleSentRefused {refused.Code}: {refused.Message}");
+            // A Failed may be the carrier's recorded refusal, or a transport refusal (UnknownStep, Unavailable) after the
+            // carrier already committed. Forget the journaled settlement only when the carrier provably still holds the
+            // hand-off unconfirmed; otherwise keep it so a retry resumes under the same id.
+            CourierReceipt? after = null;
+            try { after = await Send(r, CourierCommand.Status, r.Start, []); }
+            catch (CourierFault probe) { warning($"{r.Run}/{u.Id} SettleSentStatusUnavailable {probe.Code}: {probe.Message}"); }
+            if (after is { } held && held.Unconfirmed == u.Id && held.LastConfirmed != u.Id)
+            {
+                r.OutsideSettlement = null; store.Save(r);
+            }
+            warning($"{r.Run}/{u.Id} SettleSentRefused {refused.Code}: {refused.Message}" +
+                (r.OutsideSettlement == null ? "" : "; settlement kept for retry (the carrier may have committed it)."));
             throw;
         }
         if (settled.Evidence is not { } sent || !Custody.Matches(sent, r.Settings.Carrier!, batch, -1))

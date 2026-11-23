@@ -252,7 +252,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
         return Result<bool>.Ok(true);
     });
     // The sender's evidence must show exactly the receive's original manifest left its bags, nothing else (gil included).
-    public Task<Result<bool>> AttestReceived(Guid step,OwnerScope partner,TradeEvidence peer,string disposition,Deadline d)=>game.Poll<bool>(d,()=>{
+    public Task<Result<bool>> AttestReceived(Guid step,OwnerScope partner,TradeEvidence peer,string disposition,Deadline d,bool commit=true)=>game.Poll<bool>(d,()=>{
         var state=store.Load();
         if(state.Step!=step || !state.Receiving || io.IsTradeOpen || receiver!=null || sender!=null || state.Recovery.CancellationPending)
             return new(CourierOutcome.Indeterminate,"TradeCheckpointMismatch",step.ToString());
@@ -260,6 +260,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
             state.Original.Concat(peer.Before.Stock).Concat(peer.After.Stock).Select(x=>(x.ItemId,x.Hq)).Append((ItemId: Custody.GilKey.Item, Hq: Custody.GilKey.Hq)).Distinct().Any(k=>
                 state.Original.Where(x=>x.ItemId==k.ItemId && x.Hq==k.Hq).Sum(x=>(long)x.Units)!=(long)peer.Before.Count(k.ItemId,k.Hq)-peer.After.Count(k.ItemId,k.Hq)))
             return new(CourierOutcome.Indeterminate,"AttestedSenderDeltaMismatch",step.ToString());
+        if(!commit)return Result<bool>.Ok(true); // Preflight: the checkpoint would close on this evidence.
         if(state.Arm!=null)state.LastSettledArm=state.Arm;
         state.Arm=null;state.SenderEvidence=peer;state.Disposition=disposition;
         foreach(var item in state.Items)item.Quantity=0;

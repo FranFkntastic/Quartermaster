@@ -320,9 +320,10 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                     if (shipped.Command.Manifest.Where(x => !x.IsGil).GroupBy(x => (x.Item, x.Hq))
                             .FirstOrDefault(g => before.Count(g.Key.Item, g.Key.Hq) != shippedProof.After.Count(g.Key.Item, g.Key.Hq)) is { } returned)
                     {
-                        warning($"{m.Run}/{m.Step} SettleSent: item {returned.Key.Item}{(returned.Key.Hq ? " HQ" : "")}: carrier holds {before.Count(returned.Key.Item, returned.Key.Hq):N0}, " +
-                            $"{shippedProof.After.Count(returned.Key.Item, returned.Key.Hq):N0} right after the send.");
-                        return Recorded("SettleSentBagsChanged");
+                        // The send receipt alone proves the manifest left; later stock movement (its own retainers, MMF)
+                        // cannot undo a completed trade. Report it; the next send still refuses on the last confirmed bags.
+                        warning($"{m.Run}/{m.Step} SettleSentBagsChanged: item {returned.Key.Item}{(returned.Key.Hq ? " HQ" : "")}: carrier holds {before.Count(returned.Key.Item, returned.Key.Hq):N0}, " +
+                            $"{shippedProof.After.Count(returned.Key.Item, returned.Key.Hq):N0} right after the send; settling from the send receipt.");
                     }
                     ledger.Units = Custody.Apply(ledger.Units, shipped.Command.Manifest, -1);
                     foreach(var abandoned in ledger.Steps.Where(x=>x.Key!=m.Step && x.Value.Result==null &&

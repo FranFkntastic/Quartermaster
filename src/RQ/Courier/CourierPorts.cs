@@ -96,7 +96,7 @@ internal interface ICourierReceiveStall
 /// </summary>
 internal interface ICourierReceiveAttestation
 {
-    Task<Result<bool>> AttestReceived(Guid step,OwnerScope partner,TradeEvidence sender,string disposition,Deadline deadline);
+    Task<Result<bool>> AttestReceived(Guid step,OwnerScope partner,TradeEvidence sender,string disposition,Deadline deadline,bool commit=true);
 }
 public interface ICharacterSwitchPort
 {

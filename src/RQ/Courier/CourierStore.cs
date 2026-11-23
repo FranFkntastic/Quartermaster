@@ -8,7 +8,7 @@ namespace RQ.Courier;
 // Such transient failures retry briefly; each retry and the final failure name the file.
 internal sealed class CourierStore<T>(string path, Action<string>? warning = null) where T : new()
 {
-    internal static readonly int[] RetryDelaysMs = [50, 100, 200, 400, 800];
+    internal static readonly int[] RetryDelaysMs = [20, 40, 80, 160, 320]; // ~0.6 s worst case; saves can run on the framework thread
     private readonly AtomicDocumentStore<T> document = new(path);
     private readonly object gate = new();
     internal T Load() { lock (gate) return Retry("load", document.Load); }
