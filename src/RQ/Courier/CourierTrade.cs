@@ -46,8 +46,12 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
     private IDisposable? prompts;
     private HashSet<string>? dropbox;
     private bool stopped,locked;
-    // Bumped by Forget; a trade started under an older generation ends without touching the checkpoint or this side's trade.
-    private int generation, operation;
+    // Steps of forgotten runs: a trade for one ends on its next tick without touching the checkpoint or this side's trade.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid,byte> forgotten=new();
+    // The step of the trade that last took this side's sender or receiver (framework thread only).
+    private Guid operationStep;
+    // Set while a forgotten trade's window is still open: unloading then keeps the auto-confirm suppression.
+    private volatile bool retainSuppression;
     private Guid stalledStep;
     private CourierTradeHold? hold;
     public Task<Result<IDisposable>> BeginHold(Guid run, Deadline deadline) => game.Poll<IDisposable>(deadline, () => {
@@ -72,15 +76,37 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
             throw new InvalidOperationException("YesAlreadySuppressionUnavailable");
         prompts??=external.Acquire();
         if(pi.TryGetData<HashSet<string>>("Dropbox.StopRequests",out var set) && set!=null)
-        {lock(set){set.Add("Quartermaster.Courier");dropbox=set;}}
+        {lock(set){set.Add(DropboxOwner);dropbox=set;}}
         else if(pi.InstalledPlugins.Any(p=>p.IsLoaded && p.InternalName.Equals("Dropbox",StringComparison.OrdinalIgnoreCase)))
             throw new InvalidOperationException("DropboxSuppressionUnavailable");
     }
+    private const string DropboxOwner="Quartermaster.Courier";
+    // Lifts this plugin's Dropbox pause even when this load never set it (a load that died without disposing left it).
     public void RestoreTradeAutoConfirm()
     {
-        if(dropbox is {} set){lock(set)set.Remove("Quartermaster.Courier");dropbox=null;}
+        var set=dropbox;
+        if(set==null && pi.TryGetData<HashSet<string>>("Dropbox.StopRequests",out var shared))set=shared;
+        if(set!=null)lock(set)set.Remove(DropboxOwner);
+        dropbox=null;
         prompts?.Dispose();prompts=null;
     }
+    // On load: a Dropbox pause a previous load left behind is lifted once no trade window is open or locked and no
+    // cancellation is pending. A pending cancellation keeps it (its settlement lifts it); a window that is open, locked
+    // or unreadable keeps it until it closes.
+    public void RestoreLeftoverSuppression()=>_=Task.Run(async()=>{
+        try{
+            var done=await game.Poll<bool>(new("CourierTradeLoadRestore",DateTimeOffset.MaxValue),()=>{
+                if(store.Load().Recovery.CancellationPending)return Result<bool>.Ok(false);
+                if(!WindowClosed())return null;
+                if(sender==null && receiver==null)RestoreTradeAutoConfirm();
+                return Result<bool>.Ok(true);
+            },true,500);
+            if(done.Outcome!=CourierOutcome.Succeeded)log.Warning($"CourierTradeLoadRestore {done.Code}: {done.Detail}");
+        }
+        catch(OperationCanceledException){}
+        catch(Exception e){log.Warning($"CourierTradeLoadRestore {e.GetType().Name}: {e.Message}");}
+    });
+    private bool WindowClosed(){try{return !io.IsTradeOpen && !io.IsRemoteLocked;}catch{return false;}}
     public void RetainTradeSuppressionOnDispose() { /* Preserve stop request ownership until closure. */ }
     public Task<Result<bool>> CancelPreLockAsync(Deadline d)=>game.Poll<bool>(d,()=>{
         stopped=true;
@@ -107,8 +133,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
         var step=CourierGame.Step.Value; TradePartner? partner=null;TradeCheckpoint? state=null;
         var allowed=CourierGame.CanContinue.Value;
         int bounces=0; var retryAt=DateTimeOffset.MinValue;
-        var gen=Volatile.Read(ref generation);
-        bool Live()=>gen==Volatile.Read(ref generation);
+        bool Live()=>!forgotten.ContainsKey(step);
         return game.Poll<bool>(d,()=>{
             if(!Live())return new(CourierOutcome.Cancelled,"TradeForgotten",d.Name);
             Result<bool>? StartSender()
@@ -163,7 +188,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                     state=new(){Step=step,DispatchAuthorized=false,Receiving=receive,Items=[..manifest.GroupBy(s=>(s.Item,s.Hq)).Select(g=>new TradeItem{
                         ItemId=g.Key.Item,IsHighQuality=g.Key.Hq,Quantity=g.Sum(s=>s.Units),ItemName=g.First().Name})]};
                     state.Original=[..state.Items.Select(i=>new BagStock(i.ItemId,i.IsHighQuality,i.Quantity))];
-                    store.Save(state);stopped=locked=false;stalledStep=Guid.Empty;operation=gen;
+                    store.Save(state);stopped=locked=false;stalledStep=Guid.Empty;operationStep=step;
                     SuppressTradeAutoConfirm();
                     if(!receive){
                         state.DispatchAuthorized=true;store.Save(state);
@@ -300,29 +325,44 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
         return !state.Recovery.CancellationPending && accounted ? Result<bool>.Ok(true) :
             new(CourierOutcome.Indeterminate,"TradeManifestUnsettled",step.ToString());
     });
-    // A cleared run's checkpoint goes with it, so no later trade waits on its pending trade or receive arm. The bump
-    // ends every trade started before it on its next tick without a write; the empty checkpoint is saved now, and again
-    // on the framework thread once that side's sender and receiver are stopped and the auto-confirm suppression
-    // (kept on a pending cancellation) is lifted, so no tick in flight can write the old one back.
-    public void Forget()
+    // A cleared run's checkpoint goes with it, so no later trade waits on its pending trade or receive arm. Its steps'
+    // trades end on their next tick without a write; on the framework thread this side's sender and receiver (when
+    // running one of those steps) are stopped and dropped and the checkpoint is emptied at once. The auto-confirm
+    // suppression is lifted only once no trade window is open or locked, so YesAlready or Dropbox never confirms a
+    // window with this run's items in it; that wait has no deadline, and an unload during it keeps the suppression.
+    public void Forget(IReadOnlySet<Guid> steps)
     {
-        var g=Interlocked.Increment(ref generation);
-        store.Save(new());
+        if(steps.Count==0)return;
+        foreach(var s in steps)forgotten.TryAdd(s,0);
+        var cleared=steps.Contains(store.Load().Step);
+        if(cleared)store.Save(new());
+        bool? ours=null;
         _=Task.Run(async()=>{
             try{
-                await game.Poll<bool>(new("CourierTradeForget",DateTimeOffset.UtcNow.AddSeconds(10)),()=>{
-                    if(Volatile.Read(ref generation)!=g)return Result<bool>.Ok(true);
-                    if(operation<g){
-                        stopped=true;
-                        if(!locked && !io.IsRemoteLocked){sender?.Stop();receiver?.Stop();}
-                        sender?.Dispose();sender=null;receiver=null;locked=false;
-                        RestoreTradeAutoConfirm();
+                var done=await game.Poll<bool>(new("CourierTradeForget",DateTimeOffset.MaxValue),()=>{
+                    if(ours==null){
+                        var running=(sender!=null || receiver!=null) && steps.Contains(operationStep);
+                        if(running){
+                            stopped=true;
+                            if(!locked && !io.IsRemoteLocked){sender?.Stop();receiver?.Stop();}
+                            sender?.Dispose();sender=null;receiver=null;locked=false;
+                        }
+                        var checkpoint=steps.Contains(store.Load().Step);
+                        if(checkpoint)store.Save(new());
+                        ours=running || checkpoint || cleared;
+                        if(ours!=true)return Result<bool>.Ok(false);
+                        retainSuppression=true;
                     }
-                    store.Save(new());
+                    if(!WindowClosed())return null;
+                    retainSuppression=false;
+                    if(sender==null && receiver==null)RestoreTradeAutoConfirm();
                     return Result<bool>.Ok(true);
-                });
-            }catch(Exception e){log.Warning($"CourierTradeForget: {e.Message}");}
+                },true);
+                if(done.Outcome!=CourierOutcome.Succeeded)log.Warning($"CourierTradeForget {done.Code}: {done.Detail}");
+            }
+            catch(OperationCanceledException){log.Warning("CourierTradeForget: unloaded"+(retainSuppression?" with a trade window open; the auto-confirm suppression is kept.":"."));}
+            catch(Exception e){log.Warning($"CourierTradeForget {e.GetType().Name}: {e.Message}");}
         });
     }
-    public void Dispose(){try{hold?.Dispose();sender?.Dispose();if(!locked && !io.IsRemoteLocked)receiver?.Stop();}finally{RestoreTradeAutoConfirm();}}
+    public void Dispose(){try{hold?.Dispose();sender?.Dispose();if(!locked && !io.IsRemoteLocked)receiver?.Stop();}finally{if(!retainSuppression)RestoreTradeAutoConfirm();}}
 }

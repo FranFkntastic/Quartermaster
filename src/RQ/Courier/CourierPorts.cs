@@ -99,10 +99,13 @@ internal interface ICourierReceiveAttestation
 {
     Task<Result<bool>> AttestReceived(Guid step,OwnerScope partner,TradeEvidence sender,string disposition,Deadline deadline,bool commit=true);
 }
-/// <summary>Clear's forget: drops this client's trade checkpoint (its pending trade and receive arm). Moves nothing.</summary>
+/// <summary>
+/// Clear's forget: ends this client's trade for one of the run's steps and drops its checkpoint (pending trade and
+/// receive arm) when it belongs to one of them. Another run's trade and checkpoint are left alone. Moves nothing.
+/// </summary>
 internal interface ICourierTradeForget
 {
-    void Forget();
+    void Forget(IReadOnlySet<Guid> steps);
 }
 public interface ICharacterSwitchPort
 {

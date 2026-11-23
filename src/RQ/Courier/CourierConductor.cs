@@ -438,7 +438,7 @@ public sealed class CourierConductor
                 warning($"{r.Run} RunAbandoned: cleared while {r.State} {r.Code}; custody [{Describe(r.Custody)}]" +
                     (r.Pending is {} p?$", {p.Action.Phase} {p.Id} unverified":"")+"; bags left as they are.");
                 r.Detail=$"{r.State} {r.Code}: {r.Detail}"; r.State="Abandoned"; r.Code="Abandoned";
-                try { (trade as ICourierTradeForget)?.Forget(); }
+                try { (trade as ICourierTradeForget)?.Forget(r.Evidence.Select(e=>e.Step).Concat(r.Pending is {} open?[open.Id]:Array.Empty<Guid>()).ToHashSet()); }
                 catch(Exception e){ warning($"{r.Run} ClearTradeCheckpoint: {e.Message}"); }
             }
             if(r.Run!=Guid.Empty)

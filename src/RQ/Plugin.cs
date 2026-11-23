@@ -355,6 +355,7 @@ public sealed class Plugin : IDalamudPlugin
         courierGame = new(pluginInterface,playerState,clientState,objects,condition,commands,dataManager,aetheryteList,
             new DalamudSummoningBellInteractor(objects,targets,dataManager),tradeIo,scanner,CurrentOwner,DispatchOnFramework,configDirectory,s=>log.Warning(s));
         courierTrade = new(courierGame,tradeIo,automation,pluginInterface,externalUiSuppression,log,configDirectory);
+        courierTrade.RestoreLeftoverSuppression();
         bool AutoRetainerLoaded()=>pluginInterface.InstalledPlugins.Any(p=>p.IsLoaded && p.InternalName=="AutoRetainer");
         courier.Warn = s => log.Warning(s);
         courier.WorldRegion = worldId => dataManager.GetExcelSheet<Lumina.Excel.Sheets.World>()?.GetRowOrDefault(worldId)?.DataCenter.ValueNullable?.Region.RowId ?? 0;

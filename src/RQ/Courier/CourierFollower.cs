@@ -441,11 +441,12 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     {
         if (ledger.Run is not { } run) return;
         var held = ledger.Units; var unconfirmed = ledger.Unconfirmed;
+        var steps = ledger.Steps.Keys.Concat(new[] { ledger.Unconfirmed, ledger.LastConfirmed }.OfType<Guid>()).ToHashSet();
         ledger.Run = null; ledger.RunKey = null; ledger.OwnerEndpoint = null; ledger.Start = null;
         ledger.Units = []; ledger.Unconfirmed = null; ledger.LastConfirmed = null; ledger.LastConfirmedBags = null;
         ledger.Paused = false; ledger.Steps.Clear(); ledger.NotDelivered.Clear(); ledger.Completed.Add(run);
         store.Save(ledger);
-        try { (trade as ICourierTradeForget)?.Forget(); }
+        try { (trade as ICourierTradeForget)?.Forget(steps); }
         finally { ReleaseNow(); }
         var units = held.Where(s => !s.IsGil).Sum(s => (long)s.Units);
         var gil = held.Where(s => s.IsGil).Sum(s => (long)s.Units);
