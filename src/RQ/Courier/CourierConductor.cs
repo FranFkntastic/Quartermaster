@@ -24,7 +24,8 @@ public sealed record CourierStep(CourierPhase Phase, int Trip, ImmutableArray<Sh
 /// <param name="PlacementOperations">A batched Retrieve/Deposit's journaled operations, in dispatch order
 /// (retrieval: one per <see cref="CourierPlacementBatch.Retrievals"/> source, deposit: one).</param>
 public sealed record RunIntent(Guid Id, CourierStep Action, InventoryView OwnerBefore, InventoryView CarrierBefore, bool LocalMayHaveStarted=true,int? RetainerBefore=null,string? PlacementOperation=null,
-    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)] ImmutableArray<string> PlacementOperations = default)
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)] ImmutableArray<string> PlacementOperations = default,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] DateTimeOffset? At = null)
 {
     internal ImmutableArray<string> Operations
     {
@@ -36,6 +37,15 @@ public sealed record RunIntent(Guid Id, CourierStep Action, InventoryView OwnerB
     }
 }
 public sealed record HandOff(Guid Step, TradeEvidence? Owner, TradeEvidence? Carrier, bool BothTradesVerified,string? Disposition=null);
+/// <summary>
+/// A hand-in being settled from the carrier's own send receipt (<see cref="CourierCommand.SettleSent"/>), journaled before
+/// it is sent: it is re-sent unchanged, under the same id, until settled. Owner is the owner's evidence it carries.
+/// </summary>
+public sealed record CourierOutsideSettlement(Guid HandIn, Guid Command, string Disposition, TradeEvidence Owner, ImmutableArray<string> Operations);
+/// <summary>Hand-in units the owner had already placed when the hand-in settled: credited as delivered with no deposit.</summary>
+public sealed record CourierPlacedOutside(Guid HandIn, string Disposition, ImmutableArray<Shipment> Units, ImmutableArray<string> Operations);
+/// <summary>What the carrier's send receipt proves for a pending hand-in: the rows that left its bags.</summary>
+public sealed record CourierSentProof(Guid Run, Guid Step, string From, string To, ImmutableArray<CustodyRow> Left, bool Complete, string? Refusal);
 public sealed class CourierJournal
 {
     public Guid Run { get; set; }
@@ -80,6 +90,9 @@ public sealed class CourierJournal
     /// resumes or replays its receipt), so an interrupted one never leaves the carrier an unsettled intent.
     /// </summary>
     public CourierCarrierMove? CarrierMove { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public CourierOutsideSettlement? OutsideSettlement { get; set; }
+    public List<CourierPlacedOutside> PlacedOutside { get; set; } = [];
 }
 public sealed record CourierCarrierMove(Guid Id, CourierCommand Command, OwnerScope Partner, MeetingBell? Bell);
 /// <summary>A run an IPC request started, as the request index keeps it (and the current journal projects).</summary>
@@ -101,7 +114,7 @@ public sealed class CourierRequestIndex
 public sealed record LineProgress(Guid Line, string Name, int Moved, int Remaining, Shipment? Route = null, bool Nq = false, bool Hq = false);
 public sealed record CourierSnapshot(Guid Run, string State, string OwnerPhase, string CarrierPhase, int Trip, int Trips,
     string Code, string Detail, ImmutableArray<LineProgress> Lines, ImmutableArray<Refusal> Refusals,bool CanResume,bool CanClear,ImmutableArray<CustodyRow> Custody,
-    CourierUnverified? Unverified=null, Guid PlanId=default, string? RequestId=null);
+    CourierUnverified? Unverified=null, Guid PlanId=default, string? RequestId=null, bool CanSettleDelivered=false, string? ClearBlocked=null);
 public sealed record CustodyRow(string Item,string Quality,int Quantity,string Holder);
 /// <summary>The journaled step whose outcome is not yet proven; Rows hold its batch at the last verified holder (From).</summary>
 public sealed record CourierUnverified(string Step,string From,string To,ImmutableArray<CustodyRow> Rows);
@@ -151,11 +164,11 @@ public sealed class CourierConductor
     {
         this.peer = peer; this.trade = trade; this.inventory = inventory; this.worlds = worlds; this.login = login; this.bells = bells;
         this.placement = placement; this.automation = automation; this.suppression = suppression; this.warning = warning; calls = new(warning);
-        store = new(Path.Combine(directory, "courier-run.json"));
+        store = new(Path.Combine(directory, "courier-run.json"), warning);
         this.information = information;
         this.needsSuppression=needsSuppression??(()=>true);
         this.directory = directory;
-        requests = new(Path.Combine(directory, RequestIndexName));
+        requests = new(Path.Combine(directory, RequestIndexName), warning);
         var r = store.Load();
         if (r.State == "Running") { r.State = "Interrupted"; store.Save(r); }
         // Built off the calling (framework) thread; only a first load after an upgrade has closed journals to read.
@@ -261,10 +274,16 @@ public sealed class CourierConductor
             step is null || !InTrip(step.Phase) ? r.Plan.Trips.Length : step.Trip + 1, r.Plan.Trips.Length, r.Code, r.Detail,
             [..r.Plan.Trips.SelectMany(t=>t.Manifest).GroupBy(s=>s.Line).Select(g=>new LineProgress(g.Key,g.First().Name,
                 r.Delivered.GetValueOrDefault(g.Key),g.Sum(s=>s.Units)-r.Delivered.GetValueOrDefault(g.Key),g.First(),g.Any(s=>!s.Hq),g.Any(s=>s.Hq)))], r.Plan.Refusals,
-            connected && attempt && r.State is "Failed" or "Interrupted" or "Indeterminate",
+            // A resume that already proved it cannot settle the hand-in would only fail again; the settle action replaces it.
+            connected && attempt && r.State is "Failed" or "Interrupted" or "Indeterminate" && r.Code != HandInNeedsSettlement,
             (connected || r.Custody.IsEmpty) && !HasPendingTrade(r) && r.State is "Completed" or "Failed" or "Interrupted" or "Indeterminate" or "Refused",Rows(r.Custody,r.Settings.Carrier),
-            Unverified(r),r.Plan.PlanId,r.RequestId);
+            Unverified(r),r.Plan.PlanId,r.RequestId,
+            connected && !carrierless && r.Pending is {Action.Phase:CourierPhase.HandIn} && r.State is "Failed" or "Interrupted" or "Indeterminate",
+            r.State is not ("Failed" or "Interrupted" or "Indeterminate") ? null : HasPendingTrade(r) ? "HandOffUnverified" :
+                !connected && !r.Custody.IsEmpty ? "CarrierNotConnected" : null);
     }
+    /// <summary>A resume found a hand-in the carrier holds unconfirmed that neither fresh bags nor the owner's journal settle.</summary>
+    internal const string HandInNeedsSettlement = "HandInNeedsSettlement";
     private static CourierUnverified? Unverified(CourierJournal r)
     {
         if(r.Pending is not {} p || p.Action.Batch.IsEmpty || r.State is not ("Failed" or "Interrupted" or "Indeterminate")) return null;
@@ -323,7 +342,7 @@ public sealed class CourierConductor
         {
             var path = ArchiveFile(r.Run);
             if (!replace && File.Exists(path)) return;
-            new CourierStore<CourierJournal>(path).Save(r);
+            new CourierStore<CourierJournal>(path, warning).Save(r);
             index.Runs.RemoveAll(x => x.Run == r.Run);
             if (r.RequestId is { Length: > 0 }) index.Runs.Add(CourierRequestRecord.Of(r, DateTimeOffset.UtcNow));
             index.Files.Add(Path.GetFileName(path));
@@ -575,6 +594,16 @@ public sealed class CourierConductor
                     status=await Send(r,CourierCommand.Status,r.Start,[]);
                 }
                 r.ResumeOwner = owner; r.ResumeCarrier = carrier; store.Save(r);
+                // A hand-in the owner's fresh bags no longer show because Quartermaster placed the goods since: settled when
+                // its journaled placements account for the bags exactly, or when an outside settlement is already under way.
+                if (r.Pending is {Action.Phase: CourierPhase.HandIn} placedHandIn && !carrierless)
+                {
+                    if (r.OutsideSettlement?.HandIn != placedHandIn.Id && status.Unconfirmed == placedHandIn.Id &&
+                        DeliveredThenPlaced(r, placedHandIn, owner, carrier) is { } placedSince)
+                        r.OutsideSettlement = new(placedHandIn.Id, Guid.NewGuid(), DeliveredThenPlacedDisposition, new(placedHandIn.OwnerBefore, owner), placedSince);
+                    if (r.OutsideSettlement?.HandIn == placedHandIn.Id && (status.Unconfirmed == placedHandIn.Id || status.LastConfirmed == placedHandIn.Id))
+                        (status, carrier) = await SettleOutsideAsync(r, placedHandIn, owner, carrier);
+                }
                 if (r.Pending is {Action.Phase: CourierPhase.HandOut or CourierPhase.HandIn} uncertain && trade is ICourierSettlement recovery &&
                     (status.Unconfirmed==uncertain.Id || status.LastConfirmed==uncertain.Id))
                 {
@@ -583,7 +612,9 @@ public sealed class CourierConductor
                     var remote=new TradeEvidence(uncertain.CarrierBefore,carrier);
                     if(Custody.TrySlice(local,uncertain.OwnerBefore.Character,remote,r.Settings.Carrier!,uncertain.Action.Batch,sign,out var moved,out var rest))
                     {
-                        if(moved.IsEmpty)throw Fault("TradeClosureUnproven","Unchanged bags alone cannot settle a dispatched trade.");
+                        if(moved.IsEmpty)throw sign==1 && status.Unconfirmed==uncertain.Id
+                            ? Fault(HandInNeedsSettlement,"The owner's bags do not show the hand-in; settle it as delivered from the carrier's send receipt.")
+                            : Fault("TradeClosureUnproven","Unchanged bags alone cannot settle a dispatched trade.");
                         var previous=r.Evidence.LastOrDefault(e=>e.Step==uncertain.Id);
                         bool verified = previous?.BothTradesVerified==true &&
                             Custody.Matches(previous.Owner,uncertain.OwnerBefore.Character,uncertain.Action.Batch,sign) &&
@@ -615,7 +646,9 @@ public sealed class CourierConductor
                         }
                         r.Pending=null;store.Save(r);
                     }
-                    else throw Fault("ResumeUnsettled","Fresh owner and carrier deltas do not agree with the pending manifest.");
+                    else throw sign==1 && status.Unconfirmed==uncertain.Id
+                        ? Fault(HandInNeedsSettlement,"The owner's bags no longer show the hand-in; settle it as delivered from the carrier's send receipt.")
+                        : Fault("ResumeUnsettled","Fresh owner and carrier deltas do not agree with the pending manifest.");
                 }
                 if (r.Pending is { Action.Phase: CourierPhase.HandOut or CourierPhase.HandIn } pending &&
                     r.Evidence.LastOrDefault(e => e.Step == pending.Id) is { } proof)
@@ -818,7 +851,8 @@ public sealed class CourierConductor
                     !CourierPlanner.Exact(owner.Character, t.Destination)) throw Fault("OwnerIdentityMismatch", owner.Character.CharacterName);
                 if (stop) throw new CourierFault(CourierOutcome.Cancelled,"StopRequested","Stopped before dispatch.");
                 // Placement needs no retainer baseline: a resume settles it from the journal and the bags.
-                var intent=r.Pending ?? new(Guid.NewGuid(),s,owner,carrier);
+                // At bounds the owner's own placements a resume may attribute to a hand-in (DeliveredThenPlaced).
+                var intent=r.Pending ?? new(Guid.NewGuid(),s,owner,carrier,At:DateTimeOffset.UtcNow);
                 if (s.Phase is not (CourierPhase.HandOut or CourierPhase.HandIn)) { r.Pending=intent; store.Save(r); }
                 CourierGame.Step.Value = intent.Id;
                 CourierGame.CanContinue.Value=()=>!stop && !unloaded;
@@ -1024,14 +1058,21 @@ public sealed class CourierConductor
         }
         catch (Exception e)
         {
-            r.Code = (e as CourierFault)?.Code ?? "UnexpectedFailure"; r.Detail = e.Message;
+            // Plugin unload cancels every pending game poll; name it so the journal reads as resumable, not as a crash.
+            r.Code = (e as CourierFault)?.Code ?? (unloaded && e is OperationCanceledException ? "OwnerUnloaded" : "UnexpectedFailure"); r.Detail = e.Message;
             string Settled() => r.Pending != null ? "Indeterminate" :
                 e is CourierFault { Outcome: CourierOutcome.Cancelled } ? "Interrupted" : "Failed";
             r.State = refusedRun && r.Pending == null && r.Custody.IsEmpty ? "Refused" : Settled();
             warning($"{r.Run}/{r.Pending?.Id} {r.State} {r.Code}: {e.Message}");
             if(!existingRun && !beginAttempted)return Project(r) with {CanResume=false,CanClear=false};
             store.Save(r);
-            if (!carrierless && (r.PeerClaimed || beginAttempted)) try { await Send(r, CourierCommand.Stop, r.Start, []); } catch (Exception cleanup) { warning(cleanup.Message); }
+            // An unloading owner has already disposed its peer link; the carrier pauses (and releases its locks) on link loss.
+            if (!carrierless && (r.PeerClaimed || beginAttempted))
+            {
+                if (unloaded) warning($"{r.Run} CarrierStopUnsent: owner unloading; the carrier pauses when the link drops.");
+                else try { await Send(r, CourierCommand.Stop, r.Start, []); }
+                    catch (Exception cleanup) { warning($"{r.Run} CarrierStopFailed: {cleanup.GetType().Name}: {cleanup.Message}"); }
+            }
             // Stop reaches the carrier ahead of its command queue and cancels a background move; the move stays
             // journaled so a resume re-sends it under the same id. Its fault is observed at dispatch.
             if (Interlocked.Exchange(ref carrierMove, null) is { } abandoned &&
@@ -1039,7 +1080,7 @@ public sealed class CourierConductor
                 warning($"{r.Run} CarrierMoveStopDeadline: 15s elapsed after Stop.");
             // A stopped or failed carrier-sourced run hands its unhanded claim back to the carrier's own stock, so nothing
             // is left held for acknowledgement; a resume claims again.
-            if (!carrierless && (!r.Custody.IsEmpty || r.Pending is { Action.Phase: CourierPhase.Claim }) && await ReleaseClaimAsync(r) && r.State == "Indeterminate")
+            if (!carrierless && !unloaded && (!r.Custody.IsEmpty || r.Pending is { Action.Phase: CourierPhase.Claim }) && await ReleaseClaimAsync(r) && r.State == "Indeterminate")
             {
                 r.State = Settled(); store.Save(r);
             }
@@ -1258,6 +1299,196 @@ public sealed class CourierConductor
             return false;
         }
     }
+    internal const string DeliveredThenPlacedDisposition = "DeliveredThenPlaced", OperatorAttestedDisposition = "OperatorAttested";
+    /// <summary>
+    /// The DeliveredThenPlaced rule. A pending hand-in whose carrier reports its send finished settles when every
+    /// Quartermaster transfer journaled for the owner since the hand-in started is terminal and verified, and the owner's
+    /// fresh bags minus those transfers' net change (deposits out, retrievals in) differ from the bags before the hand-in
+    /// by exactly the batch, on every key including unrelated items and gil, while the carrier's bags show exactly the
+    /// batch left. Returns the operations it relied on; null when the rule does not apply (never when it is ambiguous).
+    /// </summary>
+    private ImmutableArray<string>? DeliveredThenPlaced(CourierJournal r, RunIntent u, InventoryView owner, InventoryView carrier)
+    {
+        if (u.At is not { } at || placement.PlacedSince(owner.Character, at) is not { Units.IsEmpty: false } since) return null;
+        if (since.Unusable is { } why)
+        {
+            warning($"{r.Run}/{u.Id} DeliveredThenPlacedUnproven: {why}");
+            return null;
+        }
+        var counts = owner.Stock.GroupBy(x => (x.ItemId, x.Hq)).ToDictionary(g => g.Key, g => g.Sum(x => (long)x.Units));
+        foreach (var moved in since.Units)
+            counts[(moved.Item, moved.Hq)] = counts.GetValueOrDefault((moved.Item, moved.Hq)) - moved.Units;
+        foreach (var (key, units) in counts)
+            if (units < 0 || units > int.MaxValue)
+            {
+                warning($"{r.Run}/{u.Id} DeliveredThenPlacedUnproven: item {key.ItemId}{(key.Hq ? " HQ" : "")} nets {units:N0} after the journaled transfers.");
+                return null;
+            }
+        var adjusted = owner with { Stock = [.. counts.Where(x => x.Value > 0).Select(x => new BagStock(x.Key.ItemId, x.Key.Hq, (int)x.Value))] };
+        if (!Custody.TrySlice(new(u.OwnerBefore, adjusted), u.OwnerBefore.Character, new(u.CarrierBefore, carrier), r.Settings.Carrier!,
+                u.Action.Batch, 1, out _, out var rest) || !rest.IsEmpty)
+        {
+            warning($"{r.Run}/{u.Id} DeliveredThenPlacedMismatch: the owner's bags net of {since.Operations.Length} journaled transfer(s) " +
+                $"({string.Join(", ", since.Operations)}) and the carrier's bags do not show exactly the hand-in.");
+            return null;
+        }
+        return since.Operations;
+    }
+    /// <summary>
+    /// Settles a pending hand-in from the carrier's own send receipt: the carrier settles its ledger (SettleSent), the
+    /// owner's receive checkpoint closes on the same receipt, the carrier's ledger is checked, and the hand-in's deposits
+    /// shrink to what is still in the owner's bags (the rest is recorded as already placed). The caller sets
+    /// <see cref="CourierJournal.OutsideSettlement"/>; it is journaled here before anything is sent.
+    /// </summary>
+    private async Task<(CourierReceipt Status, InventoryView Carrier)> SettleOutsideAsync(CourierJournal r, RunIntent u, InventoryView owner, InventoryView carrier)
+    {
+        var o = r.OutsideSettlement!;
+        store.Save(r);
+        if (trade is not ICourierReceiveAttestation attest) throw Fault("ReceiveAttestationUnavailable", "This client cannot close its receive checkpoint.");
+        var batch = u.Action.Batch;
+        // Preflight every owner-side precondition before the carrier drops custody: once SettleSent commits, a refusal
+        // here could no longer be undone and the run could neither settle nor clear.
+        var preflight = await Send(r, CourierCommand.Status, r.Start, []);
+        if (preflight.Evidence is not { } proof || !Custody.Matches(proof, r.Settings.Carrier!, batch, -1))
+            throw Fault("SettleSentEvidenceMismatch", "The carrier's send receipt does not show exactly the hand-in left its bags.");
+        await calls.Call("OwnerReceiveAttestationPreflight", 15, d => attest.AttestReceived(u.Id, r.Settings.Carrier!, proof, o.Disposition, d, commit: false));
+        if (batch.GroupBy(x => (x.Item, x.Hq)).Any(g => !g.First().IsGil &&
+                (long)owner.Count(g.Key.Item, g.Key.Hq) - u.OwnerBefore.Count(g.Key.Item, g.Key.Hq) < g.Sum(x => (long)x.Units)))
+            DepositsFor(r.Schedule, r.Cursor, batch); // throws ScheduleShapeMismatch before anything settles
+        CourierReceipt settled;
+        try { settled = await Send(r, CourierCommand.SettleSent, u.OwnerBefore.Character, batch, id: o.Command, confirm: u.Id, evidence: o.Owner); }
+        catch (CourierFault refused) when (refused.Outcome == CourierOutcome.Failed)
+        {
+            // A Failed may be the carrier's recorded refusal, or a transport refusal (UnknownStep, Unavailable) after the
+            // carrier already committed. Forget the journaled settlement only when the carrier provably still holds the
+            // hand-off unconfirmed; otherwise keep it so a retry resumes under the same id.
+            CourierReceipt? after = null;
+            try { after = await Send(r, CourierCommand.Status, r.Start, []); }
+            catch (CourierFault probe) { warning($"{r.Run}/{u.Id} SettleSentStatusUnavailable {probe.Code}: {probe.Message}"); }
+            if (after is { } held && held.Unconfirmed == u.Id && held.LastConfirmed != u.Id)
+            {
+                r.OutsideSettlement = null; store.Save(r);
+            }
+            warning($"{r.Run}/{u.Id} SettleSentRefused {refused.Code}: {refused.Message}" +
+                (r.OutsideSettlement == null ? "" : "; settlement kept for retry (the carrier may have committed it)."));
+            throw;
+        }
+        if (settled.Evidence is not { } sent || !Custody.Matches(sent, r.Settings.Carrier!, batch, -1))
+            throw Fault("SettleSentEvidenceMismatch", "The carrier's send receipt does not show exactly the hand-in left its bags.");
+        await calls.Call("OwnerReceiveAttestation", 15, d => attest.AttestReceived(u.Id, r.Settings.Carrier!, sent, o.Disposition, d));
+        var status = await Send(r, CourierCommand.Status, r.Start, []);
+        var expected = Custody.Apply(r.Custody, batch, -1);
+        if (status.LastConfirmed != u.Id || status.Unconfirmed != null || !SameCustody(Held(status), expected))
+            throw Fault("SettlementLedgerMismatch", "The carrier has not acknowledged the same custody delta.");
+        var placed = PlaceOutside(r, u, owner);
+        r.Evidence.Add(new(u.Id, o.Owner, sent, false, o.Disposition));
+        if (!placed.IsEmpty) r.PlacedOutside.Add(new(u.Id, o.Disposition, placed, o.Operations));
+        r.Custody = expected; r.OwnerCheckpoint = owner; r.CarrierCheckpoint = status.Bags ?? carrier;
+        r.Pending = null; r.OutsideSettlement = null; store.Save(r);
+        warning($"{r.Run}/{u.Id} HandInSettled{o.Disposition}: carrier send receipt {o.Command}; " +
+            (placed.IsEmpty ? "every unit is still in the owner's bags." :
+                $"already placed: {string.Join(", ", placed.Select(x => $"{x.Name}{(x.Hq ? " HQ" : "")} x{x.Units:N0}"))}" +
+                (o.Operations.IsEmpty ? "." : $" (operations {string.Join(", ", o.Operations)}).")));
+        return (status, r.CarrierCheckpoint);
+    }
+    /// <summary>
+    /// Shrinks a settled hand-in's deposits to the units its owner's bags still hold above the pre-hand-in count (in
+    /// manifest order), credits the rest as delivered, and moves past the hand-in. Gil is never placed: it stays in the deposit.
+    /// </summary>
+    private static ImmutableArray<Shipment> PlaceOutside(CourierJournal r, RunIntent u, InventoryView owner)
+    {
+        var batch = u.Action.Batch;
+        var left = batch.GroupBy(x => (x.Item, x.Hq)).ToDictionary(g => g.Key, g => g.First().IsGil ? long.MaxValue :
+            Math.Clamp((long)owner.Count(g.Key.Item, g.Key.Hq) - u.OwnerBefore.Count(g.Key.Item, g.Key.Hq), 0, g.Sum(x => (long)x.Units)));
+        var kept = new List<Shipment>(); var placed = new List<Shipment>();
+        foreach (var x in batch)
+        {
+            var take = (int)Math.Min(x.Units, left[(x.Item, x.Hq)]);
+            left[(x.Item, x.Hq)] -= take;
+            if (take > 0) kept.Add(x with { Units = take });
+            if (take < x.Units) placed.Add(x with { Units = x.Units - take });
+        }
+        if (placed.Count > 0)
+        {
+            var deposits = DepositsFor(r.Schedule, r.Cursor, batch);
+            ImmutableArray<CourierStep> remaining = kept.Count == 0 ? [] : [new(CourierPhase.Deposit, u.Action.Trip, [.. kept])];
+            r.Schedule = [.. r.Schedule.Take(r.Cursor + 1), .. remaining, .. r.Schedule.Skip(r.Cursor + 1 + deposits)];
+            foreach (var x in placed) r.Delivered[x.Line] = checked(r.Delivered.GetValueOrDefault(x.Line) + x.Units);
+        }
+        r.Cursor++;
+        return [.. placed];
+    }
+    private RunIntent PendingHandIn(CourierJournal r, Guid expectedRun)
+    {
+        if (r.Run != expectedRun || r.State is not ("Failed" or "Interrupted" or "Indeterminate"))
+            throw new InvalidOperationException("RunNotSettleable");
+        if (r.Pending is not { Action.Phase: CourierPhase.HandIn } u || Carrierless(r))
+            throw new InvalidOperationException("NoPendingHandIn");
+        return u;
+    }
+    /// <summary>What the carrier's send receipt proves for the run's pending hand-in. Moves nothing.</summary>
+    public async Task<CourierSentProof> SentProofAsync(Guid expectedRun)
+    {
+        if (!await gate.WaitAsync(0)) throw new InvalidOperationException("CourierAlreadyRunning");
+        try
+        {
+            var r = store.Load();
+            var u = PendingHandIn(r, expectedRun);
+            var status = await Send(r, CourierCommand.Status, r.Start, []);
+            var from = r.Settings.Carrier?.CharacterName ?? "Unknown";
+            var to = u.OwnerBefore.Character.CharacterName ?? "Unknown";
+            var resuming = r.OutsideSettlement?.HandIn == u.Id && status.LastConfirmed == u.Id;
+            string? refusal = status.ActiveRun != r.Run ? "CarrierRunConflict" :
+                status.Unconfirmed != u.Id && !resuming ? "CarrierHandOffNotPending" :
+                status.Evidence == null ? "CarrierSendUnproven" :
+                !Custody.Matches(status.Evidence, r.Settings.Carrier!, u.Action.Batch, -1) ? "CarrierSendIncomplete" : null;
+            ImmutableArray<CustodyRow> left = status.Evidence is { } e
+                ? [.. u.Action.Batch.GroupBy(x => (x.Item, x.Hq)).Select(g => new CustodyRow(g.First().Name, g.First().IsGil ? "" : g.Key.Hq ? "HQ" : "NQ",
+                    Math.Max(0, e.Before.Count(g.Key.Item, g.Key.Hq) - e.After.Count(g.Key.Item, g.Key.Hq)), from))]
+                : [];
+            return new(r.Run, u.Id, from, to, left, refusal == null, refusal);
+        }
+        finally { gate.Release(); }
+    }
+    /// <summary>
+    /// The operator's attestation that a pending hand-in was delivered, for a hand-in no evidence Quartermaster owns can
+    /// settle (the owner's goods were moved on outside its journal, or before this build recorded when the hand-in began).
+    /// The carrier still settles only its own proven send; the owner's checkpoint, the run's custody and its deposits
+    /// follow as for DeliveredThenPlaced, under the OperatorAttested disposition. The run stays resumable.
+    /// </summary>
+    public async Task<CourierSnapshot> SettleDeliveredAsync(Guid expectedRun)
+    {
+        if (!await gate.WaitAsync(0)) throw new InvalidOperationException("CourierAlreadyRunning");
+        IDisposable? lease = null;
+        try
+        {
+            var r = store.Load();
+            var u = PendingHandIn(r, expectedRun);
+            // Holds Quartermaster's own placements off the owner's bags while they are read and the deposits shrink.
+            if (!automation.TryAcquire("courier owner", out lease) || lease == null)
+                throw new CourierFault(CourierOutcome.Failed, "AutomationBusy", automation.AcquisitionBlockReason ?? "Busy");
+            var owner = await Observe();
+            if (!CourierPlanner.Exact(owner.Character, u.OwnerBefore.Character)) throw Fault("OwnerIdentityMismatch", owner.Character.CharacterName);
+            var status = await Send(r, CourierCommand.Status, r.Start, []);
+            var carrier = status.Bags ?? throw Fault("CarrierBagsMissing", "Fresh observation required.");
+            var resuming = r.OutsideSettlement?.HandIn == u.Id;
+            if (status.ActiveRun != r.Run || !(status.Unconfirmed == u.Id || resuming && status.LastConfirmed == u.Id))
+                throw Fault("CarrierHandOffNotPending", "The carrier does not hold this hand-in unconfirmed.");
+            if (!resuming)
+                r.OutsideSettlement = new(u.Id, Guid.NewGuid(), OperatorAttestedDisposition, new(u.OwnerBefore, owner),
+                    u.At is { } at && placement.PlacedSince(owner.Character, at) is { } since ? since.Operations : []);
+            await SettleOutsideAsync(r, u, owner, carrier);
+            r.State = "Interrupted"; r.Code = "SettledAsDelivered"; r.Detail = "";
+            store.Save(r);
+            return Project(r);
+        }
+        catch (CourierFault e)
+        {
+            warning($"{expectedRun} SettleDeliveredRefused {e.Code}: {e.Message}");
+            throw;
+        }
+        finally { lease?.Dispose(); gate.Release(); }
+    }
     private async Task Meet(MeetingBell bell)
     {
         if ((await calls.Call("OwnerPosition", 15, bells.PositionAsync)).World != bell.World)
@@ -1317,6 +1548,21 @@ public sealed class CourierConductor
             TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         return first;
     }
+    /// <summary>
+    /// How long the owner's receive may stay open after the carrier reported its send finished. Each window's closure
+    /// is observed within 30s; a receive still open after this no longer tracks the trade (a window opened before the
+    /// previous one's closure was seen) and would otherwise wait out the whole trade deadline.
+    /// </summary>
+    internal static readonly TimeSpan ReceiveStallGrace = TimeSpan.FromSeconds(45);
+    private async Task EndStalledReceive(CourierJournal r, Guid id, Task local, Task<CourierReceipt> remote)
+    {
+        try { await remote; } catch { return; } // A carrier fault cancels the receive through FirstFaultCancelsOther.
+        if (await Task.WhenAny(local, Task.Delay(ReceiveStallGrace)) == local || trade is not ICourierReceiveStall stall) return;
+        warning($"{r.Run}/{id} OwnerReceiveStalledAfterSenderFinished: the carrier's send finished {ReceiveStallGrace.TotalSeconds:0}s ago " +
+            "and the owner's receive is still open; ending it so the hand-in settles from both clients' fresh bags.");
+        try { await calls.Call("OwnerReceiveStall", 10, d => stall.EndStalledReceiveAsync(id, d)); }
+        catch (Exception e) { warning($"{r.Run}/{id} OwnerReceiveStallUnended: {(e as CourierFault)?.Code ?? e.GetType().Name}: {e.Message}"); }
+    }
     private async Task HandOffAsync(CourierJournal r,RunIntent intent)
     {
         var step=intent.Action;var before=intent.OwnerBefore;
@@ -1354,6 +1600,7 @@ public sealed class CourierConductor
             r.Pending=intent;store.Save(r);
         } finally {peer.Progress-=Started;}
         var local = calls.Call("OwnerTrade", Deadline.TradeSeconds(batch), d => send ? trade.SendAsync(r.Settings.Carrier!, batch, d) : trade.ReceiveAsync(r.Settings.Carrier!, batch, d));
+        if (!send) _ = EndStalledReceive(r, id, local, remote);
         // A side that faults first cancels its counterpart so neither waits out its full trade deadline.
         var settled = await FirstFaultCancelsOther(r, local, remote, "HandOff");
         var fenced = false;
@@ -1391,9 +1638,19 @@ public sealed class CourierConductor
             // A fenced step already journaled its NotDelivered evidence.
             if (!fenced)
             {
-                var e = new HandOff(id, new(before, await Observe()), remote.IsCompletedSuccessfully ? remote.Result.Evidence : cancellationReceipt?.Evidence,
-                    local.IsCompletedSuccessfully && remote.IsCompletedSuccessfully,r.Pending==null?"NotDelivered":null);
-                r.Evidence.Add(e); store.Save(r);
+                // An unloading owner cannot observe its bags; the trade's own fault stays the step's outcome and the
+                // pending intent settles from fresh bags on resume.
+                InventoryView? after = null;
+                try { after = await Observe(); }
+                catch (Exception missing) { warning($"{r.Run}/{id} HandOffEvidenceUnavailable: {missing.GetType().Name}: {missing.Message}"); }
+                if (after != null)
+                {
+                    var e = new HandOff(id, new(before, after), remote.IsCompletedSuccessfully ? remote.Result.Evidence : cancellationReceipt?.Evidence,
+                        local.IsCompletedSuccessfully && remote.IsCompletedSuccessfully,r.Pending==null?"NotDelivered":null);
+                    r.Evidence.Add(e); store.Save(r);
+                }
+                else if (local.IsCompletedSuccessfully && remote.IsCompletedSuccessfully)
+                    throw Fault("HandOffEvidenceUnavailable", "Both trades finished; the owner's bags could not be observed.");
             }
         }
         var proof = r.Evidence[^1];

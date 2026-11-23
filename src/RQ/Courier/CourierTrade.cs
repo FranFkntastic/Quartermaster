@@ -17,13 +17,16 @@ internal sealed class TradeCheckpoint
     public CourierReceiveArm? LastSettledArm {get;set;}
     public InventoryView? ReceiveAfter {get;set;}
     public TradeEvidence? SenderEvidence {get;set;}
+    /// <summary>Set when the receive was closed by attestation rather than its own trade record (DeliveredThenPlaced, OperatorAttested).</summary>
+    public string? Disposition {get;set;}
     public List<BagStock> Original {get;set;}=[];
     public bool Receiving {get;set;}
     public List<TradeItem> Items {get;set;}=[];
     public TradeRecoveryState Recovery {get;set;}=new();
 }
 internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease lease,IDalamudPluginInterface pi,
-    DalamudExternalUiAutomationSuppression external,IPluginLog log,string directory) : ICourierTradePort, ICourierDispatchEvidence, ICourierSettlement, ICourierHoldPort, ITradeSuppression, IDisposable
+    DalamudExternalUiAutomationSuppression external,IPluginLog log,string directory) : ICourierTradePort, ICourierDispatchEvidence, ICourierSettlement, ICourierHoldPort,
+    ICourierReceiveStall, ICourierReceiveAttestation, ITradeSuppression, IDisposable
 {
     private sealed class Intent(CourierStore<TradeCheckpoint> store, TradeCheckpoint current) : ITradeIntentStore
     {
@@ -31,7 +34,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
         public TradeRecoveryState Recovery => current.Recovery;
         public void Save()=>store.Save(current);
     }
-    private readonly CourierStore<TradeCheckpoint> store=new(Path.Combine(directory,"courier-trade.json"));
+    private readonly CourierStore<TradeCheckpoint> store=new(Path.Combine(directory,"courier-trade.json"),s=>log.Warning(s));
     // Paces UI actions only; every slot and the final batch are still verified against the trade window and bags.
     private static TradeTimingOptions Timing => new(){ActionDelayMilliseconds=80};
     // A partner window that opens and closes before either side locks moved nothing; retry it a few times.
@@ -42,13 +45,21 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
     private IDisposable? prompts;
     private HashSet<string>? dropbox;
     private bool stopped,locked;
+    private Guid stalledStep;
     private CourierTradeHold? hold;
     public Task<Result<IDisposable>> BeginHold(Guid run, Deadline deadline) => game.Poll<IDisposable>(deadline, () => {
         var next = new CourierTradeHold(pi, $"Quartermaster.Courier/{run:N}/{Guid.NewGuid():N}", s=>log.Warning(s));
         var result=next.Begin();
-        if(result.Outcome==CourierOutcome.Succeeded)hold=next;
-        return result;
+        if(result.Outcome!=CourierOutcome.Succeeded)return result;
+        hold=next;
+        // Releasing the scope also forgets it, so a later trade refuses TradeHoldLost instead of checking a dead hold.
+        return Result<IDisposable>.Ok(new HoldScope(()=>{try{next.Dispose();}finally{Interlocked.CompareExchange(ref hold,null,next);}}));
     });
+    private sealed class HoldScope(Action release) : IDisposable
+    {
+        private Action? pending = release;
+        public void Dispose() => Interlocked.Exchange(ref pending, null)?.Invoke();
+    }
     public void CheckHold() => hold?.Check(false);
     public void SuppressTradeAutoConfirm()
     {
@@ -146,7 +157,7 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                     state=new(){Step=step,DispatchAuthorized=false,Receiving=receive,Items=[..manifest.GroupBy(s=>(s.Item,s.Hq)).Select(g=>new TradeItem{
                         ItemId=g.Key.Item,IsHighQuality=g.Key.Hq,Quantity=g.Sum(s=>s.Units),ItemName=g.First().Name})]};
                     state.Original=[..state.Items.Select(i=>new BagStock(i.ItemId,i.IsHighQuality,i.Quantity))];
-                    store.Save(state);stopped=locked=false;
+                    store.Save(state);stopped=locked=false;stalledStep=Guid.Empty;
                     SuppressTradeAutoConfirm();
                     if(!receive){
                         state.DispatchAuthorized=true;store.Save(state);
@@ -155,6 +166,14 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                 }
                 OperationResult? result;
                 if(receive){
+                    if(stalledStep==step && !io.IsTradeOpen && !io.IsRemoteLocked){
+                        stalledStep=Guid.Empty;
+                        var unverified=string.Join(", ",state.Items.Where(i=>i.Quantity>0).Select(i=>$"{i.ItemName ?? i.ItemId.ToString()}{(i.IsHighQuality?" HQ":"")} x{i.Quantity:N0}"));
+                        var detail=$"Sender finished; receive {(state.Arm!=null?"armed on an unverified window":"not armed")}, unverified {(unverified.Length>0?unverified:"nothing")}.";
+                        log.Warning($"OwnerReceiveStalledAfterSenderFinished: {d.Name} step {step}: {detail} The armed baseline stays for settlement.");
+                        receiver?.Stop();
+                        return End(CourierOutcome.Indeterminate,"OwnerReceiveStalledAfterSenderFinished",detail);
+                    }
                     if(receiver==null){
                         if(stopped) return End(CourierOutcome.Cancelled,lost?.Code??"ReceiveStopped",lost?.Message??d.Name);
                         if(game.Bags() is not {} baseline) {
@@ -227,6 +246,28 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
             }catch(Exception e){return End(CourierOutcome.Indeterminate,"TradeAdapterFault",e.Message);}
         },true,CourierGame.TradePollMilliseconds);
     }
+    public Task<Result<bool>> EndStalledReceiveAsync(Guid step,Deadline d)=>game.Poll<bool>(d,()=>{
+        if(receiver==null && sender==null)return Result<bool>.Fail("ReceiveNotRunning",step.ToString());
+        stalledStep=step;
+        return Result<bool>.Ok(true);
+    });
+    // The sender's evidence must show exactly the receive's original manifest left its bags, nothing else (gil included).
+    public Task<Result<bool>> AttestReceived(Guid step,OwnerScope partner,TradeEvidence peer,string disposition,Deadline d,bool commit=true)=>game.Poll<bool>(d,()=>{
+        var state=store.Load();
+        if(state.Step!=step || !state.Receiving || io.IsTradeOpen || receiver!=null || sender!=null || state.Recovery.CancellationPending)
+            return new(CourierOutcome.Indeterminate,"TradeCheckpointMismatch",step.ToString());
+        if(!CourierPlanner.Exact(partner,peer.Before.Character) || !CourierPlanner.Exact(partner,peer.After.Character) ||
+            state.Original.Concat(peer.Before.Stock).Concat(peer.After.Stock).Select(x=>(x.ItemId,x.Hq)).Append((ItemId: Custody.GilKey.Item, Hq: Custody.GilKey.Hq)).Distinct().Any(k=>
+                state.Original.Where(x=>x.ItemId==k.ItemId && x.Hq==k.Hq).Sum(x=>(long)x.Units)!=(long)peer.Before.Count(k.ItemId,k.Hq)-peer.After.Count(k.ItemId,k.Hq)))
+            return new(CourierOutcome.Indeterminate,"AttestedSenderDeltaMismatch",step.ToString());
+        if(!commit)return Result<bool>.Ok(true); // Preflight: the checkpoint would close on this evidence.
+        if(state.Arm!=null)state.LastSettledArm=state.Arm;
+        state.Arm=null;state.SenderEvidence=peer;state.Disposition=disposition;
+        foreach(var item in state.Items)item.Quantity=0;
+        store.Save(state);
+        log.Warning($"CourierReceiveAttested: step {step} closed as {disposition}; the sender's evidence shows the full manifest left its bags.");
+        return Result<bool>.Ok(true);
+    });
     // Called only after the run owner has checked both clients' complete fresh deltas.
     public Task<Result<bool>> Settle(Guid step,OwnerScope partner,TradeEvidence peer,Deadline d)=>game.Poll<bool>(d,()=>{
         var state=store.Load();
