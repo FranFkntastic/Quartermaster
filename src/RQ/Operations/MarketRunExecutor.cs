@@ -22,6 +22,8 @@ internal sealed class MarketGatherIndeterminateException(ulong retainerId, strin
 }
 public sealed record MarketMutationIntent(string Kind, ulong RetainerId, string ItemName,
     RetainerMarketListingTarget? Listing, DalamudInventoryStack? Source, int Quantity, uint Price);
+/// <summary>A planned listing retainer this character cannot visit now. Code names the failed check.</summary>
+public sealed record MarketRetainerUnavailable(ulong RetainerId, string Code, string Detail);
 
 /// <summary>All reads are live. Implementations must not retry mutations.</summary>
 public interface IMarketRunDriver
@@ -30,6 +32,12 @@ public interface IMarketRunDriver
     int GatherInventoryBlockedUnits => 0;
     string ItemName(uint itemId);
     Task RequireRetainerListAsync(CancellationToken token);
+    /// <summary>
+    /// Read-only: the given listing retainers this character cannot list on right now (not in its
+    /// assigned roster, unassigned, unavailable, or missing from the retainer list). Moves nothing.
+    /// </summary>
+    Task<IReadOnlyList<MarketRetainerUnavailable>> UnavailableListingRetainersAsync(IReadOnlyCollection<ulong> retainerIds, CancellationToken token) =>
+        Task.FromResult<IReadOnlyList<MarketRetainerUnavailable>>([]);
     Task OpenAsync(ulong retainerId, string name, CancellationToken token);
     Task<IReadOnlyList<RetainerMarketListingTarget>> ListingsAsync(CancellationToken token);
     Task<MarketPlayerInventory> PlayerAsync(CancellationToken token);
@@ -97,6 +105,10 @@ public sealed class MarketRunRecord
     public int SplitStacks { get; set; }
     /// <summary>Listings the end-of-run top-up pass set out to cover, from this run's final scans.</summary>
     public int TopUpShortfall { get; set; }
+    /// <summary>Listings skipped before gathering because their retainer failed the roster check.</summary>
+    public int TargetUnavailableListings { get; set; }
+    /// <summary>Planned listings a visit that passed the roster check still failed to post.</summary>
+    public int ListingsNotMade { get; set; }
     public bool RequiresAcknowledgement => State == "Interrupted" || NeedsCheck.Count > 0 ||
         Mutations.Any(m => m.Outcome is null or MarketMutationOutcome.Indeterminate);
 }
@@ -168,6 +180,11 @@ public sealed class MarketRunExecutor(
     private bool topUpActive;
     // Retainer IDs in the plan that the current roster no longer assigns to this character.
     private readonly HashSet<ulong> missingRetainers = [];
+    // Per run: retainers that failed the pre-gather roster check (never gathered for or visited),
+    // the listings each assignment's visit set out to post, and the items with a reserve home.
+    private readonly HashSet<ulong> unavailableRetainers = [];
+    private readonly Dictionary<Guid, int> plannedListings = [];
+    private readonly HashSet<uint> reserveHomes = [];
     private readonly object persistenceGate = new();
     public bool IsRunning => Volatile.Read(ref running) != 0;
     private bool disposed;
@@ -239,6 +256,10 @@ public sealed class MarketRunExecutor(
             persistenceFailed = false;
             shortByAssignment.Clear();
             freshListings.Clear();
+            unavailableRetainers.Clear();
+            plannedListings.Clear();
+            reserveHomes.Clear();
+            reserveHomes.UnionWith(reserves.Where(r => r.Enabled && r.ItemId > 0 && (r.Location.AnySpace || r.Location.PreferredRetainerIds.Count > 0)).Select(r => r.ItemId));
             topUpActive = false;
             Volatile.Write(ref posted, 0);
             ListingTarget = evaluation.Retainers.Sum(r => r.RefillListings.IsKnown ? r.RefillListings.Value : 0);
@@ -269,9 +290,20 @@ public sealed class MarketRunExecutor(
                 driver.BeginRun(runLease!, () => HasSessionAuthority(record));
                 if (listingWork)
                 {
+                    Status = "Checking listing retainers";
+                    await CheckListingTargetsAsync(record, evaluation).ConfigureAwait(false);
+                    Check(record);
                     Status = "Gathering stock";
-                    var targets = evaluation.Items.Where(i => i.RefillUnits.Value > 0)
-                        .Select(i => new MarketGatherTarget(i.ItemId, i.ItemName, i.Quality, i.RefillUnits.Value)).ToArray();
+                    // Gather only for listings the run can make: a retainer that failed the check
+                    // contributes no units, so nothing leaves a retainer for a listing it cannot take.
+                    var listable = evaluation.Retainers.Where(r => !unavailableRetainers.Contains(r.RetainerId) && !missingRetainers.Contains(r.RetainerId))
+                        .SelectMany(r => r.Assignments).Where(a => a.RefillListings is { IsKnown: true, Value: > 0 })
+                        .GroupBy(a => (a.Assignment.ItemId, a.Assignment.Quality))
+                        .ToDictionary(g => g.Key, g => g.Sum(a => a.RefillListings.Value * Math.Max(0, a.Assignment.QuantityPerListing)));
+                    var targets = evaluation.Items.Where(i => listable.GetValueOrDefault((i.ItemId, i.Quality)) > 0)
+                        .Select(i => new MarketGatherTarget(i.ItemId, i.ItemName, i.Quality, listable[(i.ItemId, i.Quality)])).ToArray();
+                    foreach (var a in evaluation.Retainers.SelectMany(r => r.Assignments))
+                        plannedListings[a.Assignment.Id] = a.RefillListings is { IsKnown: true, Value: > 0 } refill ? refill.Value : 0;
                     // Gather owns per-call deadlines, not a single deadline for a multi-retainer route.
                     await GatherAsync(record, targets).ConfigureAwait(false);
                     Check(record);
@@ -380,6 +412,44 @@ public sealed class MarketRunExecutor(
         warning?.Invoke(message);
     }
 
+    /// <summary>
+    /// Before any retrieval: every listing retainer must be in this character's roster, assigned,
+    /// available and reachable from the retainer list. A retainer that is not is skipped up front:
+    /// nothing is gathered for it and it is never visited. The rest of the run proceeds. A check
+    /// that cannot complete stops the run before anything moves.
+    /// </summary>
+    private async Task CheckListingTargetsAsync(MarketRunRecord record, MarketRunEvaluation evaluation)
+    {
+        var ids = record.Assignments.Select(a => a.RetainerId).Distinct().ToArray();
+        IReadOnlyList<MarketRetainerUnavailable> unavailable;
+        try { unavailable = await deadline.RunAsync(t => driver.UnavailableListingRetainersAsync(ids, t)).ConfigureAwait(false); }
+        catch (Exception e) when (e is not OperationCanceledException || Volatile.Read(ref cancelled) == 0)
+        {
+            var message = $"MarketRunTargetCheckFailed: could not confirm the listing retainers ({e.Message}); run stopped before gathering, nothing was moved.";
+            warning?.Invoke(message);
+            throw new RunStoppedException(message);
+        }
+        foreach (var blocked in unavailable.Where(u => ids.Contains(u.RetainerId)))
+        {
+            if (!unavailableRetainers.Add(blocked.RetainerId)) continue;
+            var name = record.Assignments.Where(a => a.RetainerId == blocked.RetainerId).Select(a => a.RetainerName)
+                .FirstOrDefault(n => !string.IsNullOrWhiteSpace(n)) ?? $"Retainer {blocked.RetainerId}";
+            var work = evaluation.Retainers.Where(r => r.RetainerId == blocked.RetainerId).SelectMany(r => r.Assignments).ToArray();
+            var refill = work.Where(a => a.RefillListings is { IsKnown: true, Value: > 0 }).ToArray();
+            var reprices = work.Sum(a => a.RepriceListings is { IsKnown: true, Value: > 0 } r ? r.Value : 0);
+            var listings = refill.Sum(a => a.RefillListings.Value);
+            record.TargetUnavailableListings += listings;
+            ListingTarget = Math.Max(0, ListingTarget - listings);
+            var skipped = refill.Length == 0 ? "no listings to post" :
+                string.Join(", ", refill.Select(a => $"{a.Assignment.ItemName} ({a.Assignment.Quality}) {a.RefillListings.Value} listings × {a.Assignment.QuantityPerListing}"));
+            var message = $"MarketRunTargetUnavailable: retainer={name} (id {blocked.RetainerId}) reason={blocked.Code}: {blocked.Detail}; " +
+                $"skipped before gathering: {skipped}{(reprices > 0 ? $"; {reprices} reprices not attempted" : string.Empty)}. Nothing was retrieved for this retainer's listings.";
+            warning?.Invoke(message);
+            Add(record, message);
+        }
+        Persist(record);
+    }
+
     private async Task GatherAsync(MarketRunRecord record, IReadOnlyList<MarketGatherTarget> targets)
     {
         // Gather owns per-call deadlines, not a single deadline for a multi-retainer route.
@@ -396,25 +466,34 @@ public sealed class MarketRunExecutor(
 
     private async Task VisitRetainerAsync(MarketRunRecord record, RetainerVisit visit, HashSet<ulong> scannedRetainers, bool reprice)
     {
+        // Already reported as MarketRunTargetUnavailable; nothing was gathered for it.
+        if (unavailableRetainers.Contains(visit.Id)) return;
         Check(record);
         Status = topUpActive ? $"Top-up · {visit.Name}" : visit.Name;
         var (id, name, assignments) = (visit.Id, visit.Name, visit.Assignments);
         // A revisit must rescan; a failed rescan leaves the summary incomplete, not stale.
         scannedRetainers.Remove(id);
         var opened = false;
+        var mutationsBefore = record.Mutations.Count;
         try
         {
             await Step(t => driver.OpenAsync(id, name, t)).ConfigureAwait(false);
             opened = true;
             await ListRetainer(record, id, name, assignments, reprice).ConfigureAwait(false);
         }
-        catch (RetainerStoppedException) { }
+        catch (RetainerStoppedException)
+        {
+            // Mutate recorded the receipt; name the listings this visit therefore did not make.
+            var failed = record.Mutations.Skip(mutationsBefore).LastOrDefault(m => m.Intent.RetainerId == id && m.Outcome != MarketMutationOutcome.Committed);
+            ReportListingNotMade(record, visit, mutationsBefore, failed is null ? "a listing mutation did not commit"
+                : $"{failed.Intent.Kind} {failed.Intent.ItemName} × {failed.Intent.Quantity} ended {failed.Outcome?.ToString() ?? "unresolved"} ({failed.Code}: {failed.Message})");
+        }
         catch (OperationCanceledException) { throw; }
         catch (RunStoppedException) { throw; }
         catch (Exception e) when (!persistenceFailed && !driverUnsettled && !MarketRunDeadline.HasUnsettled)
         {
             warning?.Invoke($"MarketRunRetainerVisitEnded: retainer={name}{(topUpActive ? " (top-up)" : string.Empty)}: {e.Message}");
-            Add(record, $"{name}: {e.Message}");
+            ReportListingNotMade(record, visit, mutationsBefore, opened ? e.Message : $"could not open the retainer ({e.Message})");
         }
         finally
         {
@@ -454,6 +533,41 @@ public sealed class MarketRunExecutor(
                 await Step(driver.ReturnAsync).ConfigureAwait(false);
         }
         Check(record);
+    }
+
+    /// <summary>
+    /// A visit that passed the roster check still ended early. Names the planned listings it did not
+    /// post and where their stock goes; stow and the journal treat that stock exactly as before.
+    /// </summary>
+    private void ReportListingNotMade(MarketRunRecord record, RetainerVisit visit, int mutationsBefore, string reason)
+    {
+        var posted = record.Mutations.Skip(mutationsBefore)
+            .Where(m => m.Intent.Kind == "Post" && m.Outcome == MarketMutationOutcome.Committed && m.Intent.RetainerId == visit.Id && m.Intent.Source is not null)
+            .GroupBy(m => (m.Intent.Source!.ItemId, m.Intent.Source.IsHighQuality)).ToDictionary(g => g.Key, g => g.Count());
+        var missed = new List<string>();
+        var total = 0;
+        foreach (var a in visit.Assignments)
+        {
+            var planned = plannedListings.GetValueOrDefault(a.Id);
+            if (planned <= 0) continue;
+            var key = (a.ItemId, a.Quality == ItemQualityPolicy.HqOnly);
+            var done = Math.Min(planned, posted.GetValueOrDefault(key));
+            posted[key] = posted.GetValueOrDefault(key) - done;
+            if (planned - done <= 0) continue;
+            total += planned - done;
+            missed.Add($"{a.ItemName} ({a.Quality}) {planned - done} of {planned} listings × {a.QuantityPerListing}" +
+                (reserveHomes.Contains(a.ItemId) ? " (stock goes to the stow step for its reserve home)" : " (no reserve home; stock stays in the bags)"));
+        }
+        if (total == 0)
+        {
+            Add(record, $"{visit.Name}: {reason}");
+            return;
+        }
+        record.ListingsNotMade += total;
+        var message = $"MarketRunListingNotMade: retainer={visit.Name} (id {visit.Id}){(topUpActive ? " (top-up)" : string.Empty)}: {reason}; " +
+            $"not listed: {string.Join(", ", missed)}.";
+        warning?.Invoke(message);
+        Add(record, message);
     }
 
     private sealed record TopUpLine(RetainerVisit Visit, ListingPlanAssignment Assignment, int Listings)
@@ -502,6 +616,8 @@ public sealed class MarketRunExecutor(
         var uncovered = new Dictionary<Guid, string>();
         foreach (var visit in visits)
         {
+            // Never gathered for or visited; its skip is already in the run results.
+            if (unavailableRetainers.Contains(visit.Id)) continue;
             var shortHere = visit.Assignments.Where(a => a.QuantityPerListing > 0 && a.ListingCount > 0).ToArray();
             if (freshListings.ContainsKey(visit.Id))
             {
@@ -595,6 +711,9 @@ public sealed class MarketRunExecutor(
             }
 
             await routeDeadline.RunAsync(async t => { await driver.RequireRetainerListAsync(t).ConfigureAwait(false); return true; }).ConfigureAwait(false);
+            // A failed top-up visit reports only the listings the top-up set out to post.
+            foreach (var a in lines.SelectMany(l => l.Visit.Assignments)) plannedListings[a.Id] = 0;
+            foreach (var l in lines) plannedListings[l.Assignment.Id] += l.Listings;
             foreach (var visit in lines.Select(l => l.Visit).Distinct())
             {
                 // A visit with nothing in hand to post would only open and close the retainer.

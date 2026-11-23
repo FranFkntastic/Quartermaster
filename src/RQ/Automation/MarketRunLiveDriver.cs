@@ -51,6 +51,41 @@ internal sealed class MarketRunLiveDriver(
         RequireSessionAuthority();
         await transferDriver.RequireRetainerListAsync(token).ConfigureAwait(false);
     }
+    /// <summary>
+    /// Judges each listing retainer by ID against the manager-owned roster read the refresh path
+    /// already uses (no UI, nothing moves), plus the cache's retainer-list accessibility. When the
+    /// live read is not ready it falls back to the cached roster; with neither, every target fails.
+    /// </summary>
+    public async Task<IReadOnlyList<MarketRetainerUnavailable>> UnavailableListingRetainersAsync(IReadOnlyCollection<ulong> retainerIds, CancellationToken token)
+    {
+        RequireSessionAuthority();
+        var roster = await session.ScanRetainerRosterAsync(token).ConfigureAwait(false);
+        RequireSessionAuthority();
+        var live = roster is { Success: true, IsComplete: true } ? roster.Retainers.ToDictionary(r => r.RetainerId) : null;
+        var cached = cache.Snapshot().Values.Where(r => r.Owner.Matches(owner)).ToDictionary(r => r.RetainerId);
+        var rosterObservedAt = cached.Values.Max(r => r.RosterObservedAtUtc);
+        var basis = live is not null ? "live roster" : $"cached roster from {rosterObservedAt:u} (live read {roster.Code}: {roster.Message})";
+        var unavailable = new List<MarketRetainerUnavailable>();
+        foreach (var id in retainerIds)
+        {
+            var entry = cached.GetValueOrDefault(id);
+            var rosterName = live?.GetValueOrDefault(id)?.RetainerName ?? entry?.RetainerName;
+            var named = string.IsNullOrWhiteSpace(rosterName) ? string.Empty : $"; roster name {rosterName}";
+            (string Code, string Detail)? failure =
+                live is null && rosterObservedAt is null ? ("RosterUnavailable", $"the live roster read failed ({roster.Code}: {roster.Message}) and no roster is cached for this character") :
+                live is not null ? !live.ContainsKey(id) ? ("NotInRoster", $"not in this character's assigned retainer roster ({basis})") : null :
+                entry is null ? ("NotInRoster", $"not in this character's assigned retainer roster ({basis})") :
+                entry.IsCurrentlyAssigned == false ? ("NotAssigned", $"no longer assigned to this character ({basis})") : null;
+            failure ??= (live?.GetValueOrDefault(id)?.IsGameAvailable ?? entry?.IsGameAvailable) == false
+                ? ("GameUnavailable", $"the game reports this retainer unavailable ({basis}{named})")
+                : entry?.IsUiAccessible == false
+                    ? ("NotInRetainerList", $"last seen missing from the retainer list at {entry.UiAccessibilityObservedAtUtc:u}{named}")
+                    : null;
+            if (failure is { } f) unavailable.Add(new(id, f.Code, f.Detail));
+        }
+        return unavailable;
+    }
+
     public async Task OpenAsync(ulong id, string name, CancellationToken token)
     {
         RequireSessionAuthority();
