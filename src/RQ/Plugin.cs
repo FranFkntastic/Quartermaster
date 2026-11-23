@@ -62,6 +62,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly DalamudInventoryMover inventoryMover;
     private readonly ListingNavigationCoordinator listingNavigation;
     private readonly MarketRunExecutor marketRuns;
+    private readonly DalamudOrdinaryGilShop vendorShop;
     private readonly TransferVendorProcurementService vendorProcurement;
     private readonly VendorCatalogLocationObserver vendorCatalogObserver;
     private readonly DalamudExternalUiAutomationSuppression externalUiSuppression;
@@ -275,9 +276,10 @@ public sealed class Plugin : IDalamudPlugin
             automation,
             autoRetainerSuppression,
             externalUiSuppression);
+        vendorShop = new DalamudOrdinaryGilShop(gameGui, dataManager, addonLifecycle);
         var vendorRuntime = new DalamudGilVendorBuyRuntime(
             vendorAccess,
-            new DalamudOrdinaryGilShop(gameGui, dataManager),
+            vendorShop,
             new DalamudVNavmeshTravel(pluginInterface),
             new DalamudLifestreamAetheryteTravel(pluginInterface),
             new DalamudLifestreamAethernetTravel(pluginInterface),
@@ -993,6 +995,7 @@ public sealed class Plugin : IDalamudPlugin
         inventoryMover.Dispose();
         retainerBellRoute.Dispose();
         vendorProcurement.Dispose();
+        vendorShop.Dispose();
         externalUiSuppression.Dispose();
         agentBridge.Dispose();
         agentBridgeViewportCapture.Dispose();
