@@ -76,11 +76,11 @@ internal sealed class MarketRunLiveDriver(
                 live is not null ? !live.ContainsKey(id) ? ("NotInRoster", $"not in this character's assigned retainer roster ({basis})") : null :
                 entry is null ? ("NotInRoster", $"not in this character's assigned retainer roster ({basis})") :
                 entry.IsCurrentlyAssigned == false ? ("NotAssigned", $"no longer assigned to this character ({basis})") : null;
-            failure ??= (live?.GetValueOrDefault(id)?.IsGameAvailable ?? entry?.IsGameAvailable) == false
-                ? ("GameUnavailable", $"the game reports this retainer unavailable ({basis}{named})")
-                : entry?.IsUiAccessible == false
-                    ? ("NotInRetainerList", $"last seen missing from the retainer list at {entry.UiAccessibilityObservedAtUtc:u}{named}")
-                    : null;
+            // Membership plus a recorded retainer-list refusal only: raw availability metadata cannot
+            // prove an assigned retainer inaccessible (same rule as RetainerRefreshCoordinator).
+            failure ??= entry?.IsUiAccessible == false
+                ? ("NotInRetainerList", $"last seen missing from the retainer list at {entry.UiAccessibilityObservedAtUtc:u}{named}")
+                : null;
             if (failure is { } f) unavailable.Add(new(id, f.Code, f.Detail));
         }
         return unavailable;
