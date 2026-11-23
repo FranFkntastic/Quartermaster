@@ -202,12 +202,22 @@ public sealed record RequestOwner
     public string CharacterName { get; init; } = string.Empty;
 }
 
+/// <summary>
+/// SourceRetainerIds (optional, capability <c>shortageSourceRetainers.v1</c>): the only retainers of the owner this
+/// item may be retrieved from. SourceSaddlebag (only with SourceRetainerIds) also allows the owner's saddlebag.
+/// Absent, retrieval may draw from any owner retainer and the saddlebag as before. A restricted item that the allowed
+/// sources cannot cover is retrieved as far as they reach and the rest is reported, never topped up elsewhere.
+/// </summary>
 public sealed record ShortageRequestItem
 {
     public uint ItemId { get; init; }
     public string ItemName { get; init; } = string.Empty;
     public int TargetQuantity { get; init; }
     public int ShortageQuantity { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<ulong>? SourceRetainerIds { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? SourceSaddlebag { get; init; }
 }
 
 public sealed record SubmissionAcknowledgement
@@ -221,6 +231,12 @@ public sealed record SubmissionAcknowledgement
     public string Message { get; init; } = string.Empty;
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ErrorCode { get; init; }
+    /// <summary>The item a rejection is about, when it is about one.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public uint? ItemId { get; init; }
+    /// <summary>The retainer a rejection is about, when it is about one.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ulong? RetainerId { get; init; }
 }
 
 public sealed record ChangedNotification(
@@ -397,4 +413,66 @@ public sealed record DeliveredStowStatus
     public string? DepositStatus { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public DeliveredStowForwardSummary? Forward { get; init; }
+}
+
+// ---- Placement edit (capability placementEdit.v1) ------------------------------------------------
+// Kept as its own block so it merges independently of other contract additions.
+
+public static class PlacementIpcChannels
+{
+    public const string GetPlacement = "Quartermaster.v1.GetPlacement";
+    public const string EditPlacement = "Quartermaster.v1.EditPlacement";
+}
+
+/// <summary>
+/// <c>gooseworks-quartermaster-placement-request/v1</c>: what the placement matrix shows. Items absent: every
+/// enabled reserve item of the logged-in owner. Items present: exactly those (an item without a reserve rule reads
+/// with no homes). Quality is <c>NqOnly</c> or <c>HqOnly</c>.
+/// </summary>
+public sealed record PlacementRequest
+{
+    public string Schema { get; init; } = string.Empty;
+    public IReadOnlyList<PlacementItemKey>? Items { get; init; }
+}
+
+public sealed record PlacementItemKey
+{
+    public uint ItemId { get; init; }
+    public string Quality { get; init; } = string.Empty;
+}
+
+/// <summary>A character by its stable identity.</summary>
+public sealed record PlacementCharacterRef
+{
+    public ulong LocalContentId { get; init; }
+    public uint HomeWorldId { get; init; }
+}
+
+/// <summary>One destination on the edited character: a retainer, or Any space (the owner only). Never both.</summary>
+public sealed record PlacementDestination
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ulong? RetainerId { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool AnySpace { get; init; }
+}
+
+/// <summary>
+/// <c>gooseworks-quartermaster-placement-edit/v1</c>: one placement editor action on these items, as the Placement
+/// window's toolbar applies it to selected rows. Operation: makeFirst, addFallback, remove, toggle (each needs
+/// Destination), useCurrentHolders or clearDestinations (no Destination). Character: whose destinations the action
+/// edits (the owner when absent); another character edits the item's remote homes. AllOrNothing: apply nothing when
+/// any item is refused.
+/// </summary>
+public sealed record PlacementEditRequest
+{
+    public string Schema { get; init; } = string.Empty;
+    public string ProviderInstanceId { get; init; } = string.Empty;
+    public string RequestId { get; init; } = string.Empty;
+    public RequestOwner? Owner { get; init; }
+    public IReadOnlyList<OpenPlacementItem>? Items { get; init; }
+    public string Operation { get; init; } = string.Empty;
+    public PlacementCharacterRef? Character { get; init; }
+    public PlacementDestination? Destination { get; init; }
+    public bool AllOrNothing { get; init; }
 }

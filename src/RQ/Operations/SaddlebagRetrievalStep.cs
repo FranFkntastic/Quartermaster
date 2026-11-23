@@ -92,7 +92,8 @@ internal sealed class SaddlebagRetrievalStep(
         IReadOnlyDictionary<(uint ItemId, ItemQualityPolicy Quality), int> Credit,
         int VerifiedRetrieved,
         bool Dispatched,
-        string? Unreconciled = null);
+        string? Unreconciled = null,
+        bool SaddlebagObserved = true);
 
     /// <summary>
     /// Retrieves saddlebag stock for every plan line still short. Returns the observed
@@ -107,6 +108,8 @@ internal sealed class SaddlebagRetrievalStep(
         var credit = new Dictionary<(uint ItemId, ItemQualityPolicy Quality), int>();
         var verified = 0;
         var dispatched = false;
+        // False once a live read could not show the saddlebag, so its stock is unknown rather than exhausted.
+        var saddlebagObserved = true;
         var shortLines = plan.Lines.Where(line => line.NeededQuantity > 0).ToArray();
         if (shortLines.Length == 0)
             return new(credit, 0, false);
@@ -122,7 +125,7 @@ internal sealed class SaddlebagRetrievalStep(
                     Math.Min(line.NeededQuantity, cached[line.ItemId]),
                     $"Cached saddlebag stock {cached[line.ItemId]:N0} was not retrieved; retainers cover the full shortfall {line.NeededQuantity:N0}. {read.Message}");
             }
-            return new(credit, 0, false);
+            return new(credit, 0, false, SaddlebagObserved: false);
         }
 
         foreach (var line in shortLines)
@@ -168,7 +171,10 @@ internal sealed class SaddlebagRetrievalStep(
             if (!read.BagsComplete)
             {
                 if (!mayHaveMoved)
-                    break; // Nothing could have moved for this line; earlier lines are already reconciled.
+                {
+                    saddlebagObserved = false;
+                    break;
+                } // Nothing could have moved for this line; earlier lines are already reconciled.
                 // A move may have landed, but its effect is unknown: planning retainers from the
                 // pre-leg count could exceed the target. Stop the operation; never resend.
                 var message =
@@ -181,10 +187,12 @@ internal sealed class SaddlebagRetrievalStep(
             var gained = CountVariant(read.Bags, line.ItemId, line.Quality) - CountVariant(before.Bags, line.ItemId, line.Quality);
             if (gained > 0)
                 credit[key] = credit.GetValueOrDefault(key) + Math.Min(gained, need);
+            if (!read.SaddlebagLoaded)
+                saddlebagObserved = false;
             if (stop || !read.SaddlebagLoaded)
                 break;
         }
-        return new(credit, verified, dispatched);
+        return new(credit, verified, dispatched, SaddlebagObserved: saddlebagObserved);
     }
 
     private enum StopScope { Line, Leg }

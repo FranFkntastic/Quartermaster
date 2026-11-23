@@ -480,6 +480,17 @@ public sealed class OperationLine
     public int TransferredQuantity { get; set; }
     public int MaxStackSize { get; set; } = 999;
     public StowageRoutingPolicy Routing { get; set; } = new();
+    /// <summary>
+    /// Retrieval may draw this line only from these owner retainers (and the saddlebag only when
+    /// <see cref="SourceSaddlebag"/>). Null: any owner retainer and the saddlebag.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<ulong>? SourceRetainerIds { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool SourceSaddlebag { get; set; }
+
+    [JsonIgnore]
+    public bool IsSourceRestricted => SourceRetainerIds is not null;
 }
 
 public sealed class OperationReceipt

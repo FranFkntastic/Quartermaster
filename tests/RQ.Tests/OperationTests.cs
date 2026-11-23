@@ -84,6 +84,94 @@ public sealed class OperationTests
             receipt => receipt.OperationId == operation.OperationId && receipt.Code == "DepositSkippedUnobserved");
     }
 
+    // Kept because a leak here is silent and costly: drawing a restricted shortage from a retainer the requester
+    // excluded moves stock reserved for something else, and nothing in a live run flags it. Covers the persisted
+    // path end to end: submission, the stored line, the planner's candidates and the coordinator's stack loop.
+    [Fact]
+    public async Task SourceRestrictedShortage_NeverDrawsFromExcludedRetainer()
+    {
+        using var directory = new TemporaryDirectory();
+        var repository = TestData.Repository(directory.Path);
+        var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
+        CachedRetainer Observed(CachedRetainer retainer)
+        {
+            retainer.ObservedSources = Enumerable.Range(1, 7).Select(page => $"RetainerPage{page}").ToList();
+            return retainer;
+        }
+        store.Save(new Dictionary<ulong, CachedRetainer>
+        {
+            [10] = Observed(TestData.Retainer(10, "Allowed", (100, "Ore", 10))),
+            [20] = Observed(TestData.Retainer(20, "Excluded", (100, "Ore", 50))),
+        });
+        var cache = new RetainerCacheRepository(store);
+        var queue = new FrameworkWorkQueue();
+        var submissions = new ShortageSubmissionService("provider", repository, queue, () => TestData.Owner, retainers: cache.Snapshot);
+        var web = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        var ack = JsonSerializer.Deserialize<SubmissionAcknowledgement>(submissions.Submit(JsonSerializer.Serialize(new ShortageRequest
+        {
+            Schema = ShortageSubmissionService.RequestSchema,
+            ProviderInstanceId = "provider",
+            RequestId = "request-1",
+            OperationId = "operation-1",
+            SubmittedAtUtc = DateTimeOffset.UtcNow,
+            ExecuteImmediately = true,
+            Owner = new RequestOwner { LocalContentId = 9001, HomeWorldId = 406, CharacterName = "Current Character" },
+            Items = [new ShortageRequestItem { ItemId = 100, ItemName = "Ore", TargetQuantity = 30, ShortageQuantity = 30, SourceRetainerIds = [10] }],
+        }, web)), web)!;
+        Assert.Null(ack.ErrorCode);
+        queue.Drain();
+        var driver = new RetrievalDriver(new()
+        {
+            [10] = [new(InventoryType.RetainerPage1, 0, 100, 10)],
+            [20] = [new(InventoryType.RetainerPage1, 0, 100, 50)],
+        });
+        var coordinator = new TransferCoordinator(new OperationJournal(repository), driver, cache, () => TestData.Owner,
+            () => new Dictionary<uint, int>());
+
+        await coordinator.ExecuteRetrievalAsync("operation-1");
+
+        Assert.DoesNotContain(20UL, driver.OpenedRetainers);
+        Assert.Equal([(10UL, 10)], driver.Retrieved);
+        var operation = new OperationJournal(repository).Get("operation-1")!;
+        Assert.Equal(OperationStatuses.PartiallySucceeded, operation.Status);
+        var receipts = repository.FullSnapshot().Receipts.Where(receipt => receipt.OperationId == "operation-1").ToArray();
+        Assert.Equal(TransferCoordinator.SourceRestrictionShortCode, receipts[^1].Code);
+        Assert.Contains(receipts, receipt => receipt.Code == TransferCoordinator.SourceRestrictionShortCode && receipt.ItemId == 100 && receipt.Quantity == 20);
+    }
+
+    private sealed class RetrievalDriver(Dictionary<ulong, List<DalamudInventoryStack>> stock) : IRetainerTransferDriver
+    {
+        private ulong open;
+        public List<ulong> OpenedRetainers { get; } = [];
+        public List<(ulong RetainerId, int Quantity)> Retrieved { get; } = [];
+        public Task RequireRetainerListAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken cancellationToken)
+        {
+            open = candidate.RetainerId;
+            OpenedRetainers.Add(candidate.RetainerId);
+            return Task.CompletedTask;
+        }
+        public Task OpenInventoryAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<IReadOnlyList<DalamudInventoryStack>> ScanRetainerAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<DalamudInventoryStack>>(stock.GetValueOrDefault(open, []).ToArray());
+        public Task<RetrievalResult> RetrieveAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken)
+        {
+            var stacks = stock[open];
+            var index = stacks.FindIndex(candidate => candidate.SlotIndex == stack.SlotIndex && candidate.ItemId == stack.ItemId);
+            var left = stacks[index].Quantity - quantity;
+            if (left > 0) stacks[index] = stacks[index] with { Quantity = left };
+            else stacks.RemoveAt(index);
+            Retrieved.Add((open, quantity));
+            return Task.FromResult(new RetrievalResult(true, quantity, "TransferVerified", "Verified."));
+        }
+        public Task<IReadOnlyList<DalamudInventoryStack>> ScanPlayerCrystalsAsync(IReadOnlySet<uint> itemIds, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<DalamudInventoryStack>>([]);
+        public Task<RetainerCrystalTransferResult> DepositCrystalAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+        public Task CloseRetainerAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public void CancelActive() { }
+    }
+
     private sealed class CapacityDepositDriver : IRetainerTransferDriver
     {
         public List<DalamudInventoryStack> PlayerStacks { get; set; } = [];

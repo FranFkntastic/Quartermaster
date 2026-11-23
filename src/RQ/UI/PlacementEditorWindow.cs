@@ -14,10 +14,10 @@ namespace RQ.UI;
 /// <summary>
 /// The market run's placement matrix for a caller-supplied set of items (opened over IPC by another
 /// plugin). Rows read the owner's reserve rules; edits persist straight to them through
-/// <see cref="WorkbenchStockService.SetPlacement"/>, creating a level-0 rule for an item that has none.
-/// A character bar above the matrix switches it to another character of this account: its retainers
-/// become the columns and an edit there sets the item's remote homes
-/// (<see cref="WorkbenchStockService.SetRemotePlacement"/>). An item has remote homes on one other
+/// <see cref="WorkbenchStockService.ApplyPlacementEdit"/> (the path the placement IPC uses too), creating a
+/// level-0 rule for an item that has none. A character bar above the matrix switches it to another character
+/// of this account: its retainers become the columns and an edit there sets the item's remote homes
+/// (<see cref="ReservePlacement.Resolve"/>). An item has remote homes on one other
 /// character at most; a row homed on a character other than the one shown reads dimmed with where it goes,
 /// and editing it there moves its remote homes to the shown character. Local homes stay as they are.
 /// </summary>
@@ -37,6 +37,8 @@ internal sealed class PlacementEditorWindow : Window
     private OwnerScope? shown;
     private OwnerScope? added;
     private IReadOnlyList<WorkbenchStockService.PlacementEditorItem> items = [];
+    private static readonly Vector4 ErrorColor = new(1f, .45f, .4f, 1f);
+    private string? saveError;
 
     public PlacementEditorWindow(Func<QuartermasterRuntimeSnapshot> runtime, WorkbenchStockService service, CourierSession courier)
         : base("Placement###RQPlacementEditor", ImGuiWindowFlags.NoCollapse)
@@ -60,6 +62,7 @@ internal sealed class PlacementEditorWindow : Window
         items = requested;
         pending.Clear();
         pendingRemote.Clear();
+        saveError = null;
         matrix.ClearSelection();
         IsOpen = true;
         BringToFront();
@@ -70,6 +73,7 @@ internal sealed class PlacementEditorWindow : Window
         items = [];
         pending.Clear();
         pendingRemote.Clear();
+        saveError = null;
         matrix.ClearSelection();
     }
 
@@ -116,6 +120,7 @@ internal sealed class PlacementEditorWindow : Window
         }).ToArray();
 
         var target = DrawCharacterBar(current, scope, resolved.Select(row => row.Remote));
+        DrawSaveError();
         var local = target.Matches(scope);
         var stock = local ? null : courier.Stock(current, target);
         var rows = resolved.Select(row =>
@@ -140,27 +145,56 @@ internal sealed class PlacementEditorWindow : Window
         var columns = PlacementMatrixData.Columns(current, rows.Select(row => row.Routing), local ? null : target);
         matrix.Draw(rows, rows, columns, changes =>
         {
+            var edits = new List<WorkbenchStockService.PlacementEditLine>();
             foreach (var (key, routing) in changes)
             {
                 var item = items.FirstOrDefault(candidate => candidate.ItemId == key.ItemId && candidate.Quality == key.Quality);
                 if (item is null) continue;
-                if (local)
-                {
-                    pending[key] = (ListingPlanCatalog.CopyLocation(routing), now + PendingLifetime);
-                    service.SetPlacement(scope, item, routing);
-                    continue;
-                }
-                // Another character offers no Any space: its homes are its ranked retainers only.
-                var ids = routing.PreferredRetainerIds.Where(id => id != PlacementEdits.AnySpace).Distinct().ToList();
-                var remote = ids.Count == 0 ? null : new ReserveRemoteHomes { Character = target with { }, RetainerIds = ids };
-                // Clearing a row shown here leaves homes it has on a third character alone.
-                var before = resolved.First(row => row.Key == key).Remote;
-                if (remote is null && before is not null && !before.Character.Matches(target)) continue;
-                pendingRemote[key] = (remote, now + PendingLifetime);
-                service.SetRemotePlacement(scope, item, target, ids);
+                // Shown at once by the same rules the save applies; the save itself goes through the shared path.
+                var row = resolved.First(candidate => candidate.Key == key);
+                var next = ReservePlacement.Resolve(scope, target, row.Local, row.Remote, routing);
+                if (!next.Changed) continue;
+                if (next.LocalChanged)
+                    pending[key] = (StowageRoutingPolicy.CopyOf(next.Local), now + PendingLifetime);
+                if (next.RemoteChanged)
+                    pendingRemote[key] = (ReserveRemoteHomes.CopyOf(next.Remote), now + PendingLifetime);
+                var edited = StowageRoutingPolicy.CopyOf(routing);
+                edits.Add(new(item, (_, _) => edited));
             }
+            if (edits.Count > 0)
+                service.QueuePlacementEdit(scope, target, edits, Saved);
             return true;
         }, anySpace: local);
+    }
+
+    /// <summary>
+    /// A save's result, on the framework thread: a refused or unsaved item drops its pending edit at once (so it shows
+    /// the stored homes again and the next edit starts from them) and the reason shows above the matrix.
+    /// </summary>
+    private void Saved(WorkbenchStockService.PlacementEditResult result)
+    {
+        var failed = result.Items.Where(outcome => outcome.Outcome is "refused" or "not_applied" && outcome.Quality is not null).ToArray();
+        foreach (var outcome in failed)
+        {
+            pending.Remove((outcome.ItemId, outcome.Quality!.Value));
+            pendingRemote.Remove((outcome.ItemId, outcome.Quality.Value));
+        }
+        if (failed.Length > 0)
+            saveError = failed.Length == 1
+                ? $"Not saved: {failed[0].Message}"
+                : $"Not saved for {failed.Length:N0} items: {string.Join(" ", failed.Select(outcome => outcome.Message))}";
+        else if (result.Items.Any(outcome => outcome.Outcome == "applied"))
+            saveError = null;
+    }
+
+    private void DrawSaveError()
+    {
+        if (string.IsNullOrWhiteSpace(saveError))
+            return;
+        var shown = DalamudUiLayout.ElideText(saveError, ImGui.GetContentRegionAvail().X);
+        ImGui.TextColored(ErrorColor, shown);
+        if (shown.Length != saveError.Length && ImGui.IsItemHovered())
+            ImGui.SetTooltip(saveError);
     }
 
     private static bool HasHome(StowageRoutingPolicy routing) => routing.AnySpace || routing.PreferredRetainerIds.Count > 0;

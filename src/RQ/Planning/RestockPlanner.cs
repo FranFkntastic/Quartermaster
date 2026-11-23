@@ -36,6 +36,12 @@ public sealed record PlanLine(
     public int SaddlebagCoverQuantity => Math.Min(NeededQuantity, SaddlebagQuantity);
 }
 
+/// <summary>The only sources one retrieval line may draw from: these owner retainers, and the saddlebag only when allowed.</summary>
+public sealed record RetrievalSourceRestriction(IReadOnlySet<ulong> RetainerIds, bool Saddlebag)
+{
+    public bool Allows(ulong retainerId) => RetainerIds.Contains(retainerId);
+}
+
 public sealed record RetrievalPlan(DateTime BuiltAtUtc, IReadOnlyList<PlanLine> Lines)
 {
     public int NeededQuantity => Lines.Sum(line => line.NeededQuantity);
@@ -52,7 +58,8 @@ public static class RestockPlanner
         OwnerScope owner,
         DateTime nowUtc,
         BrowserProjection? stock = null,
-        IReadOnlyDictionary<(uint, ItemQualityPolicy), int>? placementBaselines = null)
+        IReadOnlyDictionary<(uint, ItemQualityPolicy), int>? placementBaselines = null,
+        IReadOnlyDictionary<Guid, RetrievalSourceRestriction>? sourceRestrictions = null)
     {
         ArgumentNullException.ThrowIfNull(rows);
         ArgumentNullException.ThrowIfNull(playerInventory);
@@ -62,7 +69,8 @@ public static class RestockPlanner
         var lines = rows
             .Where(row => row.Enabled && row.Courier is null && row.ItemId > 0 && row.TargetQuantity > 0)
             .Select(row => BuildLine(row, placementBaselines is null ? playerInventory.GetValueOrDefault(row.ItemId)
-                : placementBaselines[(row.ItemId, row.Quality)], cache, owner, nowUtc, stock))
+                : placementBaselines[(row.ItemId, row.Quality)], cache, owner, nowUtc, stock,
+                sourceRestrictions?.GetValueOrDefault(row.Id)))
             .OrderByDescending(line => line.NeededQuantity > 0)
             .ThenByDescending(line => line.MissingQuantity > 0)
             .ThenBy(line => line.ItemName, StringComparer.OrdinalIgnoreCase)
@@ -77,19 +85,23 @@ public static class RestockPlanner
         IReadOnlyDictionary<ulong, CachedRetainer> cache,
         OwnerScope owner,
         DateTime nowUtc,
-        BrowserProjection? stock)
+        BrowserProjection? stock,
+        RetrievalSourceRestriction? restriction)
     {
         var stacks = stock?.Items.FirstOrDefault(item => item.ItemId == row.ItemId)?.Stacks
             .Where(stack => QualityMatches(row.Quality, stack.Quality == Franthropy.FFXIV.Filtering.FfxivItemQuality.HQ))
             .ToArray();
         var player = stacks?.Where(stack => stack.ScopeKind == BrowserScopeKind.Player).Sum(stack => stack.Quantity)
             ?? baselineQuantity;
-        var saddlebag = stacks?.Where(stack => stack.ScopeKind == BrowserScopeKind.Saddlebag).Sum(stack => stack.Quantity) ?? 0;
+        // A restricted line counts the saddlebag only when it may draw from it.
+        var saddlebag = restriction is { Saddlebag: false } ? 0
+            : stacks?.Where(stack => stack.ScopeKind == BrowserScopeKind.Saddlebag).Sum(stack => stack.Quantity) ?? 0;
         var needed = Math.Max(0, row.TargetQuantity - player);
         var candidates = needed == 0
             ? []
             : cache.Values
                 .Where(retainer => retainer.Owner.Matches(owner))
+                .Where(retainer => restriction is null || restriction.Allows(retainer.RetainerId))
                 .Where(retainer => retainer.IsCurrentlyAssigned is not false)
                 .Where(retainer => retainer.IsUiAccessible is not false)
                 .Where(retainer => StockCoverage.CoversItem(retainer, row.ItemId))
@@ -121,6 +133,7 @@ public static class RestockPlanner
         var retainerNeed = needed - Math.Min(needed, saddlebag);
         var missing = Math.Max(0, retainerNeed - cached);
         var unverified = cache.Values.Any(retainer => retainer.Owner.Matches(owner) &&
+            (restriction is null || restriction.Allows(retainer.RetainerId)) &&
             retainer.IsCurrentlyAssigned is not false && retainer.IsUiAccessible is not false &&
             !StockCoverage.CoversItem(retainer, row.ItemId));
         var status = retainerNeed > cached && unverified

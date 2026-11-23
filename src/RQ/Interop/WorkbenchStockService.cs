@@ -13,7 +13,7 @@ namespace RQ.Interop;
 /// rebuilt only when a cache revision moves; edits are validated on the caller's thread and applied to the
 /// Listing Plan on the framework work queue, then announced through Changed like any other plan edit.
 /// </summary>
-public sealed class WorkbenchStockService
+public sealed partial class WorkbenchStockService
 {
     public const string StockSourcesCapability = "stockSources.v1";
     public const string ReserveItemsCapability = "reserveItems.v1";
@@ -73,7 +73,8 @@ public sealed class WorkbenchStockService
     }
 
     public static IReadOnlyList<string> Capabilities { get; } =
-        [StockSourcesCapability, ReserveItemsCapability, PlacementEditorCapability, ReserveLevelsCapability, RemoteHomesCapability, ArrivalPlanCapability];
+        [StockSourcesCapability, ReserveItemsCapability, PlacementEditorCapability, ReserveLevelsCapability, RemoteHomesCapability, ArrivalPlanCapability,
+            PlacementEditCapability];
 
     // ---- Stock sources ------------------------------------------------------------------------
 
@@ -417,7 +418,7 @@ public sealed class WorkbenchStockService
             if (Validate(request.ProviderInstanceId, request.Owner, item.ItemId, item.Quality, current, out var quality) is { } error)
                 return Ack(request.RequestId, "rejected", error.Code, error.Message);
             if (items.All(existing => existing.ItemId != item.ItemId || existing.Quality != quality))
-                items.Add(new(item.ItemId, string.IsNullOrWhiteSpace(item.ItemName) ? $"Item {item.ItemId}" : item.ItemName.Trim(), quality));
+                items.Add(new(item.ItemId, RealItemName(item.ItemId, item.ItemName) ?? PlaceholderName(item.ItemId), quality));
         }
         if (items.Count == 0)
             return Ack(request.RequestId, "rejected", "invalid_item", "Name at least one item.");
@@ -427,38 +428,6 @@ public sealed class WorkbenchStockService
         var owner = current.Owner with { };
         workQueue.Enqueue(() => open(owner, items));
         return Ack(request.RequestId, "queued", null, "Placement editor queued for the framework thread.");
-    }
-
-    /// <summary>
-    /// Persists one item's ranked destinations to the owner's reserve rule, creating a level-0 rule when the
-    /// item has none and removing a level-0 rule left with no destination. Queued to the framework thread.
-    /// </summary>
-    public void SetPlacement(OwnerScope owner, PlacementEditorItem item, StowageRoutingPolicy routing)
-    {
-        var location = ListingPlanCatalog.CopyLocation(routing);
-        workQueue.Enqueue(() => EditReserve(owner, item.ItemId, item.ItemName, item.Quality, reserve =>
-        {
-            if (SameLocation(reserve.Location, location)) return false;
-            reserve.Location = ListingPlanCatalog.CopyLocation(location);
-            return true;
-        }, create: location.PreferredRetainerIds.Count > 0 || location.AnySpace));
-    }
-
-    /// <summary>
-    /// Persists one item's ranked homes on another character (none clears them), creating a level-0 rule when
-    /// the item has none. Local homes are left as they are. Queued to the framework thread.
-    /// </summary>
-    public void SetRemotePlacement(OwnerScope owner, PlacementEditorItem item, OwnerScope character, IReadOnlyList<ulong> retainerIds)
-    {
-        if (character.Matches(owner))
-            throw new ArgumentException("Remote homes belong to another character than the owner.", nameof(character));
-        var remote = retainerIds.Count == 0 ? null : new ReserveRemoteHomes { Character = character with { }, RetainerIds = retainerIds.Distinct().ToList() };
-        workQueue.Enqueue(() => EditReserve(owner, item.ItemId, item.ItemName, item.Quality, reserve =>
-        {
-            if (ReserveRemoteHomes.Same(reserve.RemoteHomes, remote)) return false;
-            reserve.RemoteHomes = ReserveRemoteHomes.CopyOf(remote);
-            return true;
-        }, create: remote is not null));
     }
 
     public static bool SameLocation(StowageRoutingPolicy left, StowageRoutingPolicy right) =>

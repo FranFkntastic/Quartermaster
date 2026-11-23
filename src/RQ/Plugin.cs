@@ -325,7 +325,8 @@ public sealed class Plugin : IDalamudPlugin
         snapshots = new(providerInstanceId, state, cache.Snapshot);
         snapshots.Refresh(initialSnapshot);
         nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
-        submissions = new ShortageSubmissionService(providerInstanceId, state, workQueue, CurrentOwner);
+        submissions = new ShortageSubmissionService(providerInstanceId, state, workQueue, CurrentOwner,
+            retainers: cache.Snapshot, warn: message => log.Warning(message));
         deposits = new ElementalDepositSubmissionService(providerInstanceId, state, workQueue, journal, cache.Snapshot, CurrentOwner);
         ipc = new(new DalamudIpcRegistrar(pluginInterface), snapshots, submissions, deposits);
         ipc.AttachRequestedOperationCancel(new RequestedOperationCancelService(providerInstanceId, journal, workQueue, message => log.Warning(message)));
@@ -390,6 +391,11 @@ public sealed class Plugin : IDalamudPlugin
         var placementEditor = new PlacementEditorWindow(() => runtimeSnapshots.Current, workbenchStock, courier);
         windows.AddWindow(placementEditor);
         workbenchStock.OpenPlacementEditor = placementEditor.Open;
+        workbenchStock.PlacementCharacters = current => courier.DestinationCharacters(current);
+        workbenchStock.CharacterStock = (current, character) => courier.Stock(current, character);
+        // The placement channels run on the framework thread (inline when the caller is already on it).
+        workbenchStock.RunOnFramework = work => framework.RunOnFrameworkThread(work).GetAwaiter().GetResult();
+        workbenchStock.ItemNames = scanner.ResolveItemName;
         ipc.AttachWorkbench(workbenchStock);
         var marketHistory = new MarketRunHistoryWindow(marketRunStore.History, CurrentOwner, window.DrawTimings)
         {
