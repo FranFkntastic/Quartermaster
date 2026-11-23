@@ -393,6 +393,9 @@ public sealed class Plugin : IDalamudPlugin
         workbenchStock.OpenPlacementEditor = placementEditor.Open;
         workbenchStock.PlacementCharacters = current => courier.DestinationCharacters(current);
         workbenchStock.CharacterStock = (current, character) => courier.Stock(current, character);
+        // The placement channels run on the framework thread (inline when the caller is already on it).
+        workbenchStock.RunOnFramework = work => framework.RunOnFrameworkThread(work).GetAwaiter().GetResult();
+        workbenchStock.ItemNames = scanner.ResolveItemName;
         ipc.AttachWorkbench(workbenchStock);
         var marketHistory = new MarketRunHistoryWindow(marketRunStore.History, CurrentOwner, window.DrawTimings)
         {

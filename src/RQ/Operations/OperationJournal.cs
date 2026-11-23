@@ -663,7 +663,7 @@ public sealed class OperationJournal
         OperationChanged?.Invoke(changed);
     }
 
-    public void RecordWarning(string operationId, string code, string message, uint? itemId = null, int? quantity = null)
+    public void RecordWarning(string operationId, string code, string message, uint? itemId = null, int? quantity = null, ulong? retainerId = null)
     {
         OperationRecord changed = null!;
         repository.Mutate(StateChangeKind.Operations, state =>
@@ -683,6 +683,7 @@ public sealed class OperationJournal
                 Message = message,
                 ItemId = itemId,
                 Quantity = quantity,
+                RetainerId = retainerId,
             });
             changed = Copy(operation);
         });

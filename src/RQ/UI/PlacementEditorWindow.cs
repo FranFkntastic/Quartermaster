@@ -37,6 +37,8 @@ internal sealed class PlacementEditorWindow : Window
     private OwnerScope? shown;
     private OwnerScope? added;
     private IReadOnlyList<WorkbenchStockService.PlacementEditorItem> items = [];
+    private static readonly Vector4 ErrorColor = new(1f, .45f, .4f, 1f);
+    private string? saveError;
 
     public PlacementEditorWindow(Func<QuartermasterRuntimeSnapshot> runtime, WorkbenchStockService service, CourierSession courier)
         : base("Placement###RQPlacementEditor", ImGuiWindowFlags.NoCollapse)
@@ -60,6 +62,7 @@ internal sealed class PlacementEditorWindow : Window
         items = requested;
         pending.Clear();
         pendingRemote.Clear();
+        saveError = null;
         matrix.ClearSelection();
         IsOpen = true;
         BringToFront();
@@ -70,6 +73,7 @@ internal sealed class PlacementEditorWindow : Window
         items = [];
         pending.Clear();
         pendingRemote.Clear();
+        saveError = null;
         matrix.ClearSelection();
     }
 
@@ -116,6 +120,7 @@ internal sealed class PlacementEditorWindow : Window
         }).ToArray();
 
         var target = DrawCharacterBar(current, scope, resolved.Select(row => row.Remote));
+        DrawSaveError();
         var local = target.Matches(scope);
         var stock = local ? null : courier.Stock(current, target);
         var rows = resolved.Select(row =>
@@ -157,9 +162,39 @@ internal sealed class PlacementEditorWindow : Window
                 edits.Add(new(item, (_, _) => edited));
             }
             if (edits.Count > 0)
-                service.QueuePlacementEdit(scope, target, edits);
+                service.QueuePlacementEdit(scope, target, edits, Saved);
             return true;
         }, anySpace: local);
+    }
+
+    /// <summary>
+    /// A save's result, on the framework thread: a refused or unsaved item drops its pending edit at once (so it shows
+    /// the stored homes again and the next edit starts from them) and the reason shows above the matrix.
+    /// </summary>
+    private void Saved(WorkbenchStockService.PlacementEditResult result)
+    {
+        var failed = result.Items.Where(outcome => outcome.Outcome is "refused" or "not_applied" && outcome.Quality is not null).ToArray();
+        foreach (var outcome in failed)
+        {
+            pending.Remove((outcome.ItemId, outcome.Quality!.Value));
+            pendingRemote.Remove((outcome.ItemId, outcome.Quality.Value));
+        }
+        if (failed.Length > 0)
+            saveError = failed.Length == 1
+                ? $"Not saved: {failed[0].Message}"
+                : $"Not saved for {failed.Length:N0} items: {string.Join(" ", failed.Select(outcome => outcome.Message))}";
+        else if (result.Items.Any(outcome => outcome.Outcome == "applied"))
+            saveError = null;
+    }
+
+    private void DrawSaveError()
+    {
+        if (string.IsNullOrWhiteSpace(saveError))
+            return;
+        var shown = DalamudUiLayout.ElideText(saveError, ImGui.GetContentRegionAvail().X);
+        ImGui.TextColored(ErrorColor, shown);
+        if (shown.Length != saveError.Length && ImGui.IsItemHovered())
+            ImGui.SetTooltip(saveError);
     }
 
     private static bool HasHome(StowageRoutingPolicy routing) => routing.AnySpace || routing.PreferredRetainerIds.Count > 0;

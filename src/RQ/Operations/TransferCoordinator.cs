@@ -236,6 +236,10 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                 "ExecutionStarted",
                 operation.ExecuteImmediately ? "Automatic live retrieval verification started." : "Reviewed live retrieval verification started.");
             var transferred = 0;
+            // Retainers whose live stock this run scanned, and whether the saddlebag leg could run at all: a restricted
+            // line is only reported as short of stock when every allowed source was reached or verified empty.
+            var visited = new HashSet<ulong>();
+            var saddlebagReachable = saddlebag is not null && placement?.Source is null;
             // Saddlebag leg first: the retainers cover only what it leaves short. Under a
             // borrowed market-run lease every dispatch also requires that the lease is still held.
             // Lines restricted away from the saddlebag never reach its leg.
@@ -302,9 +306,9 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                 .ToArray();
             if (candidates.Length == 0)
             {
-                if (RestrictedShortOnly(remaining, restrictionByKey))
+                var shortfall = RecordRestrictedShort(operationId, operation, remaining, restrictionByKey, sources, owner, plan.Lines, visited, saddlebagReachable);
+                if (shortfall.Unreached.Count == 0 && RestrictedShortOnly(remaining, restrictionByKey))
                 {
-                    RecordRestrictedShort(operationId, operation, remaining, restrictionByKey);
                     journal.Transition(
                         operationId,
                         transferred > 0 ? OperationStatuses.PartiallySucceeded : OperationStatuses.Failed,
@@ -312,16 +316,17 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                         $"Retrieved {transferred:N0} units; {remainingNeed:N0} units remain because the allowed sources hold no more. Other sources were not used.");
                     return new(true, "Retrieval completed with missing units.");
                 }
+                var unreachedNote = UnreachedNote(shortfall.Unreached);
                 if (transferred > 0)
                 {
                     journal.Transition(
                         operationId,
                         OperationStatuses.PartiallySucceeded,
                         "RetrievalPartial",
-                        $"Retrieved {transferred:N0} units from the saddlebag; {remainingNeed:N0} units remain and no owner-scoped cached retainer candidates cover them.");
+                        $"Retrieved {transferred:N0} units from the saddlebag; {remainingNeed:N0} units remain and no owner-scoped cached retainer candidates cover them.{unreachedNote}");
                     return new(true, "Retrieval completed with missing units.");
                 }
-                journal.Transition(operationId, OperationStatuses.Failed, "NoCachedCandidates", "No owner-scoped cached retainer candidates cover this operation.");
+                journal.Transition(operationId, OperationStatuses.Failed, "NoCachedCandidates", $"No owner-scoped cached retainer candidates cover this operation.{unreachedNote}");
                 return new(true, "No owner-scoped cached retainer candidates cover this operation.");
             }
 
@@ -354,6 +359,7 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                         line.ItemId == itemId &&
                         remaining.GetValueOrDefault(RetrievalKey(line.ItemId, line.Quality)) > 0)).ToHashSet();
                 var liveStacks = await driver.ScanRetainerAsync(wanted, token).ConfigureAwait(false);
+                visited.Add(candidate.Route.RetainerId);
                 // The route scan is already required to choose physical source stacks.
                 // Reuse its per-variant totals as verification baselines instead of
                 // adding another retainer-wide scan to every retrieval command.
@@ -465,10 +471,11 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
             var missing = remaining.Values.Where(quantity => quantity > 0).Sum();
             var bypassedRetainerLeg = retainerLegMessage is not null;
             // Allowed sources ran dry (not a full inventory, a stop, or a missing bell): say so per restricted line.
-            var restrictedShortLines = missing > 0 && !inventoryFull && !bypassedRetainerLeg && !StopRequested(operationId)
-                ? RecordRestrictedShort(operationId, operation, remaining, restrictionByKey)
-                : 0;
-            var sourceShort = restrictedShortLines > 0 && RestrictedShortOnly(remaining, restrictionByKey);
+            var shortfallAfter = missing > 0 && !inventoryFull && !bypassedRetainerLeg && !StopRequested(operationId)
+                ? RecordRestrictedShort(operationId, operation, remaining, restrictionByKey, sources, owner, plan.Lines, visited, saddlebagReachable)
+                : (ShortLines: 0, Unreached: (IReadOnlyList<string>)[]);
+            var sourceShort = shortfallAfter.ShortLines > 0 && shortfallAfter.Unreached.Count == 0 && RestrictedShortOnly(remaining, restrictionByKey);
+            var unreachedAfter = UnreachedNote(shortfallAfter.Unreached);
             if (bypassedRetainerLeg)
             {
                 journal.RecordWarning(
@@ -489,7 +496,7 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                         ? $"Retrieved {transferred:N0} units; inventory space blocked the remaining {missing:N0} units."
                     : bypassedRetainerLeg
                         ? $"Retainer retrieval could not start ({retainerLegMessage}); remaining units are left for vendor procurement."
-                        : $"Retrieved {transferred:N0} units; {missing:N0} units remain missing.");
+                        : $"Retrieved {transferred:N0} units; {missing:N0} units remain missing.{unreachedAfter}");
             return new(true, missing == 0 ? "Retrieval completed." : "Retrieval completed with missing units.");
         }
         catch (OperationCanceledException)
@@ -1021,28 +1028,68 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
         restrictionByKey.Count > 0 &&
         remaining.Where(pair => pair.Value > 0).All(pair => restrictionByKey.ContainsKey(pair.Key));
 
+    /// <summary>Per-source receipt code: an allowed source of a short restricted line was never reached or verified.</summary>
+    public const string SourceRetainerUnreachedCode = "SourceRetainerUnreached";
+
     /// <summary>
-    /// Records one <see cref="SourceRestrictionShortCode"/> receipt (item and units left) per restricted line still
-    /// short, and logs it at Warning. Returns how many lines were short.
+    /// For each restricted line still short: when every allowed source was reached (its live stock scanned) or verified
+    /// to hold none of the item (assigned, accessible, fully observed, no cached units), records one
+    /// <see cref="SourceRestrictionShortCode"/> receipt (item, units left). Otherwise records one
+    /// <see cref="SourceRetainerUnreachedCode"/> receipt per source that was not (item, retainer, units left, why).
+    /// Everything is logged at Warning. Returns the short line count and a "Name (id): why" entry per unreached source.
     /// </summary>
-    private int RecordRestrictedShort(string operationId, OperationRecord operation, IReadOnlyDictionary<string, int> remaining,
-        IReadOnlyDictionary<string, HashSet<ulong>> restrictionByKey)
+    private (int ShortLines, IReadOnlyList<string> Unreached) RecordRestrictedShort(string operationId, OperationRecord operation,
+        IReadOnlyDictionary<string, int> remaining, IReadOnlyDictionary<string, HashSet<ulong>> restrictionByKey,
+        IReadOnlyDictionary<ulong, CachedRetainer> sources, OwnerScope owner, IEnumerable<PlanLine> planLines,
+        IReadOnlySet<ulong> visited, bool saddlebagReachable)
     {
         var count = 0;
+        var unreachedAll = new List<string>();
         foreach (var line in operation.Lines)
         {
             var key = RetrievalKey(line.ItemId, line.Quality);
-            if (!restrictionByKey.TryGetValue(key, out var allowed) || remaining.GetValueOrDefault(key) <= 0)
+            if (line.SourceRetainerIds is not { } allowed || !restrictionByKey.ContainsKey(key) || remaining.GetValueOrDefault(key) <= 0)
                 continue;
             count++;
             var left = remaining[key];
-            var message = $"{line.ItemName} ({line.ItemId}): {left:N0} units not retrieved; the allowed retainers [{string.Join(", ", allowed)}]" +
-                          $"{(line.SourceSaddlebag ? " and the saddlebag" : string.Empty)} hold no more. Other sources were not used.";
-            warning?.Invoke($"[Quartermaster] {SourceRestrictionShortCode}: operation {operationId}: {message}");
-            journal.RecordWarning(operationId, SourceRestrictionShortCode, message, line.ItemId, left);
+            var offered = planLines.Where(planned => RetrievalKey(planned.ItemId, planned.Quality) == key)
+                .SelectMany(planned => planned.Candidates).Select(candidate => candidate.RetainerId).ToHashSet();
+            var unreached = new List<(ulong? RetainerId, string Label, string Reason)>();
+            foreach (var id in allowed.Distinct())
+            {
+                var known = sources.TryGetValue(id, out var retainer) && retainer.Owner.Matches(owner) ? retainer : null;
+                var reason = known is null ? "is not among this character's observed retainers on this run"
+                    : known.IsCurrentlyAssigned is false ? "is no longer assigned"
+                    : known.IsUiAccessible is false ? "could not be opened from the retainer list"
+                    : !StockCoverage.CoversItem(known, line.ItemId) ? "has stock that was never fully observed"
+                    : offered.Contains(id) && !visited.Contains(id) ? "was not visited"
+                    : null;
+                if (reason is not null)
+                    unreached.Add((id, known is null ? $"Retainer {id}" : $"{known.RetainerName} ({id})", reason));
+            }
+            if (line.SourceSaddlebag && !saddlebagReachable)
+                unreached.Add((null, "the saddlebag", "could not be used on this run"));
+            if (unreached.Count == 0)
+            {
+                var message = $"{line.ItemName} ({line.ItemId}): {left:N0} units not retrieved; the allowed retainers [{string.Join(", ", allowed)}]" +
+                              $"{(line.SourceSaddlebag ? " and the saddlebag" : string.Empty)} hold no more. Other sources were not used.";
+                warning?.Invoke($"[Quartermaster] {SourceRestrictionShortCode}: operation {operationId}: {message}");
+                journal.RecordWarning(operationId, SourceRestrictionShortCode, message, line.ItemId, left);
+                continue;
+            }
+            foreach (var (retainerId, label, reason) in unreached)
+            {
+                var message = $"{line.ItemName} ({line.ItemId}): {left:N0} units not retrieved; allowed source {label} {reason}. Other sources were not used.";
+                warning?.Invoke($"[Quartermaster] {SourceRetainerUnreachedCode}: operation {operationId}: {message}");
+                journal.RecordWarning(operationId, SourceRetainerUnreachedCode, message, line.ItemId, left, retainerId);
+                unreachedAll.Add($"{label} {reason}");
+            }
         }
-        return count;
+        return (count, unreachedAll.Distinct().ToArray());
     }
+
+    private static string UnreachedNote(IReadOnlyList<string> unreached) =>
+        unreached.Count == 0 ? string.Empty : $" Allowed sources not reached: {string.Join("; ", unreached)}. Other sources were not used.";
 
     /// <summary>
     /// True when the retainer list could not be opened because no summoning bell is

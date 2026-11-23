@@ -30,9 +30,44 @@ public sealed partial class WorkbenchStockService
     /// <summary>Another character's observed stock (null while unobserved); set once the courier exists.</summary>
     public Func<QuartermasterRuntimeSnapshot, OwnerScope, BrowserProjection?>? CharacterStock { get; set; }
 
+    /// <summary>
+    /// Runs work on the framework thread and returns its result (inline when already there). Both placement channels
+    /// go through it, so the courier's caches are only touched, and placement saves and their Changed notifications
+    /// only happen, on the framework thread whichever thread the caller used. Unset (tests), work runs inline.
+    /// </summary>
+    public Func<Func<string>, string>? RunOnFramework { get; set; }
+
+    /// <summary>The game's name for an item; may return the <c>Item {id}</c> placeholder when it cannot resolve one.</summary>
+    public Func<uint, string>? ItemNames { get; set; }
+
+    private string OnFramework(Func<string> work) => RunOnFramework is { } run ? run(work) : work();
+
+    internal static string PlaceholderName(uint itemId) => $"Item {itemId}";
+
+    private static bool IsPlaceholder(uint itemId, string? name) =>
+        string.IsNullOrWhiteSpace(name) || string.Equals(name.Trim(), PlaceholderName(itemId), StringComparison.Ordinal);
+
+    /// <summary>The caller's name, else the game's; null when neither is a real name (the placeholder is display-only).</summary>
+    private string? RealItemName(uint itemId, string? given)
+    {
+        if (!IsPlaceholder(itemId, given))
+            return given!.Trim();
+        string? resolved = null;
+        try { resolved = ItemNames?.Invoke(itemId); }
+        catch (Exception exception) { warn?.Invoke($"Quartermaster could not resolve the name of item {itemId}: {exception.Message}"); }
+        return IsPlaceholder(itemId, resolved) ? null : resolved!.Trim();
+    }
+
+    /// <summary>
+    /// The same character for placement: by content id when both have one (a world transfer keeps it), else by name.
+    /// </summary>
+    private static bool SameCharacter(OwnerScope left, OwnerScope right) => ReservePlacement.SameCharacter(left, right);
+
     // ---- Read ---------------------------------------------------------------------------------
 
-    public string GetPlacement(string requestJson)
+    public string GetPlacement(string requestJson) => OnFramework(() => GetPlacementCore(requestJson));
+
+    private string GetPlacementCore(string requestJson)
     {
         object Rejected(string code, string message) => new { schema = PlacementSchema, providerInstanceId, status = "rejected", errorCode = code, message };
         PlacementRequest? request = null;
@@ -104,13 +139,16 @@ public sealed partial class WorkbenchStockService
         var rows = (keys ?? reserves.Keys.OrderBy(key => reserves[key].ItemName, StringComparer.OrdinalIgnoreCase).ThenBy(key => key.ItemId).ToList())
             .Select(key => (Key: key, Rule: reserves.GetValueOrDefault(key)))
             .ToArray();
+        // Every per-character map is keyed by content id, the identity the character list is unique on.
         var characters = PlacementCharacterList(current, plan);
         var bags = playerInventory.Read(entries => entries
             .Where(entry => entry.Owner.LocalContentId is > 0)
             .GroupBy(entry => entry.Owner.LocalContentId!.Value)
-            .ToDictionary(group => group.Key, group => group.First()));
+            .ToDictionary(group => group.Key, group => group.OrderByDescending(entry => entry.UpdatedAtUtc).First()));
         var stocks = characters.ToDictionary(character => character.LocalContentId!.Value,
-            character => character.Matches(owner) ? current.Browser : CharacterStock?.Invoke(current, character));
+            character => SameCharacter(character, owner) ? current.Browser : CharacterStock?.Invoke(current, character));
+        // A stored home names its character as it was then; report it as the listed (current) character.
+        OwnerScope Listed(OwnerScope stored) => characters.FirstOrDefault(character => SameCharacter(character, stored)) ?? stored;
 
         object Character(OwnerScope character) => new
         {
@@ -132,12 +170,12 @@ public sealed partial class WorkbenchStockService
             owner = Character(owner),
             characters = characters.Select(character =>
             {
-                var isOwner = character.Matches(owner);
+                var isOwner = SameCharacter(character, owner);
                 var bag = BagView(bags.GetValueOrDefault(character.LocalContentId!.Value), character);
                 // The character's assigned retainers in game order, then any retainer an item names there.
                 var named = rows.SelectMany(row => isOwner
                         ? row.Rule?.Location.PreferredRetainerIds ?? []
-                        : row.Rule?.RemoteHomes is { } remote && remote.Character.Matches(character) ? remote.RetainerIds : [])
+                        : row.Rule?.RemoteHomes is { } remote && SameCharacter(remote.Character, character) ? remote.RetainerIds : [])
                     .Where(id => id != PlacementEdits.AnySpace);
                 return new
                 {
@@ -175,7 +213,8 @@ public sealed partial class WorkbenchStockService
                 return new
                 {
                     itemId = row.Key.ItemId,
-                    itemName = rule?.ItemName is { Length: > 0 } name ? name : null,
+                    // The rule's name, else the game's; null only when neither is known.
+                    itemName = RealItemName(row.Key.ItemId, rule?.ItemName),
                     quality = row.Key.Quality.ToString(),
                     hasRule = rule is not null,
                     reserveUnits = rule?.ReserveUnits ?? 0,
@@ -188,7 +227,7 @@ public sealed partial class WorkbenchStockService
                     },
                     remote = remote is null ? null : new
                     {
-                        character = Character(remote.Character),
+                        character = Character(Listed(remote.Character)),
                         homes = Ranked(remote.RetainerIds),
                     },
                     // Per shown character: units in its bags (null while unobserved) and in each retainer whose stock
@@ -197,14 +236,14 @@ public sealed partial class WorkbenchStockService
                     {
                         var stock = stocks[character.LocalContentId!.Value];
                         var observedBags = BagView(bags.GetValueOrDefault(character.LocalContentId.Value), character).Observed;
-                        var holdings = character.Matches(owner)
+                        var holdings = SameCharacter(character, owner)
                             ? PlacementMatrixData.Holdings(current, row.Key.ItemId, row.Key.Quality)
                             : PlacementMatrixData.Holdings(current, row.Key.ItemId, row.Key.Quality, character, stock);
                         return new
                         {
                             character.LocalContentId,
                             bags = observedBags
-                                ? (character.Matches(owner)
+                                ? (SameCharacter(character, owner)
                                     ? PlacementMatrixData.BagHoldings(current, row.Key.ItemId, row.Key.Quality)
                                     : PlacementMatrixData.BagHoldings(current, row.Key.ItemId, row.Key.Quality, character, stock))
                                 : (int?)null,
@@ -220,7 +259,8 @@ public sealed partial class WorkbenchStockService
 
     /// <summary>
     /// The characters the editor can show: the owner first, then (by name) every character the courier can deliver
-    /// to and every character a reserve item already has remote homes on.
+    /// to and every character a reserve item already has remote homes on. One entry per content id: a character that
+    /// changed worlds is listed once, as the courier knows it now, ahead of the world its stored homes still carry.
     /// </summary>
     private IReadOnlyList<OwnerScope> PlacementCharacterList(QuartermasterRuntimeSnapshot current, ListingPlan? plan)
     {
@@ -234,8 +274,8 @@ public sealed partial class WorkbenchStockService
             .Where(remote => remote.RetainerIds.Count > 0)
             .Select(remote => remote.Character);
         var others = offered.Concat(homed)
-            .Where(character => character.HasStableIdentity && !character.Matches(owner))
-            .DistinctBy(character => (character.LocalContentId, character.HomeWorldId))
+            .Where(character => character.HasStableIdentity && !SameCharacter(character, owner))
+            .DistinctBy(character => character.LocalContentId!.Value)
             .OrderBy(character => character.CharacterName, StringComparer.OrdinalIgnoreCase)
             .ThenBy(character => character.HomeWorldName, StringComparer.OrdinalIgnoreCase);
         return [owner with { }, .. others.Select(character => character with { })];
@@ -258,7 +298,7 @@ public sealed partial class WorkbenchStockService
             return new(id, retainer, free, observed);
         }
         var columns = current.Retainers.Values
-            .Where(retainer => retainer.Owner.Matches(character) && retainer.IsCurrentlyAssigned is not false)
+            .Where(retainer => SameCharacter(retainer.Owner, character) && retainer.IsCurrentlyAssigned is not false)
             .OrderBy(retainer => retainer.DisplayOrder ?? int.MaxValue)
             .ThenBy(retainer => retainer.RetainerName, StringComparer.OrdinalIgnoreCase)
             .ThenBy(retainer => retainer.RetainerId)
@@ -267,7 +307,7 @@ public sealed partial class WorkbenchStockService
         var shown = columns.Select(column => column.RetainerId).ToHashSet();
         foreach (var id in named)
             if (id != PlacementEdits.AnySpace && shown.Add(id))
-                columns.Add(View(id, current.Retainers.TryGetValue(id, out var retainer) && retainer.Owner.Matches(character) ? retainer : null));
+                columns.Add(View(id, current.Retainers.TryGetValue(id, out var retainer) && SameCharacter(retainer.Owner, character) ? retainer : null));
         return columns;
     }
 
@@ -276,7 +316,7 @@ public sealed partial class WorkbenchStockService
     /// <summary>The main bags as this client last saw them whole; unobserved bags have no free count (never zero).</summary>
     private static BagObservation BagView(CachedPlayerInventory? cached, OwnerScope character)
     {
-        if (cached is null || !character.Matches(cached.Owner) ||
+        if (cached is null || !SameCharacter(character, cached.Owner) ||
             !PlayerBagNames.All(name => cached.ObservedSources.Contains(name, StringComparer.Ordinal)))
             return new(false, null, null);
         var main = cached.Bags.Where(bag => PlayerBagNames.Contains(bag.BagName, StringComparer.Ordinal)).ToArray();
@@ -317,14 +357,23 @@ public sealed partial class WorkbenchStockService
 
     private sealed class PlacementEditAborted : Exception;
 
-    /// <summary>Queues a Placement window edit onto the framework thread; it then runs <see cref="ApplyPlacementEdit"/>.</summary>
-    internal void QueuePlacementEdit(OwnerScope owner, OwnerScope shown, IReadOnlyList<PlacementEditLine> lines) =>
-        workQueue.Enqueue(() => ApplyPlacementEdit(owner, shown, lines, allOrNothing: false, source: "Placement window"));
+    /// <summary>
+    /// Queues a Placement window edit onto the framework thread; it then runs <see cref="ApplyPlacementEdit"/> and hands
+    /// the result to <paramref name="completed"/> there (the window's draw thread).
+    /// </summary>
+    internal void QueuePlacementEdit(OwnerScope owner, OwnerScope shown, IReadOnlyList<PlacementEditLine> lines,
+        Action<PlacementEditResult>? completed = null) =>
+        workQueue.Enqueue(() =>
+        {
+            var result = ApplyPlacementEdit(owner, shown, lines, allOrNothing: false, source: "Placement window");
+            completed?.Invoke(result);
+        });
 
     /// <summary>
     /// The one placement edit path, for the Placement window and the IPC alike. Each item's next homes come from its
     /// stored rule through <see cref="ReservePlacement.Resolve"/>, then must name only retainers the editor offers on
-    /// the shown character and pass the Listing Plan's reserve validation.
+    /// the shown character and pass the Listing Plan's reserve validation for the fields it changes (a field the edit
+    /// leaves alone is not held against it, even when already invalid). A placeholder item name is never saved.
     /// Every accepted change is written in one state mutation, creating the plan and a level-0 rule as needed and
     /// removing a level-0 rule left with no home. Refusals are logged at Warning.
     /// </summary>
@@ -332,12 +381,12 @@ public sealed partial class WorkbenchStockService
         bool allOrNothing, string source)
     {
         var current = runtime();
-        var isOwner = shown.Matches(owner);
+        var isOwner = SameCharacter(shown, owner);
         var known = current.Retainers.Values
-            .Where(retainer => retainer.Owner.Matches(shown) && retainer.IsCurrentlyAssigned is not false)
+            .Where(retainer => SameCharacter(retainer.Owner, shown) && retainer.IsCurrentlyAssigned is not false)
             .Select(retainer => retainer.RetainerId)
             .ToHashSet();
-        var ownerRetainers = current.Retainers.Values.Where(retainer => retainer.Owner.Matches(owner)).Select(retainer => retainer.RetainerId).ToHashSet();
+        var ownerRetainers = current.Retainers.Values.Where(retainer => SameCharacter(retainer.Owner, owner)).Select(retainer => retainer.RetainerId).ToHashSet();
         var stock = isOwner ? null : CharacterStock?.Invoke(current, shown);
         IReadOnlyList<PlacementItemOutcome> outcomes = [];
         try
@@ -351,7 +400,7 @@ public sealed partial class WorkbenchStockService
                 // already names there. A retainer observed holding the item also counts (use current holders).
                 known.UnionWith((target?.Reserves ?? []).Where(reserve => reserve.Enabled).SelectMany(reserve => isOwner
                     ? reserve.Location.PreferredRetainerIds
-                    : reserve.RemoteHomes is { } remote && remote.Character.Matches(shown) ? remote.RetainerIds : []));
+                    : reserve.RemoteHomes is { } remote && SameCharacter(remote.Character, shown) ? remote.RetainerIds : []));
                 foreach (var line in lines)
                 {
                     var item = line.Item;
@@ -380,13 +429,16 @@ public sealed partial class WorkbenchStockService
                         continue;
                     }
                     var candidate = rule is null
-                        ? new ListingReserveRule { ItemId = item.ItemId, ItemName = item.ItemName, Quality = item.Quality }
+                        ? new ListingReserveRule { ItemId = item.ItemId, Quality = item.Quality }
                         : ListingPlanCatalog.Copy(rule);
                     candidate.Location = StowageRoutingPolicy.CopyOf(next.Local);
                     candidate.RemoteHomes = ReserveRemoteHomes.CopyOf(next.Remote);
                     var allowed = ownerRetainers.Concat(rule?.Location.PreferredRetainerIds ?? [])
                         .Concat(isOwner ? known.Concat(holdings.Keys) : []).ToHashSet();
-                    if (ListingPlanCatalog.ValidateReserves([candidate], allowed).FirstOrDefault() is { } issue)
+                    // Only what this edit changes is checked; a stored field it leaves alone stays as it was.
+                    if (ListingPlanCatalog.ValidateReserves([candidate], allowed).FirstOrDefault(issue =>
+                            issue.Field == nameof(ListingReserveRule.Location) && next.LocalChanged ||
+                            issue.Field == nameof(ListingReserveRule.RemoteHomes) && next.RemoteChanged) is { } issue)
                     {
                         results.Add(Outcome("refused", "RuleInvalid", $"{item.ItemName}: {issue.Message}") with { Field = issue.Field });
                         continue;
@@ -418,13 +470,15 @@ public sealed partial class WorkbenchStockService
                 {
                     var reserve = target.Reserves.FirstOrDefault(rule => rule.Enabled && rule.ItemId == item.ItemId && rule.Quality == item.Quality);
                     var created = reserve is null;
+                    // The "Item {id}" placeholder is for messages only; a rule keeps a blank name until a real one is known.
+                    var savedName = IsPlaceholder(item.ItemId, item.ItemName) ? string.Empty : item.ItemName.Trim();
                     if (reserve is null)
                     {
-                        reserve = new ListingReserveRule { ItemId = item.ItemId, ItemName = item.ItemName, Quality = item.Quality };
+                        reserve = new ListingReserveRule { ItemId = item.ItemId, ItemName = savedName, Quality = item.Quality };
                         target.Reserves.Add(reserve);
                     }
-                    if (string.IsNullOrWhiteSpace(reserve.ItemName))
-                        reserve.ItemName = item.ItemName;
+                    if (string.IsNullOrWhiteSpace(reserve.ItemName) || IsPlaceholder(item.ItemId, reserve.ItemName))
+                        reserve.ItemName = savedName;
                     if (next.LocalChanged)
                         reserve.Location = StowageRoutingPolicy.CopyOf(next.Local);
                     if (next.RemoteChanged)
@@ -471,7 +525,9 @@ public sealed partial class WorkbenchStockService
     /// Applies one Placement toolbar action to the named items of the logged-in owner, synchronously, and returns
     /// per-item outcomes (<c>gooseworks-quartermaster-placement-edit-ack/v1</c>).
     /// </summary>
-    public string EditPlacement(string requestJson)
+    public string EditPlacement(string requestJson) => OnFramework(() => EditPlacementCore(requestJson));
+
+    private string EditPlacementCore(string requestJson)
     {
         PlacementEditRequest? request;
         try { request = JsonSerializer.Deserialize<PlacementEditRequest>(requestJson, JsonOptions); }
@@ -501,13 +557,14 @@ public sealed partial class WorkbenchStockService
             if (named.LocalContentId == 0 || named.HomeWorldId == 0)
                 return Reject("invalid_character", "character needs localContentId and homeWorldId.");
             var plan = state.Read(document => ListingPlanCatalog.OwnerPlan(document, owner) is { } found ? Snapshot(found) : null);
+            // By content id: a character that changed worlds is still named by the world its stored homes carry.
             var match = PlacementCharacterList(current, plan)
-                .FirstOrDefault(character => character.LocalContentId == named.LocalContentId && character.HomeWorldId == named.HomeWorldId);
+                .FirstOrDefault(character => character.LocalContentId == named.LocalContentId);
             if (match is null)
                 return Reject("character_not_offered", $"Character {named.LocalContentId}@{named.HomeWorldId} is not one the placement editor can show.");
             shown = match;
         }
-        var isOwner = shown.Matches(owner);
+        var isOwner = SameCharacter(shown, owner);
 
         var destination = PlacementEdits.AnySpace;
         if (ReservePlacement.NeedsDestination(operation))
@@ -531,7 +588,8 @@ public sealed partial class WorkbenchStockService
         var seen = new HashSet<(uint, ItemQualityPolicy)>();
         foreach (var item in items)
         {
-            var name = string.IsNullOrWhiteSpace(item.ItemName) ? $"Item {item.ItemId}" : item.ItemName.Trim();
+            // The caller's name, else the game's; the placeholder only labels messages and is never saved.
+            var name = (item.ItemId == 0 ? null : RealItemName(item.ItemId, item.ItemName)) ?? PlaceholderName(item.ItemId);
             PlacementItemOutcome Refused(ItemQualityPolicy? quality, string code, string message) =>
                 new(item.ItemId, name, quality, item.Quality, "refused", code, message);
             if (item.ItemId == 0)

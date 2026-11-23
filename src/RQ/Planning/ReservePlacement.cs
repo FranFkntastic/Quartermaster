@@ -38,11 +38,20 @@ public sealed record PlacementResolution(
 /// </summary>
 public static class ReservePlacement
 {
+    /// <summary>
+    /// The same character for placement: by content id when both carry one (a world transfer keeps it, so homes stored
+    /// under the old world stay with the character), else by name and world.
+    /// </summary>
+    public static bool SameCharacter(OwnerScope left, OwnerScope right) =>
+        left.LocalContentId is > 0 && right.LocalContentId is > 0
+            ? left.LocalContentId == right.LocalContentId
+            : left.Matches(right);
+
     /// <summary>The destinations the editor shows for the item on <paramref name="shown"/>.</summary>
     public static StowageRoutingPolicy Shown(OwnerScope owner, OwnerScope shown, StowageRoutingPolicy? local, ReserveRemoteHomes? remote) =>
-        shown.Matches(owner)
+        SameCharacter(shown, owner)
             ? StowageRoutingPolicy.CopyOf(local)
-            : remote is { RetainerIds.Count: > 0 } && remote.Character.Matches(shown)
+            : remote is { RetainerIds.Count: > 0 } && SameCharacter(remote.Character, shown)
                 ? new StowageRoutingPolicy { PreferredRetainerIds = remote.RetainerIds.Distinct().ToList() }
                 : new StowageRoutingPolicy();
 
@@ -79,7 +88,7 @@ public static class ReservePlacement
     {
         var storedLocal = StowageRoutingPolicy.CopyOf(local);
         var storedRemote = ReserveRemoteHomes.CopyOf(remote);
-        if (shown.Matches(owner))
+        if (SameCharacter(shown, owner))
         {
             var nextLocal = StowageRoutingPolicy.CopyOf(edited);
             return new(nextLocal, storedRemote, !nextLocal.SameAs(local ?? new StowageRoutingPolicy()), false, null, null);
@@ -89,9 +98,10 @@ public static class ReservePlacement
         var ids = edited.PreferredRetainerIds.Where(id => id != PlacementEdits.AnySpace).Distinct().ToList();
         var nextRemote = ids.Count == 0 ? null : new ReserveRemoteHomes { Character = shown with { }, RetainerIds = ids };
         // Clearing an item shown here leaves the homes it has on another character alone.
-        if (nextRemote is null && storedRemote is not null && !storedRemote.Character.Matches(shown))
+        if (nextRemote is null && storedRemote is not null && !SameCharacter(storedRemote.Character, shown))
             return new(storedLocal, storedRemote, false, false, null, storedRemote.Character);
-        var movedFrom = nextRemote is not null && storedRemote is not null && !storedRemote.Character.Matches(shown)
+        // Saved homes carry the character as shown now, so a character that changed worlds is re-stamped on its next edit.
+        var movedFrom = nextRemote is not null && storedRemote is not null && !SameCharacter(storedRemote.Character, shown)
             ? storedRemote.Character
             : null;
         return new(storedLocal, nextRemote, false, !ReserveRemoteHomes.Same(storedRemote, nextRemote), movedFrom, null);

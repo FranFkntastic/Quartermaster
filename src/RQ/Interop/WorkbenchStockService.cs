@@ -418,7 +418,7 @@ public sealed partial class WorkbenchStockService
             if (Validate(request.ProviderInstanceId, request.Owner, item.ItemId, item.Quality, current, out var quality) is { } error)
                 return Ack(request.RequestId, "rejected", error.Code, error.Message);
             if (items.All(existing => existing.ItemId != item.ItemId || existing.Quality != quality))
-                items.Add(new(item.ItemId, string.IsNullOrWhiteSpace(item.ItemName) ? $"Item {item.ItemId}" : item.ItemName.Trim(), quality));
+                items.Add(new(item.ItemId, RealItemName(item.ItemId, item.ItemName) ?? PlaceholderName(item.ItemId), quality));
         }
         if (items.Count == 0)
             return Ack(request.RequestId, "rejected", "invalid_item", "Name at least one item.");

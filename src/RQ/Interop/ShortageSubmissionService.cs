@@ -62,7 +62,7 @@ public sealed class ShortageSubmissionService
         var error = Validate(request, owner, providerInstanceId);
         if (error is not null)
             return Serialize(Reject(request.RequestId, request.OperationId, error.Value.Code, error.Value.Message));
-        if (ValidateSourceRestrictions(request, owner) is { } refusal)
+        string Refuse((string Code, string Message, uint? ItemId, ulong? RetainerId) refusal)
         {
             warn?.Invoke($"[Quartermaster] Shortage request {request.RequestId} refused: {refusal.Code}: {refusal.Message}");
             return Serialize(Reject(request.RequestId, request.OperationId, refusal.Code, refusal.Message) with
@@ -71,6 +71,9 @@ public sealed class ShortageSubmissionService
                 RetainerId = refusal.RetainerId,
             });
         }
+        // Structural checks first; the live roster check waits until a replay of an accepted request has been answered.
+        if (ValidateSourceRestrictions(request) is { } refusal)
+            return Refuse(refusal);
 
         var canonicalHash = CanonicalHash(request);
         lock (gate)
@@ -90,6 +93,8 @@ public sealed class ShortageSubmissionService
                     ? Serialize(Acknowledge(request.RequestId, pendingRequest.OperationId, OperationStatuses.Queued, 0, $"Idempotent replay returned the queued {(pendingRequest.ExecuteImmediately ? "automatic" : "review-required")} operation."))
                     : Serialize(Reject(request.RequestId, request.OperationId, "request_conflict", "Request ID is queued with a different canonical payload."));
             }
+            if (ValidateSourceRoster(request, owner) is { } rosterRefusal)
+                return Refuse(rosterRefusal);
             var operationCollision = repository.Read(state => state.Operations.Any(operation => operation.OperationId == request.OperationId));
             if (operationCollision || pending.Values.Any(candidate => candidate.OperationId == request.OperationId))
                 return Serialize(Reject(request.RequestId, request.OperationId, "operation_conflict", "Operation ID is already in use."));
@@ -318,7 +323,8 @@ public sealed class ShortageSubmissionService
     /// Source restrictions name current retainers of the owner, apply only to automatic execution (a reviewed request
     /// becomes the user's own plan, which carries no restriction), and always leave at least one source.
     /// </summary>
-    private (string Code, string Message, uint? ItemId, ulong? RetainerId)? ValidateSourceRestrictions(ShortageRequest request, OwnerScope owner)
+    /// <summary>The shape of each item's source restriction; needs no live data.</summary>
+    private static (string Code, string Message, uint? ItemId, ulong? RetainerId)? ValidateSourceRestrictions(ShortageRequest request)
     {
         var restricted = request.Items.Where(item => item.SourceRetainerIds is not null || item.SourceSaddlebag is not null).ToArray();
         if (restricted.Length == 0)
@@ -334,6 +340,15 @@ public sealed class ShortageSubmissionService
         }
         if (!request.ExecuteImmediately)
             return ("source_restriction_requires_immediate", "Source restrictions apply only to executeImmediately requests; a reviewed request becomes the user's own plan.", restricted[0].ItemId, null);
+        return null;
+    }
+
+    /// <summary>Every named source retainer is a current retainer of the owner, by the live roster.</summary>
+    private (string Code, string Message, uint? ItemId, ulong? RetainerId)? ValidateSourceRoster(ShortageRequest request, OwnerScope owner)
+    {
+        var restricted = request.Items.Where(item => item.SourceRetainerIds is not null).ToArray();
+        if (restricted.Length == 0)
+            return null;
         if (retainers is null)
             return ("source_restriction_unavailable", "This Quartermaster build cannot check source retainers.", restricted[0].ItemId, null);
         var roster = retainers();
