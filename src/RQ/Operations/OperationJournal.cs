@@ -663,7 +663,7 @@ public sealed class OperationJournal
         OperationChanged?.Invoke(changed);
     }
 
-    public void RecordWarning(string operationId, string code, string message)
+    public void RecordWarning(string operationId, string code, string message, uint? itemId = null, int? quantity = null)
     {
         OperationRecord changed = null!;
         repository.Mutate(StateChangeKind.Operations, state =>
@@ -681,6 +681,8 @@ public sealed class OperationJournal
                 Status = operation.Status,
                 Code = code,
                 Message = message,
+                ItemId = itemId,
+                Quantity = quantity,
             });
             changed = Copy(operation);
         });
@@ -749,6 +751,8 @@ public sealed class OperationJournal
             TransferredQuantity = line.TransferredQuantity,
             MaxStackSize = line.MaxStackSize,
             Routing = CopyRouting(line.Routing),
+            SourceRetainerIds = line.SourceRetainerIds?.ToList(),
+            SourceSaddlebag = line.SourceSaddlebag,
         }).ToList(),
     };
 

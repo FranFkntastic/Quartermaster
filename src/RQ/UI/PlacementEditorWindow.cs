@@ -14,10 +14,10 @@ namespace RQ.UI;
 /// <summary>
 /// The market run's placement matrix for a caller-supplied set of items (opened over IPC by another
 /// plugin). Rows read the owner's reserve rules; edits persist straight to them through
-/// <see cref="WorkbenchStockService.SetPlacement"/>, creating a level-0 rule for an item that has none.
-/// A character bar above the matrix switches it to another character of this account: its retainers
-/// become the columns and an edit there sets the item's remote homes
-/// (<see cref="WorkbenchStockService.SetRemotePlacement"/>). An item has remote homes on one other
+/// <see cref="WorkbenchStockService.ApplyPlacementEdit"/> (the path the placement IPC uses too), creating a
+/// level-0 rule for an item that has none. A character bar above the matrix switches it to another character
+/// of this account: its retainers become the columns and an edit there sets the item's remote homes
+/// (<see cref="ReservePlacement.Resolve"/>). An item has remote homes on one other
 /// character at most; a row homed on a character other than the one shown reads dimmed with where it goes,
 /// and editing it there moves its remote homes to the shown character. Local homes stay as they are.
 /// </summary>
@@ -140,25 +140,24 @@ internal sealed class PlacementEditorWindow : Window
         var columns = PlacementMatrixData.Columns(current, rows.Select(row => row.Routing), local ? null : target);
         matrix.Draw(rows, rows, columns, changes =>
         {
+            var edits = new List<WorkbenchStockService.PlacementEditLine>();
             foreach (var (key, routing) in changes)
             {
                 var item = items.FirstOrDefault(candidate => candidate.ItemId == key.ItemId && candidate.Quality == key.Quality);
                 if (item is null) continue;
-                if (local)
-                {
-                    pending[key] = (ListingPlanCatalog.CopyLocation(routing), now + PendingLifetime);
-                    service.SetPlacement(scope, item, routing);
-                    continue;
-                }
-                // Another character offers no Any space: its homes are its ranked retainers only.
-                var ids = routing.PreferredRetainerIds.Where(id => id != PlacementEdits.AnySpace).Distinct().ToList();
-                var remote = ids.Count == 0 ? null : new ReserveRemoteHomes { Character = target with { }, RetainerIds = ids };
-                // Clearing a row shown here leaves homes it has on a third character alone.
-                var before = resolved.First(row => row.Key == key).Remote;
-                if (remote is null && before is not null && !before.Character.Matches(target)) continue;
-                pendingRemote[key] = (remote, now + PendingLifetime);
-                service.SetRemotePlacement(scope, item, target, ids);
+                // Shown at once by the same rules the save applies; the save itself goes through the shared path.
+                var row = resolved.First(candidate => candidate.Key == key);
+                var next = ReservePlacement.Resolve(scope, target, row.Local, row.Remote, routing);
+                if (!next.Changed) continue;
+                if (next.LocalChanged)
+                    pending[key] = (StowageRoutingPolicy.CopyOf(next.Local), now + PendingLifetime);
+                if (next.RemoteChanged)
+                    pendingRemote[key] = (ReserveRemoteHomes.CopyOf(next.Remote), now + PendingLifetime);
+                var edited = StowageRoutingPolicy.CopyOf(routing);
+                edits.Add(new(item, (_, _) => edited));
             }
+            if (edits.Count > 0)
+                service.QueuePlacementEdit(scope, target, edits);
             return true;
         }, anySpace: local);
     }

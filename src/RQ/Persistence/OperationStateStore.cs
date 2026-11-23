@@ -508,6 +508,8 @@ internal sealed class OperationStateStore
             TransferredQuantity = line.TransferredQuantity,
             MaxStackSize = line.MaxStackSize,
             Routing = StowageRoutingPolicy.CopyOf(line.Routing),
+            SourceRetainerIds = line.SourceRetainerIds?.ToList(),
+            SourceSaddlebag = line.SourceSaddlebag,
         }).ToList(),
     };
 }

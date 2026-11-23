@@ -62,6 +62,8 @@ public sealed class QuartermasterIpcProvider : IDisposable
         registrar.Register(IpcChannels.OpenPlacement, workbench.OpenPlacement);
         registrar.Register(IpcChannels.SetReserveLevel, workbench.SetReserveLevel);
         registrar.Register(IpcChannels.PlanArrival, workbench.PlanArrival);
+        registrar.Register(PlacementIpcChannels.GetPlacement, workbench.GetPlacement);
+        registrar.Register(PlacementIpcChannels.EditPlacement, workbench.EditPlacement);
     }
 
     /// <summary>Registers the delivered-stow channels (capability deliveredStow.v1).</summary>
@@ -115,6 +117,8 @@ public sealed class QuartermasterIpcProvider : IDisposable
             registrar.Unregister(IpcChannels.OpenPlacement);
             registrar.Unregister(IpcChannels.SetReserveLevel);
             registrar.Unregister(IpcChannels.PlanArrival);
+            registrar.Unregister(PlacementIpcChannels.GetPlacement);
+            registrar.Unregister(PlacementIpcChannels.EditPlacement);
         }
         if (cancelAttached)
             registrar.Unregister(RequestedOperationCancelService.Channel);

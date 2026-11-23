@@ -9,6 +9,8 @@ namespace RQ.Interop;
 public sealed class ShortageSubmissionService
 {
     public const string RequestSchema = "gooseworks-quartermaster-shortages/v1";
+    /// <summary>Shortage items may name the only retainers (and optionally the saddlebag) retrieval draws them from.</summary>
+    public const string SourceRetainersCapability = "shortageSourceRetainers.v1";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly object gate = new();
@@ -17,6 +19,8 @@ public sealed class ShortageSubmissionService
     private readonly IFrameworkWorkQueue workQueue;
     private readonly Func<OwnerScope> currentOwner;
     private readonly Func<DateTime> utcNow;
+    private readonly Func<IReadOnlyDictionary<ulong, CachedRetainer>>? retainers;
+    private readonly Action<string>? warn;
     private readonly Dictionary<string, PendingRequest> pending = new(StringComparer.Ordinal);
     private readonly Dictionary<string, TransientOperation> transientOperations = new(StringComparer.Ordinal);
 
@@ -27,8 +31,12 @@ public sealed class ShortageSubmissionService
         StateRepository repository,
         IFrameworkWorkQueue workQueue,
         Func<OwnerScope> currentOwner,
-        Func<DateTime>? utcNow = null)
+        Func<DateTime>? utcNow = null,
+        Func<IReadOnlyDictionary<ulong, CachedRetainer>>? retainers = null,
+        Action<string>? warn = null)
     {
+        this.retainers = retainers;
+        this.warn = warn;
         this.providerInstanceId = providerInstanceId;
         this.repository = repository;
         this.workQueue = workQueue;
@@ -50,9 +58,19 @@ public sealed class ShortageSubmissionService
         if (request is null)
             return Serialize(Reject(string.Empty, string.Empty, "invalid_json", "Request body is empty."));
 
-        var error = Validate(request, currentOwner(), providerInstanceId);
+        var owner = currentOwner();
+        var error = Validate(request, owner, providerInstanceId);
         if (error is not null)
             return Serialize(Reject(request.RequestId, request.OperationId, error.Value.Code, error.Value.Message));
+        if (ValidateSourceRestrictions(request, owner) is { } refusal)
+        {
+            warn?.Invoke($"[Quartermaster] Shortage request {request.RequestId} refused: {refusal.Code}: {refusal.Message}");
+            return Serialize(Reject(request.RequestId, request.OperationId, refusal.Code, refusal.Message) with
+            {
+                ItemId = refusal.ItemId,
+                RetainerId = refusal.RetainerId,
+            });
+        }
 
         var canonicalHash = CanonicalHash(request);
         lock (gate)
@@ -220,6 +238,8 @@ public sealed class ShortageSubmissionService
                         ItemName = item.ItemName.Trim(),
                         TargetQuantity = item.TargetQuantity,
                         ShortageQuantity = item.ShortageQuantity,
+                        SourceRetainerIds = item.SourceRetainerIds?.Distinct().ToList(),
+                        SourceSaddlebag = item.SourceRetainerIds is not null && item.SourceSaddlebag == true,
                     }).ToList(),
                 };
                 state.Operations.Add(operation);
@@ -294,6 +314,40 @@ public sealed class ShortageSubmissionService
         return null;
     }
 
+    /// <summary>
+    /// Source restrictions name current retainers of the owner, apply only to automatic execution (a reviewed request
+    /// becomes the user's own plan, which carries no restriction), and always leave at least one source.
+    /// </summary>
+    private (string Code, string Message, uint? ItemId, ulong? RetainerId)? ValidateSourceRestrictions(ShortageRequest request, OwnerScope owner)
+    {
+        var restricted = request.Items.Where(item => item.SourceRetainerIds is not null || item.SourceSaddlebag is not null).ToArray();
+        if (restricted.Length == 0)
+            return null;
+        foreach (var item in restricted)
+        {
+            if (item.SourceRetainerIds is null)
+                return ("invalid_source_restriction", $"Item {item.ItemId}: sourceSaddlebag needs sourceRetainerIds.", item.ItemId, null);
+            if (item.SourceRetainerIds.Count == 0 && item.SourceSaddlebag != true)
+                return ("invalid_source_restriction", $"Item {item.ItemId}: sourceRetainerIds is empty and the saddlebag is not allowed, so nothing could supply it.", item.ItemId, null);
+            if (item.SourceRetainerIds.Contains(0UL))
+                return ("invalid_source_restriction", $"Item {item.ItemId}: retainer id 0 is not a retainer.", item.ItemId, 0UL);
+        }
+        if (!request.ExecuteImmediately)
+            return ("source_restriction_requires_immediate", "Source restrictions apply only to executeImmediately requests; a reviewed request becomes the user's own plan.", restricted[0].ItemId, null);
+        if (retainers is null)
+            return ("source_restriction_unavailable", "This Quartermaster build cannot check source retainers.", restricted[0].ItemId, null);
+        var roster = retainers();
+        foreach (var item in restricted)
+        foreach (var id in item.SourceRetainerIds!)
+        {
+            if (!roster.TryGetValue(id, out var retainer) || !retainer.Owner.Matches(owner))
+                return ("unknown_source_retainer", $"Item {item.ItemId}: retainer {id} is not a known retainer of {owner.CharacterName}.", item.ItemId, id);
+            if (retainer.IsCurrentlyAssigned is false)
+                return ("unknown_source_retainer", $"Item {item.ItemId}: retainer {id} ({retainer.RetainerName}) is no longer assigned to {owner.CharacterName}.", item.ItemId, id);
+        }
+        return null;
+    }
+
     private static string CanonicalHash(ShortageRequest request, bool includeExecutionIntent = true)
     {
         var canonical = new StringBuilder()
@@ -306,7 +360,13 @@ public sealed class ShortageSubmissionService
         if (includeExecutionIntent)
             canonical.Append('|').Append(request.ExecuteImmediately ? '1' : '0');
         foreach (var item in request.Items.OrderBy(item => item.ItemId))
+        {
             canonical.Append('|').Append(item.ItemId).Append('|').Append(item.TargetQuantity).Append('|').Append(item.ShortageQuantity);
+            // Appended only when present so unrestricted requests keep their earlier hashes.
+            if (item.SourceRetainerIds is { } sources)
+                canonical.Append("|src:").Append(string.Join(',', sources.Distinct().Order()))
+                    .Append("|sb:").Append(item.SourceSaddlebag == true ? '1' : '0');
+        }
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical.ToString()))).ToLowerInvariant();
     }
 

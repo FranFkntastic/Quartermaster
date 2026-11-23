@@ -1,0 +1,619 @@
+using System.Text.Json;
+using RQ.Domain;
+using RQ.Inventory;
+using RQ.Persistence;
+using RQ.Planning;
+using RQ.Runtime;
+using RQ.UI;
+
+namespace RQ.Interop;
+
+/// <summary>
+/// Placement over IPC (capability <c>placementEdit.v1</c>): <see cref="GetPlacement"/> returns what the Placement
+/// window's matrix shows, and <see cref="EditPlacement"/> applies one toolbar action through
+/// <see cref="ApplyPlacementEdit"/>, the same path the window's edits take.
+/// </summary>
+public sealed partial class WorkbenchStockService
+{
+    public const string PlacementEditCapability = "placementEdit.v1";
+    public const string PlacementRequestSchema = "gooseworks-quartermaster-placement-request/v1";
+    public const string PlacementSchema = "gooseworks-quartermaster-placement/v1";
+    public const string PlacementEditSchema = "gooseworks-quartermaster-placement-edit/v1";
+    public const string PlacementEditAckSchema = "gooseworks-quartermaster-placement-edit-ack/v1";
+
+    private const int PlayerBagSlots = 140;
+    private (long Runtime, long Players, long State, string Json)? placement;
+
+    /// <summary>Characters the placement editor can show besides the owner; set once the courier exists.</summary>
+    public Func<QuartermasterRuntimeSnapshot, IEnumerable<OwnerScope>>? PlacementCharacters { get; set; }
+
+    /// <summary>Another character's observed stock (null while unobserved); set once the courier exists.</summary>
+    public Func<QuartermasterRuntimeSnapshot, OwnerScope, BrowserProjection?>? CharacterStock { get; set; }
+
+    // ---- Read ---------------------------------------------------------------------------------
+
+    public string GetPlacement(string requestJson)
+    {
+        object Rejected(string code, string message) => new { schema = PlacementSchema, providerInstanceId, status = "rejected", errorCode = code, message };
+        PlacementRequest? request = null;
+        if (!string.IsNullOrWhiteSpace(requestJson))
+        {
+            try { request = JsonSerializer.Deserialize<PlacementRequest>(requestJson, JsonOptions); }
+            catch (JsonException exception) { return JsonSerializer.Serialize(Rejected("invalid_json", exception.Message), JsonOptions); }
+        }
+        if (request is not null && !string.IsNullOrEmpty(request.Schema) && request.Schema != PlacementRequestSchema)
+            return JsonSerializer.Serialize(Rejected("unsupported_schema", $"Expected schema '{PlacementRequestSchema}'."), JsonOptions);
+        List<(uint ItemId, ItemQualityPolicy Quality)>? keys = null;
+        if (request?.Items is { } requested)
+        {
+            if (requested.Count > MaxPlacementItems)
+                return JsonSerializer.Serialize(Rejected("too_many_items", $"At most {MaxPlacementItems:N0} items."), JsonOptions);
+            keys = [];
+            foreach (var item in requested)
+            {
+                if (item.ItemId == 0)
+                    return JsonSerializer.Serialize(Rejected("invalid_item", "Each item needs an itemId."), JsonOptions);
+                if (!Enum.TryParse<ItemQualityPolicy>(item.Quality, ignoreCase: false, out var quality) || quality == ItemQualityPolicy.Any)
+                    return JsonSerializer.Serialize(Rejected("invalid_quality", $"Item {item.ItemId}: quality must be NqOnly or HqOnly."), JsonOptions);
+                if (!keys.Contains((item.ItemId, quality)))
+                    keys.Add((item.ItemId, quality));
+            }
+        }
+
+        var current = runtime();
+        if (!current.Owner.HasStableIdentity)
+            return JsonSerializer.Serialize(Rejected("missing_owner_scope", "No character is logged in."), JsonOptions);
+        var (stateRevision, plan) = state.Read(document => (document.Revision,
+            ListingPlanCatalog.OwnerPlan(document, current.Owner) is { } found ? Snapshot(found) : null));
+        if (keys is null)
+        {
+            lock (gate)
+                if (placement is { } cached && cached.Runtime == current.Revision && cached.Players == playerInventory.Revision && cached.State == stateRevision)
+                    return cached.Json;
+        }
+
+        string json;
+        try { json = BuildPlacement(current, plan, keys); }
+        catch (Exception exception)
+        {
+            warn?.Invoke($"Quartermaster could not build the placement view: {exception}");
+            return JsonSerializer.Serialize(Rejected("unavailable", exception.Message), JsonOptions);
+        }
+        if (keys is null)
+            lock (gate)
+                placement = (current.Revision, playerInventory.Revision, stateRevision, json);
+        return json;
+    }
+
+    private static ListingPlan Snapshot(ListingPlan plan) => new()
+    {
+        Id = plan.Id,
+        Revision = plan.Revision,
+        Owner = plan.Owner with { },
+        Reserves = plan.Reserves.Select(ListingPlanCatalog.Copy).ToList(),
+        UpdatedAtUtc = plan.UpdatedAtUtc,
+    };
+
+    private string BuildPlacement(QuartermasterRuntimeSnapshot current, ListingPlan? plan, IReadOnlyList<(uint ItemId, ItemQualityPolicy Quality)>? keys)
+    {
+        var owner = current.Owner;
+        var now = DateTime.UtcNow;
+        var reserves = (plan?.Reserves ?? []).Where(reserve => reserve.Enabled && reserve.ItemId > 0)
+            .GroupBy(reserve => (reserve.ItemId, reserve.Quality))
+            .ToDictionary(group => group.Key, group => group.First());
+        var rows = (keys ?? reserves.Keys.OrderBy(key => reserves[key].ItemName, StringComparer.OrdinalIgnoreCase).ThenBy(key => key.ItemId).ToList())
+            .Select(key => (Key: key, Rule: reserves.GetValueOrDefault(key)))
+            .ToArray();
+        var characters = PlacementCharacterList(current, plan);
+        var bags = playerInventory.Read(entries => entries
+            .Where(entry => entry.Owner.LocalContentId is > 0)
+            .GroupBy(entry => entry.Owner.LocalContentId!.Value)
+            .ToDictionary(group => group.Key, group => group.First()));
+        var stocks = characters.ToDictionary(character => character.LocalContentId!.Value,
+            character => character.Matches(owner) ? current.Browser : CharacterStock?.Invoke(current, character));
+
+        object Character(OwnerScope character) => new
+        {
+            character.LocalContentId,
+            character.HomeWorldId,
+            character.CharacterName,
+            character.HomeWorldName,
+        };
+        static long? Age(DateTime? observed, DateTime now) => observed is { } at ? (long)Math.Max(0, (now - at).TotalSeconds) : null;
+        static object Ranked(IEnumerable<ulong> ids) => ids.Distinct().Select((id, index) => new { rank = index + 1, retainerId = id }).ToArray();
+
+        return JsonSerializer.Serialize(new
+        {
+            schema = PlacementSchema,
+            providerInstanceId,
+            status = "ok",
+            revision = current.Revision,
+            generatedAtUtc = now,
+            owner = Character(owner),
+            characters = characters.Select(character =>
+            {
+                var isOwner = character.Matches(owner);
+                var bag = BagView(bags.GetValueOrDefault(character.LocalContentId!.Value), character);
+                // The character's assigned retainers in game order, then any retainer an item names there.
+                var named = rows.SelectMany(row => isOwner
+                        ? row.Rule?.Location.PreferredRetainerIds ?? []
+                        : row.Rule?.RemoteHomes is { } remote && remote.Character.Matches(character) ? remote.RetainerIds : [])
+                    .Where(id => id != PlacementEdits.AnySpace);
+                return new
+                {
+                    character.LocalContentId,
+                    character.HomeWorldId,
+                    character.CharacterName,
+                    character.HomeWorldName,
+                    isOwner,
+                    offersAnySpace = isOwner,
+                    bags = new
+                    {
+                        observed = bag.Observed,
+                        freeSlots = bag.FreeSlots,
+                        observedAtUtc = bag.ObservedAtUtc,
+                        observedAgeSeconds = Age(bag.ObservedAtUtc, now),
+                    },
+                    retainers = PlacementColumns(current, character, named).Select(column => new
+                    {
+                        column.RetainerId,
+                        retainerName = column.Retainer?.RetainerName,
+                        assigned = column.Retainer is { IsCurrentlyAssigned: not false },
+                        stockObserved = column.FreeSlots is not null,
+                        freeSlots = column.FreeSlots,
+                        observedAtUtc = column.ObservedAtUtc,
+                        observedAgeSeconds = Age(column.ObservedAtUtc, now),
+                    }),
+                };
+            }),
+            items = rows.Select(row =>
+            {
+                var rule = row.Rule;
+                var location = rule?.Location ?? new StowageRoutingPolicy();
+                var remote = rule?.RemoteHomes is { RetainerIds.Count: > 0 } homes ? homes : null;
+                var local = location.PreferredRetainerIds.Where(id => id != PlacementEdits.AnySpace).Distinct().ToArray();
+                return new
+                {
+                    itemId = row.Key.ItemId,
+                    itemName = rule?.ItemName is { Length: > 0 } name ? name : null,
+                    quality = row.Key.Quality.ToString(),
+                    hasRule = rule is not null,
+                    reserveUnits = rule?.ReserveUnits ?? 0,
+                    local = new
+                    {
+                        homes = Ranked(local),
+                        anySpace = location.AnySpace,
+                        anySpaceRank = location.AnySpace ? local.Length + 1 : (int?)null,
+                        consolidate = location.Consolidate,
+                    },
+                    remote = remote is null ? null : new
+                    {
+                        character = Character(remote.Character),
+                        homes = Ranked(remote.RetainerIds),
+                    },
+                    // Per shown character: units in its bags (null while unobserved) and in each retainer whose stock
+                    // was observed (a retainer absent here holds none when its stockObserved is true, unknown otherwise).
+                    held = characters.Select(character =>
+                    {
+                        var stock = stocks[character.LocalContentId!.Value];
+                        var observedBags = BagView(bags.GetValueOrDefault(character.LocalContentId.Value), character).Observed;
+                        var holdings = character.Matches(owner)
+                            ? PlacementMatrixData.Holdings(current, row.Key.ItemId, row.Key.Quality)
+                            : PlacementMatrixData.Holdings(current, row.Key.ItemId, row.Key.Quality, character, stock);
+                        return new
+                        {
+                            character.LocalContentId,
+                            bags = observedBags
+                                ? (character.Matches(owner)
+                                    ? PlacementMatrixData.BagHoldings(current, row.Key.ItemId, row.Key.Quality)
+                                    : PlacementMatrixData.BagHoldings(current, row.Key.ItemId, row.Key.Quality, character, stock))
+                                : (int?)null,
+                            retainers = holdings.Where(entry => entry.Value > 0)
+                                .OrderByDescending(entry => entry.Value).ThenBy(entry => entry.Key)
+                                .Select(entry => new { retainerId = entry.Key, quantity = entry.Value }),
+                        };
+                    }),
+                };
+            }),
+        }, JsonOptions);
+    }
+
+    /// <summary>
+    /// The characters the editor can show: the owner first, then (by name) every character the courier can deliver
+    /// to and every character a reserve item already has remote homes on.
+    /// </summary>
+    private IReadOnlyList<OwnerScope> PlacementCharacterList(QuartermasterRuntimeSnapshot current, ListingPlan? plan)
+    {
+        var owner = current.Owner;
+        IEnumerable<OwnerScope> offered = [];
+        try { offered = PlacementCharacters?.Invoke(current)?.ToArray() ?? []; }
+        catch (Exception exception) { warn?.Invoke($"Quartermaster could not list placement characters: {exception.Message}"); }
+        var homed = (plan?.Reserves ?? []).Where(reserve => reserve.Enabled)
+            .Select(reserve => reserve.RemoteHomes)
+            .OfType<ReserveRemoteHomes>()
+            .Where(remote => remote.RetainerIds.Count > 0)
+            .Select(remote => remote.Character);
+        var others = offered.Concat(homed)
+            .Where(character => character.HasStableIdentity && !character.Matches(owner))
+            .DistinctBy(character => (character.LocalContentId, character.HomeWorldId))
+            .OrderBy(character => character.CharacterName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(character => character.HomeWorldName, StringComparer.OrdinalIgnoreCase);
+        return [owner with { }, .. others.Select(character => character with { })];
+    }
+
+    private sealed record PlacementColumnView(ulong RetainerId, CachedRetainer? Retainer, int? FreeSlots, DateTime? ObservedAtUtc);
+
+    /// <summary>The character's assigned retainers in game order, then any other retainer named there (as the matrix columns).</summary>
+    private static IReadOnlyList<PlacementColumnView> PlacementColumns(QuartermasterRuntimeSnapshot current, OwnerScope character, IEnumerable<ulong> named)
+    {
+        PlacementColumnView View(ulong id, CachedRetainer? retainer)
+        {
+            var free = retainer is null ? null : StowageRouter.FreeInventorySlots(retainer);
+            DateTime? observed = null;
+            if (free is not null)
+            {
+                var pages = retainer!.Bags.Where(bag => RetainerPageNames.Contains(bag.BagName, StringComparer.Ordinal) && bag.ObservedAtUtc is not null).ToArray();
+                observed = pages.Length == 0 ? retainer.ObservedAtUtc : pages.Min(bag => bag.ObservedAtUtc!.Value);
+            }
+            return new(id, retainer, free, observed);
+        }
+        var columns = current.Retainers.Values
+            .Where(retainer => retainer.Owner.Matches(character) && retainer.IsCurrentlyAssigned is not false)
+            .OrderBy(retainer => retainer.DisplayOrder ?? int.MaxValue)
+            .ThenBy(retainer => retainer.RetainerName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(retainer => retainer.RetainerId)
+            .Select(retainer => View(retainer.RetainerId, retainer))
+            .ToList();
+        var shown = columns.Select(column => column.RetainerId).ToHashSet();
+        foreach (var id in named)
+            if (id != PlacementEdits.AnySpace && shown.Add(id))
+                columns.Add(View(id, current.Retainers.TryGetValue(id, out var retainer) && retainer.Owner.Matches(character) ? retainer : null));
+        return columns;
+    }
+
+    private sealed record BagObservation(bool Observed, int? FreeSlots, DateTime? ObservedAtUtc);
+
+    /// <summary>The main bags as this client last saw them whole; unobserved bags have no free count (never zero).</summary>
+    private static BagObservation BagView(CachedPlayerInventory? cached, OwnerScope character)
+    {
+        if (cached is null || !character.Matches(cached.Owner) ||
+            !PlayerBagNames.All(name => cached.ObservedSources.Contains(name, StringComparer.Ordinal)))
+            return new(false, null, null);
+        var main = cached.Bags.Where(bag => PlayerBagNames.Contains(bag.BagName, StringComparer.Ordinal)).ToArray();
+        var used = main.SelectMany(bag => bag.Items).Count(item => item.ItemId > 0 && item.Quantity > 0);
+        return new(true, Math.Max(0, PlayerBagSlots - used), main.Length == 0 ? cached.UpdatedAtUtc : main.Min(bag => bag.ObservedAtUtc));
+    }
+
+    // ---- Write --------------------------------------------------------------------------------
+
+    /// <summary>One item's edit: the item and its next shown destinations from what the shown character showed and holds.</summary>
+    internal sealed record PlacementEditLine(
+        PlacementEditorItem Item,
+        Func<StowageRoutingPolicy, IReadOnlyDictionary<ulong, int>, StowageRoutingPolicy> Edit);
+
+    /// <summary>
+    /// What happened to one item. Outcome: applied, unchanged, refused or not_applied (a refusal elsewhere stopped an
+    /// all-or-nothing edit). Code: Applied, Unchanged, RemoteHomesKeptOnOtherCharacter, InvalidItem, InvalidQuality,
+    /// DuplicateItem, UnknownRetainer, RuleInvalid or NotApplied.
+    /// </summary>
+    internal sealed record PlacementItemOutcome(
+        uint ItemId,
+        string ItemName,
+        ItemQualityPolicy? Quality,
+        string QualityText,
+        string Outcome,
+        string Code,
+        string Message)
+    {
+        public ulong? RetainerId { get; init; }
+        public string? Field { get; init; }
+        public bool RuleCreated { get; init; }
+        public bool RuleRemoved { get; init; }
+        public OwnerScope? RemoteHomesMovedFrom { get; init; }
+        public OwnerScope? RemoteHomesKeptOn { get; init; }
+    }
+
+    internal sealed record PlacementEditResult(IReadOnlyList<PlacementItemOutcome> Items, string? FailureCode = null, string? FailureMessage = null);
+
+    private sealed class PlacementEditAborted : Exception;
+
+    /// <summary>Queues a Placement window edit onto the framework thread; it then runs <see cref="ApplyPlacementEdit"/>.</summary>
+    internal void QueuePlacementEdit(OwnerScope owner, OwnerScope shown, IReadOnlyList<PlacementEditLine> lines) =>
+        workQueue.Enqueue(() => ApplyPlacementEdit(owner, shown, lines, allOrNothing: false, source: "Placement window"));
+
+    /// <summary>
+    /// The one placement edit path, for the Placement window and the IPC alike. Each item's next homes come from its
+    /// stored rule through <see cref="ReservePlacement.Resolve"/>, then must name only retainers the editor offers on
+    /// the shown character and pass the Listing Plan's reserve validation.
+    /// Every accepted change is written in one state mutation, creating the plan and a level-0 rule as needed and
+    /// removing a level-0 rule left with no home. Refusals are logged at Warning.
+    /// </summary>
+    internal PlacementEditResult ApplyPlacementEdit(OwnerScope owner, OwnerScope shown, IReadOnlyList<PlacementEditLine> lines,
+        bool allOrNothing, string source)
+    {
+        var current = runtime();
+        var isOwner = shown.Matches(owner);
+        var known = current.Retainers.Values
+            .Where(retainer => retainer.Owner.Matches(shown) && retainer.IsCurrentlyAssigned is not false)
+            .Select(retainer => retainer.RetainerId)
+            .ToHashSet();
+        var ownerRetainers = current.Retainers.Values.Where(retainer => retainer.Owner.Matches(owner)).Select(retainer => retainer.RetainerId).ToHashSet();
+        var stock = isOwner ? null : CharacterStock?.Invoke(current, shown);
+        IReadOnlyList<PlacementItemOutcome> outcomes = [];
+        try
+        {
+            state.Mutate(StateChangeKind.Listings, document =>
+            {
+                var results = new List<PlacementItemOutcome>();
+                var accepted = new List<(PlacementEditorItem Item, PlacementResolution Next, int Index)>();
+                var target = ListingPlanCatalog.OwnerPlan(document, owner);
+                // As the editor's columns: the shown character's assigned retainers plus any retainer a reserve item
+                // already names there. A retainer observed holding the item also counts (use current holders).
+                known.UnionWith((target?.Reserves ?? []).Where(reserve => reserve.Enabled).SelectMany(reserve => isOwner
+                    ? reserve.Location.PreferredRetainerIds
+                    : reserve.RemoteHomes is { } remote && remote.Character.Matches(shown) ? remote.RetainerIds : []));
+                foreach (var line in lines)
+                {
+                    var item = line.Item;
+                    var rule = target?.Reserves.FirstOrDefault(reserve => reserve.Enabled && reserve.ItemId == item.ItemId && reserve.Quality == item.Quality);
+                    var storedRemote = rule?.RemoteHomes is { RetainerIds.Count: > 0 } homes ? homes : null;
+                    var before = ReservePlacement.Shown(owner, shown, rule?.Location, storedRemote);
+                    var holdings = isOwner
+                        ? PlacementMatrixData.Holdings(current, item.ItemId, item.Quality)
+                        : PlacementMatrixData.Holdings(current, item.ItemId, item.Quality, shown, stock);
+                    var next = ReservePlacement.Resolve(owner, shown, rule?.Location, storedRemote, line.Edit(before, holdings));
+                    PlacementItemOutcome Outcome(string outcome, string code, string message) =>
+                        new(item.ItemId, item.ItemName, item.Quality, item.Quality.ToString(), outcome, code, message);
+                    if (!next.Changed)
+                    {
+                        results.Add(next.RemoteKeptOn is { } kept
+                            ? Outcome("unchanged", "RemoteHomesKeptOnOtherCharacter",
+                                $"{item.ItemName} has no homes on {shown.CharacterName}; its homes on {kept.CharacterName} stay.") with { RemoteHomesKeptOn = kept }
+                            : Outcome("unchanged", "Unchanged", $"{item.ItemName} already has these destinations."));
+                        continue;
+                    }
+                    var after = isOwner ? next.Local.PreferredRetainerIds : next.Remote?.RetainerIds ?? [];
+                    if (after.FirstOrDefault(id => id != PlacementEdits.AnySpace && !known.Contains(id) && !holdings.ContainsKey(id)) is var unknown and > 0)
+                    {
+                        results.Add(Outcome("refused", "UnknownRetainer",
+                            $"Retainer {unknown} is not a current retainer of {shown.CharacterName}; {item.ItemName} was left as it was.") with { RetainerId = unknown });
+                        continue;
+                    }
+                    var candidate = rule is null
+                        ? new ListingReserveRule { ItemId = item.ItemId, ItemName = item.ItemName, Quality = item.Quality }
+                        : ListingPlanCatalog.Copy(rule);
+                    candidate.Location = StowageRoutingPolicy.CopyOf(next.Local);
+                    candidate.RemoteHomes = ReserveRemoteHomes.CopyOf(next.Remote);
+                    var allowed = ownerRetainers.Concat(rule?.Location.PreferredRetainerIds ?? [])
+                        .Concat(isOwner ? known.Concat(holdings.Keys) : []).ToHashSet();
+                    if (ListingPlanCatalog.ValidateReserves([candidate], allowed).FirstOrDefault() is { } issue)
+                    {
+                        results.Add(Outcome("refused", "RuleInvalid", $"{item.ItemName}: {issue.Message}") with { Field = issue.Field });
+                        continue;
+                    }
+                    accepted.Add((item, next, results.Count));
+                    results.Add(Outcome("applied", "Applied", $"{item.ItemName}: destinations saved."));
+                }
+
+                var refused = results.Any(result => result.Outcome == "refused");
+                if (accepted.Count == 0 || allOrNothing && refused)
+                {
+                    foreach (var entry in accepted)
+                        results[entry.Index] = results[entry.Index] with
+                        {
+                            Outcome = "not_applied",
+                            Code = "NotApplied",
+                            Message = $"{entry.Item.ItemName}: not applied because another item in this all-or-nothing edit was refused.",
+                        };
+                    outcomes = results;
+                    throw new PlacementEditAborted();
+                }
+
+                if (target is null)
+                {
+                    target = new ListingPlan { Owner = owner with { } };
+                    document.ListingPlans.Add(target);
+                }
+                foreach (var (item, next, index) in accepted)
+                {
+                    var reserve = target.Reserves.FirstOrDefault(rule => rule.Enabled && rule.ItemId == item.ItemId && rule.Quality == item.Quality);
+                    var created = reserve is null;
+                    if (reserve is null)
+                    {
+                        reserve = new ListingReserveRule { ItemId = item.ItemId, ItemName = item.ItemName, Quality = item.Quality };
+                        target.Reserves.Add(reserve);
+                    }
+                    if (string.IsNullOrWhiteSpace(reserve.ItemName))
+                        reserve.ItemName = item.ItemName;
+                    if (next.LocalChanged)
+                        reserve.Location = StowageRoutingPolicy.CopyOf(next.Local);
+                    if (next.RemoteChanged)
+                        reserve.RemoteHomes = ReserveRemoteHomes.CopyOf(next.Remote);
+                    var removed = reserve.ReserveUnits == 0 && !reserve.HasAnyHome;
+                    if (removed)
+                        target.Reserves.Remove(reserve);
+                    results[index] = results[index] with
+                    {
+                        RuleCreated = created && !removed,
+                        RuleRemoved = removed && !created,
+                        RemoteHomesMovedFrom = next.RemoteMovedFrom,
+                        Message = next.RemoteMovedFrom is { } from
+                            ? $"{item.ItemName}: destinations saved; its homes moved from {from.CharacterName} to {shown.CharacterName}."
+                            : results[index].Message,
+                    };
+                }
+                target.UpdatedAtUtc = DateTime.UtcNow;
+                target.Revision = checked(target.Revision + 1);
+                document.Schema = "gooseworks-quartermaster-state/v5";
+                outcomes = results;
+            });
+        }
+        catch (PlacementEditAborted)
+        {
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            warn?.Invoke($"[Quartermaster] Placement edit ({source}) on {shown.CharacterName} could not be saved for " +
+                         $"{lines.Count:N0} item(s): {exception.Message}");
+            return new(lines.Select(line => new PlacementItemOutcome(line.Item.ItemId, line.Item.ItemName, line.Item.Quality,
+                line.Item.Quality.ToString(), "not_applied", "NotApplied", $"{line.Item.ItemName}: not saved ({exception.Message}).")).ToArray(),
+                "save_failed", exception.Message);
+        }
+        foreach (var refusal in outcomes.Where(outcome => outcome.Outcome == "refused"))
+            warn?.Invoke($"[Quartermaster] Placement edit ({source}) refused {refusal.ItemName} ({refusal.ItemId} {refusal.QualityText}) " +
+                         $"on {shown.CharacterName}: {refusal.Code}" +
+                         (refusal.RetainerId is { } id ? $" retainer={id}" : string.Empty) +
+                         (refusal.Field is { } field ? $" field={field}" : string.Empty) + $": {refusal.Message}");
+        return new(outcomes);
+    }
+
+    /// <summary>
+    /// Applies one Placement toolbar action to the named items of the logged-in owner, synchronously, and returns
+    /// per-item outcomes (<c>gooseworks-quartermaster-placement-edit-ack/v1</c>).
+    /// </summary>
+    public string EditPlacement(string requestJson)
+    {
+        PlacementEditRequest? request;
+        try { request = JsonSerializer.Deserialize<PlacementEditRequest>(requestJson, JsonOptions); }
+        catch (JsonException exception) { return EditAck(string.Empty, "rejected", "invalid_json", exception.Message, null, []); }
+        if (request is null)
+            return EditAck(string.Empty, "rejected", "invalid_json", "Request body is empty.", null, []);
+        string Reject(string code, string message)
+        {
+            warn?.Invoke($"[Quartermaster] Placement edit request {request.RequestId} rejected: {code}: {message}");
+            return EditAck(request.RequestId, "rejected", code, message, null, []);
+        }
+        if (request.Schema != PlacementEditSchema)
+            return Reject("unsupported_schema", $"Expected {PlacementEditSchema}.");
+        if (request.ProviderInstanceId != providerInstanceId)
+            return Reject("provider_mismatch", "The request names another Quartermaster instance.");
+        var current = runtime();
+        var owner = current.Owner;
+        if (!owner.HasStableIdentity || request.Owner is null ||
+            request.Owner.LocalContentId != owner.LocalContentId || request.Owner.HomeWorldId != owner.HomeWorldId)
+            return Reject("owner_mismatch", "The request owner is not the current character.");
+        if (!TryParseOperation(request.Operation, out var operation))
+            return Reject("invalid_operation", $"Operation '{request.Operation}' is not one of makeFirst, addFallback, remove, toggle, useCurrentHolders, clearDestinations.");
+
+        var shown = owner;
+        if (request.Character is { } named)
+        {
+            if (named.LocalContentId == 0 || named.HomeWorldId == 0)
+                return Reject("invalid_character", "character needs localContentId and homeWorldId.");
+            var plan = state.Read(document => ListingPlanCatalog.OwnerPlan(document, owner) is { } found ? Snapshot(found) : null);
+            var match = PlacementCharacterList(current, plan)
+                .FirstOrDefault(character => character.LocalContentId == named.LocalContentId && character.HomeWorldId == named.HomeWorldId);
+            if (match is null)
+                return Reject("character_not_offered", $"Character {named.LocalContentId}@{named.HomeWorldId} is not one the placement editor can show.");
+            shown = match;
+        }
+        var isOwner = shown.Matches(owner);
+
+        var destination = PlacementEdits.AnySpace;
+        if (ReservePlacement.NeedsDestination(operation))
+        {
+            if (request.Destination is not { } chosen || chosen.AnySpace == chosen.RetainerId is not null || chosen.RetainerId == 0)
+                return Reject("invalid_destination", $"{request.Operation} needs a destination: a retainerId, or anySpace: true.");
+            if (chosen.AnySpace && !isOwner)
+                return Reject("any_space_not_offered", $"Any space is the owner's only; {shown.CharacterName}'s homes are its ranked retainers.");
+            destination = chosen.AnySpace ? PlacementEdits.AnySpace : chosen.RetainerId!.Value;
+        }
+        else if (request.Destination is not null)
+            return Reject("invalid_destination", $"{request.Operation} takes no destination.");
+
+        if (request.Items is not { Count: > 0 } items)
+            return Reject("no_items", "Name at least one item.");
+        if (items.Count > MaxPlacementItems)
+            return Reject("too_many_items", $"At most {MaxPlacementItems:N0} items.");
+
+        var outcomes = new List<PlacementItemOutcome>();
+        var lines = new List<PlacementEditLine>();
+        var seen = new HashSet<(uint, ItemQualityPolicy)>();
+        foreach (var item in items)
+        {
+            var name = string.IsNullOrWhiteSpace(item.ItemName) ? $"Item {item.ItemId}" : item.ItemName.Trim();
+            PlacementItemOutcome Refused(ItemQualityPolicy? quality, string code, string message) =>
+                new(item.ItemId, name, quality, item.Quality, "refused", code, message);
+            if (item.ItemId == 0)
+                outcomes.Add(Refused(null, "InvalidItem", "An item needs an itemId."));
+            else if (!Enum.TryParse<ItemQualityPolicy>(item.Quality, ignoreCase: false, out var quality) || quality == ItemQualityPolicy.Any)
+                outcomes.Add(Refused(null, "InvalidQuality", $"{name}: quality must be NqOnly or HqOnly."));
+            else if (!seen.Add((item.ItemId, quality)))
+                outcomes.Add(Refused(quality, "DuplicateItem", $"{name} ({quality}) is named more than once."));
+            else
+                lines.Add(new(new(item.ItemId, name, quality), (before, holdings) => ReservePlacement.Operate(operation, before, destination, holdings)));
+        }
+        foreach (var refusal in outcomes)
+            warn?.Invoke($"[Quartermaster] Placement edit request {request.RequestId} refused item {refusal.ItemId} ({refusal.QualityText}): {refusal.Code}: {refusal.Message}");
+        if (request.AllOrNothing && outcomes.Count > 0 || lines.Count == 0)
+            return EditAck(request.RequestId, "rejected", "item_refused", "No item was changed: an item was refused.", shown,
+                outcomes.Concat(lines.Select(line => new PlacementItemOutcome(line.Item.ItemId, line.Item.ItemName, line.Item.Quality,
+                    line.Item.Quality.ToString(), "not_applied", "NotApplied", $"{line.Item.ItemName}: not applied because another item was refused."))).ToArray());
+
+        var result = ApplyPlacementEdit(owner, shown, lines, request.AllOrNothing, $"IPC request {request.RequestId}");
+        var all = outcomes.Concat(result.Items).ToArray();
+        if (result.FailureCode is { } failure)
+            return EditAck(request.RequestId, "rejected", failure, $"Nothing was saved: {result.FailureMessage}", shown, all);
+        var applied = all.Count(outcome => outcome.Outcome == "applied");
+        var refusedCount = all.Count(outcome => outcome.Outcome == "refused");
+        return applied > 0
+            ? EditAck(request.RequestId, refusedCount > 0 ? "partially_applied" : "applied", null,
+                refusedCount > 0 ? $"Applied to {applied:N0} item(s); {refusedCount:N0} refused." : $"Applied to {applied:N0} item(s).", shown, all)
+            : refusedCount > 0
+                ? EditAck(request.RequestId, "rejected", "item_refused", "No item was changed: an item was refused.", shown, all)
+                : EditAck(request.RequestId, "unchanged", null, "Every item already had these destinations.", shown, all);
+    }
+
+    private static bool TryParseOperation(string text, out PlacementOperation operation)
+    {
+        operation = default;
+        return text switch
+        {
+            "makeFirst" => Set(PlacementOperation.MakeFirst, out operation),
+            "addFallback" => Set(PlacementOperation.AddFallback, out operation),
+            "remove" => Set(PlacementOperation.Remove, out operation),
+            "toggle" => Set(PlacementOperation.Toggle, out operation),
+            "useCurrentHolders" => Set(PlacementOperation.UseCurrentHolders, out operation),
+            "clearDestinations" => Set(PlacementOperation.ClearDestinations, out operation),
+            _ => false,
+        };
+
+        static bool Set(PlacementOperation value, out PlacementOperation operation)
+        {
+            operation = value;
+            return true;
+        }
+    }
+
+    private string EditAck(string requestId, string status, string? errorCode, string message, OwnerScope? character,
+        IReadOnlyList<PlacementItemOutcome> items) =>
+        JsonSerializer.Serialize(new
+        {
+            schema = PlacementEditAckSchema,
+            providerInstanceId,
+            requestId,
+            status,
+            errorCode,
+            message,
+            character = character is null ? null : new { character.LocalContentId, character.HomeWorldId, character.CharacterName, character.HomeWorldName },
+            items = items.Select(item => new
+            {
+                item.ItemId,
+                item.ItemName,
+                quality = item.QualityText,
+                item.Outcome,
+                item.Code,
+                item.Message,
+                item.RetainerId,
+                item.Field,
+                item.RuleCreated,
+                item.RuleRemoved,
+                remoteHomesMovedFrom = item.RemoteHomesMovedFrom is { } from
+                    ? new { from.LocalContentId, from.HomeWorldId, from.CharacterName, from.HomeWorldName }
+                    : null,
+                remoteHomesKeptOn = item.RemoteHomesKeptOn is { } kept
+                    ? new { kept.LocalContentId, kept.HomeWorldId, kept.CharacterName, kept.HomeWorldName }
+                    : null,
+            }),
+        }, JsonOptions);
+}
