@@ -315,6 +315,7 @@ public sealed class MarketRunExecutor(
                             $"is not on {record.Owner.CharacterName}'s current retainer roster; its {stale.Length} assignment(s) were not listed. Reassign them in the Listing Plan.";
                         warning?.Invoke(message);
                         Add(record, message);
+                        ListingTarget = Math.Max(0, ListingTarget - evaluation.Retainers.Where(r => r.RetainerId == id).Sum(r => r.RefillListings.IsKnown ? r.RefillListings.Value : 0));
                     }
                     var visits = record.Assignments.Where(a => !missingRetainers.Contains(a.RetainerId)).GroupBy(a => a.RetainerId)
                         .Select(g => new RetainerVisit(g.Key, g.Select(a => a.RetainerName).FirstOrDefault(n => !string.IsNullOrWhiteSpace(n)) ?? $"Retainer {g.Key}", g.ToArray()))
@@ -420,7 +421,8 @@ public sealed class MarketRunExecutor(
     /// </summary>
     private async Task CheckListingTargetsAsync(MarketRunRecord record, MarketRunEvaluation evaluation)
     {
-        var ids = record.Assignments.Select(a => a.RetainerId).Distinct().ToArray();
+        // Retainers already missing from the roster get their own MarketRunRetainerMissing report.
+        var ids = record.Assignments.Select(a => a.RetainerId).Where(id => !missingRetainers.Contains(id)).Distinct().ToArray();
         IReadOnlyList<MarketRetainerUnavailable> unavailable;
         try { unavailable = await deadline.RunAsync(t => driver.UnavailableListingRetainersAsync(ids, t)).ConfigureAwait(false); }
         catch (Exception e) when (e is not OperationCanceledException || Volatile.Read(ref cancelled) == 0)

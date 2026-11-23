@@ -432,6 +432,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
 
     /// <summary>No enabled listing assignment and no reserve units: the rule only records where the item lives.</summary>
     private static bool IsPlacementOnly(ListingPlanDraft draft, MarketRunItem item) =>
+        item.ListedUnits is not { IsKnown: true, Value: > 0 } &&
         !draft.Assignments.Any(a => a.Enabled && a.ItemId == item.ItemId && a.Quality == item.Quality) &&
         !draft.Reserves.Any(r => r.ItemId == item.ItemId && r.Quality == item.Quality && r.ReserveUnits > 0);
 
