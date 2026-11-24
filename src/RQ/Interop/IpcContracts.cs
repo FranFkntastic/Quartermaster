@@ -15,6 +15,7 @@ public static class IpcChannels
     public const string SubmitCourierTransfer = "Quartermaster.v1.SubmitCourierTransfer";
     public const string StopCourierRun = "Quartermaster.v1.StopCourierRun";
     public const string ResumeCourierRun = "Quartermaster.v1.ResumeCourierRun";
+    public const string ClearCourierRun = "Quartermaster.v1.ClearCourierRun";
     public const string PairCourierOwner = "Quartermaster.v1.PairCourierOwner";
     public const string GetStockSources = "Quartermaster.v1.GetStockSources";
     public const string GetReserveItems = "Quartermaster.v1.GetReserveItems";
@@ -143,10 +144,14 @@ public sealed record CourierTransferRequest
     public bool ReturnCarrier { get; init; }
 }
 
-/// <summary>Stop or resume a courier run; an empty RunId means the current run.</summary>
+/// <summary>
+/// Stop, resume or clear a courier run. For stop and resume an empty RunId means the current run; clear requires
+/// the RunId of the run to forget. RequestId is optional and only echoed in the acknowledgement and the log.
+/// </summary>
 public sealed record CourierRunRequest
 {
     public string? RunId { get; init; }
+    public string? RequestId { get; init; }
 }
 
 /// <summary>

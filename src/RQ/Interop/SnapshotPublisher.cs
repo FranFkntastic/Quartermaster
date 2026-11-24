@@ -212,7 +212,7 @@ public sealed class SnapshotPublisher
         providerInstanceId,
         revision = Revision,
         channels = new[] { IpcChannels.GetCapabilities, IpcChannels.GetSnapshot, IpcChannels.SubmitShortages, IpcChannels.SubmitElementalDeposit, IpcChannels.GetOperation, IpcChannels.Changed,
-            IpcChannels.GetCourierStatus, IpcChannels.SubmitCourierTransfer, IpcChannels.StopCourierRun, IpcChannels.ResumeCourierRun, IpcChannels.PairCourierOwner,
+            IpcChannels.GetCourierStatus, IpcChannels.SubmitCourierTransfer, IpcChannels.StopCourierRun, IpcChannels.ResumeCourierRun, IpcChannels.ClearCourierRun, IpcChannels.PairCourierOwner,
             IpcChannels.GetStockSources, IpcChannels.GetReserveItems, IpcChannels.OpenPlacement, IpcChannels.SetReserveLevel, IpcChannels.PlanArrival,
             DeliveredStowIpcChannels.SubmitDeliveredStow, DeliveredStowIpcChannels.GetDeliveredStow, RequestedOperationCancelService.Channel,
             PlacementIpcChannels.GetPlacement, PlacementIpcChannels.EditPlacement },
