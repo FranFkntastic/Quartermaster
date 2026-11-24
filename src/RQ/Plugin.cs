@@ -363,12 +363,12 @@ public sealed class Plugin : IDalamudPlugin
         courier.LocalOwners = playerInventory.Owners;
         courier.ExternalStockCache = externalAccountStock = new ExternalAccountStockCache(configDirectory, s => log.Warning(s));
         courier.Follower = new(configDirectory,()=>state.ReadConfiguration(s=>s.Courier),automation,autoRetainerSuppression,courierTrade,
-            courierGame,courierGame,courierGame,s=>log.Warning(s),s=>log.Information(s),AutoRetainerLoaded);
+            courierGame,courierGame,courierGame,s=>log.Warning(s),s=>log.Information(s),AutoRetainerLoaded,courierGame.LifestreamBusy);
         courier.Follower.RestoreCustodyHold();
         courier.Link = courierPeer = new(courierGame,courier.Follower,DispatchOnFramework,s=>log.Warning(s),()=>state.ReadConfiguration(s=>s.Courier),
             change=>courier.UpdateSettings(change));
         courier.Conductor = new(configDirectory,courierPeer,courierTrade,courierGame,courierGame,courierGame,courierGame,
-            transfers,automation,autoRetainerSuppression,s=>log.Warning(s),s=>log.Information(s),AutoRetainerLoaded);
+            transfers,automation,autoRetainerSuppression,s=>log.Warning(s),s=>log.Information(s),AutoRetainerLoaded,courierGame.LifestreamBusy);
         courierPeer.OwnerRun = courier.Conductor.CurrentRun;
         var courierWorldRegion = courier.WorldRegion!;
         ipc.AttachCourier(new Interop.CourierIpcService(providerInstanceId, courier,

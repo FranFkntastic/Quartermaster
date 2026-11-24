@@ -29,7 +29,8 @@ public sealed class CarrierLedger
 
 public sealed class CourierFollower(string directory, Func<CourierSettings> settings, AutomationLease automation,
     AutoRetainerSuppression suppression, ICourierTradePort trade, IWorldVisitPort worlds, IMeetingBellPort bells,
-    IInventoryObservationPort inventory, Action<string> warning, Action<string>? information = null, Func<bool>? needsSuppression=null) : IDisposable
+    IInventoryObservationPort inventory, Action<string> warning, Action<string>? information = null, Func<bool>? needsSuppression=null,
+    Func<bool>? lifestreamBusy=null) : IDisposable
 {
     private readonly CourierStore<CarrierLedger> store = new(Path.Combine(directory, "courier-custody.json"), warning);
     private readonly CourierCalls calls = new(warning);
@@ -163,7 +164,15 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                 if(needsSuppression?.Invoke()!=false)suppress = suppression.Acquire();
                 stopped = false;
             }
-            if (suppression.IsBusy) return Refuse("AutoRetainerBusy");
+            // Only a step that moves the character, trades or takes a bag baseline waits for AutoRetainer and Lifestream
+            // to settle; ledger-only steps (Finish, Stop, settlements, Unclaim) move nothing and are never held back by them.
+            if (m.Command is CourierCommand.Travel or CourierCommand.Receive or CourierCommand.Send or CourierCommand.ReturnHome or CourierCommand.Claim)
+            {
+                var budget = deadline.Expires - DateTimeOffset.UtcNow;
+                if (budget > CourierBusyGate.Budget) budget = CourierBusyGate.Budget;
+                if (await CourierBusyGate.WaitIdleAsync(suppression, lifestreamBusy, () => stopped || disposed, budget) is { } busy)
+                    return stopped || disposed ? Refuse("CarrierDisarmed") : Refuse(busy.Code, busy.Detail);
+            }
             if (trade is ICourierHoldPort holds && m.Command is not (CourierCommand.Stop or CourierCommand.Finish or CourierCommand.Confirm or CourierCommand.Unclaim or CourierCommand.SettleSent))
             {
                 if(tradeHold==null && m.Command is not (CourierCommand.Begin or CourierCommand.Settle or CourierCommand.VerifySettlement)) return Refuse("TradeHoldScopeMissing");
@@ -363,7 +372,14 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                     information?.Invoke($"{m.Run}/{shipped.Command.Step} carrier settled its send from its own receipt ({m.Step}).");
                     break;
                 case CourierCommand.ReturnHome:
-                    await ReturnHomeAsync(cfg, m, ledger.Start); break;
+                    await ReturnHomeAsync(cfg, m, ledger.Start);
+                    // World arrival and bell range can be reached while Lifestream is still finishing its travel; the
+                    // receipt waits (bounded) for Lifestream to settle, so the owner's next step does not meet a carrier still moving.
+                    var settleBudget = deadline.Expires - DateTimeOffset.UtcNow;
+                    if (settleBudget > CourierBusyGate.Budget) settleBudget = CourierBusyGate.Budget;
+                    if (await CourierBusyGate.WaitIdleAsync(null, lifestreamBusy, () => stopped || disposed, settleBudget) is { } unsettled && !stopped && !disposed)
+                        warning($"{m.Run}/{m.Step} ReturnHomeUnsettled: {unsettled.Code}: {unsettled.Detail}; the carrier is home.");
+                    break;
                 case CourierCommand.Finish:
                     if (!ledger.Units.IsEmpty || ledger.Unconfirmed != null) return Refuse("CustodyRemaining");
                     ledger.Run = null; ledger.RunKey=null;ledger.OwnerEndpoint=null;ledger.Completed.Add(m.Run);

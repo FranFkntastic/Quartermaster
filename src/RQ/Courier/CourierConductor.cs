@@ -132,6 +132,7 @@ public sealed class CourierConductor
     private readonly Action<string> warning;
     private readonly Action<string>? information;
     private readonly Func<bool> needsSuppression;
+    private readonly Func<bool>? lifestreamBusy;
     private readonly CourierCalls calls;
     private readonly SemaphoreSlim gate = new(1);
     private volatile bool stop;
@@ -159,8 +160,9 @@ public sealed class CourierConductor
     public CourierConductor(string directory, ICourierPeerPort peer, ICourierTradePort trade, IInventoryObservationPort inventory,
         IWorldVisitPort worlds, ICharacterSwitchPort login, IMeetingBellPort bells, ICourierPlacementPort placement,
         AutomationLease automation, AutoRetainerSuppression suppression, Action<string> warning, Action<string>? information = null,
-        Func<bool>? needsSuppression=null)
+        Func<bool>? needsSuppression=null, Func<bool>? lifestreamBusy=null)
     {
+        this.lifestreamBusy = lifestreamBusy;
         this.peer = peer; this.trade = trade; this.inventory = inventory; this.worlds = worlds; this.login = login; this.bells = bells;
         this.placement = placement; this.automation = automation; this.suppression = suppression; this.warning = warning; calls = new(warning);
         store = new(Path.Combine(directory, "courier-run.json"), warning);
@@ -580,7 +582,11 @@ public sealed class CourierConductor
             carrierless = Carrierless(r);
             if (!automation.TryAcquire("courier owner", out lease) || lease == null) throw new CourierFault(CourierOutcome.Failed, "AutomationBusy", automation.AcquisitionBlockReason ?? "Busy");
             if(needsSuppression())suppress = suppression.Acquire();
-            if (suppression.IsBusy) throw new CourierFault(CourierOutcome.Failed, "AutoRetainerBusy", "AutoRetainer still active");
+            // AutoRetainer or Lifestream can still be finishing work right after a previous movement; wait for them
+            // (bounded) instead of refusing at once, and name the one still busy when the wait runs out.
+            if (await CourierBusyGate.WaitIdleAsync(suppression, lifestreamBusy, () => stop || unloaded, CourierBusyGate.Budget) is { } busy)
+                throw stop || unloaded ? new CourierFault(CourierOutcome.Cancelled, "StopRequested", "Stopped while waiting for automation to go idle.")
+                    : new CourierFault(CourierOutcome.Failed, busy.Code, busy.Detail);
             peerPhase = "Idle";
             if (!carrierless) peer.LinkLost += Lost;
             peer.Progress += Progress; peer.StopRequested += RemoteStop;
