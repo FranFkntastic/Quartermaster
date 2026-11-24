@@ -263,7 +263,8 @@ public sealed class CourierConductor
             CourierPhase.HandOut or CourierPhase.HandIn => pending.LocalMayHaveStarted==false ||
                 trade is ICourierSettlement or ICourierDispatchEvidence || r.Evidence.Any(e=>e.Step==pending.Id && e.BothTradesVerified),
             // Placement settles from its journaled operations and fresh bags; no retainer baseline is needed.
-            CourierPhase.Finish => false,
+            // A pending Finish moves nothing: with nothing in custody, a resume re-sends it or finds it already landed.
+            CourierPhase.Finish => r.Custody.IsEmpty,
             _=>true
         };
         var step = r.Schedule.Skip(r.Cursor).FirstOrDefault();
@@ -526,7 +527,7 @@ public sealed class CourierConductor
         void Lost() { stop = true; warning($"CourierLinkLost: {r.Run}"); _ = CancelLocal(); }
         void RemoteStop(Guid run) { if (run == r.Run) { stop = true; _ = CancelLocal(); } }
         void Progress(CourierProgress p) { if (p.Run == r.Run) peerPhase = p.Phase; }
-        bool beginAttempted = false, existingRun=false, carrierless=false;
+        bool beginAttempted = false, existingRun=false, carrierless=false, finishLanded=false;
         // A carrier-sourced run that cannot claim what it must deliver ends Refused: nothing held, not resumable.
         bool refusedRun = false;
         // A carrier-less run has no carrier to ask: it stands in an empty bag view and ledger for one.
@@ -686,6 +687,21 @@ public sealed class CourierConductor
                         }
                     }
                 }
+                // A pending Finish moves no stock or gil. While the carrier still holds this run it is re-sent under its id
+                // (the carrier answers with its recorded receipt or runs it once); a carrier that no longer holds the run
+                // already closed it, so the run completes without sending it again.
+                var finishing=r.Pending is {Action.Phase:CourierPhase.Finish};
+                if (finishing)
+                {
+                    if (!r.Custody.IsEmpty)
+                        throw Fault("ResumeFinishCustodyRemaining", $"Finish is pending but the run still holds [{Describe(r.Custody)}] in custody.");
+                    if (!carrierless && status.ActiveRun != r.Run)
+                    {
+                        warning($"{r.Run}/{r.Pending!.Id} ResumeFinishLanded: the carrier holds {status.ActiveRun?.ToString() ?? "no run"}; completing without re-sending Finish.");
+                        r.OwnerCheckpoint = owner; r.CarrierCheckpoint = carrier; r.PeerClaimed = false;
+                        r.Pending = null; r.Cursor = r.Schedule.Length; finishLanded = true; store.Save(r);
+                    }
+                }
                 var travel=r.Pending?.Action.Phase is CourierPhase.EnsureSource or CourierPhase.SwitchToDestination or CourierPhase.ReturnOwner
                     or CourierPhase.ReturnCarrier or CourierPhase.CarrierToSource or CourierPhase.CarrierToDestination or CourierPhase.ReturnDestinationHome;
                 // An unstarted claim moves nothing and re-checks the carrier's fresh bags itself; a released claim resumes
@@ -696,15 +712,15 @@ public sealed class CourierConductor
                 var claiming=r.Pending is {Action.Phase:CourierPhase.Claim} claim ? claim : null;
                 var custodyAgrees=SameCustody(status.Custody,r.Custody) ||
                     claiming!=null && SameCustody(status.Custody,Custody.Apply(r.Custody,claiming.Action.Batch,1));
-                if (r.Pending is { } unproven && !travel && claiming==null)
+                if (r.Pending is { } unproven && !travel && claiming==null && !finishing)
                     throw Fault("ResumePendingUnsettled", $"{unproven.Action.Phase} {unproven.Id} is still unverified" +
                         (unproven.Action.Phase is CourierPhase.HandOut or CourierPhase.HandIn
                             ? $"; the carrier holds {status.Unconfirmed?.ToString() ?? "no hand-off"} unconfirmed and last confirmed {status.LastConfirmed?.ToString() ?? "nothing"}." : "."));
-                if (status.Unconfirmed is { } foreign)
+                if (!finishLanded && status.Unconfirmed is { } foreign)
                     throw Fault("ResumeCarrierUnconfirmed", $"The carrier holds hand-off {foreign} unconfirmed, which this run has no pending step for.");
-                if (!custodyAgrees)
+                if (!finishLanded && !custodyAgrees)
                     throw Fault("ResumeCustodyMismatch", $"The run holds [{Describe(r.Custody)}] in custody; the carrier's ledger holds [{Describe(Held(status))}].");
-                if (!travel && !unstartedTrade && r.Cursor != 0 && (!Agrees(r.OwnerCheckpoint, owner, r) || !carrierless && !Agrees(r.CarrierCheckpoint, carrier, r)))
+                if (!travel && !unstartedTrade && !finishing && r.Cursor != 0 && (!Agrees(r.OwnerCheckpoint, owner, r) || !carrierless && !Agrees(r.CarrierCheckpoint, carrier, r)))
                     throw Fault("ResumeCheckpointMismatch", string.Join("; ", new[] { Drift("Owner", r.OwnerCheckpoint, owner, r),
                         carrierless ? "" : Drift("Carrier", r.CarrierCheckpoint, carrier, r) }.Where(x => x.Length > 0)) + ".");
             }
@@ -712,7 +728,8 @@ public sealed class CourierConductor
             // Begin may succeed on the peer even if its acknowledgement is lost.
             if(stop)throw new CourierFault(CourierOutcome.Cancelled,"StopBeforeBegin","Begin was not dispatched.");
             r.State = "Running"; r.Code=r.Detail=""; store.Save(r); beginAttempted = true;
-            if (!carrierless)
+            // A Finish the carrier already landed closed its run there: a Begin would be refused as closed.
+            if (!carrierless && !finishLanded)
             {
                 await Send(r, CourierCommand.Begin, r.Start, []);
                 r.PeerClaimed = true; store.Save(r);
@@ -992,7 +1009,7 @@ public sealed class CourierConductor
                         if (!r.Custody.IsEmpty) throw Fault("CustodyRemaining", "Carrier still holds stock");
                         // Finish closes the carrier's run, so its receipt is the terminal checkpoint;
                         // a later Status could no longer be authorized against this run.
-                        finished = await Send(r, CourierCommand.Finish, r.Start, []); r.PeerClaimed = false; break;
+                        finished = await Send(r, CourierCommand.Finish, r.Start, [], id: intent.Id); r.PeerClaimed = false; break;
                 }
                 if (s.Phase is CourierPhase.HandOut or CourierPhase.HandIn)
                 {
