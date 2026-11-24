@@ -993,7 +993,12 @@ public sealed class CourierSession
             "HandOffDeltaMismatch" or "LedgerMismatch" or "SettlementDeltaMismatch" or "SettlementLedgerMismatch" or "CustodyMismatch"
                 or "ReceiptMismatch" or "NotDeliveredDeltaMismatch" or "PlacementSettlementMismatch" or "PlacementSettlementIdentity" or "ClaimLedgerMismatch"
                 => "Hand-off did not match the plan",
-            "TradeClosureUnproven" or "ResumeUnsettled" => "Hand-off unverified",
+            "UnmanifestedTransfer" => "Unplanned items moved in the hand-off",
+            "ManifestDeltaMismatch" or "ManifestDeltaOutOfRange" or "TradeRecordDisagrees" or "SettlementIdentityMismatch"
+                or "SettlementEvidenceMissing" or "SettlementUnavailable" or "TradeManifestUnsettled" => "Hand-off did not match the plan",
+            "TradeClosureUnproven" or "ResumeUnsettled" or "ResumePendingUnsettled" or "ResumeCarrierUnconfirmed" => "Hand-off unverified",
+            "ResumeCustodyMismatch" => $"{who}'s held items differ from the run",
+            "ResumeCheckpointMismatch" => "Bags changed since the last step",
             "HandInNeedsSettlement" => "Hand-in unproven",
             "OwnerReceiveStalledAfterSenderFinished" => $"Receive stalled after {who} finished",
             "OwnerUnloaded" => "Quartermaster unloaded mid-run",

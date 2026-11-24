@@ -32,6 +32,13 @@ internal static class CourierReceiveRecovery
             long original = state.Original.Where(i=>i.ItemId==id && i.Hq==hq).Sum(i=>(long)i.Units);
             long increase = (long)fresh.Count(id,hq)-arm.Before.Count(id,hq);
             long sent = (long)sender.Before.Count(id,hq)-sender.After.Count(id,hq);
+            if (original == 0)
+            {
+                // Not in the receive: only a move between the two (left one, reached the other) is the trade's.
+                // A change on one side alone, or both gaining or both losing, happened outside it.
+                if (increase != 0 && sent != 0 && Math.Sign(increase) == Math.Sign(sent)) return Unknown();
+                continue;
+            }
             if (increase < 0 || increase > remain || sent != original-remain+increase) return Unknown();
             if (increase > 0) delta.Add((item!,checked((int)increase)));
         }
