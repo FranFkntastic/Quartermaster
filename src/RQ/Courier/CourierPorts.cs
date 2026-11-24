@@ -83,7 +83,11 @@ internal interface ICourierDispatchEvidence
 }
 internal interface ICourierSettlement
 {
-    Task<Result<bool>> Settle(Guid step,OwnerScope partner,TradeEvidence peer,Deadline deadline);
+    /// <summary>
+    /// Settles this side's trade record for <paramref name="step"/> once the run has reconciled both sides' bags:
+    /// <paramref name="credit"/> is what that reconciliation found moved, and the record must have credited exactly it.
+    /// </summary>
+    Task<Result<bool>> Settle(Guid step,OwnerScope partner,TradeEvidence peer,ImmutableArray<Shipment> credit,Deadline deadline);
 }
 /// <summary>Ends an owner receive that no longer tracks a trade its sender already finished; its armed window stays for settlement.</summary>
 internal interface ICourierReceiveStall
@@ -132,6 +136,26 @@ public interface IInventoryObservationPort
     Task<Result<InventoryView>> ObserveAsync(Deadline deadline);
 }
 
+/// <summary>
+/// A hand-off settled from both sides' bags: Moved and Rest split its batch; Outside lists changes either side made outside
+/// the trade (ignored, for a warning). A refusal (Code set) names every offending key, which side and both deltas.
+/// </summary>
+internal sealed record Reconciliation(ImmutableArray<Shipment> Moved, ImmutableArray<Shipment> Rest, ImmutableArray<string> Outside,
+    string? Code = null, string Detail = "")
+{
+    internal bool Settled => Code == null;
+    internal static Reconciliation Refused(string code, string detail, ImmutableArray<string> outside = default) =>
+        new([], [], outside.IsDefault ? [] : outside, code, detail);
+}
+/// <summary>
+/// The trade layer's own record of one step: every window it verified against bags as it closed. Read only while the step
+/// is at rest (no trade running or window open, nothing armed, no unverified lock or pending cancellation).
+/// </summary>
+internal interface ICourierTradeRecord
+{
+    /// <summary>Units the step's trades credited, per key; refused when the record is not this step's or not at rest.</summary>
+    Task<Result<IReadOnlyDictionary<(uint Item, bool Hq), long>>> CreditedAsync(Guid step, Deadline deadline);
+}
 internal static class Custody
 {
     // Carried gil is always in the key universe: an item trade must leave gil unchanged on both sides,
@@ -143,29 +167,104 @@ internal static class Custody
         e.Before.Stock.Concat(e.After.Stock).Select(s => (Item: s.ItemId, s.Hq)).Concat(manifest.Select(s => (s.Item, s.Hq))).Append(GilKey)
             .Distinct().All(key => (long)e.After.Count(key.Item, key.Hq) - e.Before.Count(key.Item, key.Hq)
             == sign * manifest.Where(s => s.Item == key.Item && s.Hq == key.Hq).Sum(s => (long)s.Units));
-    // Allocate observed units in manifest order only after comparing every stock key,
-    // including unrelated decreases, both identities and both quality variants.
     internal static bool TrySlice(TradeEvidence local, OwnerScope who, TradeEvidence remote, OwnerScope other,
         ImmutableArray<Shipment> batch, int sign, out ImmutableArray<Shipment> moved, out ImmutableArray<Shipment> rest)
     {
-        moved=rest=[];
-        if (!CourierPlanner.Exact(local.Before.Character,who) || !CourierPlanner.Exact(local.After.Character,who) ||
-            !CourierPlanner.Exact(remote.Before.Character,other) || !CourierPlanner.Exact(remote.After.Character,other)) return false;
-        var counts=new Dictionary<(uint,bool),long>();
-        foreach(var k in local.Before.Stock.Concat(local.After.Stock).Concat(remote.Before.Stock).Concat(remote.After.Stock)
-            .Select(x=>(x.ItemId,x.Hq)).Append((ItemId: GilKey.Item, Hq: GilKey.Hq)).Distinct())
+        var settled = Reconcile(local, who, remote, other, batch, sign);
+        (moved, rest) = (settled.Moved, settled.Rest);
+        return settled.Settled;
+    }
+    /// <summary>
+    /// What a hand-off between <paramref name="who"/> (local) and <paramref name="other"/> (remote) moved, from both sides'
+    /// bags before and after it; <paramref name="sign"/> -1 when local sent, +1 when it received. Units are allocated in
+    /// manifest order.
+    /// <para>Only a change a trade between the two could have produced is held against the hand-off. A manifest key must
+    /// move the same amount on both sides, between nothing and its batch. A key outside the manifest refuses only when it
+    /// moved on both sides in the same direction (left one, reached the other): a change on one side alone, or both sides
+    /// gaining or both losing, happened outside the trade and is reported in <see cref="Reconciliation.Outside"/>.</para>
+    /// <para><paramref name="credited"/> is the local trade layer's own record of the step (units it verified window by
+    /// window). When given it must equal what the bags agree on; when the two sides' bags disagree on a manifest key, it
+    /// settles that key only if one side's bags equal it, the other side's difference then being an outside change. The
+    /// remote side checks its own record the same way, and the carrier's ledger acknowledgement proves both agree.</para>
+    /// </summary>
+    internal static Reconciliation Reconcile(TradeEvidence local, OwnerScope who, TradeEvidence remote, OwnerScope other,
+        ImmutableArray<Shipment> batch, int sign, IReadOnlyDictionary<(uint Item, bool Hq), long>? credited = null)
+    {
+        foreach (var (view, expected, side) in new[] { (local.Before, who, "local before"), (local.After, who, "local after"),
+                     (remote.Before, other, "remote before"), (remote.After, other, "remote after") })
+            if (!CourierPlanner.Exact(view.Character, expected))
+                return Reconciliation.Refused("SettlementIdentityMismatch", $"{side} bags are {view.Character.CharacterName}'s, not {expected.CharacterName}'s.");
+        string Name((uint Item, bool Hq) k) => k == GilKey ? "Gil" :
+            (batch.FirstOrDefault(s => s.Item == k.Item && s.Hq == k.Hq)?.Name is { Length: > 0 } name ? $"{name} ({k.Item})" : $"item {k.Item}") + (k.Hq ? " HQ" : " NQ");
+        string Deltas((uint Item, bool Hq) k) =>
+            $"{who.CharacterName} {(long)local.After.Count(k.Item, k.Hq) - local.Before.Count(k.Item, k.Hq):+#,0;-#,0;0}, " +
+            $"{other.CharacterName} {(long)remote.After.Count(k.Item, k.Hq) - remote.Before.Count(k.Item, k.Hq):+#,0;-#,0;0}";
+        var counts = new Dictionary<(uint, bool), long>();
+        var outside = ImmutableArray.CreateBuilder<string>();
+        var refusals = new List<(int Rank, string Code, string Detail)>();
+        // Manifest keys first, so details read in the order the run lists its lines.
+        foreach (var k in batch.Select(s => (s.Item, s.Hq)).Concat(local.Before.Stock.Concat(local.After.Stock).Concat(remote.Before.Stock)
+                     .Concat(remote.After.Stock).Select(x => (Item: x.ItemId, x.Hq))).Append(GilKey).Distinct())
         {
-            var n=sign*((long)local.After.Count(k.ItemId,k.Hq)-local.Before.Count(k.ItemId,k.Hq));
-            if(n<0 || n>batch.Where(x=>x.Item==k.ItemId && x.Hq==k.Hq).Sum(x=>(long)x.Units) ||
-                n!=sign*((long)remote.Before.Count(k.ItemId,k.Hq)-remote.After.Count(k.ItemId,k.Hq)))return false;
-            counts[k]=n;
+            // Both in the hand-off's direction: n left (sign -1) or reached (+1) the local side, m reached or left the remote side.
+            long n = sign * ((long)local.After.Count(k.Item, k.Hq) - local.Before.Count(k.Item, k.Hq));
+            long m = sign * ((long)remote.Before.Count(k.Item, k.Hq) - remote.After.Count(k.Item, k.Hq));
+            long b = batch.Where(x => x.Item == k.Item && x.Hq == k.Hq).Sum(x => (long)x.Units);
+            if (b == 0)
+            {
+                if (n == 0 && m == 0) continue;
+                if (n != 0 && m != 0 && Math.Sign(n) == Math.Sign(m))
+                    refusals.Add((0, "UnmanifestedTransfer", $"{Name(k)} is not in the hand-off but moved between them: {Deltas(k)}."));
+                else outside.Add($"{Name(k)}: {Deltas(k)}");
+                continue;
+            }
+            long? c = credited == null ? null : credited.GetValueOrDefault(k);
+            if (n == m)
+            {
+                if (n < 0 || n > b) refusals.Add((2, "ManifestDeltaOutOfRange", $"{Name(k)} moved {n:#,0} of a {b:#,0} batch: {Deltas(k)}."));
+                else if (c is { } recorded && recorded != n)
+                    refusals.Add((3, "TradeRecordDisagrees", $"{Name(k)}: both bags moved {n:#,0}, {who.CharacterName}'s trade record {recorded:#,0}: {Deltas(k)}."));
+                else counts[k] = n;
+            }
+            else if (c is { } recorded && recorded >= 0 && recorded <= b && (recorded == n || recorded == m))
+            {
+                // One side's bags match the verified trade record; the other side's difference is its own outside change.
+                counts[k] = recorded;
+                var (changed, beyond) = recorded == n ? (other.CharacterName, -sign * (m - recorded)) : (who.CharacterName, sign * (n - recorded));
+                outside.Add($"{Name(k)}: {changed} changed {beyond:+#,0;-#,0;0} beyond the {recorded:#,0} {who.CharacterName}'s trade record verified ({Deltas(k)})");
+            }
+            else refusals.Add((1, "ManifestDeltaMismatch", $"{Name(k)}: {Deltas(k)}" +
+                (c is { } r ? $"; {who.CharacterName}'s trade record {r:#,0}." : "; no settled trade record to break the tie.")));
         }
-        foreach(var s in batch){
-            var key=(s.Item,s.Hq);int n=(int)Math.Min(s.Units,counts.GetValueOrDefault(key));
-            if(n>0){moved=moved.Add(s with {Units=n});counts[key]-=n;}
-            if(n<s.Units)rest=rest.Add(s with {Units=s.Units-n});
+        if (refusals.Count > 0)
+            return Reconciliation.Refused(refusals.MinBy(x => x.Rank).Code, string.Join(" ", refusals.Select(x => x.Detail)), outside.ToImmutable());
+        ImmutableArray<Shipment> moved = [], rest = [];
+        foreach (var s in batch)
+        {
+            var key = (s.Item, s.Hq); int n = (int)Math.Min(s.Units, counts.GetValueOrDefault(key));
+            if (n > 0) { moved = moved.Add(s with { Units = n }); counts[key] -= n; }
+            if (n < s.Units) rest = rest.Add(s with { Units = s.Units - n });
         }
-        return true;
+        return new(moved, rest, outside.ToImmutable());
+    }
+    /// <summary>The trade port's record of <paramref name="step"/> at rest, or null when it has none (or none at rest) within 10s.</summary>
+    internal static async Task<IReadOnlyDictionary<(uint Item, bool Hq), long>?> RecordOf(object trade, Guid step)
+    {
+        if (trade is not ICourierTradeRecord book) return null;
+        try
+        {
+            var read = await book.CreditedAsync(step, Deadline.After("TradeRecord", 10)).WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+            return read is { Outcome: CourierOutcome.Succeeded, Value: { } credited } ? credited : null;
+        }
+        catch (Exception e) when (e is TimeoutException or OperationCanceledException) { return null; }
+    }
+    /// <summary>Units per key a trade record credited: its original queue less what is still queued.</summary>
+    internal static IReadOnlyDictionary<(uint Item, bool Hq), long> Credited(IEnumerable<BagStock> original, IEnumerable<BagStock> remaining)
+    {
+        var credited = new Dictionary<(uint Item, bool Hq), long>();
+        foreach (var x in original) credited[(x.ItemId, x.Hq)] = credited.GetValueOrDefault((x.ItemId, x.Hq)) + x.Units;
+        foreach (var x in remaining) credited[(x.ItemId, x.Hq)] = credited.GetValueOrDefault((x.ItemId, x.Hq)) - x.Units;
+        return credited;
     }
     internal static bool Covers(IEnumerable<Shipment> held, IEnumerable<Shipment> wanted)
         => wanted.GroupBy(s => s with { Units = 0 }).All(g => held.Where(s => (s with { Units = 0 }) == g.Key)

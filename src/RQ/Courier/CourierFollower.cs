@@ -69,11 +69,11 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     {
         var cfg = settings();
         var refused = false;
-        Result<CourierReceipt> Refuse(string code)
+        Result<CourierReceipt> Refuse(string code, string? detail = null)
         {
             refused = true;
-            warning($"{m.Run}/{m.Step} {m.Command}: {code} ({deadline.Name})");
-            return Result<CourierReceipt>.Fail(code, deadline.Name);
+            warning($"{m.Run}/{m.Step} {m.Command}: {code} ({deadline.Name}){(detail == null ? "" : ": " + detail)}");
+            return Result<CourierReceipt>.Fail(code, detail ?? deadline.Name);
         }
         if (!cfg.CarrierOptIn) return Refuse("CarrierOptInOff");
         if(disposed)return Refuse("CarrierUnloaded");
@@ -291,18 +291,27 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                     var pending = staged.Command;
                     var sign = pending.Command == CourierCommand.Receive ? 1 : -1;
                     var credit = pending.Manifest;
+                    IReadOnlyDictionary<(uint Item, bool Hq), long>? record = null;
                     if(m.Command is CourierCommand.VerifySettlement or CourierCommand.Settle){
-                        if(staged.Before==null || m.OwnerEvidence==null ||
-                            !Custody.TrySlice(new(staged.Before,before),m.Carrier,m.OwnerEvidence,pending.Partner,pending.Manifest,sign,out credit,out _))
-                            return Refuse("SettlementDeltaMismatch");
+                        if(staged.Before==null || m.OwnerEvidence==null)
+                            return Refuse("SettlementEvidenceMissing", $"hand-off {pending.Step}: {(staged.Before==null?"no carrier bags before it":"no owner evidence")}.");
+                        // This side's own trade record breaks a tie the two sides' bags cannot (an outside change on a manifest key).
+                        record = await Custody.RecordOf(trade, pending.Step);
+                        var settled = Custody.Reconcile(new(staged.Before,before),m.Carrier,m.OwnerEvidence,pending.Partner,pending.Manifest,sign,record);
+                        if (!settled.Outside.IsEmpty)
+                            warning($"{m.Run}/{pending.Step} SettlementOutsideChange: ignored as outside the trade: {string.Join("; ", settled.Outside)}.");
+                        if (!settled.Settled) return Refuse(settled.Code!, $"hand-off {pending.Step}: {settled.Detail}");
+                        credit = settled.Moved;
                     }
                     if (m.Command is CourierCommand.Settle or CourierCommand.VerifySettlement && staged.Result?.Outcome==CourierOutcome.Succeeded &&
-                        (staged.Result.Value?.Evidence is not {} recorded || !Custody.TrySlice(recorded,m.Carrier,m.OwnerEvidence!,pending.Partner,pending.Manifest,sign,out var saved,out _) ||
-                        !saved.SequenceEqual(credit))) return Refuse("SettledReceiptChanged");
+                        (staged.Result.Value?.Evidence is not {} recorded ||
+                            Custody.Reconcile(recorded,m.Carrier,m.OwnerEvidence!,pending.Partner,pending.Manifest,sign,record) is not {Settled:true} saved ||
+                        !saved.Moved.SequenceEqual(credit))) return Refuse("SettledReceiptChanged");
                     if (m.Command is CourierCommand.Settle or CourierCommand.VerifySettlement && staged.Result?.Outcome != CourierOutcome.Succeeded)
                     {
-                        if (trade is not ICourierSettlement recovery || staged.Before == null) return Refuse("SettlementDeltaMismatch");
-                        await calls.Call("CarrierSettlement",15,d=>recovery.Settle(pending.Step,pending.Partner,m.OwnerEvidence!,d));
+                        if (trade is not ICourierSettlement recovery || staged.Before == null) return Refuse("SettlementUnavailable", "this client cannot settle its trade record.");
+                        var reconciled = credit;
+                        await calls.Call("CarrierSettlement",15,d=>recovery.Settle(pending.Step,pending.Partner,m.OwnerEvidence!,reconciled,d));
                         staged=staged with {Result=Result<CourierReceipt>.Ok(new(m.Run,pending.Step,Evidence:new(staged.Before,before),Custody:ledger.Units))};
                         ledger.Steps[pending.Step]=staged;
                     }

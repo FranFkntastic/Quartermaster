@@ -211,6 +211,42 @@ public sealed class CourierRunTests : IDisposable
         Assert.Empty(engine.Journal().Custody);
     }
 
+    // Live 2026-11-24: a 66,198,372-gil hand-out moved 45 of its million-gil windows, then the next window closed before
+    // anything was offered. Before the resume, the owner gained 4,995 Cobalt Joint Plates from ordinary play that the
+    // carrier never saw, and every resume refused because that unrelated key did not reconcile: the run was stranded
+    // holding 45M with its new transfers refused. A change on one side alone is outside the trade and must not block
+    // settlement; a move that mirrors between the two (left the owner, reached the carrier) still refuses, by name.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PartialGilHandOutSettlesPastOneSidedChangesButNotMirroredOnes(bool mirrored)
+    {
+        const int Total = 66_198_372, Moved = 45_000_000, Carried = 40_199_677, Held = 919_387_159;
+        const uint Plates = 7023;
+        owner.Gil[source] = Held; mule.Gil[carrier] = Carried;
+        owner.Other[source] = new(Plates, false, 10_000);
+        owner.PartialGil = mule.PartialGil = Moved;
+        var interrupted = await engine.StartAsync(Transfer(source, destination, Total, false), cfg);
+        Assert.True(interrupted is { State: "Indeterminate", CanResume: true }, interrupted.State + " " + interrupted.Code + ":" + interrupted.Detail);
+        Assert.Equal((Held - Moved, Carried + Moved), (owner.Gil[source], mule.Gil[carrier]));
+        if (mirrored) { owner.Other[source] = new(Plates, false, 10_000 - 100); mule.Other[carrier] = new(Plates, false, 100); }
+        else owner.Other[source] = new(Plates, false, 10_000 + 4_995);
+
+        engine = Conductor();
+        var resumed = await engine.StartAsync(new(Guid.Empty, 0, [], []), new());
+        if (mirrored)
+        {
+            Assert.True(resumed is { State: "Indeterminate", Code: "UnmanifestedTransfer" }, resumed.State + " " + resumed.Code + ":" + resumed.Detail);
+            Assert.Contains("item 7023 NQ", resumed.Detail); Assert.Contains("Character 1 -100, Character 3 +100", resumed.Detail);
+            Assert.Equal([Total], owner.SentGil); Assert.Empty(engine.Journal().Custody);
+            return;
+        }
+        Assert.True(resumed.State == "Completed", resumed.Code + ":" + resumed.Detail);
+        Assert.Equal([Total, Total - Moved], owner.SentGil);
+        Assert.Equal((Held - Total, Total, Carried), (owner.Gil[source], owner.Gil[destination], mule.Gil[carrier]));
+        Assert.Equal(10_000 + 4_995, owner.Other[source].Units); Assert.Empty(engine.Journal().Custody);
+    }
+
     // A funding leg into another region: hand-in at the bridge, then the shopper goes home alongside the
     // carrier, and the run ends on the shopper (no switch back to the primary).
     [Fact]
@@ -433,7 +469,9 @@ public sealed class CourierRunTests : IDisposable
         public readonly List<int> SentGil = [];
         // The next gil trade moves only this much, then reports an unsettled closure.
         public int? PartialGil;
-        InventoryView View() => new(who, 4, [new(Ore, false, Units)], GilHeld);
+        // One unrelated stack per character, outside every manifest (ordinary play changes it between steps).
+        public Dictionary<OwnerScope, BagStock> Other = new();
+        InventoryView View() => new(who, 4, Other.TryGetValue(who, out var other) ? [new(Ore, false, Units), other] : [new(Ore, false, Units)], GilHeld);
         static int GilIn(ImmutableArray<Shipment> m) => m.Where(x => x.IsGil).Sum(x => x.Units);
         static int ItemsIn(ImmutableArray<Shipment> m) => m.Where(x => !x.IsGil).Sum(x => x.Units);
         bool Partial(ImmutableArray<Shipment> m, int sign)
@@ -459,7 +497,7 @@ public sealed class CourierRunTests : IDisposable
         public string? BounceSendRecord; public bool CancelNextReceive; bool bounced;
         public Task<Result<bool>> WasNotOpened(Guid step,Deadline d)=>OK(BounceSendRecord is {} path
             ? CourierTrade.NeverCredited(new CourierStore<TradeCheckpoint>(path).Load(),step,true) : step!=openedStep);
-        public Task<Result<bool>> Settle(Guid step,OwnerScope partner,TradeEvidence peer,Deadline d){
+        public Task<Result<bool>> Settle(Guid step,OwnerScope partner,TradeEvidence peer,ImmutableArray<Shipment> credit,Deadline d){
             if(CheckpointDirectory!=null){
                 var store=ReceiveStore;var record=store.Load();
                 return Task.FromResult(CourierReceiveRecovery.Settle(record,step,partner,View(),peer,()=>store.Save(record)));

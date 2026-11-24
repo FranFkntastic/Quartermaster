@@ -25,7 +25,7 @@ internal sealed class TradeCheckpoint
     public TradeRecoveryState Recovery {get;set;}=new();
 }
 internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease lease,IDalamudPluginInterface pi,
-    DalamudExternalUiAutomationSuppression external,IPluginLog log,string directory) : ICourierTradePort, ICourierDispatchEvidence, ICourierSettlement, ICourierHoldPort,
+    DalamudExternalUiAutomationSuppression external,IPluginLog log,string directory) : ICourierTradePort, ICourierDispatchEvidence, ICourierSettlement, ICourierTradeRecord, ICourierHoldPort,
     ICourierReceiveStall, ICourierReceiveAttestation, ICourierTradeForget, ITradeSuppression, IDisposable
 {
     // live is false once the checkpoint was forgotten: a stopped trade's late record never writes it back.
@@ -319,13 +319,26 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
         log.Warning($"CourierReceiveAttested: step {step} closed as {disposition}; the sender's evidence shows the full manifest left its bags.");
         return Result<bool>.Ok(true);
     });
-    // Called only after the run owner has checked both clients' complete fresh deltas.
-    public Task<Result<bool>> Settle(Guid step,OwnerScope partner,TradeEvidence peer,Deadline d)=>game.Poll<bool>(d,()=>{
+    // The step's record at rest: no trade of it running here, no window open, nothing armed, unverified or being cancelled.
+    public Task<Result<IReadOnlyDictionary<(uint Item,bool Hq),long>>> CreditedAsync(Guid step,Deadline d)=>game.Poll<IReadOnlyDictionary<(uint Item,bool Hq),long>>(d,()=>{
+        var state=store.Load();
+        if(state.Step!=step || state.Original.Count==0)return Result<IReadOnlyDictionary<(uint Item,bool Hq),long>>.Fail("TradeRecordMissing",step.ToString());
+        if(io.IsTradeOpen || io.IsRemoteLocked || sender!=null || receiver!=null || inFlight && operationStep==step || state.Arm!=null ||
+            state.Recovery.AwaitingVerification!=null || state.Recovery.CancellationPending)
+            return Result<IReadOnlyDictionary<(uint Item,bool Hq),long>>.Fail("TradeRecordUnsettled",step.ToString());
+        return Result<IReadOnlyDictionary<(uint Item,bool Hq),long>>.Ok(
+            Custody.Credited(state.Original,state.Items.Select(i=>new BagStock(i.ItemId,i.IsHighQuality,i.Quantity))));
+    });
+    // Called only after the run has reconciled both clients' complete fresh deltas into credit.
+    public Task<Result<bool>> Settle(Guid step,OwnerScope partner,TradeEvidence peer,ImmutableArray<Shipment> credit,Deadline d)=>game.Poll<bool>(d,()=>{
         var state=store.Load();
         if(state.Step!=step || io.IsTradeOpen)return new(CourierOutcome.Indeterminate,"TradeCheckpointMismatch",step.ToString());
+        if(!CourierPlanner.Exact(partner,peer.Before.Character) || !CourierPlanner.Exact(partner,peer.After.Character))
+            return new(CourierOutcome.Indeterminate,"TradeCheckpointMismatch",$"{step}: the peer's evidence is not {partner.CharacterName}'s.");
         if(state.Receiving && state.Arm!=null){
             if(game.Bags() is not {} fresh) return null;
-            return CourierReceiveRecovery.Settle(state,step,partner,fresh,peer,()=>store.Save(state));
+            var received=CourierReceiveRecovery.Settle(state,step,partner,fresh,peer,()=>store.Save(state));
+            if(received.Outcome!=CourierOutcome.Succeeded || state.Original.Count==0)return received;
         }
         if(state.Recovery.AwaitingVerification!=null){
             using var runner=new TradeRunner(new Intent(store,state),Timing,io,this,log);
@@ -334,16 +347,17 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                 return new(CourierOutcome.Indeterminate,"TradeSettlementUnproven",step.ToString());
             runner.AcknowledgeSettlement(decision);
         }
-        // For new checkpoints the peer's exact settled delta must equal the quantity
-        // already debited/credited here, including partial and zero deliveries.
-        bool accounted = state.Original.Count==0 ? state.Items.All(i=>i.Quantity==0) :
-            CourierPlanner.Exact(partner,peer.Before.Character) && CourierPlanner.Exact(partner,peer.After.Character) &&
-            state.Original.Concat(peer.Before.Stock).Concat(peer.After.Stock).Select(x=>(x.ItemId,x.Hq)).Append((ItemId: Custody.GilKey.Item, Hq: Custody.GilKey.Hq)).Distinct().All(k=>
-                state.Original.Where(x=>x.ItemId==k.ItemId && x.Hq==k.Hq).Sum(x=>(long)x.Units)-
-                state.Items.Where(x=>x.ItemId==k.ItemId && x.IsHighQuality==k.Hq).Sum(x=>(long)x.Quantity)==
-                (state.Receiving ? -1 : 1)*((long)peer.After.Count(k.ItemId,k.Hq)-peer.Before.Count(k.ItemId,k.Hq)));
-        return !state.Recovery.CancellationPending && accounted ? Result<bool>.Ok(true) :
-            new(CourierOutcome.Indeterminate,"TradeManifestUnsettled",step.ToString());
+        if(state.Recovery.CancellationPending)return new(CourierOutcome.Indeterminate,"TradeManifestUnsettled",$"{step}: a cancellation is still pending.");
+        if(state.Original.Count==0)
+            return state.Items.All(i=>i.Quantity==0) ? Result<bool>.Ok(true) : new(CourierOutcome.Indeterminate,"TradeManifestUnsettled",step.ToString());
+        // The record must have credited exactly what both sides' bags were reconciled to, including partial and zero
+        // deliveries. Keys outside the manifest were reconciled by the run (only mirrored moves refuse there).
+        var record=Custody.Credited(state.Original,state.Items.Select(i=>new BagStock(i.ItemId,i.IsHighQuality,i.Quantity)));
+        var differs=record.Keys.Concat(credit.Select(s=>(s.Item,s.Hq))).Distinct().Select(k=>(Key:k,Record:record.GetValueOrDefault(k),
+            Credit:credit.Where(s=>s.Item==k.Item && s.Hq==k.Hq).Sum(s=>(long)s.Units))).Where(x=>x.Record!=x.Credit).ToArray();
+        return differs.Length==0 ? Result<bool>.Ok(true) : new(CourierOutcome.Indeterminate,"TradeManifestUnsettled",
+            $"{step}: trade record and reconciled bags differ: "+string.Join("; ",differs.Select(x=>
+                $"{(x.Key==Custody.GilKey?"Gil":$"item {x.Key.Item}{(x.Key.Hq?" HQ":"")}")} record {x.Record:#,0}, bags {x.Credit:#,0}")));
     });
     // A cleared run's checkpoint goes with it, so no later trade waits on its pending trade or receive arm. Its steps'
     // trades end on their next tick without a write; on the next framework tick this side's trade (when running one
