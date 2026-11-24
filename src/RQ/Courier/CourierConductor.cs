@@ -1201,8 +1201,10 @@ public sealed class CourierConductor
         if(!stowed.SequenceEqual(batch))throw Fault("ScheduleShapeMismatch","The hand-in's deposits do not match its batch.");
         return count;
     }
-    // Carried gil is left out: teleport and travel fees spend it outside any trade. Every trade still
-    // verifies its gil delta exactly (Custody.Matches and TrySlice always include the gil key).
+    // Carried gil is left out: teleport and travel fees spend it outside any trade. A fully verified trade still
+    // checks its gil delta exactly (Custody.Matches includes the gil key). Settlement (Custody.Reconcile) checks gil only
+    // where a trade could have moved it: in a gil hand-off both sides must agree, while in an item-only hand-off a gil
+    // change on one side alone is ignored as outside and only gil that moved between the two refuses.
     private static bool Agrees(InventoryView? checkpoint, InventoryView fresh, CourierJournal r) =>
         checkpoint != null && CourierPlanner.Exact(checkpoint.Character, fresh.Character) &&
         r.Plan.Trips.SelectMany(t => t.Manifest).Where(s => !s.IsGil).All(s => checkpoint.Count(s.Item, s.Hq) == fresh.Count(s.Item, s.Hq));
