@@ -971,6 +971,7 @@ public sealed class CourierSession
             "PlanRefused" => "Some lines cannot be sent",
             "AutomationBusy" => "Another automation is running",
             "AutoRetainerBusy" => "AutoRetainer is still running",
+            "LifestreamBusy" => "Lifestream is still travelling",
             "BagSlotLimit" => "No free bag slot",
             "SourceGilShort" => "Source carries too little gil",
             "DestinationGilShort" => "Gil did not arrive",

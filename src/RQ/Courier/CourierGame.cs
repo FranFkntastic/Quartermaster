@@ -374,6 +374,8 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         }
     }
     private bool Busy(string gate)=>pi.GetIpcSubscriber<bool>(gate).InvokeFunc();
+    /// <summary>Whether Lifestream is still travelling; a missing Lifestream IPC reads as idle.</summary>
+    internal bool LifestreamBusy() { try { return Busy("Lifestream.IsBusy"); } catch { return false; } }
     private bool IdleCharacter()
     {
         var state = CharacterSwitchGameState.Observe(client, objects, conditions, false, null);
