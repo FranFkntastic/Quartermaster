@@ -397,7 +397,7 @@ public sealed class CourierIpcService
         }
     }
 
-    // ---- StopCourierRun / ResumeCourierRun ----------------------------------------------------
+    // ---- StopCourierRun / ResumeCourierRun / ClearCourierRun ----------------------------------------------------
 
     private static Guid? RunOf(string json, out string? error)
     {
@@ -431,6 +431,43 @@ public sealed class CourierIpcService
             return Ack(journal.RequestId ?? "", journal.Run, "idle", null, $"No run is active ({journal.State}).");
         session.Stop();
         return Ack(journal.RequestId ?? "", journal.Run, "stopping", null, "Stopping at the next verified checkpoint.");
+    }
+
+    /// <summary>
+    /// The escape hatch over IPC, identical to the run pane's Clear: forgets the named run whatever it holds or awaits.
+    /// Refused only when the courier is not loaded, a run is active (stop it first), or the named run is not the
+    /// current one (already cleared, or another run). Accepted clears report status "clearing"; GetCourierStatus
+    /// shows no run once it lands.
+    /// </summary>
+    public string Clear(string json)
+    {
+        string requestId = "";
+        Guid run = Guid.Empty;
+        try
+        {
+            var request = string.IsNullOrWhiteSpace(json) ? null : JsonSerializer.Deserialize<CourierRunRequest>(json, JsonOptions);
+            requestId = request?.RequestId?.Trim() ?? "";
+            if (string.IsNullOrWhiteSpace(request?.RunId) || !Guid.TryParse(request.RunId, out run) || run == Guid.Empty)
+                return Ack(requestId, null, "rejected", "InvalidRequest", "runId must name the run to clear.");
+        }
+        catch (JsonException e) { return Ack(requestId, null, "rejected", "InvalidRequest", e.Message); }
+        if (session.Conductor is not { } conductor)
+            return Ack(requestId, run, "rejected", "CourierNotLoaded", "The courier is not loaded.");
+        var journal = conductor.Journal();
+        if (run != journal.Run)
+            return Ack(requestId, journal.Run, "rejected", "RunNotCurrent",
+                journal.Run == Guid.Empty ? $"Run {run} is already cleared." : $"Run {run} is not the current courier run.");
+        if (session.IsActive)
+            return Ack(requestId, run, "rejected", "CourierAlreadyRunning", "The run is active; stop it before clearing.");
+        warn($"CourierIpcClear {requestId}: clearing run {run} ({journal.State} {journal.Code}).");
+        var launched = session.Clear(run, (_, fault) =>
+        {
+            if (fault != null)
+                warn($"CourierIpcClear {requestId}: run {run} not cleared: {fault.Message}");
+        });
+        return launched
+            ? Ack(requestId, run, "clearing", null, $"Clearing run {run}.")
+            : Ack(requestId, run, "rejected", "CourierAlreadyRunning", "The run is active; stop it before clearing.");
     }
 
     public string Resume(string json)

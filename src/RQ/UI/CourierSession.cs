@@ -828,10 +828,12 @@ public sealed class CourierSession
     }
 
     /// <summary>Clears the run, whatever it holds or awaits: the escape hatch. One click, no acknowledgement.</summary>
-    internal void Clear(Guid expectedRun)
+    /// <returns>Whether the clear was launched (false when the courier is not loaded or a run is active).</returns>
+    internal bool Clear(Guid expectedRun, Action<CourierSnapshot?, Exception?>? settled = null)
     {
-        if (Conductor is not { } conductor || IsActive) return;
-        Launch(async () => await conductor.ClearAsync(expectedRun).ConfigureAwait(false));
+        if (Conductor is not { } conductor || IsActive) return false;
+        Launch(async () => await conductor.ClearAsync(expectedRun).ConfigureAwait(false), settled);
+        return true;
     }
 
     /// <summary>Resumes an interrupted run from its journal; the journal owns the plan and settings.</summary>
