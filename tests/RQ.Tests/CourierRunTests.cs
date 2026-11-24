@@ -247,6 +247,66 @@ public sealed class CourierRunTests : IDisposable
         Assert.Equal(10_000 + 4_995, owner.Other[source].Units); Assert.Empty(engine.Journal().Custody);
     }
 
+    // A multi-window gil hand-out dies mid-way (the next window closes before anything is offered) after both trade
+    // records verified some windows. The verified part must settle into custody right away, so the run ends Failed and
+    // resumable with only the rest scheduled; the resume must hand out only that rest and credit custody exactly once.
+    // Crediting the moved part twice would make the carrier owe gil it never received.
+    [Fact]
+    public async Task GilHandOutFailingMidWaySettlesVerifiedWindowsAtFailureAndResumesOnce()
+    {
+        const int Total = 5_000_000, Moved = 2_000_000, Held = 9_000_000, Carried = 100;
+        owner.Gil[source] = Held; mule.Gil[carrier] = Carried;
+        owner.KeepsRecord = mule.KeepsRecord = true;
+        owner.PartialGil = mule.PartialGil = Moved;
+        var failed = await engine.StartAsync(Transfer(source, destination, Total, false), cfg);
+        Assert.True(failed is { State: "Failed", CanResume: true }, failed.State + " " + failed.Code + ":" + failed.Detail);
+        var r = engine.Journal();
+        Assert.Null(r.Pending);
+        Assert.Equal(Moved, Assert.Single(r.Custody).Units);
+        Assert.Contains(r.Schedule.Skip(r.Cursor), s => s.Phase == CourierPhase.HandOut && s.Batch.Sum(x => (long)x.Units) == Total - Moved);
+        Assert.Equal((Held - Moved, Carried + Moved), (owner.Gil[source], mule.Gil[carrier]));
+
+        engine = Conductor();
+        var resumed = await engine.StartAsync(new(Guid.Empty, 0, [], []), new());
+        Assert.True(resumed.State == "Completed", resumed.Code + ":" + resumed.Detail);
+        Assert.Equal([Total, Total - Moved], owner.SentGil);
+        Assert.Equal((Held - Total, Total, Carried), (owner.Gil[source], owner.Gil[destination], mule.Gil[carrier]));
+        Assert.Empty(engine.Journal().Custody);
+    }
+
+    // A partial gil hand-out left pending (no trade record at rest when it failed) is resumed after one side's gil
+    // changed outside the trade, so the two sides' bags disagree on the gil key. Both trade records verified the moved
+    // part: they settle it at the record and the other difference is an outside change. When both bags agree but a
+    // trade record says otherwise, the step refuses rather than trusting either.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PartialGilHandOutSettlesAtTradeRecordOrRefusesWhenRecordDisagrees(bool recordDisagrees)
+    {
+        const int Total = 5_000_000, Moved = 2_000_000, Held = 9_000_000, Carried = 100, Fee = 4_995;
+        owner.Gil[source] = Held; mule.Gil[carrier] = Carried;
+        owner.PartialGil = mule.PartialGil = Moved;
+        var interrupted = await engine.StartAsync(Transfer(source, destination, Total, false), cfg);
+        Assert.True(interrupted is { State: "Indeterminate", CanResume: true }, interrupted.State + " " + interrupted.Code + ":" + interrupted.Detail);
+        owner.KeepsRecord = mule.KeepsRecord = true;
+        if (recordDisagrees) owner.RecordedGil = Moved - 1_000_000;
+        else owner.Gil[source] -= Fee; // A teleport fee: the owner's bags show the hand-out plus an outside change.
+
+        engine = Conductor();
+        var resumed = await engine.StartAsync(new(Guid.Empty, 0, [], []), new());
+        if (recordDisagrees)
+        {
+            Assert.True(resumed is { State: "Indeterminate", Code: "TradeRecordDisagrees" }, resumed.State + " " + resumed.Code + ":" + resumed.Detail);
+            Assert.Equal([Total], owner.SentGil); Assert.Empty(engine.Journal().Custody);
+            Assert.Equal((Held - Moved, Carried + Moved), (owner.Gil[source], mule.Gil[carrier]));
+            return;
+        }
+        Assert.True(resumed.State == "Completed", resumed.Code + ":" + resumed.Detail);
+        Assert.Equal([Total, Total - Moved], owner.SentGil);
+        Assert.Equal((Held - Total - Fee, Total, Carried), (owner.Gil[source], owner.Gil[destination], mule.Gil[carrier]));
+        Assert.Empty(engine.Journal().Custody);
+    }
+
     // A funding leg into another region: hand-in at the bridge, then the shopper goes home alongside the
     // carrier, and the run ends on the shopper (no switch back to the primary).
     [Fact]
@@ -450,8 +510,23 @@ public sealed class CourierRunTests : IDisposable
         }
     }
     sealed class Client(OwnerScope initial) : ICourierPlacementPort, ICourierTradePort, ICourierDispatchEvidence, ICourierSettlement, ICourierHoldPort,
-        ICourierReceiveAttestation, ICharacterSwitchPort, IInventoryObservationPort, IWorldVisitPort, IMeetingBellPort
+        ICourierReceiveAttestation, ICourierTradeRecord, ICharacterSwitchPort, IInventoryObservationPort, IWorldVisitPort, IMeetingBellPort
     {
+        // The trade layer's window-verified record per step, readable only while KeepsRecord (a record not at rest reads as none).
+        // RecordedGil, when set, replaces the gil this side's record credited.
+        public bool KeepsRecord; public long? RecordedGil;
+        readonly Dictionary<Guid, Dictionary<(uint Item, bool Hq), long>> record = new();
+        void Record(ImmutableArray<Shipment> m, long gil) =>
+            record[CourierGame.Step.Value] = m.Where(x => !x.IsGil).GroupBy(x => (x.Item, x.Hq)).ToDictionary(g => g.Key, g => g.Sum(x => (long)x.Units))
+                .Append(new(Custody.GilKey, gil)).Where(x => x.Value != 0).ToDictionary(x => x.Key, x => x.Value);
+        public Task<Result<IReadOnlyDictionary<(uint Item, bool Hq), long>>> CreditedAsync(Guid step, Deadline d)
+        {
+            if (!KeepsRecord || !record.TryGetValue(step, out var credited))
+                return Task.FromResult(Result<IReadOnlyDictionary<(uint Item, bool Hq), long>>.Fail("NoTradeRecord", "fixture"));
+            var read = new Dictionary<(uint Item, bool Hq), long>(credited);
+            if (RecordedGil is { } gil) read[Custody.GilKey] = gil;
+            return OK<IReadOnlyDictionary<(uint Item, bool Hq), long>>(read);
+        }
         // The owner's journaled placements since a hand-in, and the dispositions its receive checkpoint was closed under.
         public CourierPlacedSince? Placed;
         public CourierPlacedSince? PlacedSince(OwnerScope owner, DateTimeOffset since) => Placed;
@@ -478,7 +553,7 @@ public sealed class CourierRunTests : IDisposable
         {
             if (PartialGil is not { } part || GilIn(m) == 0) return false;
             PartialGil = null; recoverable = CourierGame.Step.Value;
-            Quantities[who] = Units + sign * ItemsIn(m); Gil[who] = GilHeld + sign * part;
+            Quantities[who] = Units + sign * ItemsIn(m); Gil[who] = GilHeld + sign * part; Record(m, part);
             return true;
         }
         public int Deposited, Sends, ReceiveOffset;
@@ -516,7 +591,7 @@ public sealed class CourierRunTests : IDisposable
             Sends++; Log.Add($"Send:{who.CharacterName}@{World}");
             if (GilIn(m) > 0) SentGil.Add(GilIn(m));
             if (Partial(m, -1)) return Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate, "TradeClosureUnproven", "Partial gil."));
-            Quantities[who] = Units - ItemsIn(m); Gil[who] = GilHeld - GilIn(m);
+            Quantities[who] = Units - ItemsIn(m); Gil[who] = GilHeld - GilIn(m); Record(m, GilIn(m));
             if(LoseSenderReply){LoseSenderReply=false; recoverable=CourierGame.Step.Value;
                 return Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate,"AwaitingVerification","Reply lost."));}
             return OK(true);
@@ -532,7 +607,7 @@ public sealed class CourierRunTests : IDisposable
                 ReceiveStore.Save(new(){Step=step,Receiving=true,Arm=new(step,partner,View()),
                     Items=[new(){ItemId=item.Item,Quantity=item.Units}],Original=[new(item.Item,false,item.Units)]});
             }
-            Quantities[who] = Units + ItemsIn(m) + ReceiveOffset; Gil[who] = GilHeld + GilIn(m); return UncertainTrade ? Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate, "LockUnknown", "Missing locked partner evidence")) : OK(true); }
+            Quantities[who] = Units + ItemsIn(m) + ReceiveOffset; Gil[who] = GilHeld + GilIn(m); Record(m, GilIn(m)); return UncertainTrade ? Task.FromResult(new Result<bool>(CourierOutcome.Indeterminate, "LockUnknown", "Missing locked partner evidence")) : OK(true); }
         public Task<Result<bool>> CancelPreLockAsync(Deadline d) => OK(true);
         public int Retrieved;
         public bool? FailPlacement;

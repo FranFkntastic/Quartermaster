@@ -295,7 +295,8 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                     if(m.Command is CourierCommand.VerifySettlement or CourierCommand.Settle){
                         if(staged.Before==null || m.OwnerEvidence==null)
                             return Refuse("SettlementEvidenceMissing", $"hand-off {pending.Step}: {(staged.Before==null?"no carrier bags before it":"no owner evidence")}.");
-                        // This side's own trade record breaks a tie the two sides' bags cannot (an outside change on a manifest key).
+                        // This side's own trade record breaks a tie the two sides' bags cannot (an outside change on a manifest key):
+                        // it settles at the record when the record equals either side's bag change, not only this side's.
                         record = await Custody.RecordOf(trade, pending.Step);
                         var settled = Custody.Reconcile(new(staged.Before,before),m.Carrier,m.OwnerEvidence,pending.Partner,pending.Manifest,sign,record);
                         if (!settled.Outside.IsEmpty)

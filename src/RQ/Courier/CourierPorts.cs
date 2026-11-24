@@ -158,8 +158,9 @@ internal interface ICourierTradeRecord
 }
 internal static class Custody
 {
-    // Carried gil is always in the key universe: an item trade must leave gil unchanged on both sides,
-    // and a gil trade must move exactly the manifest's gil and no stack.
+    // Carried gil is always in the key universe. Matches (a fully verified trade) requires an item trade to leave gil
+    // unchanged and a gil trade to move exactly the manifest's gil. Reconcile treats gil like any other key: outside a
+    // gil manifest, a change on one side alone is an outside change, and only gil that moved between the two refuses.
     internal static readonly (uint Item, bool Hq) GilKey = (CourierPlanner.GilItemId, false);
     internal static bool Matches(TradeEvidence? e, OwnerScope who, ImmutableArray<Shipment> manifest, int sign)
         => e != null && CourierPlanner.Exact(e.Before.Character, who) && CourierPlanner.Exact(e.After.Character, who)
@@ -183,9 +184,11 @@ internal static class Custody
     /// moved on both sides in the same direction (left one, reached the other): a change on one side alone, or both sides
     /// gaining or both losing, happened outside the trade and is reported in <see cref="Reconciliation.Outside"/>.</para>
     /// <para><paramref name="credited"/> is the local trade layer's own record of the step (units it verified window by
-    /// window). When given it must equal what the bags agree on; when the two sides' bags disagree on a manifest key, it
-    /// settles that key only if one side's bags equal it, the other side's difference then being an outside change. The
-    /// remote side checks its own record the same way, and the carrier's ledger acknowledgement proves both agree.</para>
+    /// window). When both sides' bags agree on a manifest key, the record must equal that amount, else the key refuses
+    /// TradeRecordDisagrees. When they disagree, the key settles at the record only if it equals either side's bag change
+    /// (local or remote), the other side's difference then being an outside change. The record need not match its own
+    /// side's bags. Each client runs this against its own record, and the carrier's ledger acknowledgement of the settled
+    /// amount proves the two agree, so what holds is: owner record = carrier record = one side's bag change.</para>
     /// </summary>
     internal static Reconciliation Reconcile(TradeEvidence local, OwnerScope who, TradeEvidence remote, OwnerScope other,
         ImmutableArray<Shipment> batch, int sign, IReadOnlyDictionary<(uint Item, bool Hq), long>? credited = null)
