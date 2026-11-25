@@ -59,8 +59,9 @@ public interface IMarketRunDeadline
 
 public sealed class MarketRunDeadline(TimeSpan timeout) : IMarketRunDeadline
 {
-    // Bell routing has its own two-minute budget; leave room for opening the list.
-    public static readonly TimeSpan RetainerListTimeout = TimeSpan.FromSeconds(150);
+    // Bell routing has its own two-minute budget, and opening the list waits up to 30 s on each side
+    // of it for the character to settle; leave room for both.
+    public static readonly TimeSpan RetainerListTimeout = TimeSpan.FromSeconds(210);
     // Franthropy bounds a reprice in wall-clock time: pre-send recovery is capped at 45 s, the
     // editor gets 5 s to appear and the confirm 6 s to be observed, so with frame overshoot the
     // worst case is about 60 s. 75 s leaves a margin, so this deadline never turns a pre-send

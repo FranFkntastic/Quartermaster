@@ -459,7 +459,8 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                         result.Transferred,
                         result.Code,
                         result.Message);
-                    if (borrowedLease is not null) movementAttempted = false;
+                    // This movement is verified and recorded; only an unresolved attempt keeps the operation uncertain.
+                    movementAttempted = false;
                     if (placement?.Source is not null && result.Transferred < quantity) break;
                 }
                 await driver.CloseRetainerAsync(token).ConfigureAwait(false);
@@ -589,6 +590,7 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
         var retainerOpen = false;
         var retainerSessionOpen = false;
         var movementAttempted = false;
+        string? lastZeroMovement = null;
         try
         {
             token.ThrowIfCancellationRequested();
@@ -717,18 +719,30 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                                 {
                                     var item = await DiagnoseMutationAsync(operationId, "Deposit", itemName, candidate.RetainerName,
                                         () => driver.DepositAsync(currentStack, quantity, mutationToken)).ConfigureAwait(false);
-                                    // The game occasionally drops the first deposit after a retainer opens: the verifier
-                                    // saw no movement on either side. Once the source slot proves untouched, retry once.
-                                    if (!item.Success && item.Transferred == 0 && item.Code == "VerificationWindowExpired" &&
-                                        (await driver.ScanPlayerInventoryAsync(new HashSet<uint> { stack.ItemId }, mutationToken).ConfigureAwait(false))
-                                            .Any(live => live.Container == currentStack.Container && live.SlotIndex == currentStack.SlotIndex &&
-                                                live.ItemId == currentStack.ItemId && live.IsHighQuality == currentStack.IsHighQuality &&
-                                                live.Quantity == currentStack.Quantity))
+                                    // The game occasionally drops a deposit after a retainer opens: the verifier saw no
+                                    // movement on either side through its window, settle and late tail. While the source
+                                    // slot proves untouched, retry: once for any move, and up to three times for a
+                                    // whole-stack move, which an earlier dispatch can never move twice. Retries stay under
+                                    // this mutation's marker. Exhausted retries with an untouched slot moved nothing.
+                                    var zeroMovementRetries = 0;
+                                    var zeroMovementRetryLimit = quantity >= currentStack.Quantity ? 3 : 1;
+                                    while (!item.Success && item.Transferred == 0 && item.Code == "VerificationWindowExpired" &&
+                                           (await driver.ScanPlayerInventoryAsync(new HashSet<uint> { stack.ItemId }, mutationToken).ConfigureAwait(false))
+                                               .Any(live => live.Container == currentStack.Container && live.SlotIndex == currentStack.SlotIndex &&
+                                                   live.ItemId == currentStack.ItemId && live.IsHighQuality == currentStack.IsHighQuality &&
+                                                   live.Quantity == currentStack.Quantity))
                                     {
-                                        var retried = $"Deposit {itemName} at {candidate.RetainerName} moved nothing and its source slot is untouched; retrying once. {item.Code}: {item.Message}";
+                                        if (zeroMovementRetries >= zeroMovementRetryLimit)
+                                        {
+                                            var unmoved = $"Deposit {itemName} at {candidate.RetainerName} moved nothing in {zeroMovementRetries + 1} attempts and its source slot is untouched; leaving it in bags. Last miss {item.Code}: {item.Message}";
+                                            item = new(false, 0, DepositZeroMovementCode, unmoved);
+                                            break;
+                                        }
+                                        zeroMovementRetries++;
+                                        var retried = $"Deposit {itemName} at {candidate.RetainerName} moved nothing and its source slot is untouched; retry {zeroMovementRetries} of {zeroMovementRetryLimit}. {item.Code}: {item.Message}";
                                         warning?.Invoke(retried);
                                         journal.RecordWarning(operationId, "DepositZeroMovementRetried", retried);
-                                        await Task.Delay(250, mutationToken).ConfigureAwait(false);
+                                        await Task.Delay(zeroMovementRetries == 1 ? 250 : 1_000, mutationToken).ConfigureAwait(false);
                                         item = await DiagnoseMutationAsync(operationId, "Deposit", itemName, candidate.RetainerName,
                                             () => driver.DepositAsync(currentStack, quantity, mutationToken)).ConfigureAwait(false);
                                     }
@@ -736,7 +750,7 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                                 }
                                 if (!result.Success)
                                 {
-                                    if (result.Code == "NoCapacity")
+                                    if (result.Code is "NoCapacity" or DepositZeroMovementCode)
                                         return VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Unchanged(result);
                                     return VerifiedMutationAttempt<(bool Success, int Transferred, string Code, string Message), RetainerVariantObservation>.Indeterminate(result);
                                 }
@@ -772,6 +786,14 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                                 $"{candidate.RetainerName} reported no live capacity for {itemName}; its remaining quantity will try other candidates. {result.Code}: {result.Message}");
                             continue;
                         }
+                        if (!result.Success &&
+                            attempt.Evidence == VerifiedMutationEvidence.Unchanged &&
+                            result.Code == DepositZeroMovementCode)
+                        {
+                            // Proven no-op: leave this stack in bags and carry on with the next stack or candidate.
+                            lastZeroMovement = result.Message;
+                            break;
+                        }
                         if (!result.Success || attempt.Evidence == VerifiedMutationEvidence.Indeterminate)
                             throw new InvalidOperationException(result.Message);
                         if (result.Transferred == 0)
@@ -802,6 +824,8 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                             journal.RecordTransfer(operationId, stack.ItemId, candidate.RetainerId, result.Transferred, result.Code, result.Message);
                         else
                             journal.RecordDepositTransfer(operationId, key, stack.ItemId, stack.IsHighQuality, candidate.RetainerId, result.Transferred, result.Code, result.Message);
+                        // This movement is verified and recorded; only an unresolved attempt keeps the operation uncertain.
+                        movementAttempted = false;
                     }
                 }
                 await driver.CloseRetainerAsync(token).ConfigureAwait(false);
@@ -816,7 +840,8 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
             journal.Transition(operationId,
                 missing == 0 ? OperationStatuses.Succeeded : transferred > 0 ? OperationStatuses.PartiallySucceeded : OperationStatuses.Failed,
                 missing == 0 ? "DepositComplete" : "DepositPartial",
-                $"Stowed {transferred:N0} units; {missing:N0} remain on character.");
+                $"Stowed {transferred:N0} units; {missing:N0} remain on character." +
+                (missing > 0 && lastZeroMovement is not null ? $" {DepositZeroMovementCode}: {lastZeroMovement}" : string.Empty));
             return new(true, missing == 0 ? "Deposit completed." : "Deposit completed with remaining units.");
         }
         catch (OperationCanceledException)
@@ -1017,6 +1042,9 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
 
     /// <summary>Outcome and per-line receipt code: a source-restricted line's allowed sources could not cover it.</summary>
     public const string SourceRestrictionShortCode = "SourceRestrictionShort";
+
+    /// <summary>Deposit result code: every zero-movement retry missed and the source slot stayed untouched, so nothing moved.</summary>
+    public const string DepositZeroMovementCode = "DepositZeroMovement";
 
     /// <summary>Allowed retainers per retrieval key; a key with any unrestricted line is unrestricted.</summary>
     private static Dictionary<string, HashSet<ulong>> SourceRestrictionsByKey(IEnumerable<OperationLine> lines) =>
