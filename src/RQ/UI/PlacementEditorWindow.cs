@@ -95,13 +95,12 @@ internal sealed class PlacementEditorWindow : Window
             IsOpen = false;
             return;
         }
-        var plan = ListingPlanCatalog.OwnerPlan(current.State, scope);
+        var placements = PlacementCatalog.OwnerPlacements(current.State, scope);
         var now = DateTime.UtcNow;
         var resolved = items.Select(item =>
         {
             var key = (item.ItemId, item.Quality);
-            var reserve = plan?.Reserves.FirstOrDefault(rule => rule.Enabled && rule.ItemId == item.ItemId && rule.Quality == item.Quality);
-            IReadOnlyList<PlacementHome> stored = reserve?.Homes ?? [];
+            IReadOnlyList<PlacementHome> stored = PlacementCatalog.Find(placements, scope, item.ItemId, item.Quality)?.Homes ?? [];
             // An edit shows at once; the stored rule takes over once it matches or the edit has had time to land.
             if (pending.TryGetValue(key, out var edit) && (edit.Until <= now || ReservePlacement.Same(edit.Homes, stored)))
                 pending.Remove(key);

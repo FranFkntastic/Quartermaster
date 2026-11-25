@@ -259,12 +259,20 @@ public sealed class ListingPlan : IJsonOnDeserialized
     public Guid Id { get; set; } = Guid.NewGuid();
     public long Revision { get; set; } = 1;
     public OwnerScope Owner { get; set; } = new();
+    /// <summary>The plan's name, unique per owner (case-insensitive). Plans written before names existed load as "Default".</summary>
+    public string Name { get; set; } = "Default";
     public List<ListingPlanAssignment> Assignments { get; set; } = [];
     public List<ListingReserveRule> Reserves { get; set; } = [];
     public DateTime UpdatedAtUtc { get; set; }
 
     /// <summary>Rules written before ranked cross-character homes are read once into <see cref="ListingReserveRule.Homes"/>.</summary>
     void IJsonOnDeserialized.OnDeserialized() => MigrateLegacyHomes();
+
+    /// <summary>The (item, quality) pairs this plan owns: enabled assignments and enabled reserves that keep units.</summary>
+    [JsonIgnore]
+    public IEnumerable<(uint ItemId, ItemQualityPolicy Quality)> OwnedItems =>
+        Assignments.Where(assignment => assignment.Enabled && assignment.ItemId > 0).Select(assignment => (assignment.ItemId, assignment.Quality))
+            .Concat(Reserves.Where(reserve => reserve.Enabled && reserve.ItemId > 0 && reserve.ReserveUnits > 0).Select(reserve => (reserve.ItemId, reserve.Quality)));
 
     /// <summary>Moves every rule's legacy Location/RemoteHomes into Homes. Idempotent; true when any rule changed.</summary>
     public bool MigrateLegacyHomes()
@@ -309,13 +317,16 @@ public sealed class ListingReserveRule
     public ItemQualityPolicy Quality { get; set; } = ItemQualityPolicy.NqOnly;
     public int ReserveUnits { get; set; }
     /// <summary>
-    /// The item's deposition homes: one ranked chain across every character of the service account (rank = index + 1).
-    /// Each home is an explicit retainer with an optional stock cap; arriving units fill rank 1 up to its cap and room,
-    /// then spill down the chain. What no home takes stays in the owner's bags. There is no "any space" home.
+    /// Legacy deposition homes, read once on load and moved into <see cref="QuartermasterState.Placements"/> by
+    /// <see cref="Planning.PlacementCatalog.SeparateFromListingPlans"/>; empty afterwards and never written while empty.
+    /// Placement authority is <see cref="ItemPlacementRule.Homes"/>.
     /// </summary>
-    public List<PlacementHome> Homes { get; set; } = [];
-    /// <summary>Owner-side stowage consolidation, carried from the legacy location.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public List<PlacementHome>? Homes { get; set; }
+    /// <summary>Legacy owner-side consolidation, moved with <see cref="Homes"/>; never written once moved.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    [EditorBrowsable(EditorBrowsableState.Never)]
     public bool Consolidate { get; set; }
     /// <summary>Legacy ranked owner homes (and Any space). Read once on load into <see cref="Homes"/>; never written.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -327,10 +338,6 @@ public sealed class ListingReserveRule
     public ReserveRemoteHomes? RemoteHomes { get; set; }
     public bool Enabled { get; set; } = true;
 
-    /// <summary>Whether the rule names any home, here or on another character.</summary>
-    [JsonIgnore]
-    public bool HasAnyHome => Homes.Count > 0;
-
     /// <summary>
     /// Reads legacy <see cref="Location"/> (the owner's ranked retainers) then <see cref="RemoteHomes"/> into
     /// <see cref="Homes"/> uncapped, dropping Any space and duplicates, then clears both so only Homes is written.
@@ -338,16 +345,16 @@ public sealed class ListingReserveRule
     /// </summary>
     public bool MigrateLegacyHomes(OwnerScope owner)
     {
-        Homes ??= [];
         if (Location is null && RemoteHomes is null)
             return false;
-        if (Homes.Count == 0)
+        var homes = Homes ??= [];
+        if (homes.Count == 0)
         {
             void Add(OwnerScope character, ulong retainerId)
             {
-                if (retainerId == 0 || Homes.Any(home => home.SameHome(character, retainerId)))
+                if (retainerId == 0 || homes.Any(home => home.SameHome(character, retainerId)))
                     return;
-                Homes.Add(new(character with { }, retainerId));
+                homes.Add(new(character with { }, retainerId));
             }
             foreach (var id in Location?.PreferredRetainerIds ?? [])
                 Add(owner, id);
@@ -360,6 +367,25 @@ public sealed class ListingReserveRule
         RemoteHomes = null;
         return true;
     }
+}
+
+/// <summary>
+/// Where one exact-quality item of one owner lives: its ranked deposition homes across every character of the service
+/// account (rank = index + 1). Each home is an explicit retainer with an optional stock cap; arriving units fill rank 1
+/// up to its cap and room, then spill down the chain. What no home takes stays in the owner's bags.
+/// </summary>
+public sealed class ItemPlacementRule
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public OwnerScope Owner { get; set; } = new();
+    public uint ItemId { get; set; }
+    public string ItemName { get; set; } = string.Empty;
+    public ItemQualityPolicy Quality { get; set; } = ItemQualityPolicy.NqOnly;
+    public List<PlacementHome> Homes { get; set; } = [];
+    /// <summary>Owner-side stowage consolidation.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool Consolidate { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
 }
 
 /// <summary>Legacy (read-once) ranked home retainers on another character than the plan owner.</summary>
@@ -605,6 +631,8 @@ public sealed class QuartermasterState
     public long Revision { get; set; }
     public List<StowagePlan> StowagePlans { get; set; } = [];
     public List<ListingPlan> ListingPlans { get; set; } = [];
+    /// <summary>Item deposition homes, one rule per (owner, item, quality); independent of every Listing Plan.</summary>
+    public List<ItemPlacementRule> Placements { get; set; } = [];
     public List<TransferPlanListingLink> TransferPlanListingLinks { get; set; } = [];
     public List<StowageMigrationRecord> StowageMigrations { get; set; } = [];
     public List<TransferPlanMigrationRecord> TransferPlanMigrations { get; set; } = [];

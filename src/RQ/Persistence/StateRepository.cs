@@ -30,7 +30,10 @@ public sealed class StateRepository
         // Plans written before Courier plans existed may mix courier lines into Transfer plans.
         var separated = Planning.StowagePlanMigration.SeparateCourierLines(state);
         // Courier lines written one per route become one line per item.
-        if (Planning.StowagePlanMigration.CollapseCourierLines(state) | separated)
+        var collapsed = Planning.StowagePlanMigration.CollapseCourierLines(state);
+        // Deposition homes written on Listing Plan reserves move into their own Placements catalog.
+        var placements = Planning.PlacementCatalog.SeparateFromListingPlans(state);
+        if (separated | collapsed | placements)
         {
             state.Revision = checked(state.Revision + 1);
             store.Save(state);
@@ -161,6 +164,7 @@ public sealed class StateRepository
         Revision = Math.Max(configuration.Revision, operations.Revision),
         StowagePlans = configuration.StowagePlans,
         ListingPlans = configuration.ListingPlans,
+        Placements = configuration.Placements,
         TransferPlanListingLinks = configuration.TransferPlanListingLinks,
         StowageMigrations = configuration.StowageMigrations,
         TransferPlanMigrations = configuration.TransferPlanMigrations,

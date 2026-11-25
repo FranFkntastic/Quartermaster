@@ -47,7 +47,8 @@ public interface IMarketRunDriver
     Task ReturnAsync(CancellationToken token);
     Task CloseListAsync(CancellationToken token);
     Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token, Action<MarketMutationReceipt>? receiptChanged = null);
-    Task<IReadOnlyList<string>> StowAsync(Guid planId, IReadOnlyList<ListingReserveRule> reserves, IDisposable lease,
+    /// <summary>Stows (and with <paramref name="reorganizeRetainers"/> relocates) only the given plan-scoped placement items.</summary>
+    Task<IReadOnlyList<string>> StowAsync(Guid planId, IReadOnlyList<ItemPlacementRule> planPlacements, IDisposable lease,
         Action check, Func<bool> hasAuthority, CancellationToken token, Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged,
         bool reorganizeRetainers);
 }
@@ -157,9 +158,12 @@ public sealed class MarketRunStore(string path)
     }
 }
 
-/// <summary>Owns one immutable plan snapshot and one lease across gather and listing passes.</summary>
+/// <summary>
+/// Owns one immutable plan snapshot and one lease across gather and listing passes. <paramref name="currentPlan"/> resolves
+/// the running plan by id (the owner may have several); the run only ever stows or relocates that plan's own items.
+/// </summary>
 public sealed class MarketRunExecutor(
-    IMarketRunDriver driver, AutomationLease automation, Func<ListingPlan?> currentPlan,
+    IMarketRunDriver driver, AutomationLease automation, Func<Guid, ListingPlan?> currentPlan,
     Action<MarketRunRecord> persist, AutoRetainerSuppression? suppression = null,
     IMarketRunDeadline? deadlines = null, Action? clear = null, IMarketRunDeadline? routeDeadlines = null,
     Action<string>? warning = null, Action<string>? information = null, IMarketRunDeadline? repriceDeadlines = null,
@@ -182,7 +186,7 @@ public sealed class MarketRunExecutor(
     // Retainer IDs in the plan that the current roster no longer assigns to this character.
     private readonly HashSet<ulong> missingRetainers = [];
     // Per run: retainers that failed the pre-gather roster check (never gathered for or visited),
-    // the listings each assignment's visit set out to post, and the items with a reserve home.
+    // the listings each assignment's visit set out to post, and the plan items with a home on the owner.
     private readonly HashSet<ulong> unavailableRetainers = [];
     private readonly Dictionary<Guid, int> plannedListings = [];
     private readonly HashSet<uint> reserveHomes = [];
@@ -231,21 +235,29 @@ public sealed class MarketRunExecutor(
     private static bool HasListingWork(MarketRunEvaluation evaluation) => evaluation.Retainers.Any(r => r.Assignments.Any(a =>
         a.ShortListings is { IsKnown: true, Value: > 0 } || a.RepriceListings is { IsKnown: true, Value: > 0 }));
 
-    public Task RunAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty = false, bool reorganizeRetainers = false)
+    /// <param name="plan">The saved plan to run.</param>
+    /// <param name="evaluation">Its evaluation; must match the plan's id and revision.</param>
+    /// <param name="draftDirty">True when unsaved edits exist; the run does not start.</param>
+    /// <param name="reorganizeRetainers">Also relocate the plan's items held by non-home retainers.</param>
+    /// <param name="ownerPlacements">The owner's placement rules; only those for the plan's own items are used.</param>
+    public Task RunAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty = false, bool reorganizeRetainers = false,
+        IReadOnlyList<ItemPlacementRule>? ownerPlacements = null)
     {
         lock (persistenceGate)
         {
             if (!CanStart) return Task.CompletedTask;
-            return ActiveTask = RunCoreAsync(plan, evaluation, draftDirty, reorganizeRetainers);
+            return ActiveTask = RunCoreAsync(plan, evaluation, draftDirty, reorganizeRetainers, ownerPlacements ?? []);
         }
     }
 
-    private async Task RunCoreAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty, bool reorganizeRetainers)
+    private async Task RunCoreAsync(ListingPlan plan, MarketRunEvaluation evaluation, bool draftDirty, bool reorganizeRetainers,
+        IReadOnlyList<ItemPlacementRule> ownerPlacements)
     {
         var listingWork = HasListingWork(evaluation);
         if (draftDirty || !evaluation.IsComplete || evaluation.PlanId != plan.Id || evaluation.PlanRevision != plan.Revision ||
             !HasWork(evaluation, reorganizeRetainers)) return;
-        var reserves = plan.Reserves.Select(ListingPlanCatalog.Copy).ToArray();
+        // One snapshot for the whole run, scoped to the plan's own items: nothing outside the plan is ever stowed or moved.
+        var placements = MarketRunPlanner.PlanPlacements(plan, ownerPlacements).Select(PlacementCatalog.Copy).ToArray();
         if (!automation.TryAcquire("market run", out var lease)) return;
         {
             if (Interlocked.CompareExchange(ref running, 1, 0) != 0) { lease!.Dispose(); return; }
@@ -260,7 +272,7 @@ public sealed class MarketRunExecutor(
             unavailableRetainers.Clear();
             plannedListings.Clear();
             reserveHomes.Clear();
-            reserveHomes.UnionWith(reserves.Where(r => r.Enabled && r.ItemId > 0 && MarketRunPlanner.HasOwnerHome(r, plan.Owner)).Select(r => r.ItemId));
+            reserveHomes.UnionWith(placements.Select(p => p.ItemId));
             topUpActive = false;
             Volatile.Write(ref posted, 0);
             ListingTarget = evaluation.Retainers.Sum(r => r.RefillListings.IsKnown ? r.RefillListings.Value : 0);
@@ -327,14 +339,14 @@ public sealed class MarketRunExecutor(
                 }
                 if (record.NeedsCheck.Count > 0 || record.Mutations.Any(m => m.Outcome is null or MarketMutationOutcome.Indeterminate))
                 {
-                    StowSkipped(record, reserves, "MarketRunStowSkippedNeedsCheck", "A mutation outcome is unknown.");
+                    StowSkipped(record, placements, "MarketRunStowSkippedNeedsCheck", "A mutation outcome is unknown.");
                     stowageEntered = true;
                 }
                 else
                 {
                     Check(record);
                     Status = "Stowing spare stock";
-                    await driver.StowAsync(record.PlanId, reserves, runLease!, () => Check(record),
+                    await driver.StowAsync(record.PlanId, placements, runLease!, () => Check(record),
                         () => HasSessionAuthority(record), CancellationToken.None, receipt =>
                         {
                             if (!record.Mutations.Contains(receipt)) record.Mutations.Add(receipt);
@@ -361,7 +373,7 @@ public sealed class MarketRunExecutor(
                 try
                 {
                     if (!stowageEntered)
-                        StowSkipped(record, reserves, record.State == "Cancelled" ? "MarketRunStowSkippedCancelled" :
+                        StowSkipped(record, placements, record.State == "Cancelled" ? "MarketRunStowSkippedCancelled" :
                             record.NeedsCheck.Count > 0 ? "MarketRunStowSkippedNeedsCheck" : "MarketRunStowSkippedStopped", record.Reason);
                     // Never overlap an abandoned call, touch a new character, or use an unloaded session.
                     if (sessionStarted && CanCleanUp(record))
@@ -393,7 +405,7 @@ public sealed class MarketRunExecutor(
 
     private sealed record RetainerVisit(ulong Id, string Name, ListingPlanAssignment[] Assignments);
 
-    private void StowSkipped(MarketRunRecord record, IReadOnlyList<ListingReserveRule> reserves, string code, string reason)
+    private void StowSkipped(MarketRunRecord record, IReadOnlyList<ItemPlacementRule> planPlacements, string code, string reason)
     {
         if (record.ForceReorganize)
         {
@@ -402,14 +414,15 @@ public sealed class MarketRunExecutor(
             warning?.Invoke(relocation);
         }
         // One line per skip; bags are not scanned, so quantities are unknown here.
-        var eligible = reserves.Where(r => r.Enabled && r.ItemId > 0 && MarketRunPlanner.HasOwnerHome(r, record.Owner))
-            .Select(r => r.ItemName).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var eligible = planPlacements.Where(p => p.ItemId > 0 && PlacementRouter.HasOwnerHome(p.Homes, record.Owner))
+            .Select(p => string.IsNullOrWhiteSpace(p.ItemName) ? driver.ItemName(p.ItemId) : p.ItemName)
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         if (eligible.Length == 0)
         {
-            Add(record, $"{code}: {reason}; no reserves with destinations.");
+            Add(record, $"{code}: {reason}; no plan items with placement homes.");
             return;
         }
-        var message = $"{code}: {reason}; stowage not attempted for {eligible.Length} reserve item(s): {string.Join(", ", eligible)}.";
+        var message = $"{code}: {reason}; stowage not attempted for {eligible.Length} plan item(s): {string.Join(", ", eligible)}.";
         Add(record, message);
         warning?.Invoke(message);
     }
@@ -559,7 +572,7 @@ public sealed class MarketRunExecutor(
             if (planned - done <= 0) continue;
             total += planned - done;
             missed.Add($"{a.ItemName} ({a.Quality}) {planned - done} of {planned} listings × {a.QuantityPerListing}" +
-                (reserveHomes.Contains(a.ItemId) ? " (stock goes to the stow step for its reserve home)" : " (no reserve home; stock stays in the bags)"));
+                (reserveHomes.Contains(a.ItemId) ? " (stock goes to the stow step for its placement home)" : " (no placement home on this character; stock stays in the bags)"));
         }
         if (total == 0)
         {
@@ -1015,7 +1028,7 @@ public sealed class MarketRunExecutor(
     private Task<bool> Step(Func<CancellationToken, Task> action) => deadline.RunAsync(async t => { await action(t).ConfigureAwait(false); return true; });
     private bool HasSessionAuthority(MarketRunRecord record) => !Volatile.Read(ref disposed) &&
         runLease is not null && automation.Owns(runLease) &&
-        currentPlan() is { Owner.HasStableIdentity: true } plan && plan.Owner.Matches(record.Owner);
+        currentPlan(record.PlanId) is { Owner.HasStableIdentity: true } plan && plan.Owner.Matches(record.Owner);
     private bool CanCleanUp(MarketRunRecord record) => HasSessionAuthority(record) &&
         !driverUnsettled && !MarketRunDeadline.HasUnsettled;
     private void Check(MarketRunRecord record)
@@ -1024,8 +1037,8 @@ public sealed class MarketRunExecutor(
         if (driverUnsettled || MarketRunDeadline.HasUnsettled)
             throw new RunStoppedException("A session call has not settled; run stopped to prevent overlapping requests.");
         if (runLease is null || !automation.Owns(runLease)) throw new RunStoppedException("Automation lease lost.");
-        var plan = currentPlan();
-        if (plan is null) throw new RunStoppedException("No Listing Plan or character still loading.");
+        var plan = currentPlan(record.PlanId);
+        if (plan is null) throw new RunStoppedException("The Listing Plan was deleted or the character is still loading.");
         if (!plan.Owner.HasStableIdentity) throw new RunStoppedException("Character identity is unstable.");
         if (plan.Id != record.PlanId || plan.Revision != record.PlanRevision || !plan.Owner.Matches(record.Owner))
             throw new RunStoppedException("Listing Plan changed; run stopped before the next mutation.");

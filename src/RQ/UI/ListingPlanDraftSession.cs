@@ -14,12 +14,18 @@ internal sealed record ListingSlotPlan(uint ItemId, string ItemName, ItemQuality
     public (uint, ItemQualityPolicy, int, int, bool) Shape => (ItemId, Quality, Units, Price, Enabled);
 }
 
-/// <summary>Window-lifetime editing intent. Only Save writes canonical state.</summary>
+/// <summary>
+/// Window-lifetime editing intent for the active Listing Plan. Only Save and the plan commands (create, rename,
+/// duplicate, delete) write canonical state.
+/// </summary>
 internal sealed class ListingPlanDraftSession(
     StateRepository state,
     Func<BrowserProjection, uint, int> resolveMaxStack,
-    Func<uint, bool> canBeHq)
+    Func<uint, bool> canBeHq,
+    WorkbenchState? workbench = null)
 {
+    private const string NewPlanName = "New plan";
+    private readonly WorkbenchState selection = workbench ?? new();
     private (int Version, long Runtime) issueKey = (-1, -1);
     private IReadOnlyList<ListingPlanValidationIssue> issues = [];
     public ListingPlanDraft? Draft { get; private set; }
@@ -31,6 +37,13 @@ internal sealed class ListingPlanDraftSession(
     public string? Error { get; private set; }
     internal Action? BeforeSaveMutate { get; set; }
 
+    /// <summary>The Market tab's chosen plan (<see cref="WorkbenchState.SelectedListingPlanId"/>); null means the default.</summary>
+    public Guid? SelectedPlanId => selection.SelectedListingPlanId;
+
+    /// <summary>The plan the draft edits: the selected one, else the owner's default (null when the owner has none).</summary>
+    private ListingPlan? ActivePlan(QuartermasterState document, OwnerScope owner) =>
+        ListingPlanCatalog.SelectedOrDefault(document, owner, SelectedPlanId);
+
     public void Ensure(QuartermasterRuntimeSnapshot runtime) => Ensure(runtime.Owner, runtime.State, runtime.Browser);
 
     private void Ensure(OwnerScope owner, QuartermasterState document, BrowserProjection browser)
@@ -41,17 +54,19 @@ internal sealed class ListingPlanDraftSession(
             Reset(document, owner, browser);
             return;
         }
-        var plan = ListingPlanCatalog.OwnerPlan(document, owner);
+        var plan = ActivePlan(document, owner);
         if (!IsDirty)
         {
-            if (plan is not null && (plan.Id != Draft.PlanId || plan.Revision != Draft.SourceRevision))
+            if (plan is null ? !Draft.IsNew : plan.Id != Draft.PlanId || plan.Revision != Draft.SourceRevision)
                 Reset(document, owner, browser);
             return;
         }
         if (!Draft.IsNew || plan is null) return;
+        // A plan appeared (for example the reserve IPC created "Default") while an unsaved first plan had edits: the
+        // edits join that plan rather than colliding with it.
         var local = Draft.Assignments.Select(ListingPlanCatalog.Copy).ToArray();
         var localReserves = Draft.Reserves.Select(ListingPlanCatalog.Copy).ToArray();
-        Draft = ListingPlanCatalog.Draft(document, owner, browser);
+        Draft = ListingPlanCatalog.Draft(document, owner, plan.Id, browser);
         Draft.Assignments.AddRange(local);
         Draft.Reserves.AddRange(localReserves);
         MergedElsewhere = true;
@@ -60,7 +75,7 @@ internal sealed class ListingPlanDraftSession(
 
     private void Reset(QuartermasterState document, OwnerScope owner, BrowserProjection browser)
     {
-        Draft = ListingPlanCatalog.Draft(document, owner, browser);
+        Draft = ListingPlanCatalog.Draft(document, owner, ActivePlan(document, owner)?.Id, browser);
         ConflictCount = 0;
         MergedElsewhere = false;
         Error = null;
@@ -276,12 +291,6 @@ internal sealed class ListingPlanDraftSession(
 
     private ListingReserveRule? FindReserve(Guid id) => Draft?.Reserves.FirstOrDefault(r => r.Id == id);
     public void SetReserveUnits(Guid id, string text) { if (FindReserve(id) is { } r) { r.ReserveUnits = ReserveInput(text); Changed(); } }
-    public void SetReserveHomes(Guid id, IReadOnlyList<PlacementHome> homes)
-    {
-        if (FindReserve(id) is not { } r || ReservePlacement.Same(r.Homes, homes)) return;
-        r.Homes = ReservePlacement.Copy(homes);
-        Changed();
-    }
     public void SetReserveEnabled(Guid id, bool enabled) { if (FindReserve(id) is { } r) { r.Enabled = enabled; Changed(); } }
     public void RemoveReserve(Guid id) { if (Draft?.Reserves.RemoveAll(r => r.Id == id) > 0) Changed(); }
 
@@ -311,8 +320,9 @@ internal sealed class ListingPlanDraftSession(
         try
         {
             BeforeSaveMutate?.Invoke();
-            state.Mutate(StateChangeKind.Listings, document => ListingPlanCatalog.Apply(document, runtime.Owner, Draft,
-                id => MaxStack(runtime.Browser, id), CurrentRetainerIds(runtime), DateTime.UtcNow));
+            var saved = state.Mutate(StateChangeKind.Listings, document => ListingPlanCatalog.Apply(document, runtime.Owner, Draft,
+                id => MaxStack(runtime.Browser, id), CurrentRetainerIds(runtime), DateTime.UtcNow).Id);
+            selection.SelectedListingPlanId = saved;
             Reset(state.Snapshot(), runtime.Owner, runtime.Browser);
         }
         catch (ListingPlanConflictException ex)
@@ -328,7 +338,7 @@ internal sealed class ListingPlanDraftSession(
         catch (InvalidOperationException ex)
         {
             var latest = state.Snapshot();
-            if (Draft.IsNew && ListingPlanCatalog.OwnerPlan(latest, runtime.Owner) is not null)
+            if (Draft.IsNew && ActivePlan(latest, runtime.Owner) is not null)
                 Ensure(runtime.Owner, latest, runtime.Browser);
             else Error = ex.Message;
         }
@@ -338,12 +348,175 @@ internal sealed class ListingPlanDraftSession(
         }
     }
 
+    /// <summary>
+    /// Saves pending edits before the session leaves the current plan. False (with <see cref="Error"/>) when they
+    /// cannot be saved: the draft stays open so nothing is lost.
+    /// </summary>
+    private bool SettleBeforeSwitch(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (Draft is null || !IsDirty) return true;
+        if (Issues(runtime).Count > 0)
+        {
+            Error = "This plan has unsaved changes that can't be saved yet. Fix or discard them before switching plans.";
+            return false;
+        }
+        Save(runtime);
+        if (Error is not null) return false;
+        if (!IsDirty) return true;
+        Error = "This plan changed elsewhere. Review the merged changes and save before switching plans.";
+        return false;
+    }
+
+    private bool Run(Action action)
+    {
+        try
+        {
+            action();
+            return true;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            Error = ex.Message;
+            return false;
+        }
+    }
+
+    private void Open(QuartermasterRuntimeSnapshot runtime, Guid? planId)
+    {
+        selection.SelectedListingPlanId = planId;
+        Reset(state.Snapshot(), runtime.Owner, runtime.Browser);
+    }
+
+    /// <summary>Makes <paramref name="planId"/> the active plan, saving the current plan's valid edits first.</summary>
+    public bool SelectPlan(QuartermasterRuntimeSnapshot runtime, Guid planId)
+    {
+        if (!runtime.Owner.HasStableIdentity) return false;
+        Ensure(runtime);
+        if (Draft?.PlanId == planId) return true;
+        if (state.Read(document => ListingPlanCatalog.FindPlan(document, runtime.Owner, planId)) is null)
+        {
+            Error = "That Listing Plan no longer exists.";
+            return false;
+        }
+        if (!SettleBeforeSwitch(runtime)) return false;
+        Error = null;
+        Open(runtime, planId);
+        return true;
+    }
+
+    /// <summary>Creates an empty plan ("New plan", "New plan 2", ...) and opens it.</summary>
+    public Guid? CreatePlan(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (!runtime.Owner.HasStableIdentity) return null;
+        Ensure(runtime);
+        if (!SettleBeforeSwitch(runtime)) return null;
+        Guid created = default;
+        if (!Run(() => created = state.Mutate(StateChangeKind.Listings, document => ListingPlanCatalog.CreatePlan(
+                document, runtime.Owner, ListingPlanCatalog.UniqueName(document, runtime.Owner, NewPlanName), DateTime.UtcNow).Id)))
+            return null;
+        Error = null;
+        Open(runtime, created);
+        return created;
+    }
+
+    /// <summary>
+    /// Renames the active plan; an unsaved first plan is saved under the name, keeping its pending edits. Returns why
+    /// the name was refused (the rename input shows it), or null.
+    /// </summary>
+    public string? RenamePlan(QuartermasterRuntimeSnapshot runtime, string name)
+    {
+        if (!runtime.Owner.HasStableIdentity) return "Owner identity unavailable.";
+        Ensure(runtime);
+        if (Draft is null) return "No Listing Plan is open.";
+        var trimmed = name.Trim();
+        if (trimmed == Draft.Name) return null;
+        var draft = Draft;
+        if (state.Read(document => ListingPlanCatalog.NameIssue(document, runtime.Owner, trimmed, draft.PlanId)) is { } issue)
+            return issue;
+        if (!draft.IsNew)
+        {
+            if (!Run(() => state.Mutate(StateChangeKind.Listings, document =>
+                    ListingPlanCatalog.RenamePlan(document, runtime.Owner, draft.PlanId, trimmed, DateTime.UtcNow))))
+                return Error;
+            draft.Name = trimmed;
+            Changed();
+            return null;
+        }
+        if (!Run(() => state.Mutate(StateChangeKind.Listings, document =>
+                ListingPlanCatalog.CreatePlan(document, runtime.Owner, trimmed, DateTime.UtcNow, draft.PlanId))))
+            return Error;
+        // The plan now exists, empty: pending edits stay pending against that empty baseline.
+        selection.SelectedListingPlanId = draft.PlanId;
+        Draft = new ListingPlanDraft
+        {
+            PlanId = draft.PlanId, Owner = draft.Owner, Name = trimmed, SourceRevision = 0,
+            IncompleteListingRetainerIds = draft.IncompleteListingRetainerIds,
+            Assignments = draft.Assignments, BaselineAssignments = [],
+            Reserves = draft.Reserves, BaselineReserves = [],
+        };
+        Changed();
+        return null;
+    }
+
+    /// <summary>
+    /// Writes an item's placement homes straight to the Placements catalog. Placement is account-wide intent shared by
+    /// every plan, so it is saved immediately and never becomes a draft change.
+    /// </summary>
+    public void SavePlacement(OwnerScope owner, uint itemId, string itemName, ItemQualityPolicy quality, IReadOnlyList<PlacementHome> homes)
+    {
+        if (!owner.HasStableIdentity || itemId == 0) return;
+        Run(() => state.Mutate(StateChangeKind.Plans, document =>
+        {
+            var consolidate = PlacementCatalog.Find(document, owner, itemId, quality)?.Consolidate == true && homes.Count > 0;
+            PlacementCatalog.Upsert(document, owner, itemId, itemName, quality, homes, consolidate, DateTime.UtcNow);
+        }));
+    }
+
+    /// <summary>Copies the active plan (after saving its valid edits) as "Name (copy)" and opens the copy.</summary>
+    public Guid? DuplicatePlan(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (!runtime.Owner.HasStableIdentity) return null;
+        Ensure(runtime);
+        if (!SettleBeforeSwitch(runtime) || Draft is null) return null;
+        if (Draft.IsNew)
+        {
+            Error = "Save this plan before duplicating it.";
+            return null;
+        }
+        var source = Draft.PlanId;
+        Guid copy = default;
+        if (!Run(() => copy = state.Mutate(StateChangeKind.Listings, document =>
+                ListingPlanCatalog.DuplicatePlan(document, runtime.Owner, source, DateTime.UtcNow).Id)))
+            return null;
+        Error = null;
+        Open(runtime, copy);
+        return copy;
+    }
+
+    /// <summary>
+    /// Deletes the active plan, its unsaved edits, and its Transfer Plan links, then opens the default plan. An
+    /// unsaved first plan is simply discarded.
+    /// </summary>
+    public bool DeletePlan(QuartermasterRuntimeSnapshot runtime)
+    {
+        if (!runtime.Owner.HasStableIdentity) return false;
+        Ensure(runtime);
+        if (Draft is null) return false;
+        var planId = Draft.PlanId;
+        if (!Draft.IsNew && !Run(() => state.Mutate(StateChangeKind.Listings, document =>
+                ListingPlanCatalog.DeletePlan(document, runtime.Owner, planId))))
+            return false;
+        Error = null;
+        Open(runtime, null);
+        return true;
+    }
+
     private void Rebase(IReadOnlyList<ListingPlanAssignment> assignments, IReadOnlyList<ListingPlanAssignment> baseline,
         IReadOnlyList<ListingReserveRule> reserves, IReadOnlyList<ListingReserveRule> baselineReserves, long revision)
     {
         Draft = new ListingPlanDraft
         {
-            PlanId = Draft!.PlanId, Owner = Draft.Owner, IsNew = Draft.IsNew,
+            PlanId = Draft!.PlanId, Owner = Draft.Owner, IsNew = Draft.IsNew, Name = Draft.Name,
             IncompleteListingRetainerIds = Draft.IncompleteListingRetainerIds,
             Assignments = assignments.Select(ListingPlanCatalog.Copy).ToList(),
             BaselineAssignments = baseline.Select(ListingPlanCatalog.Copy).ToList(),

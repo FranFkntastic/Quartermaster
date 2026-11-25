@@ -119,15 +119,48 @@ public static class ListingPlanEvaluator
             ? Evidence.Known(checked(Math.Max(0, independentTarget) + listingContribution.Value))
             : Evidence.Unknown<int>(listingContribution.UnknownReason ?? "Listing demand is unknown.");
 
+    /// <summary>
+    /// The listing demand a Transfer Plan links to, from every one of the owner's Listing Plans it links (an owner may
+    /// have several): each linked plan is evaluated once.
+    /// </summary>
+    public static IReadOnlyList<TransferPlanListingContribution> LinkedContributions(
+        QuartermasterState state,
+        BrowserProjection projection,
+        OwnerScope owner,
+        Guid stowagePlanId) =>
+        state.TransferPlanListingLinks
+            .Where(link => link.StowagePlanId == stowagePlanId)
+            .Select(link => link.ListingPlanId)
+            .Distinct()
+            .Select(listingPlanId => ListingPlanCatalog.FindPlan(state, owner, listingPlanId))
+            .Where(plan => plan is not null)
+            .SelectMany(plan => Contributions(state, stowagePlanId, Evaluate(plan, projection)))
+            .ToArray();
+
+    /// <summary>
+    /// <see cref="LinkedContributions"/> per item: demand for the same item from several Listing Plans adds up, and any
+    /// unknown part leaves the item's demand unknown.
+    /// </summary>
+    public static Dictionary<(uint ItemId, ItemQualityPolicy Quality), TransferPlanListingContribution> LinkedDemand(
+        QuartermasterState state,
+        BrowserProjection projection,
+        OwnerScope owner,
+        Guid stowagePlanId) =>
+        LinkedContributions(state, projection, owner, stowagePlanId)
+            .GroupBy(contribution => (contribution.Link.ItemId, contribution.Link.Quality))
+            .ToDictionary(group => group.Key, group => new TransferPlanListingContribution(
+                group.First().Link,
+                group.All(contribution => contribution.Quantity.IsKnown)
+                    ? Evidence.Known(group.Sum(contribution => contribution.Quantity.Value))
+                    : Evidence.Unknown<int>(group.First(contribution => !contribution.Quantity.IsKnown).Quantity.UnknownReason ?? "Listing demand is unknown.")));
+
     public static IReadOnlyList<TargetPlanItem> ComposeRules(
         QuartermasterState state,
         BrowserProjection projection,
         OwnerScope owner,
         Guid stowagePlanId)
     {
-        var evaluation = Evaluate(ListingPlanCatalog.OwnerPlan(state, owner), projection);
-        var contributions = Contributions(state, stowagePlanId, evaluation)
-            .ToDictionary(contribution => (contribution.Link.ItemId, contribution.Link.Quality));
+        var contributions = LinkedDemand(state, projection, owner, stowagePlanId);
         return state.PlanItems
             .Where(rule => rule.StowagePlanId == stowagePlanId && rule.Courier is null)
             .Select(rule =>
@@ -158,8 +191,7 @@ public static class ListingPlanEvaluator
         OwnerScope owner,
         Guid stowagePlanId)
     {
-        var evaluation = Evaluate(ListingPlanCatalog.OwnerPlan(state, owner), projection);
-        return Contributions(state, stowagePlanId, evaluation).Any(contribution => !contribution.Quantity.IsKnown);
+        return LinkedContributions(state, projection, owner, stowagePlanId).Any(contribution => !contribution.Quantity.IsKnown);
     }
 
     private static ListingPlanItemEvaluation EvaluateItem(

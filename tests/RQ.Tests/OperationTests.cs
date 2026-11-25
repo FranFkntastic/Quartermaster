@@ -149,17 +149,11 @@ public sealed class OperationTests
         using var directory = new TemporaryDirectory();
         var repository = TestData.Repository(directory.Path);
         var (first, second) = (Character(7001, "First Alt"), Character(7002, "Second Alt"));
-        repository.Mutate(StateChangeKind.Listings, state => state.ListingPlans.Add(new ListingPlan
+        repository.Mutate(StateChangeKind.Plans, state => state.Placements.Add(new ItemPlacementRule
         {
             Owner = TestData.Owner,
-            Reserves =
-            [
-                new ListingReserveRule
-                {
-                    ItemId = 100, ItemName = "Ore", Quality = ItemQualityPolicy.NqOnly,
-                    Homes = [new(TestData.Owner, 1, 1000), new(TestData.Owner, 2, 500), new(first, 3, 300), new(second, 4)],
-                },
-            ],
+            ItemId = 100, ItemName = "Ore", Quality = ItemQualityPolicy.NqOnly,
+            Homes = [new(TestData.Owner, 1, 1000), new(TestData.Owner, 2, 500), new(first, 3, 300), new(second, 4)],
         }));
         var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
         store.Save(new Dictionary<ulong, CachedRetainer>
@@ -212,17 +206,11 @@ public sealed class OperationTests
         using var directory = new TemporaryDirectory();
         var repository = TestData.Repository(directory.Path);
         var (first, second) = (Character(7001, "First Alt"), Character(7002, "Second Alt"));
-        repository.Mutate(StateChangeKind.Listings, state => state.ListingPlans.Add(new ListingPlan
+        repository.Mutate(StateChangeKind.Plans, state => state.Placements.Add(new ItemPlacementRule
         {
             Owner = TestData.Owner,
-            Reserves =
-            [
-                new ListingReserveRule
-                {
-                    ItemId = 100, ItemName = "Ore", Quality = ItemQualityPolicy.NqOnly,
-                    Homes = [new(first, 3, 200), new(second, 4)],
-                },
-            ],
+            ItemId = 100, ItemName = "Ore", Quality = ItemQualityPolicy.NqOnly,
+            Homes = [new(first, 3, 200), new(second, 4)],
         }));
         var store = new RetainerCacheStore(Path.Combine(directory.Path, "cache.json"));
         store.Save(new Dictionary<ulong, CachedRetainer>

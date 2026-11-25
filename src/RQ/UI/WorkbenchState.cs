@@ -30,6 +30,8 @@ public sealed class WorkbenchState
     public DalamudFilterAutocompleteState ItemFilterState { get; } = new();
     public DalamudFilterAutocompleteState ListingFilterState { get; } = new();
     public ulong? SelectedListingRetainerId { get; set; }
+    /// <summary>The Market tab's active Listing Plan; null means the owner's default plan. Cleared when the owner changes.</summary>
+    public Guid? SelectedListingPlanId { get; set; }
     private OwnerScope? listingOwner;
     private readonly HashSet<ulong> expandedListingRetainers = [];
     public bool IsListingExpanded(ulong id) => expandedListingRetainers.Contains(id);
@@ -45,6 +47,7 @@ public sealed class WorkbenchState
         listingOwner = owner;
         expandedListingRetainers.Clear();
         SelectedListingRetainerId = null;
+        SelectedListingPlanId = null;
         HighlightedListingItem = null;
         ScrollToListingRetainer = false;
         ScrollToListingDetail = null;

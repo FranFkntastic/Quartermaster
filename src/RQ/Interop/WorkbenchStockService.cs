@@ -9,9 +9,10 @@ namespace RQ.Interop;
 
 /// <summary>
 /// Stock by source for every character this machine knows, and the owner's reserve items (reserve level,
-/// counted spare stock, home retainers) for an external buy-list builder. Reads come from in-memory caches
-/// rebuilt only when a cache revision moves; edits are validated on the caller's thread and applied to the
-/// Listing Plan on the framework work queue, then announced through Changed like any other plan edit.
+/// counted spare stock, home retainers) for an external buy-list builder. Reserve levels come from the owner's
+/// selected (else default) Listing Plan; homes come from the Placements catalog. Reads come from in-memory caches
+/// rebuilt only when a cache revision moves; edits are validated on the caller's thread and applied on the
+/// framework work queue, then announced through Changed like any other plan edit.
 /// </summary>
 public sealed partial class WorkbenchStockService
 {
@@ -49,7 +50,21 @@ public sealed partial class WorkbenchStockService
     private readonly Func<uint, int>? maxStackSize;
     private readonly object gate = new();
     private (long Runtime, long Players, long External, IReadOnlyList<SourceCharacter> Characters)? sources;
-    private (long Runtime, string Json)? reserves;
+    private (long Runtime, Guid? Plan, string Json)? reserves;
+
+    /// <summary>
+    /// The Listing Plan the Market tab has open (reserve reads and edits target it when it belongs to the owner);
+    /// unset or stale, the owner's default plan is used.
+    /// </summary>
+    public Func<Guid?>? SelectedListingPlanId { get; set; }
+
+    private ListingPlan? ReservePlan(QuartermasterState document, OwnerScope owner)
+    {
+        Guid? selected = null;
+        try { selected = SelectedListingPlanId?.Invoke(); }
+        catch (Exception exception) { warn?.Invoke($"Quartermaster could not read the selected Listing Plan: {exception.Message}"); }
+        return ListingPlanCatalog.SelectedOrDefault(document, owner, selected);
+    }
 
     /// <summary>Opens the placement editor for the owner and items; set once the window exists. Runs on the framework thread.</summary>
     public Action<OwnerScope, IReadOnlyList<PlacementEditorItem>>? OpenPlacementEditor { get; set; }
@@ -228,12 +243,16 @@ public sealed partial class WorkbenchStockService
     public string GetReserveItems()
     {
         var current = runtime();
+        var owner = current.Owner;
+        var plan = owner.HasStableIdentity ? ReservePlan(current.State, owner) : null;
         lock (gate)
-            if (reserves is { } cached && cached.Runtime == current.Revision)
+            if (reserves is { } cached && cached.Runtime == current.Revision && cached.Plan == plan?.Id)
                 return cached.Json;
 
-        var owner = current.Owner;
-        var plan = owner.HasStableIdentity ? ListingPlanCatalog.OwnerPlan(current.State, owner) : null;
+        var placements = PlacementCatalog.OwnerPlacements(current.State, owner).Where(rule => owner.HasStableIdentity && rule.ItemId > 0)
+            .GroupBy(rule => (rule.ItemId, rule.Quality)).ToDictionary(group => group.Key, group => group.First());
+        var planReserves = (plan?.Reserves ?? []).Where(reserve => reserve.Enabled && reserve.ItemId > 0)
+            .GroupBy(reserve => (reserve.ItemId, reserve.Quality)).ToDictionary(group => group.Key, group => group.First());
         MarketRunEvaluation? evaluation = null;
         try { evaluation = plan is null ? null : MarketRunPlanner.Evaluate(plan, current.Browser); }
         catch (Exception exception) { warn?.Invoke($"Quartermaster could not count reserve stock: {exception.Message}"); }
@@ -244,27 +263,29 @@ public sealed partial class WorkbenchStockService
             revision = current.Revision,
             owner,
             retainers = OwnerRetainers(current).Select(retainer => new { retainer.RetainerId, retainer.RetainerName }),
-            items = (plan?.Reserves ?? []).Where(reserve => reserve.Enabled && reserve.ItemId > 0)
-                .GroupBy(reserve => (reserve.ItemId, reserve.Quality))
-                .Select(group => group.First())
-                .Select(reserve =>
+            // Every item the owner keeps a reserve level for or has placement homes for, as before homes left the plan.
+            items = planReserves.Keys.Concat(placements.Keys.Where(key => !planReserves.ContainsKey(key)))
+                .Select(key =>
                 {
-                    var counted = evaluation?.Find(reserve.ItemId, reserve.Quality)?.SpareUnits;
+                    var reserve = planReserves.GetValueOrDefault(key);
+                    var homes = (IReadOnlyList<PlacementHome>?)placements.GetValueOrDefault(key)?.Homes ?? [];
+                    var name = reserve?.ItemName is { Length: > 0 } reserveName ? reserveName : placements.GetValueOrDefault(key)?.ItemName ?? string.Empty;
+                    var counted = evaluation?.Find(key.ItemId, key.Quality)?.SpareUnits;
                     return new
                     {
-                        reserve.ItemId,
-                        reserve.ItemName,
-                        quality = reserve.Quality.ToString(),
-                        reserve.ReserveUnits,
+                        key.ItemId,
+                        ItemName = name,
+                        quality = key.Quality.ToString(),
+                        ReserveUnits = reserve?.ReserveUnits ?? 0,
                         // Null when any accessible stock is unobserved: unknown, not zero.
                         countedUnits = counted is { IsKnown: true } known ? known.Value : (int?)null,
                         // Derived for v1 readers: the owner's homes in rank order, and the first other character's.
-                        homes = reserve.Homes.Where(home => ReservePlacement.SameCharacter(home.Character, owner))
+                        homes = homes.Where(home => ReservePlacement.SameCharacter(home.Character, owner))
                             .Select(home => home.RetainerId).Distinct().ToArray(),
                         anySpace = false,
-                        remoteHomes = RemoteHomesView(reserve, owner, current),
+                        remoteHomes = RemoteHomesView(homes, owner, current),
                         // Canonical: every home in global rank order across characters, with its cap.
-                        placementHomes = reserve.Homes.Select((home, index) => new
+                        placementHomes = homes.Select((home, index) => new
                         {
                             rank = index + 1,
                             character = new { home.Character.LocalContentId, home.Character.HomeWorldId, home.Character.CharacterName, home.Character.HomeWorldName },
@@ -275,7 +296,7 @@ public sealed partial class WorkbenchStockService
                 }),
         }, JsonOptions);
         lock (gate)
-            reserves = (current.Revision, json);
+            reserves = (current.Revision, plan?.Id, json);
         return json;
     }
 
@@ -311,12 +332,12 @@ public sealed partial class WorkbenchStockService
             : current.Owner;
         if (!asked.HasStableIdentity)
             return JsonSerializer.Serialize(Rejected("missing_owner_scope", "No owner was named and no character is logged in."), JsonOptions);
-        var plan = ListingPlanCatalog.OwnerPlan(current.State, asked);
-        var owner = asked.Matches(current.Owner) ? current.Owner : plan?.Owner ?? asked;
+        var rules = PlacementCatalog.OwnerPlacements(current.State, asked);
+        var owner = asked.Matches(current.Owner) ? current.Owner : rules.FirstOrDefault()?.Owner ?? asked;
         var now = DateTime.UtcNow;
         try
         {
-            IReadOnlyList<PlacementHome> HomesOf(ArrivalPlanRequestItem item) => ReserveFor(plan, item.ItemId, item.IsHq)?.Homes ?? [];
+            IReadOnlyList<PlacementHome> HomesOf(ArrivalPlanRequestItem item) => PlacementCatalog.ForArrival(rules, item.ItemId, item.IsHq)?.Homes ?? [];
             // One shared projection: items sharing a retainer share its room, on every character.
             var routes = PlacementRouter.Route(
                 items.Select(item => (new PlacementItem(item.ItemId, $"Item {item.ItemId}", item.IsHq, item.Quantity), HomesOf(item))),
@@ -388,20 +409,15 @@ public sealed partial class WorkbenchStockService
         }
     }
 
-    /// <summary>The enabled reserve rule for an arriving item variant (a rule of either quality counts for both).</summary>
-    internal static ListingReserveRule? ReserveFor(ListingPlan? plan, uint itemId, bool isHq) =>
-        plan?.Reserves.FirstOrDefault(reserve => reserve.Enabled && reserve.ItemId == itemId &&
-            (reserve.Quality == ItemQualityPolicy.Any || reserve.Quality == ItemQualityPolicy.HqOnly == isHq));
-
     /// <summary>The v1 <c>remoteHomes</c> view: the first other character the ranked homes reach, and its homes there.</summary>
-    private static object? RemoteHomesView(ListingReserveRule reserve, OwnerScope owner, QuartermasterRuntimeSnapshot current)
+    private static object? RemoteHomesView(IReadOnlyList<PlacementHome> homes, OwnerScope owner, QuartermasterRuntimeSnapshot current)
     {
-        if (reserve.Homes.FirstOrDefault(home => !ReservePlacement.SameCharacter(home.Character, owner))?.Character is not { } character)
+        if (homes.FirstOrDefault(home => !ReservePlacement.SameCharacter(home.Character, owner))?.Character is not { } character)
             return null;
         return new
         {
             character = new { character.LocalContentId, character.HomeWorldId, character.CharacterName, character.HomeWorldName },
-            retainers = reserve.Homes.Where(home => ReservePlacement.SameCharacter(home.Character, character)).Select(home => new
+            retainers = homes.Where(home => ReservePlacement.SameCharacter(home.Character, character)).Select(home => new
             {
                 retainerId = home.RetainerId,
                 // Null while this client has not observed the retainer under that character.
@@ -494,16 +510,16 @@ public sealed partial class WorkbenchStockService
     }
 
     /// <summary>
-    /// Edits the owner's enabled reserve rule for one item and quality, creating the rule (and the
-    /// Listing Plan) when <paramref name="create"/> allows it. A rule left with no level and no home is
-    /// removed so a cleared home leaves nothing behind. Runs on the framework thread.
+    /// Edits the owner's enabled reserve rule for one item and quality in the selected (else default) Listing Plan,
+    /// creating the rule (and a "Default" plan when the owner has none) when <paramref name="create"/> allows it. A rule
+    /// left with no level is removed from the plan. Placement homes are never touched. Runs on the framework thread.
     /// </summary>
     private void EditReserve(OwnerScope owner, uint itemId, string itemName, ItemQualityPolicy quality,
         Func<ListingReserveRule, bool> edit, bool create)
     {
         try
         {
-            var plan = state.Read(document => ListingPlanCatalog.OwnerPlan(document, owner));
+            var plan = state.Read(document => ReservePlan(document, owner));
             var existing = plan?.Reserves.FirstOrDefault(reserve => reserve.Enabled && reserve.ItemId == itemId && reserve.Quality == quality);
             if (existing is null && !create)
                 return;
@@ -511,11 +527,11 @@ public sealed partial class WorkbenchStockService
                 return;
             state.Mutate(StateChangeKind.Listings, document =>
             {
-                var target = ListingPlanCatalog.OwnerPlan(document, owner);
+                var target = plan is null ? null : ListingPlanCatalog.FindPlan(document, owner, plan.Id);
                 if (target is null)
                 {
-                    target = new ListingPlan { Owner = owner with { } };
-                    document.ListingPlans.Add(target);
+                    target = ListingPlanCatalog.DefaultPlan(document, owner) ??
+                             ListingPlanCatalog.CreatePlan(document, owner, ListingPlanDraft.DefaultPlanName, DateTime.UtcNow);
                 }
                 var reserve = target.Reserves.FirstOrDefault(rule => rule.Enabled && rule.ItemId == itemId && rule.Quality == quality);
                 if (reserve is null)
@@ -526,7 +542,7 @@ public sealed partial class WorkbenchStockService
                 if (string.IsNullOrWhiteSpace(reserve.ItemName))
                     reserve.ItemName = itemName;
                 edit(reserve);
-                if (reserve.ReserveUnits == 0 && !reserve.HasAnyHome)
+                if (reserve.ReserveUnits <= 0)
                     target.Reserves.Remove(reserve);
                 target.UpdatedAtUtc = DateTime.UtcNow;
                 target.Revision = checked(target.Revision + 1);

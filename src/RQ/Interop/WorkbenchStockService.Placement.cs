@@ -12,7 +12,8 @@ namespace RQ.Interop;
 /// Placement over IPC (capabilities <c>placementEdit.v1</c> and <c>placementEdit.v2</c>): <see cref="GetPlacement"/>
 /// returns what the Placement window's matrix shows, and <see cref="EditPlacement"/> applies one toolbar action through
 /// <see cref="ApplyPlacementEdit"/>, the same path the window's edits take. v2: an item's homes are one ranked list
-/// across characters (each an explicit retainer with an optional cap); there is no "any space" home.
+/// across characters (each an explicit retainer with an optional cap); there is no "any space" home. Homes live in
+/// <see cref="QuartermasterState.Placements"/>; placement reads and edits never touch a Listing Plan.
 /// </summary>
 public sealed partial class WorkbenchStockService
 {
@@ -24,7 +25,7 @@ public sealed partial class WorkbenchStockService
     public const string PlacementEditAckSchema = "gooseworks-quartermaster-placement-edit-ack/v1";
 
     private const int PlayerBagSlots = 140;
-    private (long Runtime, long Players, long State, string Json)? placement;
+    private (long Runtime, long Players, long State, Guid? Plan, string Json)? placement;
 
     /// <summary>Characters the placement editor can show besides the owner; set once the courier exists.</summary>
     public Func<QuartermasterRuntimeSnapshot, IEnumerable<OwnerScope>>? PlacementCharacters { get; set; }
@@ -100,17 +101,19 @@ public sealed partial class WorkbenchStockService
         var current = runtime();
         if (!current.Owner.HasStableIdentity)
             return JsonSerializer.Serialize(Rejected("missing_owner_scope", "No character is logged in."), JsonOptions);
-        var (stateRevision, plan) = state.Read(document => (document.Revision,
-            ListingPlanCatalog.OwnerPlan(document, current.Owner) is { } found ? Snapshot(found) : null));
+        var (stateRevision, rules, plan) = state.Read(document => (document.Revision,
+            OwnerPlacementsSnapshot(document, current.Owner),
+            ReservePlan(document, current.Owner) is { } found ? Snapshot(found) : null));
         if (keys is null)
         {
             lock (gate)
-                if (placement is { } cached && cached.Runtime == current.Revision && cached.Players == playerInventory.Revision && cached.State == stateRevision)
+                if (placement is { } cached && cached.Runtime == current.Revision && cached.Players == playerInventory.Revision &&
+                    cached.State == stateRevision && cached.Plan == plan?.Id)
                     return cached.Json;
         }
 
         string json;
-        try { json = BuildPlacement(current, plan, keys); }
+        try { json = BuildPlacement(current, rules, plan, keys); }
         catch (Exception exception)
         {
             warn?.Invoke($"Quartermaster could not build the placement view: {exception}");
@@ -118,7 +121,7 @@ public sealed partial class WorkbenchStockService
         }
         if (keys is null)
             lock (gate)
-                placement = (current.Revision, playerInventory.Revision, stateRevision, json);
+                placement = (current.Revision, playerInventory.Revision, stateRevision, plan?.Id, json);
         return json;
     }
 
@@ -127,22 +130,33 @@ public sealed partial class WorkbenchStockService
         Id = plan.Id,
         Revision = plan.Revision,
         Owner = plan.Owner with { },
+        Name = plan.Name,
         Reserves = plan.Reserves.Select(ListingPlanCatalog.Copy).ToList(),
         UpdatedAtUtc = plan.UpdatedAtUtc,
     };
 
-    private string BuildPlacement(QuartermasterRuntimeSnapshot current, ListingPlan? plan, IReadOnlyList<(uint ItemId, ItemQualityPolicy Quality)>? keys)
+    private static IReadOnlyList<ItemPlacementRule> OwnerPlacementsSnapshot(QuartermasterState document, OwnerScope owner) =>
+        PlacementCatalog.OwnerPlacements(document, owner).Select(PlacementCatalog.Copy).ToArray();
+
+    private string BuildPlacement(QuartermasterRuntimeSnapshot current, IReadOnlyList<ItemPlacementRule> placements, ListingPlan? plan,
+        IReadOnlyList<(uint ItemId, ItemQualityPolicy Quality)>? keys)
     {
         var owner = current.Owner;
         var now = DateTime.UtcNow;
+        var rules = placements.Where(rule => rule.ItemId > 0)
+            .GroupBy(rule => (rule.ItemId, rule.Quality))
+            .ToDictionary(group => group.Key, group => group.First());
+        // Reserve levels come from the owner's selected (else default) Listing Plan; they never carry homes.
         var reserves = (plan?.Reserves ?? []).Where(reserve => reserve.Enabled && reserve.ItemId > 0)
             .GroupBy(reserve => (reserve.ItemId, reserve.Quality))
             .ToDictionary(group => group.Key, group => group.First());
-        var rows = (keys ?? reserves.Keys.OrderBy(key => reserves[key].ItemName, StringComparer.OrdinalIgnoreCase).ThenBy(key => key.ItemId).ToList())
-            .Select(key => (Key: key, Rule: reserves.GetValueOrDefault(key)))
+        string NameOf((uint ItemId, ItemQualityPolicy Quality) key) =>
+            rules.GetValueOrDefault(key)?.ItemName is { Length: > 0 } name ? name : reserves.GetValueOrDefault(key)?.ItemName ?? string.Empty;
+        var rows = (keys ?? rules.Keys.Union(reserves.Keys).OrderBy(NameOf, StringComparer.OrdinalIgnoreCase).ThenBy(key => key.ItemId).ToList())
+            .Select(key => (Key: key, Rule: rules.GetValueOrDefault(key), Reserve: reserves.GetValueOrDefault(key)))
             .ToArray();
         // Every per-character map is keyed by content id, the identity the character list is unique on.
-        var characters = PlacementCharacterList(current, plan);
+        var characters = PlacementCharacterList(current, placements);
         var bags = playerInventory.Read(entries => entries
             .Where(entry => entry.Owner.LocalContentId is > 0)
             .GroupBy(entry => entry.Owner.LocalContentId!.Value)
@@ -161,7 +175,7 @@ public sealed partial class WorkbenchStockService
         };
         static long? Age(DateTime? observed, DateTime now) => observed is { } at ? (long)Math.Max(0, (now - at).TotalSeconds) : null;
         static object Ranked(IEnumerable<ulong> ids) => ids.Distinct().Select((id, index) => new { rank = index + 1, retainerId = id }).ToArray();
-        static IReadOnlyList<PlacementHome> HomesOf(ListingReserveRule? rule) => rule?.Homes ?? [];
+        static IReadOnlyList<PlacementHome> HomesOf(ItemPlacementRule? rule) => rule?.Homes ?? [];
 
         return JsonSerializer.Serialize(new
         {
@@ -217,10 +231,10 @@ public sealed partial class WorkbenchStockService
                 {
                     itemId = row.Key.ItemId,
                     // The rule's name, else the game's; null only when neither is known.
-                    itemName = RealItemName(row.Key.ItemId, rule?.ItemName),
+                    itemName = RealItemName(row.Key.ItemId, rule?.ItemName is { Length: > 0 } ruleName ? ruleName : row.Reserve?.ItemName),
                     quality = row.Key.Quality.ToString(),
                     hasRule = rule is not null,
-                    reserveUnits = rule?.ReserveUnits ?? 0,
+                    reserveUnits = row.Reserve?.ReserveUnits ?? 0,
                     // Canonical (v2): every home in global rank order, across characters, with its cap.
                     homes = homes.Select((home, index) => new
                     {
@@ -274,15 +288,13 @@ public sealed partial class WorkbenchStockService
     /// to and every character a reserve item already has homes on. One entry per content id: a character that
     /// changed worlds is listed once, as the courier knows it now, ahead of the world its stored homes still carry.
     /// </summary>
-    private IReadOnlyList<OwnerScope> PlacementCharacterList(QuartermasterRuntimeSnapshot current, ListingPlan? plan)
+    private IReadOnlyList<OwnerScope> PlacementCharacterList(QuartermasterRuntimeSnapshot current, IReadOnlyList<ItemPlacementRule> placements)
     {
         var owner = current.Owner;
         IEnumerable<OwnerScope> offered = [];
         try { offered = PlacementCharacters?.Invoke(current)?.ToArray() ?? []; }
         catch (Exception exception) { warn?.Invoke($"Quartermaster could not list placement characters: {exception.Message}"); }
-        var homed = (plan?.Reserves ?? []).Where(reserve => reserve.Enabled)
-            .SelectMany(reserve => reserve.Homes)
-            .Select(home => home.Character);
+        var homed = placements.SelectMany(rule => rule.Homes).Select(home => home.Character);
         var others = offered.Concat(homed)
             .Where(character => character.HasStableIdentity && !SameCharacter(character, owner))
             .DistinctBy(character => character.LocalContentId!.Value)
@@ -381,19 +393,19 @@ public sealed partial class WorkbenchStockService
         });
 
     /// <summary>
-    /// The one placement edit path, for the Placement window and the IPC alike. Each item's next homes come from its
-    /// stored homes through the line's edit; a home the edit adds must be a retainer the editor offers on that home's
-    /// character (an assigned retainer, one a reserve item already names there, or one observed holding the item),
-    /// and the result must pass the Listing Plan's reserve validation of Homes. A placeholder item name is never
-    /// saved. Every accepted change is written in one state mutation, creating the plan and a level-0 rule as needed
-    /// and removing a level-0 rule left with no home. Refusals are logged at Warning.
+    /// The one placement edit path, for the Placement window, the Market placement matrix and the IPC alike. Each
+    /// item's next homes come from its stored homes (<see cref="QuartermasterState.Placements"/>) through the line's
+    /// edit; a home the edit adds must be a retainer the editor offers on that home's character (an assigned retainer,
+    /// one a placement rule already names there, or one observed holding the item), and the result must pass
+    /// <see cref="ListingPlanCatalog.HomesIssue"/>. A placeholder item name is never saved. Every accepted change is
+    /// written in one state mutation of the Placements catalog only, creating the item's rule as needed and removing a
+    /// rule left with no home and no consolidation. No Listing Plan is read or written. Refusals are logged at Warning.
     /// </summary>
     internal PlacementEditResult ApplyPlacementEdit(OwnerScope owner, IReadOnlyList<PlacementEditLine> lines,
         bool allOrNothing, string source)
     {
         var current = runtime();
-        var listed = PlacementCharacterList(current,
-            state.Read(document => ListingPlanCatalog.OwnerPlan(document, owner) is { } found ? Snapshot(found) : null));
+        var listed = PlacementCharacterList(current, state.Read(document => OwnerPlacementsSnapshot(document, owner)));
         var stocks = listed.Where(character => !SameCharacter(character, owner))
             .Select(character => (Character: character, Stock: CharacterStock?.Invoke(current, character)))
             .ToArray();
@@ -413,17 +425,17 @@ public sealed partial class WorkbenchStockService
         IReadOnlyList<PlacementItemOutcome> outcomes = [];
         try
         {
-            state.Mutate(StateChangeKind.Listings, document =>
+            state.Mutate(StateChangeKind.Plans, document =>
             {
                 var results = new List<PlacementItemOutcome>();
                 var accepted = new List<(PlacementEditorItem Item, List<PlacementHome> Homes, int Index)>();
-                var target = ListingPlanCatalog.OwnerPlan(document, owner);
-                // As the editor's columns: any retainer a reserve item already names counts as offered there.
-                var named = (target?.Reserves ?? []).Where(reserve => reserve.Enabled).SelectMany(reserve => reserve.Homes).ToArray();
+                var owned = PlacementCatalog.OwnerPlacements(document, owner);
+                // As the editor's columns: any retainer a placement rule already names counts as offered there.
+                var named = owned.SelectMany(rule => rule.Homes).ToArray();
                 foreach (var line in lines)
                 {
                     var item = line.Item;
-                    var rule = target?.Reserves.FirstOrDefault(reserve => reserve.Enabled && reserve.ItemId == item.ItemId && reserve.Quality == item.Quality);
+                    var rule = PlacementCatalog.Find(owned, owner, item.ItemId, item.Quality);
                     IReadOnlyList<PlacementHome> before = rule?.Homes ?? [];
                     var holdings = Holdings(item);
                     PlacementItemOutcome Outcome(string outcome, string code, string message) =>
@@ -432,7 +444,7 @@ public sealed partial class WorkbenchStockService
                     try { next = line.Edit(before, holdings); }
                     catch (ArgumentException exception)
                     {
-                        results.Add(Outcome("refused", "RuleInvalid", $"{item.ItemName}: {exception.Message}") with { Field = nameof(ListingReserveRule.Homes) });
+                        results.Add(Outcome("refused", "RuleInvalid", $"{item.ItemName}: {exception.Message}") with { Field = nameof(ItemPlacementRule.Homes) });
                         continue;
                     }
                     if (ReservePlacement.Same(before, next))
@@ -452,7 +464,7 @@ public sealed partial class WorkbenchStockService
                     }
                     if (ListingPlanCatalog.HomesIssue(next) is { } issue)
                     {
-                        results.Add(Outcome("refused", "RuleInvalid", $"{item.ItemName}: {issue}") with { Field = nameof(ListingReserveRule.Homes) });
+                        results.Add(Outcome("refused", "RuleInvalid", $"{item.ItemName}: {issue}") with { Field = nameof(ItemPlacementRule.Homes) });
                         continue;
                     }
                     accepted.Add((item, next, results.Count));
@@ -473,36 +485,26 @@ public sealed partial class WorkbenchStockService
                     throw new PlacementEditAborted();
                 }
 
-                if (target is null)
-                {
-                    target = new ListingPlan { Owner = owner with { } };
-                    document.ListingPlans.Add(target);
-                }
+                var now = DateTime.UtcNow;
                 foreach (var (item, next, index) in accepted)
                 {
-                    var reserve = target.Reserves.FirstOrDefault(rule => rule.Enabled && rule.ItemId == item.ItemId && rule.Quality == item.Quality);
-                    var created = reserve is null;
+                    var existing = PlacementCatalog.Find(document, owner, item.ItemId, item.Quality);
+                    var created = existing is null;
                     // The "Item {id}" placeholder is for messages only; a rule keeps a blank name until a real one is known.
                     var savedName = IsPlaceholder(item.ItemId, item.ItemName) ? string.Empty : item.ItemName.Trim();
-                    if (reserve is null)
-                    {
-                        reserve = new ListingReserveRule { ItemId = item.ItemId, ItemName = savedName, Quality = item.Quality };
-                        target.Reserves.Add(reserve);
-                    }
-                    if (string.IsNullOrWhiteSpace(reserve.ItemName) || IsPlaceholder(item.ItemId, reserve.ItemName))
-                        reserve.ItemName = savedName;
-                    reserve.Homes = ReservePlacement.Copy(next);
-                    var removed = reserve.ReserveUnits == 0 && !reserve.HasAnyHome;
-                    if (removed)
-                        target.Reserves.Remove(reserve);
+                    // A known name stays; a blank or placeholder one takes the edit's real name.
+                    if (existing is not null && IsPlaceholder(item.ItemId, existing.ItemName))
+                        existing.ItemName = string.Empty;
+                    var name = existing is { ItemName.Length: > 0 } ? existing.ItemName : savedName;
+                    var kept = PlacementCatalog.Upsert(document, owner, item.ItemId, name, item.Quality, next,
+                        existing?.Consolidate == true && next.Count > 0, now);
+                    var removed = kept is null;
                     results[index] = results[index] with
                     {
                         RuleCreated = created && !removed,
                         RuleRemoved = removed && !created,
                     };
                 }
-                target.UpdatedAtUtc = DateTime.UtcNow;
-                target.Revision = checked(target.Revision + 1);
                 document.Schema = "gooseworks-quartermaster-state/v5";
                 outcomes = results;
             });
@@ -565,9 +567,9 @@ public sealed partial class WorkbenchStockService
         {
             if (named.LocalContentId == 0 || named.HomeWorldId == 0)
                 return Reject("invalid_character", "character needs localContentId and homeWorldId.");
-            var plan = state.Read(document => ListingPlanCatalog.OwnerPlan(document, owner) is { } found ? Snapshot(found) : null);
+            var placements = state.Read(document => OwnerPlacementsSnapshot(document, owner));
             // By content id: a character that changed worlds is still named by the world its stored homes carry.
-            var match = PlacementCharacterList(current, plan)
+            var match = PlacementCharacterList(current, placements)
                 .FirstOrDefault(character => character.LocalContentId == named.LocalContentId);
             if (match is null)
                 return Reject("character_not_offered", $"Character {named.LocalContentId}@{named.HomeWorldId} is not one the placement editor can show.");

@@ -5,9 +5,13 @@ namespace RQ.Planning;
 
 public sealed class ListingPlanDraft
 {
+    public const string DefaultPlanName = "Default";
+
     public Guid PlanId { get; init; }
     public long SourceRevision { get; set; }
     public bool IsNew { get; init; }
+    /// <summary>The plan's name; used when a new plan is first saved.</summary>
+    public string Name { get; set; } = DefaultPlanName;
     public OwnerScope Owner { get; init; } = new();
     public List<ListingPlanAssignment> Assignments { get; set; } = [];
     public List<ListingPlanAssignment> BaselineAssignments { get; set; } = [];
@@ -52,8 +56,114 @@ public sealed class ListingPlanConflictException(
 
 public static class ListingPlanCatalog
 {
-    public static ListingPlan? OwnerPlan(QuartermasterState state, OwnerScope owner) =>
-        state.ListingPlans.SingleOrDefault(plan => plan.Owner.Matches(owner));
+    public const int MaxNameLength = 64;
+
+    /// <summary>Every Listing Plan of the owner, by name (case-insensitive) then id.</summary>
+    public static IReadOnlyList<ListingPlan> OwnerPlans(QuartermasterState state, OwnerScope owner) =>
+        state.ListingPlans.Where(plan => plan.Owner.Matches(owner))
+            .OrderBy(plan => plan.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(plan => plan.Id)
+            .ToArray();
+
+    public static ListingPlan? FindPlan(QuartermasterState state, OwnerScope owner, Guid planId) =>
+        state.ListingPlans.FirstOrDefault(plan => plan.Id == planId && plan.Owner.Matches(owner));
+
+    /// <summary>The owner's first plan by name, or null when it has none.</summary>
+    public static ListingPlan? DefaultPlan(QuartermasterState state, OwnerScope owner) =>
+        OwnerPlans(state, owner).FirstOrDefault();
+
+    /// <summary>The selected plan when it still exists for the owner, else the owner's default plan.</summary>
+    public static ListingPlan? SelectedOrDefault(QuartermasterState state, OwnerScope owner, Guid? selectedPlanId) =>
+        (selectedPlanId is { } id ? FindPlan(state, owner, id) : null) ?? DefaultPlan(state, owner);
+
+    /// <summary>Why a plan name is unusable for the owner, or null. <paramref name="exceptPlanId"/> is the plan being renamed.</summary>
+    public static string? NameIssue(QuartermasterState state, OwnerScope owner, string? name, Guid? exceptPlanId = null)
+    {
+        var trimmed = name?.Trim() ?? string.Empty;
+        if (trimmed.Length == 0)
+            return "Name the plan.";
+        if (trimmed.Length > MaxNameLength)
+            return $"Plan names are at most {MaxNameLength} characters.";
+        return state.ListingPlans.Any(plan => plan.Owner.Matches(owner) && plan.Id != exceptPlanId &&
+                                              string.Equals(plan.Name.Trim(), trimmed, StringComparison.OrdinalIgnoreCase))
+            ? $"Another Listing Plan is already named \"{trimmed}\"."
+            : null;
+    }
+
+    /// <summary>A name not yet used by the owner: <paramref name="baseName"/>, else "baseName 2", "baseName 3", ...</summary>
+    public static string UniqueName(QuartermasterState state, OwnerScope owner, string baseName)
+    {
+        var root = string.IsNullOrWhiteSpace(baseName) ? ListingPlanDraft.DefaultPlanName : baseName.Trim();
+        if (NameIssue(state, owner, root) is null)
+            return root;
+        for (var n = 2; ; n++)
+        {
+            var candidate = $"{root} {n}";
+            if (NameIssue(state, owner, candidate) is null)
+                return candidate;
+        }
+    }
+
+    /// <summary>Creates an empty named plan for the owner (with <paramref name="planId"/> when given).</summary>
+    public static ListingPlan CreatePlan(QuartermasterState state, OwnerScope owner, string name, DateTime nowUtc, Guid? planId = null)
+    {
+        if (!owner.HasStableIdentity)
+            throw new InvalidOperationException("Listing Plans require stable owner identity.");
+        if (NameIssue(state, owner, name) is { } issue)
+            throw new InvalidOperationException(issue);
+        if (planId is { } id && state.ListingPlans.Any(existing => existing.Id == id))
+            throw new InvalidOperationException("This Listing Plan was already saved.");
+        var plan = new ListingPlan { Id = planId ?? Guid.NewGuid(), Owner = owner with { }, Name = name.Trim(), UpdatedAtUtc = nowUtc };
+        state.ListingPlans.Add(plan);
+        state.Schema = "gooseworks-quartermaster-state/v5";
+        return plan;
+    }
+
+    /// <summary>
+    /// Renames a plan. The revision is unchanged: a name is not listing intent, so an open draft and a running
+    /// Market Run of the plan stay valid.
+    /// </summary>
+    public static ListingPlan RenamePlan(QuartermasterState state, OwnerScope owner, Guid planId, string name, DateTime nowUtc)
+    {
+        var plan = FindPlan(state, owner, planId) ?? throw new InvalidOperationException("That Listing Plan no longer exists.");
+        if (NameIssue(state, owner, name, planId) is { } issue)
+            throw new InvalidOperationException(issue);
+        if (plan.Name == name.Trim())
+            return plan;
+        plan.Name = name.Trim();
+        plan.UpdatedAtUtc = nowUtc;
+        return plan;
+    }
+
+    /// <summary>Copies a plan's assignments and reserves (new identities) under "Name (copy)", "Name (copy 2)", ...</summary>
+    public static ListingPlan DuplicatePlan(QuartermasterState state, OwnerScope owner, Guid sourcePlanId, DateTime nowUtc)
+    {
+        var source = FindPlan(state, owner, sourcePlanId) ?? throw new InvalidOperationException("That Listing Plan no longer exists.");
+        var name = $"{source.Name} (copy)";
+        for (var n = 2; NameIssue(state, owner, name) is not null; n++)
+            name = $"{source.Name} (copy {n})";
+        var plan = new ListingPlan
+        {
+            Owner = owner with { },
+            Name = name,
+            UpdatedAtUtc = nowUtc,
+            Assignments = source.Assignments.Select(assignment => { var copy = Copy(assignment); copy.Id = Guid.NewGuid(); return copy; }).ToList(),
+            Reserves = source.Reserves.Select(reserve => { var copy = Copy(reserve); copy.Id = Guid.NewGuid(); return copy; }).ToList(),
+        };
+        state.ListingPlans.Add(plan);
+        state.Schema = "gooseworks-quartermaster-state/v5";
+        return plan;
+    }
+
+    /// <summary>Deletes a plan and every Transfer Plan link to it. True when it existed.</summary>
+    public static bool DeletePlan(QuartermasterState state, OwnerScope owner, Guid planId)
+    {
+        if (FindPlan(state, owner, planId) is not { } plan)
+            return false;
+        state.ListingPlans.Remove(plan);
+        state.TransferPlanListingLinks.RemoveAll(link => link.ListingPlanId == planId);
+        return true;
+    }
 
     /// <summary>
     /// The current roster name of <paramref name="retainerId"/> for <paramref name="owner"/>, or null when the
@@ -97,14 +207,20 @@ public static class ListingPlanCatalog
         return renamed;
     }
 
+    /// <summary>
+    /// A draft of the owner's plan <paramref name="planId"/>; with no id (or one that no longer exists), a new
+    /// unsaved plan named <paramref name="newName"/> (default "Default").
+    /// </summary>
     public static ListingPlanDraft Draft(
         QuartermasterState state,
         OwnerScope owner,
-        BrowserProjection projection)
+        Guid? planId,
+        BrowserProjection projection,
+        string? newName = null)
     {
         if (!owner.HasStableIdentity)
             throw new InvalidOperationException("Listing Plans require stable owner identity.");
-        var existing = OwnerPlan(state, owner);
+        var existing = planId is { } id ? FindPlan(state, owner, id) : null;
         var incomplete = projection.Scopes
             .Where(scope => scope.Kind == BrowserScopeKind.Retainer &&
                             !projection.RetainerListingsCompleteByScope.GetValueOrDefault(scope.Key))
@@ -118,6 +234,7 @@ public static class ListingPlanCatalog
             {
                 PlanId = existing.Id,
                 SourceRevision = existing.Revision,
+                Name = existing.Name,
                 Owner = owner with { },
                 Assignments = assignments,
                 BaselineAssignments = assignments.Select(Copy).ToList(),
@@ -131,6 +248,7 @@ public static class ListingPlanCatalog
         {
             PlanId = Guid.NewGuid(),
             IsNew = true,
+            Name = string.IsNullOrWhiteSpace(newName) ? UniqueName(state, owner, ListingPlanDraft.DefaultPlanName) : newName.Trim(),
             Owner = owner with { },
             Assignments = [],
             BaselineAssignments = [],
@@ -155,15 +273,18 @@ public static class ListingPlanCatalog
         var didMerge = false;
         if (draft.IsNew)
         {
-            if (state.ListingPlans.Any(existing => existing.Owner.Matches(owner) || existing.Id == draft.PlanId))
-                throw new InvalidOperationException("This owner already has a Listing Plan.");
-            plan = new ListingPlan { Id = draft.PlanId, Owner = owner with { } };
+            if (state.ListingPlans.Any(existing => existing.Id == draft.PlanId))
+                throw new InvalidOperationException("This Listing Plan was already saved.");
+            if (NameIssue(state, owner, draft.Name) is { } nameIssue)
+                throw new InvalidOperationException(nameIssue);
+            plan = new ListingPlan { Id = draft.PlanId, Owner = owner with { }, Name = draft.Name.Trim() };
             candidate = draft.Assignments.Select(Copy).ToArray();
             candidateReserves = draft.Reserves.Select(Copy).ToArray();
         }
         else
         {
-            plan = state.ListingPlans.Single(existing => existing.Id == draft.PlanId && existing.Owner.Matches(owner));
+            plan = FindPlan(state, owner, draft.PlanId)
+                   ?? throw new InvalidOperationException("This Listing Plan was deleted. Discard the draft to continue.");
             didMerge = plan.Revision != draft.SourceRevision;
             if (didMerge)
             {
@@ -264,8 +385,6 @@ public static class ListingPlanCatalog
                 issues.Add(new(reserve.Id, nameof(reserve.Quality), "Reserve quality must be explicitly NQ or HQ."));
             if (reserve.ReserveUnits is < 0 or > ListingReserveRule.MaxReserveUnits)
                 issues.Add(new(reserve.Id, nameof(reserve.ReserveUnits), $"Reserve must be between 0 and {ListingReserveRule.MaxReserveUnits:N0} units."));
-            if (HomesIssue(reserve.Homes) is { } homesIssue)
-                issues.Add(new(reserve.Id, nameof(reserve.Homes), homesIssue));
         }
         foreach (var duplicate in enabled.GroupBy(reserve => (reserve.ItemId, reserve.Quality)).Where(group => group.Count() > 1))
         {
@@ -382,15 +501,12 @@ public static class ListingPlanCatalog
         ItemName = source.ItemName,
         Quality = source.Quality,
         ReserveUnits = source.ReserveUnits,
-        Homes = ReservePlacement.Copy(source.Homes),
-        Consolidate = source.Consolidate,
         Enabled = source.Enabled,
     };
 
     public static bool ReserveEquals(ListingReserveRule left, ListingReserveRule right) =>
         left.Id == right.Id && left.ItemId == right.ItemId && left.ItemName == right.ItemName &&
-        left.Quality == right.Quality && left.ReserveUnits == right.ReserveUnits &&
-        ReservePlacement.Same(left.Homes, right.Homes) && left.Consolidate == right.Consolidate && left.Enabled == right.Enabled;
+        left.Quality == right.Quality && left.ReserveUnits == right.ReserveUnits && left.Enabled == right.Enabled;
 
     private static IReadOnlyList<ListingPlanAssignment> MergeAssignments(
         IReadOnlyList<ListingPlanAssignment> baseline,
@@ -473,9 +589,6 @@ public static class ListingPlanCatalog
         result.ItemName = Merge(original.ItemName, edited.ItemName, canonical.ItemName, id, nameof(result.ItemName), conflicts);
         result.Quality = Merge(original.Quality, edited.Quality, canonical.Quality, id, nameof(result.Quality), conflicts);
         result.ReserveUnits = Merge(original.ReserveUnits, edited.ReserveUnits, canonical.ReserveUnits, id, nameof(result.ReserveUnits), conflicts);
-        result.Homes = ReservePlacement.Copy(Merge<IReadOnlyList<PlacementHome>>(original.Homes, edited.Homes, canonical.Homes, id,
-            nameof(result.Homes), conflicts, HomesComparer.Instance));
-        result.Consolidate = Merge(original.Consolidate, edited.Consolidate, canonical.Consolidate, id, nameof(result.Consolidate), conflicts);
         result.Enabled = Merge(original.Enabled, edited.Enabled, canonical.Enabled, id, nameof(result.Enabled), conflicts);
         return result;
     }
@@ -528,13 +641,4 @@ public static class ListingPlanCatalog
         left.RetainerName == right.RetainerName && left.ListingCount == right.ListingCount &&
         left.QuantityPerListing == right.QuantityPerListing && left.UnitPrice == right.UnitPrice &&
         left.Enabled == right.Enabled;
-
-    private sealed class HomesComparer : IEqualityComparer<IReadOnlyList<PlacementHome>>
-    {
-        public static readonly HomesComparer Instance = new();
-
-        public bool Equals(IReadOnlyList<PlacementHome>? left, IReadOnlyList<PlacementHome>? right) => ReservePlacement.Same(left, right);
-
-        public int GetHashCode(IReadOnlyList<PlacementHome> value) => value.Count;
-    }
 }

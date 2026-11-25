@@ -78,7 +78,7 @@ public sealed class MarketRunExecutorTests
                 Assert.Null(Assert.Single(recovered.Mutations).Outcome);
                 Assert.Contains(10ul, recovered.NeedsCheck);
             };
-            var executor = new MarketRunExecutor(fake, new(), () => plan, store.Save);
+            var executor = new MarketRunExecutor(fake, new(), _ => plan, store.Save);
             await executor.RunAsync(plan, Evaluation(plan));
             Assert.Equal("Completed", store.Load()!.State);
             store.Clear(); Assert.Null(store.Load());
@@ -86,7 +86,45 @@ public sealed class MarketRunExecutorTests
         finally { Directory.Delete(directory, true); }
     }
 
-    private static MarketRunExecutor Create(ListingPlan plan, Driver fake) => new(fake, new(), () => plan, _ => { });
+    private static MarketRunExecutor Create(ListingPlan plan, Driver fake) => new(fake, new(), _ => plan, _ => { });
+
+    // A market run for one plan must never move stock of items outside it, even when those items have placement
+    // homes and sit loose in the bags or in a retainer that is not their home: from the user's side that looks like
+    // the run randomly shuffling unrelated inventory.
+    [Fact]
+    public async Task MarketRun_StowsAndRelocatesOnlyItsOwnPlanItems()
+    {
+        var plan = Plan();
+        var owner = plan.Owner;
+        ItemPlacementRule Home(uint itemId, string name, ulong retainerId) => new()
+        {
+            Owner = owner, ItemId = itemId, ItemName = name, Quality = ItemQualityPolicy.NqOnly, Homes = [new(owner, retainerId)],
+        };
+        ItemPlacementRule[] placements = [Home(1, "Hull", 10), Home(2, "Bow", 11)];
+        (uint, bool, int)[] bags = [(1, false, 5), (2, false, 7)];
+        var retainers = new Dictionary<ulong, CachedRetainer>
+        {
+            [12] = new()
+            {
+                RetainerId = 12, RetainerName = "Gamma", Owner = owner,
+                Bags = [new() { BagName = "RetainerPage1", Items = [new() { ItemId = 1, Quantity = 3 }, new() { ItemId = 2, Quantity = 4 }] }],
+            },
+        };
+        var evaluation = Evaluation(plan);
+
+        static void OnlyPlanItem(IReadOnlyList<StowageDepositRequest>? requests)
+        {
+            Assert.NotNull(requests);
+            Assert.Equal([1U], requests.Select(request => request.ItemId).Distinct());
+        }
+        OnlyPlanItem(MarketRunPlanner.StowRequests(plan, placements, bags, owner));
+        OnlyPlanItem(MarketRunPlanner.ProjectedStowRequests(plan, placements, evaluation, bags, owner));
+        OnlyPlanItem(MarketRunPlanner.RelocationRequests(plan, placements, retainers, owner));
+
+        var fake = new Driver();
+        await Create(plan, fake).RunAsync(plan, evaluation, ownerPlacements: placements);
+        Assert.Equal([1U], Assert.IsAssignableFrom<IReadOnlyList<ItemPlacementRule>>(fake.Stowed).Select(rule => rule.ItemId));
+    }
 
     [Theory]
     [InlineData(true)]
@@ -96,7 +134,7 @@ public sealed class MarketRunExecutorTests
         var plan = Plan(); var current = plan; var fake = new Driver();
         var pending = new TaskCompletionSource<MarketMutationOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
         fake.PendingPost = pending.Task;
-        var executor = new MarketRunExecutor(fake, new(), () => current, _ => { });
+        var executor = new MarketRunExecutor(fake, new(), _ => current, _ => { });
         var run = executor.RunAsync(plan, Evaluation(plan));
         Assert.Single(fake.Posts);
         var scansAtPost = fake.ListingScans;
@@ -119,7 +157,7 @@ public sealed class MarketRunExecutorTests
         fake.Live[10] = [new(0, 1, 2, false, 10)];
         var pending = new TaskCompletionSource<MarketMutationOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
         fake.PendingReprice = pending.Task;
-        var executor = new MarketRunExecutor(fake, new(), () => current, _ => { });
+        var executor = new MarketRunExecutor(fake, new(), _ => current, _ => { });
         var run = executor.RunAsync(plan, Evaluation(plan));
         var scansAtReprice = fake.ListingScans;
         if (unload) executor.CancelAndWait(TimeSpan.Zero);
@@ -138,7 +176,7 @@ public sealed class MarketRunExecutorTests
         var plan = Plan(); var current = plan; var fake = new Driver { Outcome = MarketMutationOutcome.Indeterminate };
         fake.Live[10] = [new(0, 1, 2, false, 10)];
         fake.OnReprice = () => fake.OnListings = () => current = new ListingPlan { Owner = plan.Owner with { LocalContentId = 999 } };
-        var executor = new MarketRunExecutor(fake, new(), () => current, _ => { });
+        var executor = new MarketRunExecutor(fake, new(), _ => current, _ => { });
         await executor.RunAsync(plan, Evaluation(plan));
         Assert.Equal(MarketMutationOutcome.Indeterminate, Assert.Single(executor.Result!.Mutations).Outcome);
         Assert.Contains(10ul, executor.Result.NeedsCheck);
@@ -166,7 +204,7 @@ public sealed class MarketRunExecutorTests
         var pending = new TaskCompletionSource<MarketMutationOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
         fake.PendingPost = pending.Task;
         var ipc = new AutoRetainer();
-        var executor = new MarketRunExecutor(fake, automation, () => plan, r => { if (cleanupThrows && r.State != "Running") throw new IOException("cleanup"); }, new AutoRetainerSuppression(ipc), deadlines: new MarketRunDeadline(TimeSpan.FromMilliseconds(5)));
+        var executor = new MarketRunExecutor(fake, automation, _ => plan, r => { if (cleanupThrows && r.State != "Running") throw new IOException("cleanup"); }, new AutoRetainerSuppression(ipc), deadlines: new MarketRunDeadline(TimeSpan.FromMilliseconds(5)));
         if (cleanupThrows) await Assert.ThrowsAsync<IOException>(() => executor.RunAsync(plan, Evaluation(plan)));
         else await executor.RunAsync(plan, Evaluation(plan));
         Assert.True(automation.IsHeld); Assert.True(ipc.IsSuppressed); Assert.Equal("Stopped", executor.Result!.State);
@@ -181,7 +219,7 @@ public sealed class MarketRunExecutorTests
     {
         var plan = Plan(); var fake = new Driver(); var writes = 0;
         var pending = new TaskCompletionSource<MarketMutationOutcome>(); fake.PendingPost = pending.Task;
-        var executor = new MarketRunExecutor(fake, new(), () => plan, _ => writes++);
+        var executor = new MarketRunExecutor(fake, new(), _ => plan, _ => writes++);
         var run = executor.RunAsync(plan, Evaluation(plan));
         executor.CancelAndWait(TimeSpan.Zero);
         var atDispose = writes;
@@ -299,11 +337,12 @@ public sealed class MarketRunExecutorTests
     }
     private sealed class Driver : IMarketRunDriver
     {
-        public Task<IReadOnlyList<string>> StowAsync(Guid planId, IReadOnlyList<ListingReserveRule> reserves,
+        public Task<IReadOnlyList<string>> StowAsync(Guid planId, IReadOnlyList<ItemPlacementRule> planPlacements,
             IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token,
             Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged,
             bool reorganizeRetainers)
-        { check(); return Task.FromResult<IReadOnlyList<string>>([]); }
+        { Stowed = planPlacements; check(); return Task.FromResult<IReadOnlyList<string>>([]); }
+        public IReadOnlyList<ItemPlacementRule>? Stowed;
         public Dictionary<ulong, List<RetainerMarketListingTarget>> Live = new() { [10] = [], [11] = [] };
         public List<DalamudInventoryStack> Stock = [new(InventoryType.Inventory1, 0, 1, 10)];
         public List<ulong> Posts = [];

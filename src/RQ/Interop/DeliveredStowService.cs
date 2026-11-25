@@ -16,7 +16,7 @@ namespace RQ.Interop;
 /// lists; items without a home stay in the bags. Execution reuses the stowage deposit path (one requested
 /// <see cref="OperationKinds.StowageSurplus"/> operation for the whole batch, so each retainer opens once),
 /// picked up by <see cref="AutomaticRetrievalQueue"/>. RequestId is the idempotency key.
-/// An item's homes are one ranked list across the characters of this account (<see cref="ListingReserveRule.Homes"/>),
+/// An item's homes are one ranked list across the characters of this account (<see cref="ItemPlacementRule.Homes"/>),
 /// routed by <see cref="PlacementRouter"/>, each home taking what its observed room and its cap allow. When the request
 /// sets AllowForward, once the owner's own stow settles what the owner's homes did not take is carried to the other
 /// characters' homes by the courier in one run (<see cref="Tick"/>), and the line's Forwards (one per character) say
@@ -385,6 +385,10 @@ public sealed class DeliveredStowService
             OperationChanged?.Invoke(operationId);
     }
 
+    /// <summary>The owner's item homes from the Placements catalog (copied out of the state lock).</summary>
+    private IReadOnlyList<ItemPlacementRule> OwnerPlacements(OwnerScope owner) =>
+        repository.Read(state => PlacementCatalog.OwnerPlacements(state, owner).Select(PlacementCatalog.Copy).ToArray());
+
     /// <summary>
     /// Plans a request through <see cref="PlacementRouter"/>: each item's ranked homes across characters, in rank order,
     /// each taking what its observed room and cap allow, against one projection for the whole request. Units the
@@ -399,12 +403,12 @@ public sealed class DeliveredStowService
             .SelectMany(bag => bag.Items)
             .GroupBy(item => (item.ItemId, item.IsHq))
             .ToDictionary(group => group.Key, group => group.Sum(item => checked((int)item.Quantity)));
-        var plan = repository.Read(state => ListingPlanCatalog.OwnerPlan(state, owner));
+        var rules = OwnerPlacements(owner);
         var retainers = cache();
         var requested = request.Items!
             .Select(item =>
             {
-                var reserve = WorkbenchStockService.ReserveFor(plan, item.ItemId, item.IsHq);
+                var reserve = PlacementCatalog.ForArrival(rules, item.ItemId, item.IsHq);
                 var all = reserve?.Homes ?? [];
                 var remote = all.Where(home => !ReservePlacement.SameCharacter(home.Character, owner) && home.Character.HasStableIdentity).ToArray();
                 var considered = !request.AllowForward && item.SentDirect <= 0 ? [] : remote;
@@ -426,7 +430,7 @@ public sealed class DeliveredStowService
                 PlacementRouter.RouteOne(new(item.Key.ItemId, item.ItemName, item.Key.IsHq, item.Held), item.Routed, retainers, projected, maxStackSize))
             .ToArray();
         var batch = PlacementRouter.LocalBatch(
-            requested.Select((item, index) => (routes[index], plan?.Id, item.Reserve?.Id,
+            requested.Select((item, index) => (routes[index], (Guid?)null, item.Reserve?.Id,
                 item.Reserve is null ? new StowageRoutingPolicy() : PlacementRouter.OwnerRouting(item.Reserve, owner).Routing)),
             retainers, owner, maxStackSize, utcNow());
 
@@ -839,7 +843,7 @@ public sealed class DeliveredStowService
             .GroupBy(item => (item.ItemId, item.IsHq))
             .ToDictionary(group => group.Key, group => group.Sum(item => checked((int)item.Quantity)));
         var retainers = cache();
-        var plan = repository.Read(state => ListingPlanCatalog.OwnerPlan(state, record.Owner));
+        var rules = OwnerPlacements(record.Owner);
         var projected = new Dictionary<ulong, CachedRetainer>();
         var items = open.GroupBy(line => (line.ItemId, line.IsHq)).Select(group => group.ToArray()).ToArray();
         var allocations = new Dictionary<DeliveredStowForwardRecordLine, List<(ulong RetainerId, int Units)>>();
@@ -848,7 +852,7 @@ public sealed class DeliveredStowService
         var plans = items.Select(lines =>
         {
             var first = lines[0];
-            var rule = WorkbenchStockService.ReserveFor(plan, first.ItemId, first.IsHq);
+            var rule = PlacementCatalog.ForArrival(rules, first.ItemId, first.IsHq);
             var remote = (rule?.Homes ?? []).Where(home => !ReservePlacement.SameCharacter(home.Character, record.Owner)).ToArray();
             var sentDirect = record.Lines.Where(line => line.ItemId == first.ItemId && line.IsHq == first.IsHq).Select(line => line.SentDirect).DefaultIfEmpty(0).Max();
             if (sentDirect > 0 && remote.Length > 0)
@@ -1262,7 +1266,7 @@ public sealed class DeliveredStowService
             RequestId = request.RequestId,
             CanonicalHash = hash,
             OperationId = operationId,
-            PlanId = repository.Read(state => ListingPlanCatalog.OwnerPlan(state, owner))?.Id,
+            PlanId = repository.Read(state => ListingPlanCatalog.DefaultPlan(state, owner))?.Id,
             Owner = owner with { },
             CreatedUtc = now,
             State = sends ? ForwardStatePending : ForwardStateSettled,

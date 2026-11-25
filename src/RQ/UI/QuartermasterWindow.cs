@@ -33,6 +33,8 @@ public sealed class QuartermasterWindow : Window
     private readonly AgentBridgeUiReviewRegistry reviewRegistry;
     private readonly AgentBridgeUiCaptureTransactionManager captureTransactions;
     private readonly WorkbenchState workbench = new();
+    /// <summary>The Market tab's active Listing Plan (null: the owner's default plan).</summary>
+    public Guid? SelectedListingPlanId => workbench.SelectedListingPlanId;
     private readonly DalamudRootConfirmationDialog confirmationDialog = new("RQConfirm");
     private readonly OperationHistoryDialog historyDialog;
 
@@ -125,7 +127,7 @@ public sealed class QuartermasterWindow : Window
             SearchItems,
             () => { },
             () => requestedView = WorkbenchView.Restock);
-        listingSession = new(state, ResolveListingMaxStack, id => dataManager.GetExcelSheet<Item>().GetRowOrDefault(id)?.CanBeHq == true);
+        listingSession = new(state, ResolveListingMaxStack, id => dataManager.GetExcelSheet<Item>().GetRowOrDefault(id)?.CanBeHq == true, workbench);
         transferExecution = new(state, runtimeSnapshots, journal, transfers, retainerRefresh)
         {
             StartCourier = (planId, revision) =>
@@ -187,7 +189,8 @@ public sealed class QuartermasterWindow : Window
             Listability,
             retainerRefresh,
             marketRunPane,
-            log);
+            log,
+            () => runtimeSnapshots.Current);
         transferReviewDialog = transferReview = new(
             () => runtimeSnapshots.Current,
             transferPlanWorkspace.ResolveProjection,
