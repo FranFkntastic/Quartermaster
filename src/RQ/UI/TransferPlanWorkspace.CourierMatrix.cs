@@ -1287,10 +1287,8 @@ internal sealed partial class TransferPlanWorkspace
 
         var boundsWidth = 80f * scale;
         DalamudUiLayout.SameLineIfFits(boundsWidth + ImGui.GetStyle().ItemSpacing.X + DalamudUiLayout.ButtonWidth("Set"));
-        var parsed = CourierBoundsText.TryParse(courierBulkBounds, out var low, out var high);
-        var typed = courierBulkBounds.Trim().Length > 0;
-        var invalid = typed && !parsed;
-        if (invalid)
+        var invalidBefore = courierBulkBounds.Trim().Length > 0 && !CourierBoundsText.TryParse(courierBulkBounds, out _, out _);
+        if (invalidBefore)
         {
             ImGui.PushStyleColor(ImGuiCol.Border, QuartermasterPalette.Amber);
             ImGui.PushStyleVar(ImGuiStyleVar.FrameBorderSize, 1f);
@@ -1298,11 +1296,15 @@ internal sealed partial class TransferPlanWorkspace
         ImGui.SetNextItemWidth(boundsWidth);
         var entered = ImGui.InputTextWithHint("##RQCourierBulkBounds", "Bounds", ref courierBulkBounds, 32,
             ImGuiInputTextFlags.AutoSelectAll | ImGuiInputTextFlags.EnterReturnsTrue);
-        if (invalid)
+        if (invalidBefore)
         {
             ImGui.PopStyleVar();
             ImGui.PopStyleColor();
         }
+        // Re-parse after InputTextWithHint so an edit and Enter in the same frame submit the latest text.
+        var typed = courierBulkBounds.Trim().Length > 0;
+        var parsed = CourierBoundsText.TryParse(courierBulkBounds, out var low, out var high);
+        var invalid = typed && !parsed;
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip(invalid ? $"Not bounds · {CourierBoundsText.Syntax}" : CourierBoundsText.Syntax);
         ImGui.SameLine();
