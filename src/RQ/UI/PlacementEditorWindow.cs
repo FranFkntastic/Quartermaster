@@ -15,11 +15,10 @@ namespace RQ.UI;
 /// The market run's placement matrix for a caller-supplied set of items (opened over IPC by another
 /// plugin). Rows read the owner's reserve rules; edits persist straight to them through
 /// <see cref="WorkbenchStockService.ApplyPlacementEdit"/> (the path the placement IPC uses too), creating a
-/// level-0 rule for an item that has none. A character bar above the matrix switches it to another character
-/// of this account: its retainers become the columns and an edit there sets the item's remote homes
-/// (<see cref="ReservePlacement.Resolve"/>). An item has remote homes on one other
-/// character at most; a row homed on a character other than the one shown reads dimmed with where it goes,
-/// and editing it there moves its remote homes to the shown character. Local homes stay as they are.
+/// level-0 rule for an item that has none. An item's homes are one ranked list across every character of the
+/// account: a character bar above the matrix switches its columns to another character's retainers, cells show
+/// each home's global rank (#1 fills first) and its cap, and an edit there adds or ranks that character's
+/// retainers in the same list. A row with no home on the shown character reads dimmed with where it goes.
 /// </summary>
 internal sealed class PlacementEditorWindow : Window
 {
@@ -30,8 +29,7 @@ internal sealed class PlacementEditorWindow : Window
     private readonly WorkbenchStockService service;
     private readonly CourierSession courier;
     private readonly PlacementMatrix<(uint ItemId, ItemQualityPolicy Quality)> matrix;
-    private readonly Dictionary<(uint ItemId, ItemQualityPolicy Quality), (StowageRoutingPolicy Routing, DateTime Until)> pending = [];
-    private readonly Dictionary<(uint ItemId, ItemQualityPolicy Quality), (ReserveRemoteHomes? Remote, DateTime Until)> pendingRemote = [];
+    private readonly Dictionary<(uint ItemId, ItemQualityPolicy Quality), (List<PlacementHome> Homes, DateTime Until)> pending = [];
     private readonly AgentBridgeUiReviewRegistry reviewRegistry = new();
     private OwnerScope? owner;
     private OwnerScope? shown;
@@ -61,7 +59,6 @@ internal sealed class PlacementEditorWindow : Window
         added = null;
         items = requested;
         pending.Clear();
-        pendingRemote.Clear();
         saveError = null;
         matrix.ClearSelection();
         IsOpen = true;
@@ -72,7 +69,6 @@ internal sealed class PlacementEditorWindow : Window
     {
         items = [];
         pending.Clear();
-        pendingRemote.Clear();
         saveError = null;
         matrix.ClearSelection();
     }
@@ -105,30 +101,20 @@ internal sealed class PlacementEditorWindow : Window
         {
             var key = (item.ItemId, item.Quality);
             var reserve = plan?.Reserves.FirstOrDefault(rule => rule.Enabled && rule.ItemId == item.ItemId && rule.Quality == item.Quality);
-            var storedLocal = reserve?.Location ?? new StowageRoutingPolicy();
-            var storedRemote = reserve?.RemoteHomes is { RetainerIds.Count: > 0 } stored ? stored : null;
+            IReadOnlyList<PlacementHome> stored = reserve?.Homes ?? [];
             // An edit shows at once; the stored rule takes over once it matches or the edit has had time to land.
-            if (pending.TryGetValue(key, out var edit) &&
-                (edit.Until <= now || WorkbenchStockService.SameLocation(edit.Routing, storedLocal)))
+            if (pending.TryGetValue(key, out var edit) && (edit.Until <= now || ReservePlacement.Same(edit.Homes, stored)))
                 pending.Remove(key);
-            if (pendingRemote.TryGetValue(key, out var remoteEdit) &&
-                (remoteEdit.Until <= now || ReserveRemoteHomes.Same(remoteEdit.Remote, storedRemote)))
-                pendingRemote.Remove(key);
-            return (Item: item, Key: key,
-                Local: pending.TryGetValue(key, out edit) ? edit.Routing : storedLocal,
-                Remote: pendingRemote.TryGetValue(key, out remoteEdit) ? remoteEdit.Remote : storedRemote);
+            return (Item: item, Key: key, Homes: pending.TryGetValue(key, out edit) ? edit.Homes : stored);
         }).ToArray();
 
-        var target = DrawCharacterBar(current, scope, resolved.Select(row => row.Remote));
+        var target = DrawCharacterBar(current, scope, resolved.SelectMany(row => row.Homes));
         DrawSaveError();
         var local = target.Matches(scope);
         var stock = local ? null : courier.Stock(current, target);
         var rows = resolved.Select(row =>
         {
-            var remoteHere = row.Remote is { } remote && remote.Character.Matches(target);
-            var routing = local ? row.Local
-                : remoteHere ? new StowageRoutingPolicy { PreferredRetainerIds = [.. row.Remote!.RetainerIds] }
-                : new StowageRoutingPolicy();
+            var (routing, ranks, caps) = PlacementMatrixData.Homes(row.Homes, target);
             return new PlacementMatrixRow<(uint, ItemQualityPolicy)>(
                 row.Key,
                 $"{row.Item.ItemId}-{row.Item.Quality}",
@@ -139,32 +125,35 @@ internal sealed class PlacementEditorWindow : Window
                     ? PlacementMatrixData.Holdings(current, row.Item.ItemId, row.Item.Quality)
                     : PlacementMatrixData.Holdings(current, row.Item.ItemId, row.Item.Quality, target, stock))
             {
-                Elsewhere = HasHome(routing) ? null : Elsewhere(current, scope, target, row.Local, row.Remote),
+                Ranks = ranks,
+                Caps = caps,
+                NextRank = row.Homes.Count + 1,
+                Elsewhere = ranks.Count == 0 && row.Homes.Count > 0 ? PlacementMatrixData.HomesSummary(current, row.Homes, scope) : null,
             };
         }).ToArray();
         var columns = PlacementMatrixData.Columns(current, rows.Select(row => row.Routing), local ? null : target);
-        matrix.Draw(rows, rows, columns, changes =>
+        matrix.DrawHomes(rows, rows, columns, (operation, retainerId, cap, keys) =>
         {
             var edits = new List<WorkbenchStockService.PlacementEditLine>();
-            foreach (var (key, routing) in changes)
+            foreach (var key in keys)
             {
                 var item = items.FirstOrDefault(candidate => candidate.ItemId == key.ItemId && candidate.Quality == key.Quality);
                 if (item is null) continue;
-                // Shown at once by the same rules the save applies; the save itself goes through the shared path.
+                // Shown at once by the same operation the save applies; the save itself goes through the shared path,
+                // which re-reads the stored homes and every listed character's holdings.
                 var row = resolved.First(candidate => candidate.Key == key);
-                var next = ReservePlacement.Resolve(scope, target, row.Local, row.Remote, routing);
-                if (!next.Changed) continue;
-                if (next.LocalChanged)
-                    pending[key] = (StowageRoutingPolicy.CopyOf(next.Local), now + PendingLifetime);
-                if (next.RemoteChanged)
-                    pendingRemote[key] = (ReserveRemoteHomes.CopyOf(next.Remote), now + PendingLifetime);
-                var edited = StowageRoutingPolicy.CopyOf(routing);
-                edits.Add(new(item, (_, _) => edited));
+                var holdings = rows.First(candidate => candidate.Key == key).Holdings
+                    .Select(entry => new PlacementHolding(target, entry.Key, entry.Value));
+                var next = ReservePlacement.Operate(operation, row.Homes, target, retainerId, cap, holdings);
+                if (ReservePlacement.Same(row.Homes, next)) continue;
+                pending[key] = (next, now + PendingLifetime);
+                var character = target with { };
+                edits.Add(new(item, (before, all) => ReservePlacement.Operate(operation, before, character, retainerId, cap, all)));
             }
             if (edits.Count > 0)
-                service.QueuePlacementEdit(scope, target, edits, Saved);
+                service.QueuePlacementEdit(scope, edits, Saved);
             return true;
-        }, anySpace: local);
+        });
     }
 
     /// <summary>
@@ -175,10 +164,7 @@ internal sealed class PlacementEditorWindow : Window
     {
         var failed = result.Items.Where(outcome => outcome.Outcome is "refused" or "not_applied" && outcome.Quality is not null).ToArray();
         foreach (var outcome in failed)
-        {
             pending.Remove((outcome.ItemId, outcome.Quality!.Value));
-            pendingRemote.Remove((outcome.ItemId, outcome.Quality.Value));
-        }
         if (failed.Length > 0)
             saveError = failed.Length == 1
                 ? $"Not saved: {failed[0].Message}"
@@ -197,33 +183,14 @@ internal sealed class PlacementEditorWindow : Window
             ImGui.SetTooltip(saveError);
     }
 
-    private static bool HasHome(StowageRoutingPolicy routing) => routing.AnySpace || routing.PreferredRetainerIds.Count > 0;
-
-    /// <summary>Where a row with no home on the shown character goes instead; null when it has no home anywhere.</summary>
-    private static string? Elsewhere(QuartermasterRuntimeSnapshot runtime, OwnerScope owner, OwnerScope target,
-        StowageRoutingPolicy local, ReserveRemoteHomes? remote)
-    {
-        var parts = new List<string>();
-        if (!target.Matches(owner) && HasHome(local))
-            parts.Add($"{CourierSession.CharacterLabel(owner)} · {TransferPresentation.RouteSummary(local, runtime.Retainers, owner)}");
-        if (remote is not null && !remote.Character.Matches(target))
-            parts.Add(RemoteSummary(runtime, remote));
-        return parts.Count == 0 ? null : string.Join("; ", parts);
-    }
-
-    /// <summary>"Dredgen Hope · Gringle → Scrongle": a remote home list by name.</summary>
-    internal static string RemoteSummary(QuartermasterRuntimeSnapshot runtime, ReserveRemoteHomes remote) =>
-        $"{CourierSession.CharacterLabel(remote.Character)} · " +
-        TransferPresentation.RouteSummary(new StowageRoutingPolicy { PreferredRetainerIds = [.. remote.RetainerIds] }, runtime.Retainers, remote.Character);
-
     /// <summary>
     /// One pill per character: the owner, then each character a row already has homes on, then one added
     /// from + (any other character the courier can deliver to). Returns the character the matrix shows.
     /// </summary>
-    private OwnerScope DrawCharacterBar(QuartermasterRuntimeSnapshot runtime, OwnerScope scope, IEnumerable<ReserveRemoteHomes?> remotes)
+    private OwnerScope DrawCharacterBar(QuartermasterRuntimeSnapshot runtime, OwnerScope scope, IEnumerable<PlacementHome> homes)
     {
-        var homed = remotes.OfType<ReserveRemoteHomes>().Select(remote => remote.Character)
-            .Where(character => !character.Matches(scope))
+        var homed = homes.Select(home => home.Character)
+            .Where(character => !ReservePlacement.SameCharacter(character, scope))
             .DistinctBy(character => (character.LocalContentId, character.HomeWorldId))
             .OrderBy(character => character.CharacterName, StringComparer.OrdinalIgnoreCase)
             .ToList();

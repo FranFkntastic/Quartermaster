@@ -538,7 +538,8 @@ public sealed record StowageDepositRequest(
     int Quantity,
     StowageRoutingPolicy Routing,
     ulong? DestinationOverride = null,
-    int MaxStackSize = 999);
+    int MaxStackSize = 999,
+    IReadOnlyDictionary<ulong, int>? Caps = null);
 
 public sealed record RetainerStowageCapacity(
     ulong RetainerId,

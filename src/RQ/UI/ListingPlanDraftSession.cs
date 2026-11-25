@@ -276,7 +276,12 @@ internal sealed class ListingPlanDraftSession(
 
     private ListingReserveRule? FindReserve(Guid id) => Draft?.Reserves.FirstOrDefault(r => r.Id == id);
     public void SetReserveUnits(Guid id, string text) { if (FindReserve(id) is { } r) { r.ReserveUnits = ReserveInput(text); Changed(); } }
-    public void SetReserveLocation(Guid id, StowageRoutingPolicy location) { if (FindReserve(id) is { } r) { r.Location = ListingPlanCatalog.CopyLocation(location); Changed(); } }
+    public void SetReserveHomes(Guid id, IReadOnlyList<PlacementHome> homes)
+    {
+        if (FindReserve(id) is not { } r || ReservePlacement.Same(r.Homes, homes)) return;
+        r.Homes = ReservePlacement.Copy(homes);
+        Changed();
+    }
     public void SetReserveEnabled(Guid id, bool enabled) { if (FindReserve(id) is { } r) { r.Enabled = enabled; Changed(); } }
     public void RemoveReserve(Guid id) { if (Draft?.Reserves.RemoveAll(r => r.Id == id) > 0) Changed(); }
 

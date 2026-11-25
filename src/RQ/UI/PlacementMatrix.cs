@@ -5,6 +5,7 @@ using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.UI.Drawing;
 using Franthropy.Dalamud.UI.Layout;
 using Franthropy.Dalamud.UI.Tables;
+using Franthropy.Dalamud.UI.Windows;
 using RQ.Domain;
 using RQ.Inventory;
 using RQ.Planning;
@@ -34,6 +35,15 @@ internal sealed record PlacementMatrixRow<TKey>(
 
     /// <summary>The row's source, shown when the matrix has a From column.</summary>
     public string? From { get; init; }
+
+    /// <summary>Homes mode: each shown retainer's rank in the item's one ranked list across characters.</summary>
+    public IReadOnlyDictionary<ulong, int>? Ranks { get; init; }
+
+    /// <summary>Homes mode: each shown retainer's cap (most units it keeps of the item).</summary>
+    public IReadOnlyDictionary<ulong, int>? Caps { get; init; }
+
+    /// <summary>Homes mode: the rank a retainer added now takes (the item's home count + 1).</summary>
+    public int NextRank { get; init; } = 1;
 }
 
 /// <summary>An owner retainer column; FreeSlots is null while its inventory is unobserved.</summary>
@@ -97,6 +107,49 @@ internal static class PlacementMatrixData
             .ToDictionary(group => group.Key, group => group.Sum(stack => stack.Quantity));
     }
 
+    /// <summary>
+    /// Homes mode: the shown character's share of an item's ranked homes as a row's routing (its retainers in rank
+    /// order, so they stay columns), their global ranks and their caps.
+    /// </summary>
+    public static (StowageRoutingPolicy Routing, IReadOnlyDictionary<ulong, int> Ranks, IReadOnlyDictionary<ulong, int> Caps) Homes(
+        IReadOnlyList<PlacementHome> homes, OwnerScope shown)
+    {
+        var ranks = new Dictionary<ulong, int>();
+        var caps = new Dictionary<ulong, int>();
+        var order = new List<ulong>();
+        for (var index = 0; index < homes.Count; index++)
+        {
+            var home = homes[index];
+            if (!ReservePlacement.SameCharacter(home.Character, shown) || ranks.ContainsKey(home.RetainerId))
+                continue;
+            ranks[home.RetainerId] = index + 1;
+            order.Add(home.RetainerId);
+            if (home.MaxUnits is { } cap)
+                caps[home.RetainerId] = cap;
+        }
+        return (new StowageRoutingPolicy { PreferredRetainerIds = order }, ranks, caps);
+    }
+
+    /// <summary>
+    /// "Gringle ≤500 → Dredgen Hope · Scrongle": an item's ranked homes by name, naming a character other than
+    /// <paramref name="owner"/> where the chain reaches it.
+    /// </summary>
+    public static string HomesSummary(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<PlacementHome> homes, OwnerScope owner)
+    {
+        var parts = new List<string>();
+        var last = owner;
+        foreach (var home in homes)
+        {
+            var name = runtime.Retainers.TryGetValue(home.RetainerId, out var retainer) && ReservePlacement.SameCharacter(retainer.Owner, home.Character)
+                ? retainer.RetainerName
+                : $"Retainer {home.RetainerId}";
+            var prefix = ReservePlacement.SameCharacter(last, home.Character) ? string.Empty : $"{CourierSession.CharacterLabel(home.Character)} · ";
+            last = home.Character;
+            parts.Add(prefix + name + (home.MaxUnits is { } cap ? $" ≤{cap:N0}" : string.Empty));
+        }
+        return string.Join(" → ", parts);
+    }
+
     /// <summary>Units of the item in the target character's bags, restricted to the row's quality.</summary>
     public static int BagHoldings(
         QuartermasterRuntimeSnapshot runtime,
@@ -155,6 +208,13 @@ internal sealed class PlacementMatrix<TKey>
 
     // Set by Draw each frame; bridge actions registered this frame use it too.
     private Func<IReadOnlyList<(TKey Key, StowageRoutingPolicy Routing)>, bool> applyRouting = _ => false;
+    // Homes mode (set by DrawHomes): edits are placement operations on the rows' ranked homes, ranks are global, and
+    // a home may carry a cap. Null in routing mode.
+    private Func<PlacementOperation, ulong, int?, IReadOnlyList<TKey>, bool>? operateHomes;
+    private string capText = string.Empty;
+    private (TKey Key, ulong RetainerId, string Name)? capCell;
+    private bool capPopupRequested;
+    private string capCellText = string.Empty;
 
     /// <param name="fromHeader">Adds a frozen source column after the quantity, filled from <see cref="PlacementMatrixRow{TKey}.From"/>.</param>
     /// <param name="emptyText">Shown in place of rows when there are none.</param>
@@ -204,9 +264,42 @@ internal sealed class PlacementMatrix<TKey>
         bool anySpace = true)
     {
         applyRouting = apply;
+        operateHomes = null;
         showAnySpace = anySpace;
         DrawCore(allRows, visibleRows, columns);
     }
+
+    /// <summary>
+    /// Ranked homes across characters (reserve placement): cells show each row's global rank (<see cref="PlacementMatrixRow{TKey}.Ranks"/>)
+    /// and cap, there is no Any space, and every edit is one <see cref="PlacementOperation"/> handed to
+    /// <paramref name="operate"/> with its target retainer (0 for the whole-row operations), its cap (SetCap; null
+    /// clears) and the rows it applies to; it returns false when refused.
+    /// </summary>
+    public void DrawHomes(
+        IReadOnlyList<PlacementMatrixRow<TKey>> allRows,
+        IReadOnlyList<PlacementMatrixRow<TKey>> visibleRows,
+        IReadOnlyList<PlacementMatrixColumn> columns,
+        Func<PlacementOperation, ulong, int?, IReadOnlyList<TKey>, bool> operate)
+    {
+        applyRouting = _ => false;
+        operateHomes = operate;
+        showAnySpace = false;
+        DrawCore(allRows, visibleRows, columns);
+    }
+
+    private bool HomesMode => operateHomes is not null;
+
+    /// <summary>Rows changed (the selection), or -1 when the surface refused the operation.</summary>
+    private int OperateSelection(IReadOnlyList<PlacementMatrixRow<TKey>> allRows, PlacementOperation operation, ulong retainerId, int? cap = null)
+    {
+        var keys = allRows.Where(row => selected.Contains(row.Key)).Select(row => row.Key).ToArray();
+        if (keys.Length == 0)
+            return 0;
+        return operateHomes!(operation, retainerId, cap, keys) ? keys.Length : -1;
+    }
+
+    private int RankOf(PlacementMatrixRow<TKey> row, ulong retainerId) =>
+        row.Ranks is { } ranks ? ranks.GetValueOrDefault(retainerId) : PlacementEdits.Rank(row.Routing, retainerId);
 
     private void DrawCore(
         IReadOnlyList<PlacementMatrixRow<TKey>> allRows,
@@ -277,6 +370,11 @@ internal sealed class PlacementMatrix<TKey>
 
     private void DrawRankedActions(IReadOnlyList<PlacementMatrixRow<TKey>> allRows, bool hasSelection, string targetName)
     {
+        if (HomesMode)
+        {
+            DrawHomeActions(allRows, hasSelection && target != PlacementEdits.AnySpace, hasSelection, targetName);
+            return;
+        }
         Action("make-first", "Make first", primary: true, hasSelection, allRows,
             $"Make {targetName} the first destination of the selected rows",
             routing => PlacementEdits.MakeFirst(routing, target));
@@ -304,6 +402,72 @@ internal sealed class PlacementMatrix<TKey>
         Action("clear-destinations", "Clear destinations", primary: false, hasSelection, allRows,
             "Clear every destination of the selected rows",
             _ => PlacementEdits.Clear());
+    }
+
+    private void DrawHomeActions(IReadOnlyList<PlacementMatrixRow<TKey>> allRows, bool hasTarget, bool hasSelection, string targetName)
+    {
+        SelectionButton("make-first", "Make first", primary: true, hasTarget,
+            $"Make {targetName} the first home of the selected rows",
+            () => OperateSelection(allRows, PlacementOperation.MakeFirst, target));
+        SelectionButton("add-fallback", "Add as fallback", primary: false, hasTarget,
+            $"Add {targetName} after the existing homes of the selected rows",
+            () => OperateSelection(allRows, PlacementOperation.AddFallback, target));
+        SelectionButton("remove", "Remove", primary: false, hasTarget,
+            $"Remove {targetName} from the selected rows",
+            () => OperateSelection(allRows, PlacementOperation.Remove, target));
+        SelectionButton("where-it-lives", "Use current holders", primary: false, hasSelection,
+            "Put the retainers holding each selected item first, most units first",
+            () => OperateSelection(allRows, PlacementOperation.UseCurrentHolders, 0));
+        SelectionButton("clear-destinations", "Clear destinations", primary: false, hasSelection,
+            "Clear every home of the selected rows",
+            () => OperateSelection(allRows, PlacementOperation.ClearDestinations, 0));
+
+        // Cap of the targeted retainer for the selected rows; empty clears it.
+        DalamudUiLayout.SameLineIfFits("Cap 000000 Clear cap");
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextDisabled("Cap");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(70f * ImGuiHelpers.GlobalScale);
+        ImGui.InputText($"##{surfaceId}.cap", ref capText, 9, ImGuiInputTextFlags.CharsDecimal | ImGuiInputTextFlags.AutoSelectAll);
+        var cap = ParseCap(capText);
+        var capLabel = cap is null ? "Clear cap" : "Set cap";
+        ImGui.SameLine();
+        ImGui.BeginDisabled(!hasTarget);
+        if (ImGui.Button($"{capLabel}##{surfaceId}.set-cap"))
+            OperateSelection(allRows, PlacementOperation.SetCap, target, cap);
+        ImGui.EndDisabled();
+        if (!hasTarget && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(hasSelection ? "No retainer to cap" : "No rows selected");
+        RegisterAction("set-cap", $"Set the cap of {targetName} on the selected rows; omit maxUnits to clear it", hasTarget,
+            $"selected={selected.Count:N0}; target={target}; cap={(cap?.ToString() ?? "none")}",
+            new AgentBridgeActionArgumentSchema([new("maxUnits", AgentBridgeActionArgumentKind.Integer, Required: false, Minimum: 0)]),
+            arguments =>
+            {
+                if (selected.Count == 0)
+                    return AgentBridgeUiActionResult.Fail("No placement rows are selected.");
+                int? requested = null;
+                if (arguments is { ValueKind: System.Text.Json.JsonValueKind.Object } value && value.TryGetProperty("maxUnits", out var units))
+                {
+                    if (!units.TryGetInt64(out var number) || number < 0)
+                        return AgentBridgeUiActionResult.Fail("maxUnits must be a whole number of at least 0.");
+                    requested = (int)Math.Min(number, int.MaxValue);
+                }
+                var changed = OperateSelection(allRows, PlacementOperation.SetCap, target, requested);
+                return changed < 0
+                    ? AgentBridgeUiActionResult.Fail("The surface refused the placement change.")
+                    : AgentBridgeUiActionResult.Ok(requested is null ? $"Cleared the cap of {targetName}." : $"Capped {targetName} at {requested:N0}.");
+            });
+    }
+
+    /// <summary>Digits only; empty is no cap. Clamped silently to int range.</summary>
+    private static int? ParseCap(string text)
+    {
+        var digits = new string(text.Where(char.IsAsciiDigit).ToArray());
+        if (digits.Length == 0)
+            return null;
+        return long.TryParse(digits, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var number)
+            ? (int)Math.Min(number, int.MaxValue)
+            : int.MaxValue;
     }
 
     private void Action(
@@ -470,7 +634,43 @@ internal sealed class PlacementMatrix<TKey>
         finally
         {
             ImGui.EndTable();
+            if (HomesMode)
+                DrawCapPopup();
         }
+    }
+
+    /// <summary>Right-click shortcut on a cell: that retainer's cap for that row (the toolbar's Cap does the same for the selection).</summary>
+    private void DrawCapPopup()
+    {
+        var id = $"##{surfaceId}.cap-popup";
+        if (capPopupRequested)
+        {
+            ImGui.OpenPopup(id);
+            capPopupRequested = false;
+        }
+        if (capCell is not { } cell || !DalamudOwnedPopup.BeginOpaquePopup(id))
+            return;
+        ImGui.TextUnformatted($"Cap · {cell.Name}");
+        ImGui.SetNextItemWidth(90f * ImGuiHelpers.GlobalScale);
+        if (ImGui.IsWindowAppearing())
+            ImGui.SetKeyboardFocusHere();
+        var commit = ImGui.InputText($"##{surfaceId}.cap-cell", ref capCellText, 9,
+            ImGuiInputTextFlags.CharsDecimal | ImGuiInputTextFlags.AutoSelectAll | ImGuiInputTextFlags.EnterReturnsTrue);
+        commit |= ImGui.IsItemDeactivatedAfterEdit();
+        ImGui.SameLine();
+        if (ImGui.Button($"Clear cap##{surfaceId}.cap-cell-clear"))
+        {
+            operateHomes?.Invoke(PlacementOperation.SetCap, cell.RetainerId, null, [cell.Key]);
+            ImGui.CloseCurrentPopup();
+        }
+        else if (commit)
+        {
+            operateHomes?.Invoke(PlacementOperation.SetCap, cell.RetainerId, ParseCap(capCellText), [cell.Key]);
+            ImGui.CloseCurrentPopup();
+        }
+        if (ImGui.IsKeyPressed(ImGuiKey.Escape))
+            ImGui.CloseCurrentPopup();
+        ImGui.EndPopup();
     }
 
     private unsafe void DrawNameHeader(
@@ -639,9 +839,10 @@ internal sealed class PlacementMatrix<TKey>
         var hovered = ImGui.IsItemHovered();
         var min = ImGui.GetItemRectMin();
         var max = ImGui.GetItemRectMax();
-        var rank = PlacementEdits.Rank(row.Routing, retainerId);
+        var rank = RankOf(row, retainerId);
         var held = retainerId == PlacementEdits.AnySpace ? 0 : row.Holdings.GetValueOrDefault(retainerId);
         var name = column?.Name ?? TransferPresentation.AnySpaceLabel;
+        int? cap = row.Caps is { } caps && caps.TryGetValue(retainerId, out var capped) ? capped : null;
         RegisterCell(row, retainerId, name, rank, held, min, max);
 
         var drawList = ImGui.GetWindowDrawList();
@@ -650,12 +851,14 @@ internal sealed class PlacementMatrix<TKey>
                 new Vector2(max.X + style.CellPadding.X, max.Y + style.CellPadding.Y), ImGui.GetColorU32(HoverCellColor));
 
         var badgeText = rank > 0 ? rank.ToString() : string.Empty;
-        var holdText = held > 0 ? held.ToString("N0") : string.Empty;
+        // A capped home reads held/cap; over its cap it is amber.
+        var holdText = cap is { } most ? $"{held:N0}/{most:N0}" : held > 0 ? held.ToString("N0") : string.Empty;
+        var holdColor = cap is { } limit && held > limit ? AmberColor : HoldColor;
         var smallScale = .85f;
         var badgeDiameter = ImGui.GetTextLineHeight();
         var badgeWidth = rank > 0 ? Math.Max(badgeDiameter, (ImGui.CalcTextSize(badgeText).X * smallScale) + (6f * ImGuiHelpers.GlobalScale)) : 0f;
-        var holdWidth = held > 0 ? ImGui.CalcTextSize(holdText).X * smallScale : 0f;
-        var gap = rank > 0 && held > 0 ? 3f * ImGuiHelpers.GlobalScale : 0f;
+        var holdWidth = holdText.Length > 0 ? ImGui.CalcTextSize(holdText).X * smallScale : 0f;
+        var gap = rank > 0 && holdText.Length > 0 ? 3f * ImGuiHelpers.GlobalScale : 0f;
         var total = badgeWidth + gap + holdWidth;
         var x = origin.X + Math.Max(0f, (width - total) / 2f);
         var centerY = origin.Y + (height / 2f);
@@ -675,15 +878,28 @@ internal sealed class PlacementMatrix<TKey>
                 ImGui.GetColorU32(rank == 1 ? new Vector4(1f, 1f, 1f, 1f) : InfoColor), badgeText);
             x += badgeWidth + gap;
         }
-        if (held > 0)
+        if (holdText.Length > 0)
         {
             var textHeight = ImGui.GetTextLineHeight() * smallScale;
-            drawList.AddText(font, fontSize, new Vector2(x, centerY - (textHeight / 2f)), ImGui.GetColorU32(HoldColor), holdText);
+            drawList.AddText(font, fontSize, new Vector2(x, centerY - (textHeight / 2f)), ImGui.GetColorU32(holdColor), holdText);
         }
 
         if (hovered)
             ImGui.SetTooltip(Tooltip(row, retainerId, column, rank, held) +
+                (cap is { } shownCap ? $" · cap {shownCap:N0}" : string.Empty) +
                 (allowConsolidation && rank == 1 && column is not null && row.Routing.Consolidate ? $" · {row.Gathering}" : ""));
+        if (HomesMode)
+        {
+            if (clicked)
+                operateHomes!(PlacementOperation.Toggle, retainerId, null, [row.Key]);
+            else if (column is not null && hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
+            {
+                capCell = (row.Key, retainerId, column.Name);
+                capPopupRequested = true;
+                capCellText = cap?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+            }
+            return;
+        }
         if (clicked)
             applyRouting([(row.Key, PlacementEdits.Toggle(row.Routing, retainerId))]);
         else if (allowConsolidation && column is not null && hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
@@ -698,7 +914,9 @@ internal sealed class PlacementMatrix<TKey>
 
     private void RegisterCell(PlacementMatrixRow<TKey> row, ulong retainerId, string name, int rank, int held, Vector2 min, Vector2 max)
     {
-        var apply = applyRouting;
+        var apply = operateHomes is { } operate
+            ? (Func<IReadOnlyList<(TKey Key, StowageRoutingPolicy Routing)>, bool>)(_ => operate(PlacementOperation.Toggle, retainerId, null, [row.Key]))
+            : applyRouting;
         registry.Register(
             $"{surfaceId}.cell.{row.Slug}.{(retainerId == PlacementEdits.AnySpace ? "any" : retainerId.ToString())}",
             rank > 0 ? $"Remove {name} (#{rank}) from {row.Label}" : $"Add {name} to {row.Label}",
@@ -724,7 +942,8 @@ internal sealed class PlacementMatrix<TKey>
                 ? $"{TransferPresentation.AnySpaceLabel} · #{rank} · remove"
                 : $"{TransferPresentation.AnySpaceLabel} · add as last";
         var free = column.FreeSlots is { } slots ? $"{slots:N0} free slot{(slots == 1 ? string.Empty : "s")}" : "free slots unknown";
-        var action = rank > 0 ? $"#{rank} · remove" : $"add as #{PlacementEdits.RankIfAdded(row.Routing, retainerId)}";
+        var action = rank > 0 ? $"#{rank} · remove"
+            : $"add as #{(HomesMode ? row.NextRank : PlacementEdits.RankIfAdded(row.Routing, retainerId))}";
         return $"{column.Name} · holds {held:N0} · {free} · {action}";
     }
 

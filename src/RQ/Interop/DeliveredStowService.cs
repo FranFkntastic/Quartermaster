@@ -16,10 +16,11 @@ namespace RQ.Interop;
 /// lists; items without a home stay in the bags. Execution reuses the stowage deposit path (one requested
 /// <see cref="OperationKinds.StowageSurplus"/> operation for the whole batch, so each retainer opens once),
 /// picked up by <see cref="AutomaticRetrievalQueue"/>. RequestId is the idempotency key.
-/// An item may also have homes on another character of this account (<see cref="ListingReserveRule.RemoteHomes"/>).
-/// When the request sets AllowForward, once the owner's own stow settles what its local homes did not take is carried
-/// there by the courier in one run (<see cref="Tick"/>), and the line's Forward says how that went; without it such
-/// items stay in the bags exactly as before forwarding existed. Only units still in the owner's bags are sent on,
+/// An item's homes are one ranked list across the characters of this account (<see cref="ListingReserveRule.Homes"/>),
+/// routed by <see cref="PlacementRouter"/>, each home taking what its observed room and its cap allow. When the request
+/// sets AllowForward, once the owner's own stow settles what the owner's homes did not take is carried to the other
+/// characters' homes by the courier in one run (<see cref="Tick"/>), and the line's Forwards (one per character) say
+/// how that went; without it only the owner's homes count and the rest stays in the bags. Only units still in the owner's bags are sent on,
 /// never more than the request delivered; units the caller already sent straight to those homes (SentDirect) are
 /// never forwarded. The forward is journaled in its own file before the local operation is created and a forward
 /// with no local operation is never pruned, so a request id is answered the same across reloads; its courier run is
@@ -92,7 +93,7 @@ public sealed class DeliveredStowService
     private readonly Func<DateTime> utcNow;
     private readonly Dictionary<string, Pending> pending = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DeliveredStowStatus> transient = new(StringComparer.Ordinal);
-    private readonly DeliveredStowCourier? courier;
+    private readonly IDeliveredStowCourier? courier;
     private readonly AtomicDocumentStore<DeliveredStowForwardDocument>? forwardStore;
     private readonly List<DeliveredStowForwardRecord> forwards = [];
     private readonly Dictionary<string, DateTime> automationWaitSince = new(StringComparer.Ordinal);
@@ -120,7 +121,7 @@ public sealed class DeliveredStowService
         Func<uint, int> maxStackSize,
         Action<string> warn,
         Func<DateTime>? utcNow = null,
-        DeliveredStowCourier? courier = null,
+        IDeliveredStowCourier? courier = null,
         string? forwardStorePath = null)
     {
         this.providerInstanceId = providerInstanceId;
@@ -188,7 +189,7 @@ public sealed class DeliveredStowService
                 return Serialize(failed with { Schema = AckSchema });
 
             var (batch, lines) = Plan(request, owner);
-            var forwardWanted = lines.Sum(line => line.Forward is { Code: ForwardPending } forward ? forward.Wanted : 0);
+            var forwardWanted = lines.Sum(line => ForwardsOf(line).Where(forward => forward.Code == ForwardPending).Sum(forward => forward.Wanted));
             if (batch.PlannedQuantity <= 0 && forwardWanted <= 0)
             {
                 // Nothing routable: no operation, nothing persisted. Callers record this outcome themselves.
@@ -198,7 +199,7 @@ public sealed class DeliveredStowService
                     ProviderInstanceId = providerInstanceId,
                     RequestId = request.RequestId,
                     Status = NothingToStow,
-                    Message = lines.Any(line => line.Code == LineNoRoom || line.Forward?.Code == ForwardNoRoom)
+                    Message = lines.Any(line => line.Code == LineNoRoom || ForwardsOf(line).Any(forward => forward.Code == ForwardNoRoom))
                         ? "No delivered item has room in its home retainers."
                         : "No delivered item has a home retainer.",
                     Lines = lines,
@@ -327,12 +328,12 @@ public sealed class DeliveredStowService
             // forward takes only what they leave), so none is left unplanned in the bags.
             if (operationId is null && batch.PlannedQuantity > 0)
                 operationId = $"rq-dstow-{Guid.NewGuid():N}";
-            if (operationId is null && !lines.Any(line => line.Forward is { Code: ForwardPending }))
+            if (operationId is null && !lines.Any(line => ForwardsOf(line).Any(forward => forward.Code == ForwardPending)))
                 throw new InvalidOperationException("Delivered items no longer have room in their homes on other characters or are no longer carried.");
             if (lines.Any(line => line.Forward is not null))
             {
                 // Journaled before the local operation exists, so a forward is never lost behind a stow that ran.
-                record = Record(request.RequestId, hash, operationId, owner, lines);
+                record = Record(request, hash, operationId, owner, lines);
                 lock (gate)
                 {
                     forwards.Add(record);
@@ -372,40 +373,98 @@ public sealed class DeliveredStowService
             OperationChanged?.Invoke(operationId);
     }
 
+    /// <summary>
+    /// Plans a request through <see cref="PlacementRouter"/>: each item's ranked homes across characters, in rank order,
+    /// each taking what its observed room and cap allow, against one projection for the whole request. Units the
+    /// caller already sent straight to homes on other characters (SentDirect) are placed there first, so they count
+    /// against those homes' room and caps. The owner's share is a per-retainer batch with exact targets (a capped
+    /// home is never filled past its cap); the rest are the item's forwards, one per other character. Homes on other
+    /// characters count only when the caller opted into forwarding or reports units it sent there itself.
+    /// </summary>
     private (StowageDepositBatch Batch, DeliveredStowLine[] Lines) Plan(DeliveredStowRequest request, OwnerScope owner)
     {
         var carried = carriedBags(owner)
             .SelectMany(bag => bag.Items)
             .GroupBy(item => (item.ItemId, item.IsHq))
             .ToDictionary(group => group.Key, group => group.Sum(item => checked((int)item.Quantity)));
-        var requested = request.Items!
-            .Select(item => (Key: (item.ItemId, item.IsHq), item.ItemName, item.Quantity, item.SentDirect))
-            .ToArray();
-        var stowable = requested
-            .Select(item => (item.Key.ItemId, item.Key.IsHq, Quantity: Math.Min(item.Quantity, carried.GetValueOrDefault(item.Key))))
-            .Where(item => item.Quantity > 0)
-            .ToArray();
-
         var plan = repository.Read(state => ListingPlanCatalog.OwnerPlan(state, owner));
-        var stowRequests = plan is null
-            ? []
-            : MarketRunPlanner.StowRequests(plan.Id, plan.Reserves, stowable);
         var retainers = cache();
-        var batch = StowageRouter.BuildBatch(stowRequests, retainers, owner, maxStackSize, utcNow());
+        var requested = request.Items!
+            .Select(item =>
+            {
+                var reserve = WorkbenchStockService.ReserveFor(plan, item.ItemId, item.IsHq);
+                var all = reserve?.Homes ?? [];
+                var remote = all.Where(home => !ReservePlacement.SameCharacter(home.Character, owner) && home.Character.HasStableIdentity).ToArray();
+                var considered = !request.AllowForward && item.SentDirect <= 0 ? [] : remote;
+                return (Key: (item.ItemId, item.IsHq), item.ItemName, item.Quantity, item.SentDirect, Reserve: reserve,
+                    Held: Math.Min(item.Quantity, carried.GetValueOrDefault((item.ItemId, item.IsHq))),
+                    // Without forwarding only the owner's homes take carried units.
+                    Routed: (IReadOnlyList<PlacementHome>)(request.AllowForward ? all.Where(home => home.Character.HasStableIdentity).ToArray()
+                        : all.Where(home => ReservePlacement.SameCharacter(home.Character, owner)).ToArray()),
+                    Remote: considered);
+            })
+            .ToArray();
 
-        var lines = requested.Select(item =>
+        var projected = new Dictionary<ulong, CachedRetainer>();
+        var direct = requested.Select(item => item.SentDirect > 0 && item.Remote.Length > 0
+                ? PlacementRouter.RouteOne(new(item.Key.ItemId, item.ItemName, item.Key.IsHq, item.SentDirect), item.Remote, retainers, projected, maxStackSize)
+                : null)
+            .ToArray();
+        var routes = requested.Select(item =>
+                PlacementRouter.RouteOne(new(item.Key.ItemId, item.ItemName, item.Key.IsHq, item.Held), item.Routed, retainers, projected, maxStackSize))
+            .ToArray();
+        var batch = PlacementRouter.LocalBatch(
+            requested.Select((item, index) => (routes[index], plan?.Id, item.Reserve?.Id,
+                item.Reserve is null ? new StowageRoutingPolicy() : PlacementRouter.OwnerRouting(item.Reserve, owner).Routing)),
+            retainers, owner, maxStackSize, utcNow());
+
+        var lines = requested.Select((item, index) =>
         {
-            var routes = batch.Routes
-                .Where(route => route.Request.ItemId == item.Key.ItemId && route.Request.IsHighQuality == item.Key.IsHq)
+            var route = routes[index];
+            var local = route.Allocations.Where(allocation => ReservePlacement.SameCharacter(allocation.Character, owner)).ToArray();
+            var planned = local.Sum(allocation => allocation.Units);
+            var sentOn = route.Allocations.Where(allocation => !ReservePlacement.SameCharacter(allocation.Character, owner)).ToArray();
+            var leftover = Math.Max(0, item.Held - route.Placed);
+            var directUnplaced = direct[index] is { } sent ? sent.Unplaced : item.SentDirect;
+            var forwards = item.Remote
+                .Select(home => home.Character)
+                .DistinctBy(character => (character.LocalContentId ?? 0, character.CharacterName))
+                .Select((character, rank) =>
+                {
+                    var routed = sentOn.Where(allocation => ReservePlacement.SameCharacter(allocation.Character, character)).Sum(allocation => allocation.Units);
+                    // Units sent directly count where the router placed them; any it could not place are the first character's.
+                    var already = (direct[index]?.Allocations ?? [])
+                        .Where(allocation => ReservePlacement.SameCharacter(allocation.Character, character)).Sum(allocation => allocation.Units) +
+                        (rank == 0 ? directUnplaced : 0);
+                    var homes = Homes(character, item.Remote.Where(home => ReservePlacement.SameCharacter(home.Character, character)).Select(home => home.RetainerId), retainers);
+                    var forward = new DeliveredStowForwardLine { Character = Character(character), Homes = homes };
+                    var also = already > 0 ? $"; {already:N0} already went there directly" : string.Empty;
+                    if (!request.AllowForward || routed <= 0 && leftover <= 0)
+                        return already > 0
+                            ? forward with { Code = ForwardSentDirect, Message = $"{already:N0} went to {character.CharacterName} directly." }
+                            : forward with { Code = ForwardNothingLeft, Message = item.Held > 0 ? "Homes ranked ahead of it take all of it." : "Not carried." };
+                    if (routed <= 0)
+                        return forward with
+                        {
+                            Code = ForwardNoRoom,
+                            Message = route.UnplacedReason == PlacementRouter.AtCap
+                                ? $"{character.CharacterName}'s homes ({HomeList(homes)}) are at their cap; {leftover:N0} stay in the bags{also}."
+                                : $"No observed room on {character.CharacterName} ({HomeList(homes)}) for {leftover:N0}; it stays in the bags{also}.",
+                        };
+                    return forward with
+                    {
+                        Code = ForwardPending,
+                        Wanted = routed,
+                        Message = $"{routed:N0} go to {character.CharacterName} after the owner's own stow{also}.",
+                    };
+                })
                 .ToArray();
-            var planned = routes.Sum(route => route.RoutedQuantity);
-            var held = Math.Min(item.Quantity, carried.GetValueOrDefault(item.Key));
-            // Remote homes matter only when the caller opted into forwarding, or reports units it sent there itself.
-            var remote = plan is null || !request.AllowForward && item.SentDirect <= 0 ? null : RemoteHomesOf(plan, item.Key.ItemId, item.Key.IsHq);
+            var pending = forwards.Any(forward => forward.Code == ForwardPending);
+            var hasLocalHome = item.Reserve?.Homes.Any(home => ReservePlacement.SameCharacter(home.Character, owner)) == true;
             var code = item.Quantity == 0 && item.SentDirect > 0 ? LineSentDirect
-                : held <= 0 ? LineNotCarried
-                : routes.Length == 0 ? remote is null || !request.AllowForward ? LineNoHome : LineHomedElsewhere
-                : planned <= 0 ? LineNoRoom
+                : item.Held <= 0 ? LineNotCarried
+                : !hasLocalHome ? forwards.Length == 0 || !request.AllowForward ? LineNoHome : LineHomedElsewhere
+                : planned <= 0 ? pending ? LineHomedElsewhere : LineNoRoom
                 : LinePlanned;
             return new DeliveredStowLine
             {
@@ -413,59 +472,19 @@ public sealed class DeliveredStowService
                 ItemName = item.ItemName,
                 IsHq = item.Key.IsHq,
                 Requested = item.Quantity,
-                Carried = held,
+                Carried = item.Held,
                 Planned = planned,
                 Code = code,
-                Destinations = routes.SelectMany(route => route.Allocations).Select(allocation => allocation.RetainerName).Distinct(StringComparer.Ordinal).ToArray(),
-                Forward = remote is null ? null : new DeliveredStowForwardLine
-                {
-                    Character = Character(remote.Character),
-                    Homes = Homes(remote.Character, remote.RetainerIds, retainers),
-                    Wanted = request.AllowForward ? Math.Max(0, held - planned) : 0,
-                },
+                Destinations = local.Select(allocation => allocation.RetainerName).Distinct(StringComparer.Ordinal).ToArray(),
+                Forward = forwards.FirstOrDefault(),
+                Forwards = forwards.Length == 0 ? null : forwards,
             };
         }).ToArray();
-
-        // What the local homes leave goes to the remote homes, routed against that character's observed room.
-        var sentDirect = requested.ToDictionary(item => item.Key, item => item.SentDirect);
-        foreach (var group in lines.Select((line, index) => (Line: line, Index: index))
-                     .Where(entry => entry.Line.Forward is not null)
-                     .GroupBy(entry => (entry.Line.Forward!.Character.LocalContentId, entry.Line.Forward.Character.HomeWorldId)))
-        {
-            var character = Scope(group.First().Line.Forward!.Character);
-            var remoteBatch = RemoteBatch(plan?.Id, group
-                .Where(entry => entry.Line.Forward!.Wanted > 0)
-                .Select(entry => (entry.Line.ItemId, entry.Line.ItemName, entry.Line.IsHq, entry.Line.Forward!.Wanted,
-                    (IReadOnlyList<ulong>)entry.Line.Forward.Homes.Select(home => home.RetainerId).ToArray())), character, retainers);
-            foreach (var (line, index) in group)
-            {
-                var forward = line.Forward!;
-                var direct = sentDirect.GetValueOrDefault((line.ItemId, line.IsHq));
-                var routed = remoteBatch.Routes.Where(route => route.Request.ItemId == line.ItemId && route.Request.IsHighQuality == line.IsHq)
-                    .Sum(route => route.RoutedQuantity);
-                var homes = HomeList(forward.Homes);
-                var already = direct > 0 ? $"; {direct:N0} already went there directly" : string.Empty;
-                lines[index] = line with
-                {
-                    Forward = forward.Wanted <= 0
-                        ? direct > 0
-                            ? forward with { Code = ForwardSentDirect, Message = $"{direct:N0} went to {forward.Character.CharacterName} directly." }
-                            : forward with { Code = ForwardNothingLeft, Message = line.Carried is > 0 ? "The owner's own homes take all of it." : "Not carried." }
-                        : routed <= 0
-                            ? forward with { Code = ForwardNoRoom, Message = $"No observed room on {forward.Character.CharacterName} ({homes}) for {forward.Wanted:N0}; it stays in the bags{already}." }
-                            : forward with
-                            {
-                                Code = ForwardPending,
-                                Message = routed < forward.Wanted
-                                    ? $"{routed:N0} go to {forward.Character.CharacterName} after the owner's own stow; {forward.Wanted - routed:N0} have no observed room there and stay in the bags{already}."
-                                    : $"{routed:N0} go to {forward.Character.CharacterName} after the owner's own stow{already}.",
-                                Wanted = routed,
-                            },
-                };
-            }
-        }
         return (batch, lines);
     }
+
+    private static IEnumerable<DeliveredStowForwardLine> ForwardsOf(DeliveredStowLine line) =>
+        line.Forwards ?? (line.Forward is { } forward ? [forward] : []);
 
     // ---- Courier forward ----------------------------------------------------------------------
 
@@ -612,42 +631,73 @@ public sealed class DeliveredStowService
         }
         automationWaitSince.Remove(record.RequestId);
 
-        // Only what is in the bags now is sent on, and never more than this request left for the remote homes.
+        // Only what is in the bags now is sent on, never more than this request left for the other characters, and
+        // re-planned through the router against those characters' homes as observed now (their caps and the units the
+        // caller sent there directly included).
         var carried = carriedBags(owner)
             .SelectMany(bag => bag.Items)
             .GroupBy(item => (item.ItemId, item.IsHq))
             .ToDictionary(group => group.Key, group => group.Sum(item => checked((int)item.Quantity)));
         var retainers = cache();
-        var groups = new List<(OwnerScope Destination, IReadOnlyList<DeliveredStowForwardUnit> Units)>();
-        var bound = new List<(DeliveredStowForwardRecordLine Line, int Units)>();
-        foreach (var group in open.GroupBy(line => (line.Character!.LocalContentId, line.Character.HomeWorldId)))
+        var plan = repository.Read(state => ListingPlanCatalog.OwnerPlan(state, record.Owner));
+        var projected = new Dictionary<ulong, CachedRetainer>();
+        var items = open.GroupBy(line => (line.ItemId, line.IsHq)).Select(group => group.ToArray()).ToArray();
+        var allocations = new Dictionary<DeliveredStowForwardRecordLine, List<(ulong RetainerId, int Units)>>();
+        var noRoom = new Dictionary<DeliveredStowForwardRecordLine, string?>();
+        // The units sent directly take their room (and cap) first, for every item.
+        var plans = items.Select(lines =>
         {
-            var character = group.First().Character!;
-            var wanted = group.Select(line => (Line: line, Units: Math.Min(line.Wanted, carried.GetValueOrDefault((line.ItemId, line.IsHq))))).ToArray();
-            foreach (var (line, _) in wanted.Where(entry => entry.Units <= 0))
-                SetLine(line, ForwardNothingLeft, "None of it is left in the owner's bags to forward.");
-            var batch = RemoteBatch(record.PlanId, wanted.Where(entry => entry.Units > 0)
-                .Select(entry => (entry.Line.ItemId, entry.Line.ItemName, entry.Line.IsHq, entry.Units, (IReadOnlyList<ulong>)entry.Line.RetainerIds)), character, retainers);
-            var units = new List<DeliveredStowForwardUnit>();
-            foreach (var (line, _) in wanted.Where(entry => entry.Units > 0))
+            var first = lines[0];
+            var rule = WorkbenchStockService.ReserveFor(plan, first.ItemId, first.IsHq);
+            var remote = (rule?.Homes ?? []).Where(home => !ReservePlacement.SameCharacter(home.Character, record.Owner)).ToArray();
+            var sentDirect = record.Lines.Where(line => line.ItemId == first.ItemId && line.IsHq == first.IsHq).Select(line => line.SentDirect).DefaultIfEmpty(0).Max();
+            if (sentDirect > 0 && remote.Length > 0)
+                PlacementRouter.RouteOne(new(first.ItemId, first.ItemName, first.IsHq, sentDirect), remote, retainers, projected, maxStackSize);
+            // The characters this request still forwards to, by the rule's current ranked homes there; the journaled
+            // retainers (uncapped) when the rule no longer names any.
+            var homes = remote.Where(home => lines.Any(line => ReservePlacement.SameCharacter(line.Character!, home.Character))).ToList();
+            foreach (var line in lines.Where(line => !homes.Any(home => ReservePlacement.SameCharacter(home.Character, line.Character!))))
+                homes.AddRange(line.RetainerIds.Distinct().Where(id => id != 0).Select(id => new PlacementHome(line.Character!, id)));
+            var units = Math.Min(lines.Sum(line => line.Wanted), carried.GetValueOrDefault((first.ItemId, first.IsHq)));
+            return (Lines: lines, Homes: (IReadOnlyList<PlacementHome>)homes, Units: units);
+        }).ToArray();
+        foreach (var (lines, homes, units) in plans)
+        {
+            var first = lines[0];
+            if (units <= 0)
             {
-                var homes = batch.Routes
-                    .Where(route => route.Request.ItemId == line.ItemId && route.Request.IsHighQuality == line.IsHq)
-                    .SelectMany(route => route.Allocations)
-                    .Where(allocation => allocation.Quantity > 0)
-                    .Select(allocation => (allocation.RetainerId, allocation.Quantity))
-                    .ToArray();
-                if (homes.Length == 0)
-                {
-                    SetLine(line, ForwardNoRoom, $"No observed room on {character.CharacterName} ({HomeList(Homes(character, line.RetainerIds, retainers))}); it stays in the bags.");
-                    continue;
-                }
-                units.Add(new(line.Line, line.ItemId, line.ItemName, line.IsHq, homes));
-                bound.Add((line, homes.Sum(home => home.Quantity)));
+                foreach (var line in lines)
+                    SetLine(line, ForwardNothingLeft, "None of it is left in the owner's bags to forward.");
+                continue;
             }
-            if (units.Count > 0)
-                groups.Add((character, units));
+            var route = PlacementRouter.RouteOne(new(first.ItemId, first.ItemName, first.IsHq, units), homes, retainers, projected, maxStackSize);
+            foreach (var line in lines)
+            {
+                var mine = route.Allocations.Where(allocation => ReservePlacement.SameCharacter(allocation.Character, line.Character!))
+                    .Select(allocation => (allocation.RetainerId, allocation.Units)).ToList();
+                if (mine.Count > 0)
+                    allocations[line] = mine;
+                else
+                    noRoom[line] = route.UnplacedReason;
+            }
         }
+        foreach (var (line, unplaced) in noRoom)
+        {
+            var homes = HomeList(Homes(line.Character!, line.RetainerIds, retainers));
+            SetLine(line, ForwardNoRoom, unplaced == PlacementRouter.AtCap
+                ? $"{line.Character!.CharacterName}'s homes ({homes}) are at their cap; it stays in the bags."
+                : unplaced is null
+                    ? $"Homes ranked ahead of {line.Character!.CharacterName} take all of it."
+                    : $"No observed room on {line.Character!.CharacterName} ({homes}); it stays in the bags.");
+        }
+        var groups = allocations
+            .GroupBy(entry => (entry.Key.Character!.LocalContentId ?? 0, entry.Key.Character.CharacterName))
+            .Select(group => (Destination: group.First().Key.Character!,
+                Units: (IReadOnlyList<DeliveredStowForwardUnit>)group
+                    .Select(entry => new DeliveredStowForwardUnit(entry.Key.Line, entry.Key.ItemId, entry.Key.ItemName, entry.Key.IsHq, entry.Value))
+                    .ToArray()))
+            .ToList();
+        var bound = allocations.Select(entry => (Line: entry.Key, Units: entry.Value.Sum(home => home.Units))).ToList();
         if (groups.Count == 0)
         {
             Settle(record, null, "Nothing was left to forward.", now);
@@ -860,11 +910,23 @@ public sealed class DeliveredStowService
     {
         var terminal = operation is not null && OperationStatuses.IsTerminal(operation.Status);
         var retainers = cache();
-        var lines = record.Lines.Select(line =>
+        // One status line per item variant; its record lines are the item's forwards, one per other character.
+        var lines = record.Lines.GroupBy(line => (line.ItemId, line.IsHq)).Select(group =>
         {
+            var line = group.First();
             var local = operation?.Lines.Where(candidate => candidate.ItemId == line.ItemId && candidate.IsHighQuality == line.IsHq).ToArray() ?? [];
             var planned = local.Sum(candidate => candidate.TargetQuantity);
             var stowed = local.Sum(candidate => candidate.TransferredQuantity);
+            var forwards = group.Where(entry => entry.Character is not null).Select(entry => new DeliveredStowForwardLine
+            {
+                Character = Character(entry.Character!),
+                Homes = Homes(entry.Character!, entry.RetainerIds, retainers),
+                Wanted = entry.Wanted,
+                Planned = entry.Planned,
+                Delivered = entry.Delivered,
+                Code = entry.Code,
+                Message = entry.Message,
+            }).ToArray();
             return new DeliveredStowLine
             {
                 ItemId = line.ItemId,
@@ -879,16 +941,8 @@ public sealed class DeliveredStowService
                     : stowed > 0 ? LinePartlyStowed
                     : LineNotStowed,
                 Destinations = planned > 0 ? Destinations(operation!, local) : line.LocalDestinations.ToArray(),
-                Forward = line.Character is not { } character ? null : new DeliveredStowForwardLine
-                {
-                    Character = Character(character),
-                    Homes = Homes(character, line.RetainerIds, retainers),
-                    Wanted = line.Wanted,
-                    Planned = line.Planned,
-                    Delivered = line.Delivered,
-                    Code = line.Code,
-                    Message = line.Message,
-                },
+                Forward = forwards.FirstOrDefault(),
+                Forwards = forwards.Length == 0 ? null : forwards,
             };
         }).ToArray();
 
@@ -950,59 +1004,50 @@ public sealed class DeliveredStowService
     }
 
     /// <summary>
-    /// The journaled forward of an accepted request. One with nothing to send (only lines the caller already sent
-    /// directly) is settled from the start and only keeps those lines answerable.
+    /// The journaled forward of an accepted request: one record line per item variant and other character it is
+    /// forwarded to (each its own courier line), or one with no character for an item forwarded nowhere. One with
+    /// nothing to send (only lines the caller already sent directly) is settled from the start and only keeps those
+    /// lines answerable.
     /// </summary>
-    private DeliveredStowForwardRecord Record(string requestId, string hash, string? operationId, OwnerScope owner, IReadOnlyList<DeliveredStowLine> lines)
+    private DeliveredStowForwardRecord Record(DeliveredStowRequest request, string hash, string? operationId, OwnerScope owner,
+        IReadOnlyList<DeliveredStowLine> lines)
     {
         var now = utcNow();
-        var sends = lines.Any(line => line.Forward is { Code: ForwardPending });
-        return new()
-    {
-        RequestId = requestId,
-        CanonicalHash = hash,
-        OperationId = operationId,
-        PlanId = repository.Read(state => ListingPlanCatalog.OwnerPlan(state, owner))?.Id,
-        Owner = owner with { },
-        CreatedUtc = now,
-        State = sends ? ForwardStatePending : ForwardStateSettled,
-        Message = sends ? "Waiting for the owner's own stow to settle." : NothingToForward,
-        SettledUtc = sends ? null : now,
-        Lines = lines.Select(line => new DeliveredStowForwardRecordLine
+        var sends = lines.Any(line => ForwardsOf(line).Any(forward => forward.Code == ForwardPending));
+        DeliveredStowForwardRecordLine Line(DeliveredStowLine line, DeliveredStowForwardLine? forward) => new()
         {
             ItemId = line.ItemId,
             ItemName = line.ItemName,
             IsHq = line.IsHq,
             Requested = line.Requested,
+            SentDirect = request.Items!.FirstOrDefault(item => item.ItemId == line.ItemId && item.IsHq == line.IsHq)?.SentDirect ?? 0,
             LocalCode = line.Code,
             LocalDestinations = [.. line.Destinations],
             Line = Guid.NewGuid(),
-            Character = line.Forward is { } forward ? Scope(forward.Character) : null,
-            RetainerIds = line.Forward?.Homes.Select(home => home.RetainerId).ToList() ?? [],
-            Wanted = line.Forward?.Wanted ?? 0,
-            Code = line.Forward?.Code ?? string.Empty,
-            Message = line.Forward?.Message ?? string.Empty,
-        }).ToList(),
-    };
+            Character = forward is null ? null : Scope(forward.Character),
+            RetainerIds = forward?.Homes.Select(home => home.RetainerId).ToList() ?? [],
+            Wanted = forward?.Wanted ?? 0,
+            Code = forward?.Code ?? string.Empty,
+            Message = forward?.Message ?? string.Empty,
+        };
+        return new()
+        {
+            RequestId = request.RequestId,
+            CanonicalHash = hash,
+            OperationId = operationId,
+            PlanId = repository.Read(state => ListingPlanCatalog.OwnerPlan(state, owner))?.Id,
+            Owner = owner with { },
+            CreatedUtc = now,
+            State = sends ? ForwardStatePending : ForwardStateSettled,
+            Message = sends ? "Waiting for the owner's own stow to settle." : NothingToForward,
+            SettledUtc = sends ? null : now,
+            Lines = lines.SelectMany(line => ForwardsOf(line).ToArray() is { Length: > 0 } forwards
+                ? forwards.Select(forward => Line(line, forward))
+                : [Line(line, null)]).ToList(),
+        };
     }
 
-    // ---- Remote homes -------------------------------------------------------------------------
-
-    /// <summary>The remote homes of the reserve that covers this item variant, if it has any.</summary>
-    private static ReserveRemoteHomes? RemoteHomesOf(ListingPlan plan, uint itemId, bool hq) =>
-        plan.Reserves.FirstOrDefault(reserve => reserve.Enabled && reserve.ItemId == itemId &&
-                (reserve.Quality == ItemQualityPolicy.Any || reserve.Quality == ItemQualityPolicy.HqOnly == hq) &&
-                reserve.RemoteHomes is { RetainerIds.Count: > 0, Character.HasStableIdentity: true })
-            ?.RemoteHomes;
-
-    /// <summary>Routes units into another character's ranked retainers by their observed room, exactly as local homes are.</summary>
-    private StowageDepositBatch RemoteBatch(Guid? planId,
-        IEnumerable<(uint ItemId, string ItemName, bool Hq, int Units, IReadOnlyList<ulong> RetainerIds)> items,
-        OwnerScope character, IReadOnlyDictionary<ulong, CachedRetainer> retainers) =>
-        StowageRouter.BuildBatch(
-            items.Select(item => new StowageDepositRequest(planId, null, item.ItemId, item.ItemName, item.Hq, item.Units,
-                new StowageRoutingPolicy { PreferredRetainerIds = [.. item.RetainerIds] })),
-            retainers, character, maxStackSize, utcNow());
+    // ---- Characters and homes -------------------------------------------------------------------------
 
     private static DeliveredStowCharacter Character(OwnerScope owner) => new()
     {
@@ -1211,7 +1256,9 @@ public sealed class DeliveredStowForwardRecord
 
 /// <summary>
 /// Every requested line, so the status reads the same with or without the local operation; Character is null for a
-/// line with no remote homes. Line is the courier line its stacks travel under.
+/// line forwarded nowhere. An item forwarded to several characters has one line per character (a journal written
+/// before that has at most one). Line is the courier line its stacks travel under. SentDirect: units of the item the
+/// caller already sent straight to its homes on other characters (they count against those homes' room and caps).
 /// </summary>
 public sealed class DeliveredStowForwardRecordLine
 {
@@ -1219,6 +1266,7 @@ public sealed class DeliveredStowForwardRecordLine
     public string ItemName { get; set; } = string.Empty;
     public bool IsHq { get; set; }
     public int Requested { get; set; }
+    public int SentDirect { get; set; }
     public string LocalCode { get; set; } = string.Empty;
     public List<string> LocalDestinations { get; set; } = [];
     public Guid Line { get; set; }

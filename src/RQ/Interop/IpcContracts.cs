@@ -336,9 +336,15 @@ public sealed record DeliveredStowLine
     public int Stowed { get; init; }
     public string Code { get; init; } = string.Empty;
     public IReadOnlyList<string> Destinations { get; init; } = [];
-    /// <summary>Present only for an item with homes on another character (capability <c>deliveredStowForward.v1</c>).</summary>
+    /// <summary>
+    /// The first of <see cref="Forwards"/>, kept for <c>deliveredStowForward.v1</c> callers. Present only for an item
+    /// with homes on another character.
+    /// </summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public DeliveredStowForwardLine? Forward { get; init; }
+    /// <summary>One forward per other character the item's ranked homes send units to, in rank order. Null when none.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<DeliveredStowForwardLine>? Forwards { get; init; }
 }
 
 /// <summary>A character of this account, by its stable identity.</summary>
@@ -464,10 +470,12 @@ public sealed record PlacementDestination
 
 /// <summary>
 /// <c>gooseworks-quartermaster-placement-edit/v1</c>: one placement editor action on these items, as the Placement
-/// window's toolbar applies it to selected rows. Operation: makeFirst, addFallback, remove, toggle (each needs
-/// Destination), useCurrentHolders or clearDestinations (no Destination). Character: whose destinations the action
-/// edits (the owner when absent); another character edits the item's remote homes. AllOrNothing: apply nothing when
-/// any item is refused.
+/// window's toolbar applies it to selected rows. Operation: makeFirst, addFallback, remove, toggle, setCap (each needs
+/// a Destination retainerId on Character), useCurrentHolders or clearDestinations (no Destination; both act on the
+/// item's whole ranked home list across characters). Character: the character the destination retainer belongs to
+/// (the owner when absent). MaxUnits: setCap's cap (null clears it; negative is refused). An item's homes are one
+/// ranked list across every character (<c>placementEdit.v2</c>); there is no "any space" destination.
+/// AllOrNothing: apply nothing when any item is refused.
 /// </summary>
 public sealed record PlacementEditRequest
 {
@@ -479,5 +487,6 @@ public sealed record PlacementEditRequest
     public string Operation { get; init; } = string.Empty;
     public PlacementCharacterRef? Character { get; init; }
     public PlacementDestination? Destination { get; init; }
+    public int? MaxUnits { get; init; }
     public bool AllOrNothing { get; init; }
 }

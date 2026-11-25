@@ -2,108 +2,174 @@ using RQ.Domain;
 
 namespace RQ.Planning;
 
-/// <summary>A placement editor action, applied to the destinations one character shows for an item.</summary>
+/// <summary>A placement editor action on a reserve item's ranked homes.</summary>
 public enum PlacementOperation
 {
     MakeFirst,
     AddFallback,
     Remove,
     Toggle,
+    SetCap,
     UseCurrentHolders,
     ClearDestinations,
 }
 
-/// <summary>
-/// A reserve item's homes after an edit on one shown character. <see cref="RemoteMovedFrom"/> names the character
-/// whose remote homes the edit replaced; <see cref="RemoteKeptOn"/> names the character whose remote homes a clear
-/// shown elsewhere left in place.
-/// </summary>
-public sealed record PlacementResolution(
-    StowageRoutingPolicy Local,
-    ReserveRemoteHomes? Remote,
-    bool LocalChanged,
-    bool RemoteChanged,
-    OwnerScope? RemoteMovedFrom,
-    OwnerScope? RemoteKeptOn)
-{
-    public bool Changed => LocalChanged || RemoteChanged;
-}
+/// <summary>Units one retainer of one character holds of an item, for <see cref="PlacementOperation.UseCurrentHolders"/>.</summary>
+public sealed record PlacementHolding(OwnerScope Character, ulong RetainerId, int Units);
 
 /// <summary>
-/// The placement editor's rules for one reserve item, shared by Quartermaster's Placement window and the
-/// placement IPC so the two cannot diverge. The editor shows one character at a time: the owner's own ranked homes
-/// (then Any space), or the item's remote homes when they are on the shown character. Another character offers no
-/// Any space, and an item has remote homes on one other character at most: editing it on a second character moves
-/// them there, while clearing it on a character it has no homes on leaves them where they are.
+/// The placement editor's rules for a reserve item's homes: one ranked chain across every character of the account
+/// (rank = index + 1), each home an explicit retainer with an optional cap. Shared by Quartermaster's placement
+/// surfaces and the placement IPC so they cannot diverge. Every operation returns a new list; none ever lists a
+/// retainer id of 0 (there is no "any space" home) or the same retainer twice.
 /// </summary>
 public static class ReservePlacement
 {
-    /// <summary>
-    /// The same character for placement: by content id when both carry one (a world transfer keeps it, so homes stored
-    /// under the old world stay with the character), else by name and world.
-    /// </summary>
-    public static bool SameCharacter(OwnerScope left, OwnerScope right) =>
-        left.LocalContentId is > 0 && right.LocalContentId is > 0
-            ? left.LocalContentId == right.LocalContentId
-            : left.Matches(right);
+    /// <summary>The same character for placement (by content id when both carry one, else by name and world).</summary>
+    public static bool SameCharacter(OwnerScope left, OwnerScope right) => PlacementHome.SameCharacter(left, right);
 
-    /// <summary>The destinations the editor shows for the item on <paramref name="shown"/>.</summary>
-    public static StowageRoutingPolicy Shown(OwnerScope owner, OwnerScope shown, StowageRoutingPolicy? local, ReserveRemoteHomes? remote) =>
-        SameCharacter(shown, owner)
-            ? StowageRoutingPolicy.CopyOf(local)
-            : remote is { RetainerIds.Count: > 0 } && SameCharacter(remote.Character, shown)
-                ? new StowageRoutingPolicy { PreferredRetainerIds = remote.RetainerIds.Distinct().ToList() }
-                : new StowageRoutingPolicy();
+    /// <summary>1-based global rank of the home, or 0 when not listed.</summary>
+    public static int Rank(IReadOnlyList<PlacementHome> homes, OwnerScope character, ulong retainerId)
+    {
+        for (var index = 0; index < homes.Count; index++)
+            if (homes[index].SameHome(character, retainerId))
+                return index + 1;
+        return 0;
+    }
+
+    /// <summary>Whether the operation targets one home.</summary>
+    public static bool NeedsDestination(PlacementOperation operation) =>
+        operation is PlacementOperation.MakeFirst or PlacementOperation.AddFallback or PlacementOperation.Remove or
+            PlacementOperation.Toggle or PlacementOperation.SetCap;
 
     /// <summary>
-    /// The editor action on the shown destinations. <paramref name="destination"/> is a retainer id or
-    /// <see cref="PlacementEdits.AnySpace"/>; <paramref name="holdings"/> is units per retainer of the shown character.
+    /// Applies one operation. <paramref name="character"/> and <paramref name="retainerId"/> name the home for the
+    /// single-home operations; <paramref name="maxUnits"/> is the cap for SetCap (null clears it); <paramref name="holdings"/>
+    /// is what each observed retainer holds, for UseCurrentHolders.
     /// </summary>
-    public static StowageRoutingPolicy Operate(
+    public static List<PlacementHome> Operate(
         PlacementOperation operation,
-        StowageRoutingPolicy shown,
-        ulong destination,
-        IReadOnlyDictionary<ulong, int> holdings) => operation switch
+        IReadOnlyList<PlacementHome> homes,
+        OwnerScope? character,
+        ulong retainerId,
+        int? maxUnits = null,
+        IEnumerable<PlacementHolding>? holdings = null)
+    {
+        if (NeedsDestination(operation) && (character is null || retainerId == 0))
+            throw new ArgumentException("A single-home placement operation needs a character and a retainer.", nameof(retainerId));
+        return operation switch
         {
-            PlacementOperation.MakeFirst => PlacementEdits.MakeFirst(shown, destination),
-            PlacementOperation.AddFallback => PlacementEdits.AddFallback(shown, destination),
-            PlacementOperation.Remove => PlacementEdits.Remove(shown, destination),
-            PlacementOperation.Toggle => PlacementEdits.Toggle(shown, destination),
-            PlacementOperation.UseCurrentHolders => PlacementEdits.WhereItLives(shown, holdings),
-            PlacementOperation.ClearDestinations => PlacementEdits.Clear(),
+            PlacementOperation.MakeFirst => MakeFirst(homes, character!, retainerId),
+            PlacementOperation.AddFallback => AddFallback(homes, character!, retainerId),
+            PlacementOperation.Remove => Remove(homes, character!, retainerId),
+            PlacementOperation.Toggle => Toggle(homes, character!, retainerId),
+            PlacementOperation.SetCap => SetCap(homes, character!, retainerId, maxUnits),
+            PlacementOperation.UseCurrentHolders => UseCurrentHolders(homes, holdings ?? []),
+            PlacementOperation.ClearDestinations => [],
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, null),
         };
+    }
 
-    /// <summary>Whether the operation targets one destination.</summary>
-    public static bool NeedsDestination(PlacementOperation operation) =>
-        operation is PlacementOperation.MakeFirst or PlacementOperation.AddFallback or PlacementOperation.Remove or PlacementOperation.Toggle;
-
-    /// <summary>The item's next local and remote homes once <paramref name="edited"/> replaces what <paramref name="shown"/> showed.</summary>
-    public static PlacementResolution Resolve(
-        OwnerScope owner,
-        OwnerScope shown,
-        StowageRoutingPolicy? local,
-        ReserveRemoteHomes? remote,
-        StowageRoutingPolicy edited)
+    /// <summary>Puts the home first, keeping its cap when it was already listed.</summary>
+    public static List<PlacementHome> MakeFirst(IReadOnlyList<PlacementHome> homes, OwnerScope character, ulong retainerId)
     {
-        var storedLocal = StowageRoutingPolicy.CopyOf(local);
-        var storedRemote = ReserveRemoteHomes.CopyOf(remote);
-        if (SameCharacter(shown, owner))
-        {
-            var nextLocal = StowageRoutingPolicy.CopyOf(edited);
-            return new(nextLocal, storedRemote, !nextLocal.SameAs(local ?? new StowageRoutingPolicy()), false, null, null);
-        }
+        var next = Copy(homes);
+        var index = next.FindIndex(home => home.SameHome(character, retainerId));
+        var moved = index >= 0 ? next[index] : new PlacementHome(character with { }, retainerId);
+        if (index >= 0)
+            next.RemoveAt(index);
+        next.Insert(0, moved);
+        return next;
+    }
 
-        // Another character offers no Any space: its homes are its ranked retainers only.
-        var ids = edited.PreferredRetainerIds.Where(id => id != PlacementEdits.AnySpace).Distinct().ToList();
-        var nextRemote = ids.Count == 0 ? null : new ReserveRemoteHomes { Character = shown with { }, RetainerIds = ids };
-        // Clearing an item shown here leaves the homes it has on another character alone.
-        if (nextRemote is null && storedRemote is not null && !SameCharacter(storedRemote.Character, shown))
-            return new(storedLocal, storedRemote, false, false, null, storedRemote.Character);
-        // Saved homes carry the character as shown now, so a character that changed worlds is re-stamped on its next edit.
-        var movedFrom = nextRemote is not null && storedRemote is not null && !SameCharacter(storedRemote.Character, shown)
-            ? storedRemote.Character
-            : null;
-        return new(storedLocal, nextRemote, false, !ReserveRemoteHomes.Same(storedRemote, nextRemote), movedFrom, null);
+    /// <summary>Appends the home uncapped; one already listed keeps its rank and cap.</summary>
+    public static List<PlacementHome> AddFallback(IReadOnlyList<PlacementHome> homes, OwnerScope character, ulong retainerId)
+    {
+        var next = Copy(homes);
+        if (!next.Any(home => home.SameHome(character, retainerId)))
+            next.Add(new(character with { }, retainerId));
+        return next;
+    }
+
+    /// <summary>Removes the home; the ranks after it close up.</summary>
+    public static List<PlacementHome> Remove(IReadOnlyList<PlacementHome> homes, OwnerScope character, ulong retainerId)
+    {
+        var next = Copy(homes);
+        next.RemoveAll(home => home.SameHome(character, retainerId));
+        return next;
+    }
+
+    public static List<PlacementHome> Toggle(IReadOnlyList<PlacementHome> homes, OwnerScope character, ulong retainerId) =>
+        homes.Any(home => home.SameHome(character, retainerId))
+            ? Remove(homes, character, retainerId)
+            : AddFallback(homes, character, retainerId);
+
+    /// <summary>
+    /// Sets the home's cap (a home not listed yet is appended with it), or clears it when <paramref name="maxUnits"/>
+    /// is null (nothing to do for a home not listed). A negative cap is refused.
+    /// </summary>
+    public static List<PlacementHome> SetCap(IReadOnlyList<PlacementHome> homes, OwnerScope character, ulong retainerId, int? maxUnits)
+    {
+        if (maxUnits is < 0)
+            throw new ArgumentOutOfRangeException(nameof(maxUnits), maxUnits, "A cap cannot be negative.");
+        var next = Copy(homes);
+        var index = next.FindIndex(home => home.SameHome(character, retainerId));
+        if (index >= 0)
+            next[index] = next[index] with { MaxUnits = maxUnits };
+        else if (maxUnits is not null)
+            next.Add(new(character with { }, retainerId, maxUnits));
+        return next;
+    }
+
+    /// <summary>
+    /// The retainers observed holding the item, across every shown character and most units first, ahead of the
+    /// homes already listed. A holder already listed keeps its cap. Unchanged when no retainer holds any.
+    /// </summary>
+    public static List<PlacementHome> UseCurrentHolders(IReadOnlyList<PlacementHome> homes, IEnumerable<PlacementHolding> holdings)
+    {
+        var holders = holdings
+            .Where(holding => holding.RetainerId != 0 && holding.Units > 0)
+            .GroupBy(holding => (Content: holding.Character.LocalContentId ?? 0, Name: holding.Character.CharacterName, holding.RetainerId))
+            .Select(group => group.First() with { Units = group.Max(holding => holding.Units) })
+            .OrderByDescending(holding => holding.Units)
+            .ThenBy(holding => holding.RetainerId)
+            .ToArray();
+        if (holders.Length == 0)
+            return Copy(homes);
+        var next = new List<PlacementHome>();
+        foreach (var holder in holders)
+        {
+            if (next.Any(home => home.SameHome(holder.Character, holder.RetainerId)))
+                continue;
+            next.Add(homes.FirstOrDefault(home => home.SameHome(holder.Character, holder.RetainerId))?.Copy()
+                     ?? new PlacementHome(holder.Character with { }, holder.RetainerId));
+        }
+        next.AddRange(homes.Where(home => !next.Any(listed => listed.SameHome(home.Character, home.RetainerId))).Select(home => home.Copy()));
+        return next;
+    }
+
+    /// <summary>Same homes, same order, same caps.</summary>
+    public static bool Same(IReadOnlyList<PlacementHome>? left, IReadOnlyList<PlacementHome>? right)
+    {
+        left ??= [];
+        right ??= [];
+        if (left.Count != right.Count)
+            return false;
+        for (var index = 0; index < left.Count; index++)
+        {
+            if (!left[index].SameHome(right[index].Character, right[index].RetainerId) || left[index].MaxUnits != right[index].MaxUnits)
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>A deep copy without retainer id 0 or repeated homes (the first of a repeat keeps its rank).</summary>
+    public static List<PlacementHome> Copy(IEnumerable<PlacementHome>? homes)
+    {
+        var next = new List<PlacementHome>();
+        foreach (var home in homes ?? [])
+            if (home.RetainerId != 0 && !next.Any(listed => listed.SameHome(home.Character, home.RetainerId)))
+                next.Add(home.Copy());
+        return next;
     }
 }
