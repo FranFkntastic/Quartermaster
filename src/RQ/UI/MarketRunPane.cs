@@ -38,7 +38,6 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
     private bool stowKnown;
     private string? status;
     private bool reorganizeRetainers;
-    private bool placementOnlyOpen;
     private DateTime? startAfterSave;
     private IReadOnlyList<MarketRunItem> items = [];
     internal MarketRunExecutor? Executor { get; set; }
@@ -68,14 +67,16 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         var plan = MarketRunPresentation.PlanView(draft);
         run = MarketRunPlanner.Evaluate(plan, runtime.Browser);
         stowByItem = [];
-        var bags = MarketRunPlanner.ProjectedStowRequests(plan.Id, plan.Reserves, run, runtime.Browser.Items
+        // Only this plan's items stow or relocate; placement for other items is never the run's business.
+        var placements = MarketRunPlanner.PlanPlacements(plan, PlacementCatalog.OwnerPlacements(runtime.State, runtime.Owner));
+        var bags = MarketRunPlanner.ProjectedStowRequests(plan.Id, placements, run, runtime.Browser.Items
             .SelectMany(i => i.Stacks).Where(s => s.ScopeKind == BrowserScopeKind.Player)
             .Select(s => (s.ItemId, s.Quality == FfxivItemQuality.HQ, s.Quantity)), runtime.Owner);
         stowKnown = bags is not null;
         if (bags is not null)
         {
             IReadOnlyList<StowageDepositRequest> moves = reorganizeRetainers
-                ? MarketRunPlanner.RelocationRequests(plan.Id, plan.Reserves, runtime.Retainers, runtime.Owner) : [];
+                ? MarketRunPlanner.RelocationRequests(plan.Id, placements, runtime.Retainers, runtime.Owner) : [];
             // Bag requests route first so relocation only gets the room stowing leaves (one projection for both):
             // the bag share is the same with or without the moves behind it.
             int Stack(uint id) => session.MaxStack(runtime.Browser, id);
@@ -84,8 +85,8 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
                 : PlacementRouter.LocalBatch(bags.Concat(moves), runtime.Retainers, runtime.Owner, Stack, DateTime.UtcNow).PlannedQuantity - stowed.PlannedQuantity;
             foreach (var route in stowed.Routes.Where(r => r.RoutedQuantity > 0))
             {
-                if (plan.Reserves.FirstOrDefault(r => r.Id == route.Request.SourceRuleId) is not { } reserve) continue;
-                var itemKey = (reserve.ItemId, reserve.Quality);
+                if (placements.FirstOrDefault(r => r.Id == route.Request.SourceRuleId) is not { } rule) continue;
+                var itemKey = (rule.ItemId, rule.Quality);
                 stowByItem[itemKey] = stowByItem.GetValueOrDefault(itemKey) + route.RoutedQuantity;
             }
             run = run with
@@ -341,14 +342,15 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
 
     private static string Capitalize(string text) => text.Length == 0 ? text : char.ToUpperInvariant(text[0]) + text[1..];
 
-    /// <summary>One plan per character: Start run saves pending edits, then runs against the saved plan.</summary>
+    /// <summary>Start run saves the active plan's pending edits, then runs against that saved plan.</summary>
     private void Start(QuartermasterRuntimeSnapshot runtime, ListingPlanDraftSession session)
     {
         status = null;
         if (!session.IsDirty)
         {
-            if (Executor is { } executor && ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner) is { } plan)
-                _ = executor.RunAsync(plan, run, session.IsDirty, reorganizeRetainers);
+            if (Executor is { } executor && session.Draft is { } draft &&
+                ListingPlanCatalog.FindPlan(runtime.State, runtime.Owner, draft.PlanId) is { } plan)
+                _ = executor.RunAsync(plan, run, session.IsDirty, reorganizeRetainers, OwnerPlacements(runtime));
             return;
         }
         session.Save(runtime);
@@ -372,12 +374,16 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
             status = "Plan saved; the run did not start. Press Start run again.";
             return;
         }
-        if (session.Draft is not { } draft || ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner) is not { } plan ||
-            plan.Id != draft.PlanId || plan.Revision != draft.SourceRevision) return;
+        if (session.Draft is not { } draft || ListingPlanCatalog.FindPlan(runtime.State, runtime.Owner, draft.PlanId) is not { } plan ||
+            plan.Revision != draft.SourceRevision) return;
         startAfterSave = null;
         Update(runtime, session);
-        _ = executor.RunAsync(plan, run, session.IsDirty, reorganizeRetainers);
+        _ = executor.RunAsync(plan, run, session.IsDirty, reorganizeRetainers, OwnerPlacements(runtime));
     }
+
+    /// <summary>The owner's placements, copied; the executor scopes them to the plan itself.</summary>
+    private static IReadOnlyList<ItemPlacementRule> OwnerPlacements(QuartermasterRuntimeSnapshot runtime) =>
+        PlacementCatalog.OwnerPlacements(runtime.State, runtime.Owner).Select(PlacementCatalog.Copy).ToArray();
 
     internal static string ResultOwnerLabel(OwnerScope owner) => string.IsNullOrWhiteSpace(owner.CharacterName)
         ? "Previous character's market run"
@@ -409,35 +415,10 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         var noProject = export.WithoutWorkshopProject.Select(l => (l.ItemId, l.Quality)).ToHashSet();
         var rows = new TableRows(runtime, session, draft, selected, noProject, layout, listedBar, showListed, showGoesTo,
             width, paneClipMin, paneClipMax);
-        var placementOnly = new List<MarketRunItem>();
         foreach (var item in items)
-        {
-            if (IsPlacementOnly(draft, item)) placementOnly.Add(item);
-            else DrawRow(item, rows);
-        }
-        if (placementOnly.Count > 0)
-        {
-            ImGui.TableNextRow(); ImGui.TableNextColumn();
-            ImGui.AlignTextToFramePadding();
-            ImGui.SetNextItemOpen(placementOnlyOpen);
-            ImGui.PushStyleColor(ImGuiCol.Text, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
-            placementOnlyOpen = ImGui.TreeNodeEx($"Placement only ({placementOnly.Count:N0})###RQMarketRunPlacementOnly",
-                ImGuiTreeNodeFlags.NoTreePushOnOpen | ImGuiTreeNodeFlags.SpanAvailWidth);
-            ImGui.PopStyleColor();
-            Registry?.RegisterLastItem("quartermaster.listings.market-run.placement-only", "Placement only items",
-                AgentBridgeUiControlKind.Toggle, true, placementOnlyOpen, $"{(placementOnlyOpen ? "open" : "closed")}, items={placementOnly.Count:N0}",
-                () => placementOnlyOpen = !placementOnlyOpen);
-            if (placementOnlyOpen)
-                foreach (var item in placementOnly) DrawRow(item, rows);
-        }
+            DrawRow(item, rows);
         ImGui.EndTable();
     }
-
-    /// <summary>No enabled listing assignment and no reserve units: the rule only records where the item lives.</summary>
-    private static bool IsPlacementOnly(ListingPlanDraft draft, MarketRunItem item) =>
-        item.ListedUnits is not { IsKnown: true, Value: > 0 } &&
-        !draft.Assignments.Any(a => a.Enabled && a.ItemId == item.ItemId && a.Quality == item.Quality) &&
-        !draft.Reserves.Any(r => r.ItemId == item.ItemId && r.Quality == item.Quality && r.ReserveUnits > 0);
 
     private sealed record TableRows(QuartermasterRuntimeSnapshot Runtime, ListingPlanDraftSession Session, ListingPlanDraft Draft,
         ListingRetainerRow? Selected, HashSet<(uint ItemId, ItemQualityPolicy Quality)> NoProject, RowLayout Layout,
@@ -464,7 +445,9 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         ImGui.TableNextColumn();
         DrawCraft(item, noProject.Contains((item.ItemId, item.Quality)));
         // The ranked homes across characters, in the order they take units.
-        var goesTo = reserve is null ? string.Empty : PlacementMatrixData.HomesSummary(runtime, reserve.Homes, runtime.Owner);
+        var goesTo = PlacementCatalog.Find(runtime.State, runtime.Owner, item.ItemId, item.Quality) is { } placement
+            ? PlacementMatrixData.HomesSummary(runtime, placement.Homes, runtime.Owner)
+            : string.Empty;
         if (showGoesTo) { ImGui.TableNextColumn(); DrawGoesTo(item, goesTo, "column"); }
         if (open)
         {
@@ -615,8 +598,16 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         ImGui.SetNextItemWidth(layout.Input);
         if (DalamudGroupedIntegerInput.InputGroupedInt("##reserve", ref units, 0, 0))
         {
-            reserve ??= session.AddReserve(item.ItemId, item.ItemName, item.Quality);
-            session.SetReserveUnits(reserve.Id, Math.Clamp(units, 0, ListingReserveRule.MaxReserveUnits).ToString());
+            // No reserve is no rule: zero removes it rather than leaving an empty stub in the plan.
+            if (units <= 0)
+            {
+                if (reserve is not null) session.RemoveReserve(reserve.Id);
+            }
+            else
+            {
+                reserve ??= session.AddReserve(item.ItemId, item.ItemName, item.Quality);
+                session.SetReserveUnits(reserve.Id, Math.Min(units, ListingReserveRule.MaxReserveUnits).ToString());
+            }
         }
         if (!layout.Compact && known && stays > units)
         {

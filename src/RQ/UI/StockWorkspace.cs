@@ -61,6 +61,7 @@ internal sealed class StockWorkspace
     private uint? focusedStockItemId;
     private IReadOnlyList<StockGroup> focusedStockItems = [];
     private long listingEvaluationRevision = -1;
+    private Guid? listingEvaluationPlanId;
     private ListingPlanEvaluation? stockListingEvaluation;
     private readonly VisibleItemIds stockVisible = new();
     private StockLookup? scopedLookup;
@@ -1091,7 +1092,7 @@ internal sealed class StockWorkspace
         };
     }
 
-    /// <summary>Every observed character's stock, plus items the logged-in character's listing plan wants.</summary>
+    /// <summary>Every observed character's stock, plus items any of the logged-in character's listing plans want.</summary>
     private IReadOnlyList<StockGroup> GetAccountItemsWithListingDemand(QuartermasterRuntimeSnapshot runtime, AccountStockProjection account)
     {
         if (accountItems is not { } cached || cached.Revision != runtime.PlanningRevision || !ReferenceEquals(cached.Account, account))
@@ -1104,12 +1105,12 @@ internal sealed class StockWorkspace
 
     private static IReadOnlyList<StockGroup> WithListingDemand(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> stock, string scopeKey)
     {
-        var plan = ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner);
-        if (plan is null)
+        var plans = ListingPlanCatalog.OwnerPlans(runtime.State, runtime.Owner);
+        if (plans.Count == 0)
             return stock;
 
         var existing = stock.Select(item => item.ItemId).ToHashSet();
-        var planned = plan.Assignments
+        var planned = plans.SelectMany(plan => plan.Assignments)
             .Where(assignment => assignment.Enabled && !existing.Contains(assignment.ItemId))
             .Where(assignment => ScopeIncludesAssignment(runtime, scopeKey, assignment))
             .GroupBy(assignment => assignment.ItemId)
@@ -1193,11 +1194,13 @@ internal sealed class StockWorkspace
 
     private ListingPlanEvaluation ResolveStockListingEvaluation(QuartermasterRuntimeSnapshot runtime)
     {
-        if (stockListingEvaluation is null || listingEvaluationRevision != runtime.PlanningRevision)
+        // The Market tab's active plan (selected, else the default).
+        var plan = ListingPlanCatalog.SelectedOrDefault(runtime.State, runtime.Owner, workbench.SelectedListingPlanId);
+        if (stockListingEvaluation is null || listingEvaluationRevision != runtime.PlanningRevision || listingEvaluationPlanId != plan?.Id)
         {
-            stockListingEvaluation = ListingPlanEvaluator.Evaluate(
-                ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner), runtime.Browser);
+            stockListingEvaluation = ListingPlanEvaluator.Evaluate(plan, runtime.Browser);
             listingEvaluationRevision = runtime.PlanningRevision;
+            listingEvaluationPlanId = plan?.Id;
         }
         return stockListingEvaluation;
     }
@@ -2483,7 +2486,7 @@ internal sealed class StockWorkspace
                 ? workbench.SelectedStockListingQuality : navigationQualities[0];
             if (ImGui.SmallButton("Show in Market")) showInListings(runtime, new(itemId, quality));
         }
-        var listingPlan = ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner);
+        var listingPlan = ListingPlanCatalog.SelectedOrDefault(runtime.State, runtime.Owner, workbench.SelectedListingPlanId);
         var demand = ResolveStockListingEvaluation(runtime).Items
             .Where(item => item.ItemId == single.ItemId && item.IsPlanned)
             .ToArray();

@@ -153,13 +153,22 @@ public static class PlacementRouter
         return LocalBatch(routes, observed, owner, maxStackSize, nowUtc);
     }
 
-    /// <summary>The owner's homes of a rule, in global rank order: its routing for owner stowage, and their caps.</summary>
-    public static (StowageRoutingPolicy Routing, IReadOnlyDictionary<ulong, int> Caps) OwnerRouting(ListingReserveRule rule, OwnerScope owner)
+    /// <summary>The owner's homes of a placement rule, in global rank order: its routing for owner stowage, and their caps.</summary>
+    public static (StowageRoutingPolicy Routing, IReadOnlyDictionary<ulong, int> Caps) OwnerRouting(ItemPlacementRule rule, OwnerScope owner) =>
+        OwnerRouting(rule.Homes, rule.Consolidate, owner);
+
+    /// <summary>The owner's homes among <paramref name="homes"/>, in global rank order: routing for owner stowage, and their caps.</summary>
+    public static (StowageRoutingPolicy Routing, IReadOnlyDictionary<ulong, int> Caps) OwnerRouting(
+        IReadOnlyList<PlacementHome> homes, bool consolidate, OwnerScope owner)
     {
-        var mine = rule.Homes.Where(home => PlacementHome.SameCharacter(home.Character, owner)).ToArray();
-        return (new StowageRoutingPolicy { PreferredRetainerIds = mine.Select(home => home.RetainerId).Distinct().ToList(), Consolidate = rule.Consolidate },
+        var mine = homes.Where(home => PlacementHome.SameCharacter(home.Character, owner)).ToArray();
+        return (new StowageRoutingPolicy { PreferredRetainerIds = mine.Select(home => home.RetainerId).Distinct().ToList(), Consolidate = consolidate },
             mine.Where(home => home.MaxUnits is not null).GroupBy(home => home.RetainerId).ToDictionary(group => group.Key, group => group.First().MaxUnits!.Value));
     }
+
+    /// <summary>Whether any of the homes is one of the owner's own retainers.</summary>
+    public static bool HasOwnerHome(IReadOnlyList<PlacementHome> homes, OwnerScope owner) =>
+        homes.Any(home => PlacementHome.SameCharacter(home.Character, owner));
 
     private static CachedRetainer? Retainer(PlacementHome home, IReadOnlyDictionary<ulong, CachedRetainer> observed, Dictionary<ulong, CachedRetainer> projected)
     {

@@ -7,6 +7,7 @@ using Franthropy.Dalamud.AgentBridge;
 using Franthropy.Dalamud.UI.Inputs;
 using Franthropy.Dalamud.UI.Layout;
 using Franthropy.Dalamud.UI.Tables;
+using Franthropy.Dalamud.UI.Windows;
 using Franthropy.FFXIV.Filtering;
 using RQ.Automation;
 using RQ.Domain;
@@ -23,6 +24,7 @@ internal sealed class ListingWorkspace
     private readonly ListingNavigationCoordinator navigation;
     private readonly AgentBridgeUiReviewRegistry registry;
     private readonly ListingPlanDraftSession session;
+    private readonly Func<QuartermasterRuntimeSnapshot> runtimeSnapshots;
     private readonly Func<string, int, IReadOnlyList<ItemChoice>> searchItems;
     private const float RunPaneMinWidth = 240;
     private const float RunPaneDefaultFraction = .40f;
@@ -38,6 +40,10 @@ internal sealed class ListingWorkspace
     private readonly MarketRunPane runPane;
     private readonly PlacementMatrix<(uint ItemId, ItemQualityPolicy Quality)> placement;
     private bool placementView;
+    private Guid? renamingPlanId;
+    private string renameText = string.Empty;
+    private string? renameIssue;
+    private bool renameFocusRequested;
     private readonly Dalamud.Plugin.Services.IPluginLog log;
     private bool openFirstRegistered;
     private string? duplicateRowsWarned;
@@ -71,9 +77,11 @@ internal sealed class ListingWorkspace
     public ListingWorkspace(WorkbenchState workbench, ListingNavigationCoordinator navigation,
         AgentBridgeUiReviewRegistry registry, ListingPlanDraftSession session,
         Func<string, int, IReadOnlyList<ItemChoice>> searchItems, Func<uint, bool?> listability,
-        RetainerRefreshCoordinator refresh, MarketRunPane runPane, Dalamud.Plugin.Services.IPluginLog log)
+        RetainerRefreshCoordinator refresh, MarketRunPane runPane, Dalamud.Plugin.Services.IPluginLog log,
+        Func<QuartermasterRuntimeSnapshot> runtimeSnapshots)
     {
         this.log = log;
+        this.runtimeSnapshots = runtimeSnapshots;
         this.workbench = workbench; this.navigation = navigation; this.registry = registry; this.session = session;
         this.searchItems = searchItems; this.listability = listability; this.refresh = refresh; this.runPane = runPane;
         placement = new("quartermaster.listings.placement", "Spare", registry);
@@ -128,7 +136,7 @@ internal sealed class ListingWorkspace
         if (session.Draft is null) return [];
         if (projectionKey != (runtime.PlanningRevision, session.Version))
         {
-            var savedIds = ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner)?.Assignments.Where(a => a.Enabled).Select(a => a.ItemId).ToHashSet() ?? [];
+            var savedIds = ListingPlanCatalog.FindPlan(runtime.State, runtime.Owner, session.Draft.PlanId)?.Assignments.Where(a => a.Enabled).Select(a => a.ItemId).ToHashSet() ?? [];
             projection = ListingRetainerProjection.Build(session.Draft, runtime.Browser, session.CurrentRetainerIds(runtime),
                 listability, savedIds);
             dirtyRetainers = session.DirtyRetainerIds();
@@ -166,6 +174,7 @@ internal sealed class ListingWorkspace
         if (!ReferenceEquals(previousDraft, session.Draft))
         { catalogs.Clear(); choiceCache.Clear(); itemOpenStatus = null; ResetSlots(null); }
         previousDraft = session.Draft;
+        DrawPlanHeader(runtime, session.Draft);
         // Expansion moving to another retainer, or collapsing this one, ends the slot selection.
         if (slotRetainerId is { } slotRetainer && (!workbench.IsListingExpanded(slotRetainer) || workbench.SelectedListingRetainerId != slotRetainer))
             ResetSlots(null);
@@ -254,6 +263,136 @@ internal sealed class ListingWorkspace
         ImGui.EndChild();
     }
 
+    /// <summary>The active Listing Plan's selector (or its inline rename) and the plan menu.</summary>
+    private void DrawPlanHeader(QuartermasterRuntimeSnapshot runtime, ListingPlanDraft draft)
+    {
+        const string menuLabel = "…##RQListingPlanMenu";
+        var width = Math.Max(120f, ImGui.GetContentRegionAvail().X - DalamudUiLayout.ButtonWidth(menuLabel) - ImGui.GetStyle().ItemSpacing.X);
+        if (renamingPlanId == draft.PlanId)
+            DrawPlanRename(runtime, width);
+        else
+            DrawPlanSelector(runtime, draft, width);
+        ImGui.SameLine();
+        DrawPlanMenu(runtime, draft, menuLabel);
+    }
+
+    private void DrawPlanSelector(QuartermasterRuntimeSnapshot runtime, ListingPlanDraft draft, float width)
+    {
+        var plans = ListingPlanCatalog.OwnerPlans(runtime.State, runtime.Owner);
+        var preview = draft.IsNew ? $"{draft.Name} (unsaved)" : draft.Name;
+        if (session.IsDirty) preview += " *";
+        ImGui.SetNextItemWidth(width);
+        var open = ImGui.BeginCombo("##RQListingPlan", preview);
+        registry.RegisterLastAction(
+            "quartermaster.listings.plan.selector",
+            "Choose the active Listing Plan",
+            AgentBridgeUiControlKind.Select,
+            plans.Count > 0,
+            false,
+            string.Join(" | ", plans.Select(plan => plan.Id == draft.PlanId ? $"[{plan.Name}]" : plan.Name)),
+            new AgentBridgeActionArgumentSchema([new("name", AgentBridgeActionArgumentKind.String, Required: true)]),
+            arguments =>
+            {
+                var name = arguments is { ValueKind: System.Text.Json.JsonValueKind.Object } value &&
+                           value.TryGetProperty("name", out var nameValue) ? nameValue.GetString()?.Trim() : null;
+                var current = runtimeSnapshots();
+                var target = ListingPlanCatalog.OwnerPlans(current.State, current.Owner)
+                    .FirstOrDefault(plan => string.Equals(plan.Name, name, StringComparison.OrdinalIgnoreCase));
+                if (target is null) return AgentBridgeUiActionResult.Fail($"No Listing Plan named \"{name}\".");
+                return session.SelectPlan(current, target.Id)
+                    ? AgentBridgeUiActionResult.Ok($"Listing Plan \"{target.Name}\" is active.")
+                    : AgentBridgeUiActionResult.Fail(session.Error ?? "The Listing Plan could not be opened.");
+            });
+        if (!open) return;
+        if (draft.IsNew)
+            ImGui.Selectable($"{draft.Name} (unsaved)##plan:{draft.PlanId}", true);
+        foreach (var plan in plans)
+            if (ImGui.Selectable($"{plan.Name}##plan:{plan.Id}", plan.Id == draft.PlanId) && plan.Id != draft.PlanId)
+                session.SelectPlan(runtime, plan.Id);
+        ImGui.EndCombo();
+    }
+
+    private void DrawPlanRename(QuartermasterRuntimeSnapshot runtime, float width)
+    {
+        ImGui.SetNextItemWidth(width);
+        if (renameFocusRequested)
+        {
+            ImGui.SetKeyboardFocusHere();
+            renameFocusRequested = false;
+        }
+        var committed = ImGui.InputTextWithHint("##RQListingPlanRename", "Plan name", ref renameText, ListingPlanCatalog.MaxNameLength,
+            ImGuiInputTextFlags.EnterReturnsTrue | ImGuiInputTextFlags.AutoSelectAll);
+        if (renameIssue is not null && ImGui.IsItemHovered()) ImGui.SetTooltip(renameIssue);
+        if (ImGui.IsKeyPressed(ImGuiKey.Escape))
+        {
+            renamingPlanId = null;
+            renameIssue = null;
+            return;
+        }
+        if (committed) CommitRename(runtime);
+        else if (ImGui.IsItemDeactivated()) renamingPlanId = null;
+        if (renameIssue is not null)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(QuartermasterPalette.Amber, renameIssue);
+        }
+    }
+
+    private void StartRename(ListingPlanDraft draft)
+    {
+        renamingPlanId = draft.PlanId;
+        renameText = draft.Name;
+        renameIssue = null;
+        renameFocusRequested = true;
+    }
+
+    private void CommitRename(QuartermasterRuntimeSnapshot runtime)
+    {
+        renameIssue = session.RenamePlan(runtime, renameText);
+        if (renameIssue is null) renamingPlanId = null;
+        else renameFocusRequested = true;
+    }
+
+    private void DrawPlanMenu(QuartermasterRuntimeSnapshot runtime, ListingPlanDraft draft, string menuLabel)
+    {
+        if (ImGui.Button(menuLabel)) ImGui.OpenPopup("RQListingPlanMenu");
+        var planName = draft.Name;
+        registry.RegisterLastButton("quartermaster.listings.plan.new", "Create a new Listing Plan", true,
+            () => session.CreatePlan(runtimeSnapshots()), "Available");
+        registry.RegisterLastAction(
+            "quartermaster.listings.plan.rename",
+            "Rename the active Listing Plan",
+            AgentBridgeUiControlKind.Button,
+            true,
+            false,
+            planName,
+            new AgentBridgeActionArgumentSchema([new("name", AgentBridgeActionArgumentKind.String, Required: true)]),
+            arguments =>
+            {
+                var name = arguments is { ValueKind: System.Text.Json.JsonValueKind.Object } value &&
+                           value.TryGetProperty("name", out var nameValue) ? nameValue.GetString() ?? string.Empty : string.Empty;
+                return session.RenamePlan(runtimeSnapshots(), name) is { } issue
+                    ? AgentBridgeUiActionResult.Fail(issue)
+                    : AgentBridgeUiActionResult.Ok($"Listing Plan renamed to \"{name.Trim()}\".");
+            });
+        registry.RegisterLastButton("quartermaster.listings.plan.duplicate", "Duplicate the active Listing Plan", !draft.IsNew,
+            () => session.DuplicatePlan(runtimeSnapshots()), draft.IsNew ? "Save the plan first" : planName);
+        registry.RegisterLastButton("quartermaster.listings.plan.delete", "Delete the active Listing Plan", true,
+            () => session.DeletePlan(runtimeSnapshots()), planName);
+
+        if (!DalamudOwnedPopup.BeginOpaquePopup("RQListingPlanMenu")) return;
+        if (ImGui.MenuItem("New plan")) session.CreatePlan(runtime);
+        if (ImGui.MenuItem("Rename")) StartRename(draft);
+        if (ImGui.MenuItem("Duplicate", string.Empty, false, !draft.IsNew)) session.DuplicatePlan(runtime);
+        ImGui.Separator();
+        if (ImGui.BeginMenu("Delete"))
+        {
+            if (ImGui.MenuItem(draft.IsNew ? $"Discard \"{planName}\"" : $"Delete \"{planName}\"")) session.DeletePlan(runtime);
+            ImGui.EndMenu();
+        }
+        ImGui.EndPopup();
+    }
+
     /// <summary>Swaps the retainer list for the placement matrix; an item name filters it to that item.</summary>
     private void OpenPlacement(string? itemName)
     {
@@ -267,13 +406,14 @@ internal sealed class ListingWorkspace
         if (ImGui.SmallButton("Return to retainer list##RQPlacementReturn")) placementView = false;
         registry.RegisterLastButton("quartermaster.listings.placement.return", "Return to retainer list", true,
             () => placementView = false, "Ready");
-        if (session.Draft is not { } draft) return;
+        if (session.Draft is null) return;
+        // The active plan's items; their homes are account-wide placement, shared by every plan.
         var items = runPane.Items(runtime, session);
         var owner = runtime.Owner;
+        var placements = PlacementCatalog.OwnerPlacements(runtime.State, owner);
         var rows = items.Select(item =>
         {
-            var reserve = draft.Reserves.FirstOrDefault(r => r.ItemId == item.ItemId && r.Quality == item.Quality);
-            var homes = reserve?.Homes ?? [];
+            IReadOnlyList<PlacementHome> homes = PlacementCatalog.Find(placements, owner, item.ItemId, item.Quality)?.Homes ?? [];
             var (routing, ranks, caps) = PlacementMatrixData.Homes(homes, owner);
             return new PlacementMatrixRow<(uint, ItemQualityPolicy)>(
                 (item.ItemId, item.Quality),
@@ -299,14 +439,13 @@ internal sealed class ListingWorkspace
             {
                 var item = items.FirstOrDefault(i => i.ItemId == key.ItemId && i.Quality == key.Quality);
                 if (item is null) continue;
-                var existing = draft.Reserves.FirstOrDefault(r => r.ItemId == key.ItemId && r.Quality == key.Quality);
+                var existing = PlacementCatalog.Find(placements, owner, key.ItemId, key.Quality)?.Homes;
                 var holdings = PlacementMatrixData.Holdings(runtime, item.ItemId, item.Quality)
                     .Select(entry => new PlacementHolding(owner, entry.Key, entry.Value));
-                var next = ReservePlacement.Operate(operation, existing?.Homes ?? [], owner, retainerId, cap, holdings);
-                if (ReservePlacement.Same(existing?.Homes, next)) continue;
-                // Placing an item without a reserve rule creates the rule, as typing a level does.
-                var reserve = existing ?? session.AddReserve(item.ItemId, item.ItemName, item.Quality);
-                session.SetReserveHomes(reserve.Id, next);
+                var next = ReservePlacement.Operate(operation, existing ?? [], owner, retainerId, cap, holdings);
+                if (ReservePlacement.Same(existing, next)) continue;
+                // Placement saves at once and never dirties the Listing Plan draft.
+                session.SavePlacement(owner, item.ItemId, item.ItemName, item.Quality, next);
             }
             return true;
         });

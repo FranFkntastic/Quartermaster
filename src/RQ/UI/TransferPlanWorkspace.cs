@@ -2265,9 +2265,7 @@ internal sealed partial class TransferPlanWorkspace
             .OrderBy(rule => rule.ItemName, StringComparer.OrdinalIgnoreCase)
             .ToArray();
         var effectiveRules = ListingPlanEvaluator.ComposeRules(runtime.State, runtime.Browser, runtime.Owner, plan.Id);
-        var listingEvaluation = ListingPlanEvaluator.Evaluate(ListingPlanCatalog.OwnerPlan(runtime.State, runtime.Owner), runtime.Browser);
-        var listingContributions = ListingPlanEvaluator.Contributions(runtime.State, plan.Id, listingEvaluation)
-            .ToDictionary(contribution => (contribution.Link.ItemId, contribution.Link.Quality));
+        var listingContributions = ListingPlanEvaluator.LinkedDemand(runtime.State, runtime.Browser, runtime.Owner, plan.Id);
         var stowage = StowageEvaluator.BuildPlan(
             runtime.State,
             runtime.Browser,

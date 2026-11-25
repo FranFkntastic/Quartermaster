@@ -16,7 +16,7 @@ internal static class MarketRunPresentation
 
     internal static ListingPlan PlanView(ListingPlanDraft draft) => new()
     {
-        Id = draft.PlanId, Revision = draft.SourceRevision, Owner = draft.Owner,
+        Id = draft.PlanId, Revision = draft.SourceRevision, Owner = draft.Owner, Name = draft.Name,
         Assignments = draft.Assignments.Select(ListingPlanCatalog.Copy).ToList(),
         Reserves = draft.Reserves.Select(ListingPlanCatalog.Copy).ToList(),
     };

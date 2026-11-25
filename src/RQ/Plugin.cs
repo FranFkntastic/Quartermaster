@@ -269,7 +269,7 @@ public sealed class Plugin : IDalamudPlugin
                 saddlebagDriver, CountCachedSaddlebagItems, message => log.Information(message),
                 id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.Item>().GetRowOrDefault(id)?.StackSize is > 0 and var size
                     ? checked((int)size) : throw new InvalidOperationException($"Stack size unavailable for item {id}.")),
-            automation, () => state.Read(s => ListingPlanCatalog.OwnerPlan(s, CurrentOwner())), marketRunStore.Save, autoRetainerSuppression, clear: marketRunStore.Clear, warning: message => log.Warning(message),
+            automation, planId => state.Read(s => ListingPlanCatalog.FindPlan(s, CurrentOwner(), planId)), marketRunStore.Save, autoRetainerSuppression, clear: marketRunStore.Clear, warning: message => log.Warning(message),
             information: message => log.Information(message), retainerRoster: cache.Snapshot);
         marketRuns.Restore(marketRunStore.Load());
         activeMarketRuns = marketRuns;
@@ -421,6 +421,8 @@ public sealed class Plugin : IDalamudPlugin
         // The placement channels run on the framework thread (inline when the caller is already on it).
         workbenchStock.RunOnFramework = work => framework.RunOnFrameworkThread(work).GetAwaiter().GetResult();
         workbenchStock.ItemNames = scanner.ResolveItemName;
+        // Reserve IPC reads and writes the Market tab's active Listing Plan.
+        workbenchStock.SelectedListingPlanId = () => window.SelectedListingPlanId;
         ipc.AttachWorkbench(workbenchStock);
         var marketHistory = new MarketRunHistoryWindow(marketRunStore.History, CurrentOwner, window.DrawTimings)
         {

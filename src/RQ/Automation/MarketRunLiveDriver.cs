@@ -251,7 +251,7 @@ internal sealed class MarketRunLiveDriver(
     }
     internal const string SaddlebagKind = "SaddlebagRetrieval";
 
-    public async Task<IReadOnlyList<string>> StowAsync(Guid planId, IReadOnlyList<ListingReserveRule> reserves,
+    public async Task<IReadOnlyList<string>> StowAsync(Guid planId, IReadOnlyList<ItemPlacementRule> planPlacements,
         IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token,
         Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged,
         bool reorganizeRetainers)
@@ -261,11 +261,11 @@ internal sealed class MarketRunLiveDriver(
         owner = currentOwner();
         check();
         var player = await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
-        var requests = MarketRunPlanner.StowRequests(planId, reserves,
+        var requests = MarketRunPlanner.StowRequests(planId, planPlacements,
             player.Stacks.Select(s => (s.ItemId, s.IsHighQuality, s.Quantity)), owner);
         var reports = (await DepositRequestsAsync(requests, lease, check, token, receiptChanged, reportChanged, false).ConfigureAwait(false)).ToList();
         if (reorganizeRetainers)
-            reports.AddRange(await RelocateAsync(planId, reserves, lease, check, token, receiptChanged, reportChanged).ConfigureAwait(false));
+            reports.AddRange(await RelocateAsync(planId, planPlacements, lease, check, token, receiptChanged, reportChanged).ConfigureAwait(false));
         return reports;
     }
 
@@ -328,11 +328,11 @@ internal sealed class MarketRunLiveDriver(
         return reports;
     }
 
-    private async Task<IReadOnlyList<string>> RelocateAsync(Guid planId, IReadOnlyList<ListingReserveRule> reserves,
+    private async Task<IReadOnlyList<string>> RelocateAsync(Guid planId, IReadOnlyList<ItemPlacementRule> planPlacements,
         IDisposable lease, Action check, CancellationToken token, Action<MarketMutationReceipt> receiptChanged, Action<string> reportChanged)
     {
         var reports = new List<string>();
-        foreach (var request in MarketRunPlanner.RelocationRequests(planId, reserves, cache.Snapshot(), owner))
+        foreach (var request in MarketRunPlanner.RelocationRequests(planId, planPlacements, cache.Snapshot(), owner))
         {
             // Finish each batch's deposit before retrieving more; never retry a refused or ambiguous move.
             var sources = cache.Snapshot().Values.Where(r => r.Owner.Matches(owner) &&

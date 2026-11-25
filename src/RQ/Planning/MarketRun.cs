@@ -80,33 +80,66 @@ public sealed record MarketRunEvaluation(
 /// </summary>
 public static class MarketRunPlanner
 {
-    /// <summary>Whether the reserve has a home among the owner's own retainers (the market run's stow targets).</summary>
-    public static bool HasOwnerHome(ListingReserveRule reserve, OwnerScope owner) =>
-        reserve.Homes.Any(home => PlacementHome.SameCharacter(home.Character, owner));
+    /// <summary>
+    /// Every (item, quality) the plan owns: an enabled assignment, or an enabled reserve that keeps units. A market run
+    /// for the plan touches these items and nothing else.
+    /// </summary>
+    public static HashSet<ListingItemKey> PlanItems(ListingPlan plan) =>
+        plan.OwnedItems.Select(item => new ListingItemKey(item.ItemId, item.Quality)).ToHashSet();
 
     /// <summary>
-    /// Every bag unit of a reserve item that has homes on the owner: routed over those homes in their global rank order
-    /// with their caps (<see cref="PlacementRouter.LocalBatch(IEnumerable{StowageDepositRequest}, IReadOnlyDictionary{ulong, CachedRetainer}, OwnerScope, Func{uint, int}, DateTime)"/>).
-    /// Homes on other characters are the courier's, never the market run's.
+    /// The owner's placement rules for the plan's own items (<see cref="PlanItems"/>) that have a home on the plan owner:
+    /// the only rules a market run for the plan may stow or relocate by. Rules for items outside the plan are dropped
+    /// even when those items sit in the bags or retainers.
+    /// </summary>
+    public static IReadOnlyList<ItemPlacementRule> PlanPlacements(ListingPlan plan, IEnumerable<ItemPlacementRule> ownerPlacements)
+    {
+        var items = PlanItems(plan);
+        return ownerPlacements
+            .Where(rule => rule.ItemId > 0 && items.Contains(new ListingItemKey(rule.ItemId, rule.Quality)) &&
+                           PlacementHome.SameCharacter(rule.Owner, plan.Owner) && PlacementRouter.HasOwnerHome(rule.Homes, plan.Owner))
+            .GroupBy(rule => (rule.ItemId, rule.Quality))
+            .Select(group => group.First())
+            .ToArray();
+    }
+
+    private static bool QualityMatches(ItemQualityPolicy quality, bool hq) =>
+        !(quality == ItemQualityPolicy.NqOnly && hq || quality == ItemQualityPolicy.HqOnly && !hq);
+
+    /// <summary>Bag stow for the plan's own items only: the plan-scoped overload over <see cref="PlanPlacements"/>.</summary>
+    public static IReadOnlyList<StowageDepositRequest> StowRequests(ListingPlan plan,
+        IEnumerable<ItemPlacementRule> ownerPlacements, IEnumerable<(uint ItemId, bool Hq, int Quantity)> stacks, OwnerScope owner) =>
+        StowRequests(plan.Id, PlanPlacements(plan, ownerPlacements), stacks, owner);
+
+    /// <summary>
+    /// Every bag unit of a plan-scoped placement item that has homes on the owner: routed over those homes in their
+    /// global rank order with their caps (<see cref="PlacementRouter.LocalBatch(IEnumerable{StowageDepositRequest}, IReadOnlyDictionary{ulong, CachedRetainer}, OwnerScope, Func{uint, int}, DateTime)"/>).
+    /// Homes on other characters are the courier's, never the market run's. <paramref name="planPlacements"/> must
+    /// already be scoped to the plan (<see cref="PlanPlacements"/>).
     /// </summary>
     public static IReadOnlyList<StowageDepositRequest> StowRequests(Guid planId,
-        IEnumerable<ListingReserveRule> reserves, IEnumerable<(uint ItemId, bool Hq, int Quantity)> stacks, OwnerScope owner)
+        IEnumerable<ItemPlacementRule> planPlacements, IEnumerable<(uint ItemId, bool Hq, int Quantity)> stacks, OwnerScope owner)
     {
         var remaining = stacks.GroupBy(s => (s.ItemId, s.Hq)).ToDictionary(g => g.Key, g => g.Sum(s => s.Quantity));
         var requests = new List<StowageDepositRequest>();
-        foreach (var reserve in reserves.Where(r => r.Enabled && r.ItemId > 0 && HasOwnerHome(r, owner)))
+        foreach (var rule in planPlacements.Where(r => r.ItemId > 0 && PlacementRouter.HasOwnerHome(r.Homes, owner)))
         foreach (var hq in new[] { false, true })
         {
-            if (reserve.Quality == ItemQualityPolicy.NqOnly && hq || reserve.Quality == ItemQualityPolicy.HqOnly && !hq) continue;
-            var key = (reserve.ItemId, hq);
+            if (!QualityMatches(rule.Quality, hq)) continue;
+            var key = (rule.ItemId, hq);
             var quantity = remaining.GetValueOrDefault(key);
             if (quantity <= 0) continue;
-            var (routing, caps) = PlacementRouter.OwnerRouting(reserve, owner);
-            requests.Add(new(planId, reserve.Id, reserve.ItemId, reserve.ItemName, hq, quantity, routing, Caps: caps));
-            remaining[key] = 0; // Overlapping policies must not authorize the same units twice.
+            var (routing, caps) = PlacementRouter.OwnerRouting(rule, owner);
+            requests.Add(new(planId, rule.Id, rule.ItemId, rule.ItemName, hq, quantity, routing, Caps: caps));
+            remaining[key] = 0; // Overlapping rules must not authorize the same units twice.
         }
         return requests;
     }
+
+    /// <summary>Projected bag stow for the plan's own items only (<see cref="PlanPlacements"/>).</summary>
+    public static IReadOnlyList<StowageDepositRequest>? ProjectedStowRequests(ListingPlan plan,
+        IEnumerable<ItemPlacementRule> ownerPlacements, MarketRunEvaluation run, IEnumerable<(uint ItemId, bool Hq, int Quantity)> bagStacks, OwnerScope owner) =>
+        ProjectedStowRequests(plan.Id, PlanPlacements(plan, ownerPlacements), run, bagStacks, owner);
 
     /// <summary>
     /// What the run's stow step will find in the bags once listing is done: today's bag stock, less the
@@ -114,7 +147,7 @@ public static class MarketRunPlanner
     /// plus pulled listings. Null when a refill amount is unknown.
     /// </summary>
     public static IReadOnlyList<StowageDepositRequest>? ProjectedStowRequests(Guid planId,
-        IEnumerable<ListingReserveRule> reserves, MarketRunEvaluation run, IEnumerable<(uint ItemId, bool Hq, int Quantity)> bagStacks, OwnerScope owner)
+        IEnumerable<ItemPlacementRule> planPlacements, MarketRunEvaluation run, IEnumerable<(uint ItemId, bool Hq, int Quantity)> bagStacks, OwnerScope owner)
     {
         var bags = bagStacks.GroupBy(s => (s.ItemId, s.Hq)).ToDictionary(g => g.Key, g => g.Sum(s => s.Quantity));
         foreach (var item in run.Items)
@@ -128,26 +161,35 @@ public static class MarketRunPlanner
             var key = (pull.Listing.ItemId, pull.Listing.Quality == FfxivItemQuality.HQ);
             bags[key] = bags.GetValueOrDefault(key) + pull.Listing.Quantity;
         }
-        return StowRequests(planId, reserves, bags.Select(b => (b.Key.ItemId, b.Key.Hq, b.Value)), owner);
+        return StowRequests(planId, planPlacements, bags.Select(b => (b.Key.ItemId, b.Key.Hq, b.Value)), owner);
     }
 
+    /// <summary>Retainer relocation for the plan's own items only (<see cref="PlanPlacements"/>).</summary>
+    public static IReadOnlyList<StowageDepositRequest> RelocationRequests(ListingPlan plan,
+        IEnumerable<ItemPlacementRule> ownerPlacements, IReadOnlyDictionary<ulong, CachedRetainer> cache, OwnerScope owner) =>
+        RelocationRequests(plan.Id, PlanPlacements(plan, ownerPlacements), cache, owner);
+
+    /// <summary>
+    /// Units of plan-scoped placement items held by the owner's retainers that are not their homes, to move home.
+    /// <paramref name="planPlacements"/> must already be scoped to the plan (<see cref="PlanPlacements"/>).
+    /// </summary>
     public static IReadOnlyList<StowageDepositRequest> RelocationRequests(Guid planId,
-        IEnumerable<ListingReserveRule> reserves, IReadOnlyDictionary<ulong, CachedRetainer> cache, OwnerScope owner)
+        IEnumerable<ItemPlacementRule> planPlacements, IReadOnlyDictionary<ulong, CachedRetainer> cache, OwnerScope owner)
     {
         var requests = new List<StowageDepositRequest>();
         var seen = new HashSet<(uint, bool)>();
-        foreach (var reserve in reserves.Where(r => r.Enabled && r.ItemId > 0 && HasOwnerHome(r, owner)))
+        foreach (var rule in planPlacements.Where(r => r.ItemId > 0 && PlacementRouter.HasOwnerHome(r.Homes, owner)))
         foreach (var hq in new[] { false, true })
         {
-            if (reserve.Quality == ItemQualityPolicy.NqOnly && hq || reserve.Quality == ItemQualityPolicy.HqOnly && !hq) continue;
-            if (!seen.Add((reserve.ItemId, hq))) continue;
-            var (routing, caps) = PlacementRouter.OwnerRouting(reserve, owner);
+            if (!QualityMatches(rule.Quality, hq)) continue;
+            if (!seen.Add((rule.ItemId, hq))) continue;
+            var (routing, caps) = PlacementRouter.OwnerRouting(rule, owner);
             var quantity = cache.Values.Where(r => r.Owner.Matches(owner) && r.IsCurrentlyAssigned is not false &&
                     r.IsUiAccessible is not false && !routing.PreferredRetainerIds.Contains(r.RetainerId))
                 .SelectMany(r => r.Bags.Where(b => b.BagName.StartsWith("RetainerPage", StringComparison.Ordinal)))
-                .SelectMany(b => b.Items).Where(i => i.ItemId == reserve.ItemId && i.IsHq == hq)
+                .SelectMany(b => b.Items).Where(i => i.ItemId == rule.ItemId && i.IsHq == hq)
                 .Sum(i => checked((int)i.Quantity));
-            if (quantity > 0) requests.Add(new(planId, reserve.Id, reserve.ItemId, reserve.ItemName, hq,
+            if (quantity > 0) requests.Add(new(planId, rule.Id, rule.ItemId, rule.ItemName, hq,
                 quantity, routing, Caps: caps));
         }
         return requests;
@@ -205,8 +247,9 @@ public static class MarketRunPlanner
         var counted = assignments.ToDictionary(assignment => assignment.Id, assignment =>
             Count(assignment, matchByAssignment.GetValueOrDefault(assignment.Id), ListingsComplete(projection, assignment.RetainerId)));
 
+        // Only reserves that keep units belong to the plan; a zero reserve owns nothing.
         var reserves = plan.Reserves
-            .Where(reserve => reserve.Enabled)
+            .Where(reserve => reserve.Enabled && reserve.ItemId > 0 && reserve.ReserveUnits > 0)
             .GroupBy(reserve => new ListingItemKey(reserve.ItemId, reserve.Quality))
             .ToDictionary(group => group.Key, group => group.First());
         var keys = assignments.Select(assignment => new ListingItemKey(assignment.ItemId, assignment.Quality))
