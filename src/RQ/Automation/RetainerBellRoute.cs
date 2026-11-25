@@ -1,4 +1,6 @@
 using System.Numerics;
+using Dalamud.Game.ClientState.Conditions;
+using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Franthropy.Dalamud.Automation.Retainers;
 using Franthropy.Dalamud.Travel;
@@ -8,6 +10,13 @@ namespace RQ.Automation;
 internal interface IRetainerBellRoute
 {
     Task<RetainerBellRouteResult> EnsureBellInRangeAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Waits, within <paramref name="budget"/>, until the character can act (loaded, not between areas or in a
+    /// cutscene, Lifestream idle) and has stayed that way briefly. Nothing is dispatched while waiting.
+    /// </summary>
+    Task<RetainerBellRouteResult> WaitUntilPlayerCanActAsync(TimeSpan budget, CancellationToken cancellationToken) =>
+        Task.FromResult(RetainerBellRouteResult.Succeeded("Readiness is not observed by this route."));
 
     void Cancel();
 }
@@ -30,6 +39,12 @@ internal interface IRetainerBellRoutePort
     bool SubmitAutomaticRetainerTravel();
 
     bool TryStopNavigation();
+
+    /// <summary>Whether Lifestream reports a running task; a missing Lifestream IPC reads as idle.</summary>
+    bool LifestreamBusy() => false;
+
+    /// <summary>Why the character cannot act yet (loading, between areas, cutscene), or null when it can.</summary>
+    string? PlayerNotReady() => null;
 }
 
 internal enum RetainerBellRouteStepState
@@ -48,12 +63,19 @@ internal sealed class RetainerBellRouteState
 {
     private static readonly TimeSpan RouteBudget = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan PathStartBudget = TimeSpan.FromSeconds(2);
+    // /li auto is swallowed when sent while the game is still settling; resend if Lifestream never picked it up.
+    private static readonly TimeSpan AutomaticTravelStartBudget = TimeSpan.FromSeconds(5);
+    private const int AutomaticTravelSubmissionLimit = 3;
     private const float ArrivalMargin = 0.75f;
 
     private readonly IRetainerBellRoutePort port;
     private readonly Func<DateTime> utcNow;
     private readonly DateTime deadline;
     private bool automaticTravelSubmitted;
+    private int automaticTravelSubmissions;
+    private DateTime automaticTravelSubmittedAt;
+    private bool automaticTravelObservedBusy;
+    private RetainerBellRouteStep? lastWait;
     private bool bellPathSubmitted;
     private bool bellPathObservedRunning;
     private bool ownsNavigation;
@@ -72,7 +94,9 @@ internal sealed class RetainerBellRouteState
     {
         var now = utcNow();
         if (now >= deadline)
-            return Fail("BellRouteTimedOut", "Timed out while acquiring an accessible summoning bell.");
+            return Fail("BellRouteTimedOut", lastWait is { } waited
+                ? $"Timed out while acquiring an accessible summoning bell; last waiting on {waited.Code}: {waited.Message}"
+                : "Timed out while acquiring an accessible summoning bell.");
 
         var bell = port.ObserveBell();
         var navigation = port.ObserveNavigation();
@@ -102,9 +126,12 @@ internal sealed class RetainerBellRouteState
             }
 
             if (automaticTravelSubmitted)
+            {
+                automaticTravelObservedBusy = true;
                 return Wait("AutomaticTravelRunning", "Automatic retainer travel is still running.");
+            }
 
-            return Fail("NavigationAlreadyRunning", "Another vnavmesh path is already running; Quartermaster did not take control of it.");
+            return Wait("NavigationAlreadyRunning", "Another vnavmesh path is running; waiting for it to finish without taking control of it.");
         }
 
         if (navigation.IsTransient)
@@ -146,28 +173,50 @@ internal sealed class RetainerBellRouteState
             return Fail("BellTargetLost", "The loaded summoning bell disappeared while Quartermaster was approaching it.");
 
         if (automaticTravelSubmitted)
+        {
+            var lifestreamBusy = port.LifestreamBusy();
+            if (navigation.IsRunning || lifestreamBusy)
+                automaticTravelObservedBusy = true;
+            // Lifestream never started: the command was swallowed, so nothing travelled. Send it again.
+            if (!automaticTravelObservedBusy &&
+                utcNow() - automaticTravelSubmittedAt >= AutomaticTravelStartBudget &&
+                automaticTravelSubmissions < AutomaticTravelSubmissionLimit &&
+                port.PlayerNotReady() is null)
+                return SubmitAutomaticTravel();
             return Wait(
-                navigation.IsRunning ? "AutomaticTravelRunning" : "WaitingForLoadedBell",
-                navigation.IsRunning
+                navigation.IsRunning || lifestreamBusy ? "AutomaticTravelRunning" : "WaitingForLoadedBell",
+                navigation.IsRunning || lifestreamBusy
                     ? "Automatic retainer travel is running."
                     : "Waiting for automatic retainer travel to load a summoning bell.");
+        }
 
         if (navigation.IsRunning)
-            return Fail("NavigationAlreadyRunning", "Another vnavmesh path is already running; Quartermaster did not take control of it.");
+            return Wait("NavigationAlreadyRunning", "Another vnavmesh path is running; waiting for it to finish without taking control of it.");
         if (navigation.IsTransient)
             return Wait("BellNavigationLoading", navigation.Message);
+        if (port.PlayerNotReady() is { } notReady)
+            return Wait("PlayerNotReady", notReady);
+        if (port.LifestreamBusy())
+            return Wait("LifestreamBusy", "Lifestream is still running another task; waiting before sending /li auto.");
+        return SubmitAutomaticTravel();
+    }
+
+    private RetainerBellRouteStep SubmitAutomaticTravel()
+    {
         if (!port.SubmitAutomaticRetainerTravel())
             return Fail("AutomaticRetainerTravelUnavailable", "Lifestream did not accept /li auto; no travel command was retried.");
 
         automaticTravelSubmitted = true;
-        return Wait("AutomaticTravelSubmitted", "Submitted /li auto once and is waiting for a summoning bell to load.");
+        automaticTravelSubmissions++;
+        automaticTravelSubmittedAt = utcNow();
+        return Wait("AutomaticTravelSubmitted", $"Submitted /li auto (attempt {automaticTravelSubmissions} of {AutomaticTravelSubmissionLimit}) and is waiting for a summoning bell to load.");
     }
 
     private RetainerBellRouteStep Succeed(string message) =>
         new(RetainerBellRouteStepState.Succeeded, "BellReady", message);
 
     private RetainerBellRouteStep Wait(string code, string message) =>
-        new(RetainerBellRouteStepState.Waiting, code, message);
+        (lastWait = new(RetainerBellRouteStepState.Waiting, code, message));
 
     private RetainerBellRouteStep Fail(string code, string message)
     {
@@ -225,6 +274,42 @@ internal sealed class RetainerBellRoute : IRetainerBellRoute, IDisposable
         }
     }
 
+    public async Task<RetainerBellRouteResult> WaitUntilPlayerCanActAsync(TimeSpan budget, CancellationToken cancellationToken)
+    {
+        var deadline = DateTime.UtcNow.Add(budget);
+        DateTime? readySince = null;
+        var sawNotReady = false;
+        string? lastReason = null;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var reason = await framework.RunOnTick(
+                () => port.PlayerNotReady() ?? (port.LifestreamBusy() ? "Lifestream is still running a task." : null),
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+            var now = DateTime.UtcNow;
+            if (reason is null)
+            {
+                readySince ??= now;
+                // Input sent in the first moments after a load or Lifestream task is often swallowed.
+                if (!sawNotReady || now - readySince.Value >= ReadySettle)
+                    return RetainerBellRouteResult.Succeeded("The character can act.");
+            }
+            else
+            {
+                sawNotReady = true;
+                readySince = null;
+                lastReason = reason;
+            }
+            if (now >= deadline)
+                return RetainerBellRouteResult.Failed(
+                    "PlayerNotReady",
+                    $"The character could not act within {budget.TotalSeconds:N0}s; last: {lastReason ?? "not settled"}. Nothing was sent.");
+            await framework.DelayTicks(10, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static readonly TimeSpan ReadySettle = TimeSpan.FromSeconds(2);
+
     public void Cancel()
     {
         lock (gate)
@@ -244,15 +329,24 @@ internal sealed class DalamudRetainerBellRoutePort : IRetainerBellRoutePort, IDi
     private readonly DalamudSummoningBellInteractor bellInteractor;
     private readonly DalamudVNavmeshTravel navigation;
     private readonly ICommandManager commands;
+    private readonly IDalamudPluginInterface? pluginInterface;
+    private readonly ICondition? condition;
+    private readonly IObjectTable? objects;
 
     public DalamudRetainerBellRoutePort(
         DalamudSummoningBellInteractor bellInteractor,
         DalamudVNavmeshTravel navigation,
-        ICommandManager commands)
+        ICommandManager commands,
+        IDalamudPluginInterface? pluginInterface = null,
+        ICondition? condition = null,
+        IObjectTable? objects = null)
     {
         this.bellInteractor = bellInteractor;
         this.navigation = navigation;
         this.commands = commands;
+        this.pluginInterface = pluginInterface;
+        this.condition = condition;
+        this.objects = objects;
     }
 
     public SummoningBellNavigationTargetObservation ObserveBell() => bellInteractor.ObserveNavigationTarget();
@@ -265,6 +359,27 @@ internal sealed class DalamudRetainerBellRoutePort : IRetainerBellRoutePort, IDi
     public bool SubmitAutomaticRetainerTravel() => commands.ProcessCommand("/li auto");
 
     public bool TryStopNavigation() => navigation.TryStop();
+
+    public bool LifestreamBusy()
+    {
+        if (pluginInterface is null)
+            return false;
+        try { return pluginInterface.GetIpcSubscriber<bool>(DalamudLifestreamAetheryteTravel.IsBusyChannel).InvokeFunc(); }
+        catch { return false; }
+    }
+
+    public string? PlayerNotReady()
+    {
+        if (objects is not null && objects.LocalPlayer is null)
+            return "No character is loaded yet.";
+        if (condition is null)
+            return null;
+        if (condition[ConditionFlag.BetweenAreas] || condition[ConditionFlag.BetweenAreas51])
+            return "The character is between areas.";
+        if (condition[ConditionFlag.OccupiedInCutSceneEvent] || condition[ConditionFlag.WatchingCutscene] || condition[ConditionFlag.WatchingCutscene78])
+            return "A cutscene is playing.";
+        return null;
+    }
 
     public void Dispose() => bellInteractor.Dispose();
 }
