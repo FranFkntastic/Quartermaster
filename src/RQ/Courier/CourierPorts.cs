@@ -61,7 +61,8 @@ public sealed record CourierMessage(int Version, Guid Run, Guid Step, CourierCom
     Guid? ConfirmStep = null, TradeEvidence? OwnerEvidence = null, string? RunKey = null, [property:System.Text.Json.Serialization.JsonIgnore(Condition=System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] InventoryView? CarrierBaseline=null);
 public sealed record CourierReceipt(Guid Run, Guid Step, InventoryView? Bags = null, TradeEvidence? Evidence = null,
     ImmutableArray<Shipment> Custody = default, Guid? Unconfirmed = null, Guid? LastConfirmed = null, Guid? ActiveRun = null);
-public sealed record CourierProgress(Guid Run, Guid Step, string Phase);
+/// <summary>A carrier step's progress; <paramref name="Waiting"/> names what a <see cref="CourierTradeStart.Preparing"/> heartbeat waits on.</summary>
+public sealed record CourierProgress(Guid Run, Guid Step, string Phase, string? Waiting = null);
 public interface ICourierPeerPort
 {
     event Action<CourierProgress> Progress;
@@ -296,7 +297,13 @@ internal sealed class CourierCalls(Action<string> warning)
         if (tasks.Length == 0) release();
         else _ = Task.WhenAll(tasks).ContinueWith(t => { _ = t.Exception; release(); }, TaskScheduler.Default);
     }
-    internal async Task<T> Call<T>(string name, int seconds, Func<Deadline, Task<Result<T>>> dispatch)
+    // A call's own poll sees the same deadline a tick later and names what it was still waiting for; it gets this long to say so.
+    private static readonly TimeSpan ReportGrace = TimeSpan.FromSeconds(1);
+    /// <summary>
+    /// Runs one port call under its own deadline. <paramref name="observation"/> marks a pure read (bags, position,
+    /// partner sighting, eligibility): one that runs out of time changed nothing, so it fails rather than reads as unverified.
+    /// </summary>
+    internal async Task<T> Call<T>(string name, int seconds, Func<Deadline, Task<Result<T>>> dispatch, bool observation = false)
     {
         var deadline = Deadline.After(name, seconds);
         var pending = dispatch(deadline);
@@ -305,17 +312,21 @@ internal sealed class CourierCalls(Action<string> warning)
         {
             var left = deadline.Expires - DateTimeOffset.UtcNow;
             if (left <= TimeSpan.Zero) throw new TimeoutException();
-            r = await pending.WaitAsync(left).ConfigureAwait(false);
+            try { r = await pending.WaitAsync(left).ConfigureAwait(false); }
+            catch (TimeoutException) { r = await pending.WaitAsync(ReportGrace).ConfigureAwait(false); }
         }
         catch (TimeoutException)
         {
             late.TryAdd(pending, 0);
             _ = pending.ContinueWith(t => { late.TryRemove(t, out _); warning($"LateArrival {name}: {t.Exception?.Message ?? t.Status.ToString()}"); },
                 CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-            throw new CourierFault(CourierOutcome.Indeterminate, name + "Deadline", $"{name}: {seconds}s elapsed.");
+            throw new CourierFault(observation ? CourierOutcome.Failed : CourierOutcome.Indeterminate, name + "Deadline", $"{name}: {seconds}s elapsed.");
         }
-        if (r.Outcome != CourierOutcome.Succeeded || r.Value == null || r.Value is false)
-            throw new CourierFault(r.Outcome == CourierOutcome.Succeeded ? CourierOutcome.Failed : r.Outcome, r.Code,
+        // A pure read whose own poll ran out of time (its *Deadline, reported within the grace) changed nothing either.
+        var outcome = observation && r.Outcome == CourierOutcome.Indeterminate && r.Code.EndsWith("Deadline", StringComparison.Ordinal)
+            ? CourierOutcome.Failed : r.Outcome;
+        if (outcome != CourierOutcome.Succeeded || r.Value == null || r.Value is false)
+            throw new CourierFault(outcome == CourierOutcome.Succeeded ? CourierOutcome.Failed : outcome, r.Code,
                 $"{name} ({seconds}s): {r.Detail}");
         return r.Value;
     }

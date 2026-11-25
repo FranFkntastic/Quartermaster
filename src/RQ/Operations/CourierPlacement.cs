@@ -154,6 +154,7 @@ public sealed partial class TransferCoordinator : ICourierPlacementPort
                 listUsed = true;
                 var result = await ExecuteRetrievalUnderLeaseAsync(id, lease, cancel.Token, leg);
                 var record = journal.Get(id);
+                if (NotStarted(result.Started, id, record, shipments[0].Name, result.Message) is { } unstarted) return unstarted;
                 if (!result.Started || record?.Status != OperationStatuses.Succeeded ||
                     record.Lines.Sum(l => l.TransferredQuantity) != shipments.Sum(s => s.Units))
                     return new(CourierOutcome.Indeterminate, "PlacementNotVerified", $"{shipments[0].Name}: {id}: {record?.Message ?? result.Message}");
@@ -192,9 +193,29 @@ public sealed partial class TransferCoordinator : ICourierPlacementPort
         recordOperation(id);
         var result = await ExecuteDepositUnderLeaseAsync(id, lease, cancel.Token, leg);
         var record = journal.Get(id);
+        if (NotStarted(result.Started, id, record, routes[0].Shipments[0].Name, result.Message) is { } unstarted) return unstarted;
         return result.Started && record?.Status == OperationStatuses.Succeeded &&
             record.Lines.Sum(l => l.TransferredQuantity) == requests.Sum(r => r.Quantity) ? Result<bool>.Ok(true) :
             new(CourierOutcome.Indeterminate, "PlacementNotVerified", $"{routes[0].Shipments[0].Name}: {id}: {record?.Message ?? result.Message}");
+    }
+    /// <summary>
+    /// The operation was journaled but refused before it began (still Accepted, nothing transferred): it moved nothing,
+    /// so the step failed rather than went unverified.
+    /// </summary>
+    private static bool NeverStarted(bool started, OperationRecord? record) =>
+        !started && record is { Status: OperationStatuses.Accepted } && record.Lines.All(l => l.TransferredQuantity == 0);
+    /// <summary>
+    /// A never-started operation is cancelled in the journal (code PlacementNotStarted) so nothing can execute it later;
+    /// a resume settles it, terminal with nothing transferred, as zero moved. Null when it started. If it began between
+    /// the read and the cancel, it is no longer provably unmoved and the step stays unverified.
+    /// </summary>
+    private Result<bool>? NotStarted(bool started, string id, OperationRecord? record, string name, string fallback)
+    {
+        if (!NeverStarted(started, record)) return null;
+        var detail = $"{name}: {id}: {record!.Message ?? fallback}";
+        try { journal.Transition(id, OperationStatuses.Cancelled, "PlacementNotStarted", $"Refused before it began: {record.Message ?? fallback}"); }
+        catch (InvalidOperationException) { return new(CourierOutcome.Indeterminate, "PlacementNotVerified", $"{detail} (started during cancellation)"); }
+        return Result<bool>.Fail("PlacementNotStarted", detail);
     }
     async Task<Result<bool>> ICourierPlacementPort.ConsolidateAsync(StowagePlan plan, ImmutableArray<CourierConsolidation> lines,
         IDisposable lease, Func<bool> authorized, Deadline deadline, Action<string> recordOperation)

@@ -38,7 +38,13 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     private readonly CourierStore<Dictionary<string,Guid>> submissions = new(Path.Combine(directory,"courier-travel.json"), warn);
     // Trade operations step through several UI states per slot; a coarse poll would add its full interval to each one.
     internal const int TradePollMilliseconds = 16;
-    internal async Task<Result<T>> Poll<T>(Deadline d, Func<Result<T>?> tick, bool primitiveDeadline = false, int pollMilliseconds = 100)
+    /// <summary>
+    /// Ticks on the framework thread until a result or the deadline. At the deadline the result is <paramref name="expiry"/>
+    /// (unverified unless the caller knows nothing it did can have an unknown effect), naming <paramref name="waiting"/>:
+    /// the last refusal or condition the poll was still waiting on.
+    /// </summary>
+    internal async Task<Result<T>> Poll<T>(Deadline d, Func<Result<T>?> tick, bool primitiveDeadline = false, int pollMilliseconds = 100,
+        Func<string>? waiting = null, CourierOutcome expiry = CourierOutcome.Indeterminate)
     {
         var token = unload.Token;
         while (!token.IsCancellationRequested)
@@ -48,7 +54,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
             {
                 token.ThrowIfCancellationRequested();
                 value = !primitiveDeadline && DateTimeOffset.UtcNow >= d.Expires
-                    ? new(CourierOutcome.Indeterminate,d.Name+"Deadline",d.Expires.ToString("O")) : tick();
+                    ? new(expiry,d.Name+"Deadline",waiting?.Invoke() is {Length:>0} why ? $"{d.Expires:O}; last: {why}" : d.Expires.ToString("O")) : tick();
             }, token).WaitAsync(token).ConfigureAwait(false);
             if (value != null) return value;
             await Task.Delay(pollMilliseconds, token).ConfigureAwait(false);
@@ -290,7 +296,8 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 if (path.Submitted) { walking=ownsPath=true; walkedAt=now(); walkTarget=seen.Position;watch=new(); }
                 else last+=$"; approach refused: {path.Code}";
                 return null;
-            });
+            // Seeing the partner and walking up to it trade nothing: running out of time changed nothing.
+            },waiting:()=>last,expiry:CourierOutcome.Failed);
             met=outcome.Outcome==CourierOutcome.Succeeded;
             return outcome;
         }
@@ -315,13 +322,16 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         var teleportMarker=Marker("Teleport",Step.Value);var pathMarker=Marker("Approach",Step.Value);
         bool teleported=teleportMarker.Already, moving=pathMarker.Already, arrived=false;
         var idle=new IdleWindow();var watch=new WalkWatch();var walkTarget=default(Vector3);
+        // A teleport is submitted only once the character has stood idle, with Lifestream free, for a whole window
+        // (right after a login, zone change or trade Lifestream refuses it); a refusal waits for another window.
+        var ready=new IdleWindow();bool settled=false;int refusals=0;var last="";
         var allowed=CanContinue.Value;
         var crystal=MainAetheryte(bell.Territory);
         Result<bool> Failure(string code,string detail){warn($"{code}: {bell.Label} on world {bell.World}: {detail}");return Result<bool>.Fail(code,detail);}
         try { var outcome=await Poll<bool>(d, () =>
         {
             if(allowed?.Invoke()==false)return new(CourierOutcome.Cancelled,"RouteStopped",d.Name);
-            if (Position() is not {} here) return null;
+            if (Position() is not {} here) {last="character not loaded";return null;}
             var at=new Vector3(here.X,here.Y,here.Z);
             if(ownsPath && watch.Stalled(this,at,walkTarget) is {} stalled)
             {
@@ -329,29 +339,39 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 return Failure("NavigationStalled",stalled);
             }
             if ((teleported || moving) && idle.Ready(this,moving))
-            {if(moving)ownsPath=false;teleported=moving=false;}
+            {if(moving)ownsPath=false;teleported=moving=false;settled=true;}
             if (here.World != bell.World) return Result<bool>.Fail("WrongRendezvousWorld",d.Name);
             if (crystal is not {} aetheryte) return Failure("PlazaAetheryteUnknown",$"Territory {bell.Territory} has no main aetheryte.");
             if (here.Territory != bell.Territory)
             {
-                if (teleported) return null;
+                if (teleported) {last="teleport submitted, not yet arrived";return null;}
                 if (!attuned.Any(a => a.AetheryteId == aetheryte)) return Result<bool>.Fail("NoAttunedAetheryte",bell.Territory.ToString());
+                if (!settled && !ready.Ready(this)) {if(last.Length==0)last="waiting for the character and Lifestream to settle";return null;}
                 teleportMarker.Save();
                 var result=teleport.TrySubmit(aetheryte);
                 teleported=result.Submitted;
-                return teleported || result.Retryable ? null : Result<bool>.Fail(result.Code,result.Message);
+                if (teleported || result.Retryable || result.State==AetheryteTravelSubmissionState.Rejected)
+                {
+                    settled=false;
+                    if (!teleported) last=TravelRefusal(result,ref refusals);
+                    return null;
+                }
+                return Result<bool>.Fail(result.Code,result.Message);
             }
             // The crystal streams in shortly after the zone loads; until then there is nothing to walk to.
-            if (objects.FirstOrDefault(o => o.ObjectKind == ObjectKind.Aetheryte && o.BaseId == aetheryte) is not {} live) return null;
+            if (objects.FirstOrDefault(o => o.ObjectKind == ObjectKind.Aetheryte && o.BaseId == aetheryte) is not {} live) {last="aetheryte not yet visible";return null;}
             if (Vector3.Distance(at,live.Position) <= PlazaArrivalRange) return Result<bool>.Ok(true);
-            if (moving || !IdleCharacter()) return null;
-            if (Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.SimpleMove.PathfindInProgress")) return null;
+            if (moving) {last="walking to the aetheryte";return null;}
+            if (!IdleCharacter()) {last="character busy";return null;}
+            if (Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.SimpleMove.PathfindInProgress")) {last="vnavmesh busy";return null;}
             pathMarker.Save();walkTarget=live.Position;
             var path=nav.TryMoveCloseTo(walkTarget,PlazaWalkRange);
             ownsPath=moving=path.Submitted;
             if(moving)watch=new();
+            if(!moving)last=$"walk {path.Code}: {path.Message}";
             return moving || path.Retryable ? null : Result<bool>.Fail(path.Code,path.Message);
-        }); arrived=outcome.Outcome==CourierOutcome.Succeeded; if(!arrived)warn($"{outcome.Code}: {outcome.Detail}");return outcome; }
+        // Travel never moves goods: a deadline here changed nothing and names what it last waited on.
+        },waiting:()=>last,expiry:CourierOutcome.Failed); arrived=outcome.Outcome==CourierOutcome.Succeeded; if(!arrived)warn($"{outcome.Code}: {outcome.Detail}");return outcome; }
         catch(Dalamud.Plugin.Ipc.Exceptions.IpcError e){return Failure("NavigationIpcUnavailable",e.Message);}
         finally
         {
@@ -372,6 +392,17 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
             if(now-since<TimeSpan.FromSeconds(5))return false;
             since=now;return true;
         }
+    }
+    /// <summary>
+    /// Names a teleport or aethernet submission Lifestream did not take. Rejected means it judged the game state not
+    /// ready (nothing was dispatched): the first one is a warning, later ones only update the deadline's reason.
+    /// </summary>
+    private string TravelRefusal(AetheryteTravelSubmissionResult result,ref int refusals)
+    {
+        var why=$"{result.Code}: {result.Message}";
+        if(result.State==AetheryteTravelSubmissionState.Rejected && refusals++==0)
+            warn($"TravelRefusedRetrying: {why}; retrying once the character settles.");
+        return why;
     }
     private bool Busy(string gate)=>pi.GetIpcSubscriber<bool>(gate).InvokeFunc();
     /// <summary>Whether Lifestream is still travelling; a missing Lifestream IPC reads as idle.</summary>
@@ -398,6 +429,9 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         bool hopPending=wardHop.Already, walkingToShard=recorded && shardWalk.Already && !moving && !hopPending;
         bool following=recorded && moving,rebuilt=false,rebuilding=false;
         var hopIdle=new IdleWindow();var shardIdle=new IdleWindow();
+        // Teleports, aethernet and ward shard hops are submitted only after an idle window with Lifestream free;
+        // Lifestream refusing one (the character could not act yet) waits for another window until the deadline.
+        var ready=new IdleWindow();var hopReady=new IdleWindow();bool settled=false;int refusals=0,hopRefusals=0;var last="";
         var walkTarget=target;var watch=new WalkWatch();
         var allowed=CanContinue.Value;
         var wardNumber=bell?.Ward ?? p.Ward;
@@ -418,7 +452,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         try { var outcome=await Poll<bool>(d, () =>
         {
             if(allowed?.Invoke()==false)return new(CourierOutcome.Cancelled,"RouteStopped",d.Name);
-            if (Position() is not {} here) return null;
+            if (Position() is not {} here) {last="character not loaded";return null;}
             if(ownsPath && watch.Stalled(this,new(here.X,here.Y,here.Z),walkTarget) is {} stalled)
             {
                 if(!nav.TryStop())return WardFailure("NavigationStalled",stalled+"; path stop refused");
@@ -437,7 +471,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 rebuilding=false;
             }
             if ((teleported || hopped || moving) && idle.Ready(this,moving))
-            {if(moving)ownsPath=false;teleported=hopped=moving=false;}
+            {if(moving)ownsPath=false;teleported=hopped=moving=false;settled=true;}
             if (here.World != p.World) return Result<bool>.Fail("WrongRendezvousWorld",d.Name);
             if(wardNumber is {} ward)
             {
@@ -450,7 +484,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 // Address travel can keep walking to its plot after the zone transition.
                 // Do not race it with our own path, or attest arrival while it owns movement.
                 if(wardSubmitted && busy)wardWasBusy=true;
-                if(busy || !IdleCharacter()){wardIdle=new();return null;}
+                if(busy || !IdleCharacter()){wardIdle=new();last=busy?"Lifestream busy with ward travel":"character busy";return null;}
                 // A recorded shard hop below crosses into the subdivision itself, so only the ward number must match.
                 if(current is not {} at || at.Number!=ward || at.Subdivision!=subdivision && !recorded)
                 {
@@ -479,19 +513,25 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                     .MinBy(r => DestinationDistanceSquared(r.AethernetId ?? r.AetheryteId, target));
                 if(route==null)return bell==null ? WardFailure("ReturnStartUnreachable","No attuned aetheryte serves this territory")
                     : Result<bool>.Fail("NoAttunedAetheryte",p.Territory.ToString());
-                if(hopped)return null;
+                if(hopped){last="aethernet hop submitted, not yet arrived";return null;}
                 if(route.AethernetId is {} shard && here.Territory==route.AetheryteTerritoryId &&
                     objects.Any(o=>o.ObjectKind==ObjectKind.Aetheryte && o.BaseId==route.AetheryteId &&
                         Vector3.Distance(o.Position,new(here.X,here.Y,here.Z))<12))
                 {
+                    if(!settled && !ready.Ready(this)){if(last.Length==0)last="waiting for the character and Lifestream to settle";return null;}
                     shardMarker.Save();var hop=aethernet.TrySubmit(shard);hopped=hop.Submitted;
-                    return hopped || hop.Retryable ? null : Result<bool>.Fail(hop.Code,hop.Message);
+                    if(hopped || hop.Retryable || hop.State==AetheryteTravelSubmissionState.Rejected)
+                    {settled=false;if(!hopped)last=TravelRefusal(hop,ref refusals);return null;}
+                    return Result<bool>.Fail(hop.Code,hop.Message);
                 }
-                if (teleported) return null;
+                if (teleported) {last="teleport submitted, not yet arrived";return null;}
+                if(!settled && !ready.Ready(this)){if(last.Length==0)last="waiting for the character and Lifestream to settle";return null;}
                 teleportMarker.Save();
                 var result=teleport.TrySubmit(route.AetheryteId);
                 teleported=result.Submitted;
-                return teleported || result.Retryable ? null : Result<bool>.Fail(result.Code,result.Message);
+                if(teleported || result.Retryable || result.State==AetheryteTravelSubmissionState.Rejected)
+                {settled=false;if(!teleported)last=TravelRefusal(result,ref refusals);return null;}
+                return Result<bool>.Fail(result.Code,result.Message);
             }
             if (bell == null)
             {
@@ -531,10 +571,18 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                     }
                     if(near.Id!=bell.Shard)
                     {
+                        // Right after address travel Lifestream can still refuse the hop; it moved nothing, so it is asked
+                        // again after another idle window until the deadline.
+                        if(!hopReady.Ready(this)){if(last.Length==0)last="waiting to settle before the ward shard hop";return null;}
                         wardHop.Save!();
                         try{hopPending=pi.GetIpcSubscriber<uint,bool>("Lifestream.HousingAethernetTeleportById").InvokeFunc(bell.Shard!.Value);}
                         catch(Exception e){return WardFailure("WardHopUnavailable",e.Message);}
-                        if(!hopPending)return WardFailure("WardHopRefused",$"Shard {bell.Shard}");
+                        if(!hopPending)
+                        {
+                            last=$"WardHopRefused: shard {bell.Shard}";
+                            if(hopRefusals++==0)warn($"WardHopRefused: {place}: shard {bell.Shard}; retrying once the character settles.");
+                            return null;
+                        }
                         wardOwned=true;hopIdle=new();return null;
                     }
                 }
@@ -547,12 +595,17 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 catch(Exception e){return WardFailure("WardRouteUnavailable",e.Message);}
                 walkTarget=target;ownsPath=moving=following=true;watch=new();return null;
             }
+            // As the plaza approach does: never race a path someone else is running, or walk a character that cannot act yet.
+            if(!IdleCharacter()){last="character busy";return null;}
+            if(Busy("vnavmesh.Path.IsRunning") || Busy("vnavmesh.SimpleMove.PathfindInProgress")){last="vnavmesh busy";return null;}
             pathMarker.Save();
             var path=nav.TryMoveCloseTo(target,1.5f);
             ownsPath=moving=path.Submitted;
             if (moving && bell == null) returnWalks++;
+            if(!moving)last=$"walk {path.Code}: {path.Message}";
             return moving || path.Retryable ? null : Result<bool>.Fail(path.Code,path.Message);
-        }); arrived=outcome.Outcome==CourierOutcome.Succeeded; if(!arrived)warn($"{outcome.Code}: {outcome.Detail}");return outcome; }
+        // Travel never moves goods: a deadline here changed nothing and names what it last waited on.
+        },waiting:()=>last,expiry:CourierOutcome.Failed); arrived=outcome.Outcome==CourierOutcome.Succeeded; if(!arrived)warn($"{outcome.Code}: {outcome.Detail}");return outcome; }
         catch(Dalamud.Plugin.Ipc.Exceptions.IpcError e){return WardFailure("NavigationIpcUnavailable",e.Message);}
         finally
         {
@@ -566,8 +619,10 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
             },unload.Token);
         }
     }
+    // Lifestream finishing a login or travel refuses a switch as busy: waiting it out here keeps that refusal from being the switch's answer.
     public Task<Result<string>> SwitchRefusalAsync(Deadline deadline)=>Poll<string>(deadline,()=>
-        Result<string>.Ok(CharacterSwitchPolicy.GetRefusal(CharacterSwitchGameState.Observe(client,objects,conditions,false,null))??""));
+        Result<string>.Ok(CharacterSwitchPolicy.GetRefusal(CharacterSwitchGameState.Observe(client,objects,conditions,false,null))??
+            (LifestreamBusy() ? "Lifestream is busy" : "")),expiry:CourierOutcome.Failed);
     private static Result<T>? Translate<T>(OperationResult result, Func<T> success) => !result.IsTerminal ? null :
         result.Status == OperationStatus.Succeeded ? Result<T>.Ok(success()) :
         new(result.Status == OperationStatus.Indeterminate ? CourierOutcome.Indeterminate : CourierOutcome.Failed,result.Code,result.Message);
@@ -589,6 +644,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         void Save(){marker.Save();submitted=true;}
         var step=Step.Value;
         var allowed=CanContinue.Value;
+        int notReady=0;
         return Poll<OwnerScope>(d,()=>
         {
             if(allowed?.Invoke()==false)return new(CourierOutcome.Cancelled,"SwitchStopped",d.Name);
@@ -596,6 +652,16 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
             if (op==null || retry) { op=new(login,new(target.CharacterName,target.HomeWorldName),d.Expires,warn,Save,submitted && !retry); }
             OperationResult Tick()=>op.Tick(CharacterSwitchGameState.Observe(client,objects,conditions,false,null),DateTimeOffset.UtcNow);
             var result=Tick();
+            if(result is {Status:OperationStatus.Failed,Code:"NotReady"})
+            {
+                // Lifestream refused before doing anything (busy finishing a login or travel, or its login workflow not
+                // ready): nothing was dispatched. The retry above submits again after an idle window, until the deadline.
+                if(CourierPlanner.Exact(owner(),target))return Result<OwnerScope>.Ok(owner());
+                if(DateTimeOffset.UtcNow>=d.Expires)
+                    return Result<OwnerScope>.Fail("CharacterSwitchDeadline",$"Character switch deadline {d.Expires:O} expired; last refusal NotReady: {result.Message}");
+                if(notReady++==0)warn($"SwitchNotReadyRetrying: {target.CharacterName}: {result.Message}; retrying once the character settles.");
+                return null;
+            }
             if(result.Status==OperationStatus.Indeterminate)WatchLate(d.Name,()=>{Tick();return op.LateIdentityObserved;});
             return Translate(result,owner);
         },true);

@@ -485,9 +485,27 @@ public sealed class CourierConductor
     {
         stop = true;
         try { await calls.Call("OwnerCancelPreLock",10,trade.CancelPreLockAsync); }
-        finally {var r=store.Load();if(r.State=="Running" && !Carrierless(r))await Send(r,CourierCommand.Stop,r.Start,[]);}
+        finally {var r=store.Load();if(r.State=="Running" && !Carrierless(r))await StopCarrierAsync(r);}
     }
-    private Task<InventoryView> Observe() => calls.Call("OwnerBags", 15, inventory.ObserveAsync);
+    // The run's Stop to its carrier, once sent: later stops await it instead of sending another.
+    private Task<CourierReceipt>? carrierStop;
+    /// <summary>
+    /// Tells the carrier to stop. A Stop already sent for this run (by the user, or by a first-fault cancel) is awaited
+    /// rather than sent again; only one that failed is sent once more.
+    /// </summary>
+    private async Task StopCarrierAsync(CourierJournal r)
+    {
+        if (Volatile.Read(ref carrierStop) is { } sent)
+        {
+            try { await sent.ConfigureAwait(false); return; }
+            catch (Exception e) { warning($"{r.Run} CarrierStopResent: the first Stop failed ({(e as CourierFault)?.Code ?? e.GetType().Name}: {e.Message})."); }
+        }
+        var again = Send(r, CourierCommand.Stop, r.Start, []);
+        Volatile.Write(ref carrierStop, again);
+        await again.ConfigureAwait(false);
+    }
+    // Only a read taken before a step dispatches anything is an observation; one after a step keeps a timeout unverified.
+    private Task<InventoryView> Observe(bool observation = false) => calls.Call("OwnerBags", 15, inventory.ObserveAsync, observation);
     private async Task<CourierReceipt> Send(CourierJournal r, CourierCommand type, OwnerScope partner, ImmutableArray<Shipment> manifest,
         MeetingBell? bell = null, Guid? id = null, Guid? confirm = null, TradeEvidence? evidence = null, Action<CourierReceipt>? cancelled = null,InventoryView? carrierBaseline=null)
     {
@@ -506,9 +524,9 @@ public sealed class CourierConductor
     private static CourierFault Fault(string code, string detail) => new(CourierOutcome.Indeterminate, code, detail);
     private async Task Switch(OwnerScope target)
     {
-        if (CourierPlanner.Exact((await Observe()).Character, target)) return;
+        if (CourierPlanner.Exact((await Observe(observation: true)).Character, target)) return;
         var deadline = Deadline.After("MaySwitchNow", 60);
-        while (await calls.Call("SwitchEligibilityObservation",5,login.SwitchRefusalAsync) is {Length:>0} reason)
+        while (await calls.Call("SwitchEligibilityObservation",5,login.SwitchRefusalAsync,observation:true) is {Length:>0} reason)
         {
             if (stop || DateTimeOffset.UtcNow >= deadline.Expires) throw new CourierFault(CourierOutcome.Failed, "MaySwitchNowDeadline", $"MaySwitchNow 60s: {reason}");
             await Task.Delay(150);
@@ -521,6 +539,8 @@ public sealed class CourierConductor
         if (!await gate.WaitAsync(0)) throw new InvalidOperationException("CourierAlreadyRunning");
         CourierJournal r;
         try { r = store.Load(); } catch { gate.Release(); throw; }
+        // A Stop sent for an earlier run never answers for this one.
+        Volatile.Write(ref carrierStop, null);
         async Task CancelLocal()
         {
             try { await calls.Call("OwnerCancelPreLock", 10, trade.CancelPreLockAsync); }
@@ -585,7 +605,7 @@ public sealed class CourierConductor
             if(needsSuppression())suppress = suppression.Acquire();
             // AutoRetainer or Lifestream can still be finishing work right after a previous movement; wait for them
             // (bounded) instead of refusing at once, and name the one still busy when the wait runs out.
-            if (await CourierBusyGate.WaitIdleAsync(suppression, lifestreamBusy, () => stop || unloaded, CourierBusyGate.Budget) is { } busy)
+            if (await CourierBusyGate.WaitIdleAsync(suppression, lifestreamBusy, () => stop || unloaded, CourierBusyGate.RunStartBudget) is { } busy)
                 throw stop || unloaded ? new CourierFault(CourierOutcome.Cancelled, "StopRequested", "Stopped while waiting for automation to go idle.")
                     : new CourierFault(CourierOutcome.Failed, busy.Code, busy.Detail);
             peerPhase = "Idle";
@@ -593,7 +613,7 @@ public sealed class CourierConductor
             peer.Progress += Progress; peer.StopRequested += RemoteStop;
             // The trade hold keeps MarketMafioso off the trade window; a run with no trades needs none.
             if (!carrierless && trade is ICourierHoldPort holds)
-                tradeHold = await calls.Call("OwnerTradeHold",10,d=>holds.BeginHold(r.Run,d));
+                tradeHold = await calls.Call("OwnerTradeHold",30,d=>holds.BeginHold(r.Run,d));
             var owner = await Observe();
             if (!resume || !r.Start.HasStableIdentity && !r.PeerClaimed && r.Cursor == 0 && r.Pending == null) r.Start = owner.Character;
             var status = await CarrierStatus();
@@ -733,7 +753,7 @@ public sealed class CourierConductor
             if (r.Schedule.IsEmpty) { r.Schedule = [.. Steps(r)]; r.ScheduleVersion = 1; }
             // Begin may succeed on the peer even if its acknowledgement is lost.
             if(stop)throw new CourierFault(CourierOutcome.Cancelled,"StopBeforeBegin","Begin was not dispatched.");
-            r.State = "Running"; r.Code=r.Detail=""; store.Save(r); beginAttempted = true;
+            r.State = "Running"; r.Code=r.Detail=""; store.Save(r); beginAttempted = true; Volatile.Write(ref carrierStop, null);
             // A Finish the carrier already landed closed its run there: a Begin would be refused as closed.
             if (!carrierless && !finishLanded)
             {
@@ -753,7 +773,7 @@ public sealed class CourierConductor
                     await SettleMove();
                 else if (r.CarrierMove is { } resumed && carrierMove == null && ownerOnly)
                     carrierMove = Dispatch(resumed); // A resumed run sets the carrier off again behind the owner.
-                if (InTrip(s.Phase) || r.Code=="")owner=await Observe();
+                if (InTrip(s.Phase) || r.Code=="")owner=await Observe(observation: true);
                 if (!Moving())
                 {
                     status = await CarrierStatus();
@@ -929,7 +949,7 @@ public sealed class CourierConductor
                             !(await SettleMove() is { Command: CourierCommand.Travel, Bell: { } went } && went.SamePlace(t.Pickup)) &&
                             Carried(r, s.Trip, -1)?.Dropoff.SamePlace(t.Pickup) != true)
                             await Send(r, CourierCommand.Travel, owner.Character, [], t.Pickup,id:intent.Id);
-                        await calls.Call("Rendezvous", 30, d => bells.ObserveTradeableAsync(r.Settings.Carrier!, d));
+                        await calls.Call("Rendezvous", 30, d => bells.ObserveTradeableAsync(r.Settings.Carrier!, d), observation: true);
                         break;
                     case CourierPhase.HandOut:
                     case CourierPhase.HandIn:
@@ -1062,7 +1082,17 @@ public sealed class CourierConductor
         {
             // Plugin unload cancels every pending game poll; name it so the journal reads as resumable, not as a crash.
             r.Code = (e as CourierFault)?.Code ?? (unloaded && e is OperationCanceledException ? "OwnerUnloaded" : "UnexpectedFailure"); r.Detail = e.Message;
-            string Settled() => r.Pending != null ? "Indeterminate" :
+            // A pending step is unverified only when it may have had an effect nobody observed. A refusal or a stop of a
+            // step that moves no goods (switches, travel, rendezvous, returns), or of a placement whose every journaled
+            // operation settled, had none: the run fails or is interrupted, and still resumes from the same pending step.
+            // A placement counts only while its journal proves nothing moved: a deposit that landed before the run
+            // failed (say, a status read ahead of crediting delivery) stays unverified, so a clear says to check custody.
+            bool settledPending = e is CourierFault { Outcome: CourierOutcome.Failed or CourierOutcome.Cancelled } && r.Pending is { } failedStep &&
+                (failedStep.Action.Phase is CourierPhase.EnsureSource or CourierPhase.SwitchToDestination
+                    or CourierPhase.CarrierToSource or CourierPhase.CarrierToDestination or CourierPhase.ReturnOwner
+                    or CourierPhase.ReturnCarrier or CourierPhase.ReturnDestinationHome ||
+                 failedStep.Action.Phase is CourierPhase.Retrieve or CourierPhase.Deposit && PlacementUnmoved(failedStep));
+            string Settled() => r.Pending != null && !settledPending ? "Indeterminate" :
                 e is CourierFault { Outcome: CourierOutcome.Cancelled } ? "Interrupted" : "Failed";
             r.State = refusedRun && r.Pending == null && r.Custody.IsEmpty ? "Refused" : Settled();
             warning($"{r.Run}/{r.Pending?.Id} {r.State} {r.Code}: {e.Message}");
@@ -1072,7 +1102,7 @@ public sealed class CourierConductor
             if (!carrierless && (r.PeerClaimed || beginAttempted))
             {
                 if (unloaded) warning($"{r.Run} CarrierStopUnsent: owner unloading; the carrier pauses when the link drops.");
-                else try { await Send(r, CourierCommand.Stop, r.Start, []); }
+                else try { await StopCarrierAsync(r); }
                     catch (Exception cleanup) { warning($"{r.Run} CarrierStopFailed: {cleanup.GetType().Name}: {cleanup.Message}"); }
             }
             // Stop reaches the carrier ahead of its command queue and cancels a background move; the move stays
@@ -1130,6 +1160,21 @@ public sealed class CourierConductor
             r.ConsolidationLimits.Add(prefix + $"{fault.Code}: {fault.Message}");
             warning($"{r.Run}/{intent.Id} ConsolidationLimited {destination.CharacterName} {fault.Code}: {fault.Message}");
         }
+    }
+    /// <summary>
+    /// True only when the journal proves a placement step moved nothing: every journaled operation is still Accepted (or
+    /// was cancelled/failed before it began) with zero transferred. Anything else, or a journal that cannot say, is false.
+    /// </summary>
+    private bool PlacementUnmoved(RunIntent move)
+    {
+        var who = move.OwnerBefore.Character;
+        try
+        {
+            return move.Operations.All(op => placement.OperationStatus(op, who) is { } status &&
+                status != OperationStatuses.Indeterminate && (status == OperationStatuses.Accepted || OperationStatuses.IsTerminal(status)) &&
+                placement.JournalUnits(op, who) is { } units && units.All(t => t.Units == 0));
+        }
+        catch (Exception e) { warning($"{move.Id} PlacementJournalUnreadable: {e.Message}"); return false; }
     }
     /// <summary>
     /// Settles an interrupted Retrieve or Deposit from its journaled operations and the owner's fresh
@@ -1444,7 +1489,7 @@ public sealed class CourierConductor
     }
     private async Task Meet(MeetingBell bell)
     {
-        if ((await calls.Call("OwnerPosition", 15, bells.PositionAsync)).World != bell.World)
+        if ((await calls.Call("OwnerPosition", 15, bells.PositionAsync, observation: true)).World != bell.World)
             await calls.Call("OwnerWorld", Deadline.WorldSeconds(bell), d => worlds.EnsureWorldAsync(bell.World, d));
         await calls.Call(bell.Ward.HasValue ? "WardTravel" : bell.IsPlaza ? "OwnerPlaza" : "OwnerBell", bell.ApproachSeconds, d => bells.GoInRangeAsync(bell, d));
     }
@@ -1479,7 +1524,7 @@ public sealed class CourierConductor
             if (!Carrierless(r))
                 try
                 {
-                    _ = Send(r, CourierCommand.Stop, r.Start, []).ContinueWith(x => warning($"{name} carrier stop: {x.Exception?.GetBaseException().Message}"),
+                    _ = StopCarrierAsync(r).ContinueWith(x => warning($"{name} carrier stop: {x.Exception?.GetBaseException().Message}"),
                         CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
                 }
                 catch (Exception e) { warning($"{name} carrier stop: {e.Message}"); }
@@ -1619,18 +1664,36 @@ public sealed class CourierConductor
             throw new CourierFault(CourierOutcome.Failed,"SenderStockShort", "Fresh sender inventory does not cover the manifest.");
         var id = intent.Id;
         CourierReceipt? cancellationReceipt = null;
-        try { (trade as ICourierHoldPort)?.CheckHold(); }
+        // A hold MarketMafioso let lapse between steps is asked for again here, before either trade is dispatched.
+        try { if (trade is ICourierHoldPort holds) await calls.Call("OwnerTradeHoldCheck", 15, holds.RegainHoldAsync); }
         catch (CourierFault) { r.Pending=null; store.Save(r); throw; } // Neither trade has been dispatched.
         var ack=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        void Started(CourierProgress p){if(p.Run==r.Run && p.Step==id && p.Phase=="TradeStarted")ack.TrySetResult();}
+        // The carrier's heartbeat ahead of TradeStarted: when it last beat, and what it was waiting on.
+        long lastBeat=Environment.TickCount64;string? waitingOn=null;
+        void Started(CourierProgress p){
+            if(p.Run!=r.Run || p.Step!=id)return;
+            if(p.Phase=="TradeStarted")ack.TrySetResult();
+            else if(p.Phase==CourierTradeStart.Preparing){Volatile.Write(ref lastBeat,Environment.TickCount64);waitingOn=p.Waiting;}
+        }
         peer.Progress+=Started;
         Task<CourierReceipt> remote;
         try {
             if(stop)throw new CourierFault(CourierOutcome.Cancelled,"StopBeforeTrade","No trade dispatched.");
             r.Pending=intent with {LocalMayHaveStarted=false};store.Save(r);
             remote=Send(r,send ? CourierCommand.Receive : CourierCommand.Send,before.Character,batch,id:id,cancelled:receipt=>cancellationReceipt=receipt);
-            try { await Task.WhenAny(remote,ack.Task).WaitAsync(TimeSpan.FromSeconds(60)); }
-            catch(TimeoutException){throw Fault("CarrierTradeStartDeadline","CarrierTradeStart: 60s elapsed without matching acknowledgement.");}
+            // Each carrier heartbeat extends the wait, never past the cap the carrier's own start budget sits under.
+            var sentAt=Environment.TickCount64;var cap=sentAt+CourierTradeStart.OwnerCapSeconds*1000L;
+            while(!remote.IsCompleted && !ack.Task.IsCompleted)
+            {
+                var now=Environment.TickCount64;
+                var quietUntil=Volatile.Read(ref lastBeat)+CourierTradeStart.QuietSeconds*1000L;
+                var waited=(now-sentAt)/1000;
+                var last=waitingOn is {} on?$"; the carrier was last waiting on {on}":"; the carrier reported no wait";
+                if(now>=cap)throw Fault("CarrierTradeStartDeadline",$"CarrierTradeStart: {waited}s (the {CourierTradeStart.OwnerCapSeconds}s cap) elapsed without TradeStarted{last}.");
+                if(now>=quietUntil)throw Fault("CarrierTradeStartSilent",$"CarrierTradeStart: {CourierTradeStart.QuietSeconds}s without a carrier heartbeat after {waited}s, no TradeStarted{last}.");
+                try{await Task.WhenAny(remote,ack.Task).WaitAsync(TimeSpan.FromMilliseconds(Math.Min(cap,quietUntil)-now));}
+                catch(TimeoutException){}
+            }
             if(!ack.Task.IsCompleted) {
                 try { await remote; throw Fault("TradeStartNotAcknowledged","Missing matching carrier acknowledgement."); }
                 catch(CourierFault original){

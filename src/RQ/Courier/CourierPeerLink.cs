@@ -192,17 +192,39 @@ j.Task.IsFaulted?Result<CourierReceipt>.Fail("CarrierStepFault",j.Task.Exception
         return connection;
     });
     private async Task PauseFollower(){try{await follower.StopLocalAsync();}catch(Exception e){warn("PeerLostStop: "+e.Message);}}
+    // A carrier missing from one discovery pass (its presence refreshing, or a discovery error) is looked for this long
+    // before the step is refused; nothing has been sent to it yet.
+    private static readonly TimeSpan DiscoveryGrace=TimeSpan.FromSeconds(30);
     public async Task<Result<CourierReceipt>> SendAsync(CourierMessage m,Deadline d)
     {
-        var targets=presences.Where(p=>CourierPlanner.Exact(p.Identity.Deserialize<CourierPeer>()?.Character,m.Carrier)).ToArray();
-        if(targets.Length!=1)return Result<CourierReceipt>.Fail("CarrierEndpointAmbiguous",$"Matched {targets.Length} carriers.");
+        PeerPresence[] targets;
+        var looking=DateTimeOffset.UtcNow+DiscoveryGrace;
+        while(true)
+        {
+            targets=presences.Where(p=>CourierPlanner.Exact(p.Identity.Deserialize<CourierPeer>()?.Character,m.Carrier)).ToArray();
+            if(targets.Length==1)break;
+            // Two matching carriers are a real ambiguity; none is waited out briefly.
+            if(targets.Length>1)
+                return Result<CourierReceipt>.Fail("CarrierEndpointAmbiguous",$"Matched {targets.Length} carriers.");
+            if(DateTimeOffset.UtcNow>=looking || DateTimeOffset.UtcNow>=d.Expires)
+                return Result<CourierReceipt>.Fail("CarrierNotFound",$"No linked client showed {m.Carrier.CharacterName} within {DiscoveryGrace.TotalSeconds:0}s.");
+            await Task.Delay(500,unload.Token);
+        }
         var ep=await endpoint;var conn=Connect(ep,targets[0]);carriers[m.Run]=targets[0].InstanceId;
-        var start=true;
+        var start=true;string? lastTimeout=null;
         while(DateTimeOffset.UtcNow<d.Expires){
             var w=start?new Wire("start",m.Run,m.Step,m,d):new Wire("query",m.Run,m.Step);
             var json=JsonSerializer.SerializeToElement(w);
             var response=start?await conn.RequestAsync(Guid.NewGuid(),json,"StepStart",TimeSpan.FromSeconds(5),unload.Token):
                 await conn.EventAsync(json,"StepQuery",TimeSpan.FromSeconds(5),unload.Token);
+            // A step query only reads the carrier's step; one that timed out is asked again until the deadline. A lost
+            // link ends the step at once (its heartbeat said so), and a timed-out start is never sent twice.
+            if(!start && response is PeerResult.TimedOut slow)
+            {
+                lastTimeout=$"{slow.Threshold} {slow.Limit}";
+                await Task.Delay(200,unload.Token);
+                continue;
+            }
             if(response is not PeerResult.Delivered ok){
                 if(response is PeerResult.LinkLost) LinkLost?.Invoke();
                 return response switch {
@@ -221,7 +243,7 @@ j.Task.IsFaulted?Result<CourierReceipt>.Fail("CarrierStepFault",j.Task.Exception
             }
             start=false;await Task.Delay(200,unload.Token);
         }
-        return new(CourierOutcome.Indeterminate,"PeerStepDeadline",d.Name);
+        return new(CourierOutcome.Indeterminate,"PeerStepDeadline",lastTimeout==null?d.Name:$"{d.Name}; last step query timed out ({lastTimeout})");
     }
     public void Dispose(){follower.StopRequested-=NotifyStop;unload.Cancel();_=Close();}
     private async Task Close(){try{await (await endpoint.ConfigureAwait(false)).DisposeAsync();}catch(Exception e){warn("PeerUnload: "+e.Message);}}
