@@ -164,7 +164,6 @@ internal sealed partial class TransferPlanWorkspace
             renamingPlanId = null;
             showPlacement = false;
             pickerOpenRequest = null;
-            sourcePickerOpenRequest = null;
         }
         workbench.SelectedStowagePlanId = planId;
     }
@@ -251,46 +250,66 @@ internal sealed partial class TransferPlanWorkspace
         });
     }
 
+    /// <summary>The line a stock action starts from: the stored one, or a line in an older shape as it is solved.</summary>
+    private CourierLine StockEditableLine(QuartermasterRuntimeSnapshot runtime, TargetPlanItem rule) =>
+        rule.Courier is { NeedsResolve: true }
+            ? courier.Allocation(runtime, runtime.Owner, rule).Line
+            : rule.Courier ?? new CourierLine();
+
     /// <summary>
     /// Adds each item to the open Courier plan (else the unsaved one), or finds its line there, and
-    /// adds a character's bags (null <paramref name="retainerId"/>) or retainer as a destination of
-    /// it. No numbers are set: the destination takes what the line's other places give up.
+    /// sends everything the containers of <paramref name="source"/> (the logged-in character when null)
+    /// hold of it to a character's bags (null <paramref name="retainerId"/>) or retainer: each holding
+    /// bag or retainer is listed to drain (0) and the destination as a pool that takes it all.
     /// </summary>
-    public void AddCourier(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, OwnerScope destination, ulong? retainerId)
+    public void AddCourier(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, OwnerScope destination, ulong? retainerId,
+        OwnerScope? source = null)
     {
         if (!runtime.Owner.HasStableIdentity || items.Count == 0)
             return;
         var target = destination with { };
+        var from = (source ?? runtime.Owner) with { };
+        // The saddlebag is not a courier place; bags and retainers holding the item are.
+        var holders = items.GroupBy(item => item.ItemId).ToDictionary(group => group.Key, group => group
+            .SelectMany(item => item.Stacks)
+            .Where(stack => stack.Quantity > 0 &&
+                            (stack.ScopeKind == BrowserScopeKind.Player || stack.ScopeKind == BrowserScopeKind.Retainer && stack.RetainerId is not null))
+            .Select(stack => stack.ScopeKind == BrowserScopeKind.Retainer ? stack.RetainerId : null)
+            .Distinct()
+            .Where(container => !(container == retainerId && from.Matches(target)))
+            .ToArray());
         var affected = AddCourierLines(runtime, SelectPlanOfKind(runtime, StowagePlanKind.Courier),
-            [.. items.Select(item => new PlanAddEntry(item.ItemId, item.ItemName, ItemQualityPolicy.Any))],
+            [.. items.DistinctBy(item => item.ItemId).Select(item => new PlanAddEntry(item.ItemId, item.ItemName, ItemQualityPolicy.Any))],
             selectAffected: items.Count > 1,
-            rule => rule.Courier = (rule.Courier is { HasLegacyPlaces: true }
-                ? courier.Allocation(runtime, runtime.Owner, rule).Line
-                : rule.Courier ?? new CourierLine()).WithDestination(target, retainerId));
+            rule =>
+            {
+                var line = StockEditableLine(runtime, rule);
+                foreach (var container in holders.GetValueOrDefault(rule.ItemId) ?? [])
+                    line = line.Lists(from, container) ? line.WithBounds(from, container, 0, 0) : line.WithPlace(from, container, 0, 0);
+                // A destination listed to drain would send straight back what it receives; it becomes a pool.
+                line = line.Entries.FirstOrDefault(place => place.Is(target, retainerId)) is { Max: 0 }
+                    ? line.WithBounds(target, retainerId, null, null)
+                    : line.WithPlace(target, retainerId);
+                rule.Courier = line;
+            });
         foreach (var id in affected)
             courierExpansion.SetExpanded(CourierKey(id), true);
     }
 
     /// <summary>
     /// Adds an item to the open Courier plan, or finds its line there, and lists a character's bags
-    /// (null <paramref name="retainerId"/>) or retainer as a source of it, unless the line already
-    /// lists that place in either role. Returns false when no Courier plan is open.
+    /// (null <paramref name="retainerId"/>) or retainer on it as a pool, unless the line already lists
+    /// that place. Returns false when no Courier plan is open.
     /// </summary>
-    public bool AddCourierSource(QuartermasterRuntimeSnapshot runtime, uint itemId, string itemName, OwnerScope source, ulong? retainerId)
+    public bool AddCourierPlace(QuartermasterRuntimeSnapshot runtime, uint itemId, string itemName, OwnerScope place, ulong? retainerId)
     {
         if (!runtime.Owner.HasStableIdentity || !CourierPlanOpen(runtime))
             return false;
-        var from = source with { };
+        var at = place with { };
         var affected = AddCourierLines(runtime, workbench.SelectedStowagePlanId!.Value,
             [new PlanAddEntry(itemId, itemName, ItemQualityPolicy.Any)],
             selectAffected: true,
-            rule =>
-            {
-                var line = rule.Courier is { HasLegacyPlaces: true }
-                    ? courier.Allocation(runtime, runtime.Owner, rule).Line
-                    : rule.Courier ?? new CourierLine();
-                rule.Courier = line.Lists(from, retainerId) ? line : line.WithSource(from, retainerId);
-            });
+            rule => rule.Courier = StockEditableLine(runtime, rule).WithPlace(at, retainerId));
         foreach (var id in affected)
             courierExpansion.SetExpanded(CourierKey(id), true);
         return true;
@@ -1171,7 +1190,7 @@ internal sealed partial class TransferPlanWorkspace
         var items = projection.Rows.Count;
         clause($"{items:N0} item{(items == 1 ? string.Empty : "s")}", null);
         var moving = projection.Rows.Where(row => row.Rule.Enabled).Sum(row => (long)(row.Distribution?.Runs ?? 0));
-        var attention = projection.Rows.Count(row => row.Rule.Enabled && row.Distribution is { Problem: not Courier.CourierProblem.None });
+        var attention = projection.Rows.Count(row => row.Rule.Enabled && row.Distribution is { NeedsAttention: true });
         if (moving > 0)
             clause($"{moving:N0} to move", TransferPresentation.SendColor);
         else if (attention == 0)

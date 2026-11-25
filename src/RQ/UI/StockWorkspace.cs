@@ -783,7 +783,7 @@ internal sealed class StockWorkspace
                       transferPlans.HasCourierDestinations(runtime, location.Character);
         var current = location.IsCurrent && identified ? runtime.Browser.FindItem(itemId) : null;
         var canStow = location.Kind == BrowserScopeKind.Player && current is { PlayerQuantity: > 0 };
-        // Any character's bags or retainer can join an open Courier plan as a source.
+        // Any character's bags or retainer can join an open Courier plan as a pool.
         var courierSource = location.Kind is BrowserScopeKind.Player or BrowserScopeKind.Retainer && transferPlans.CourierPlanOpen(runtime);
         var canPlan = courierSource || location.Kind is BrowserScopeKind.Saddlebag or BrowserScopeKind.Retainer && current is not null;
 
@@ -795,12 +795,12 @@ internal sealed class StockWorkspace
         if (canStow)
             reviewRegistry.RegisterLastButton($"{control}.stow", $"Stow carried {row.Item.ItemName}", true,
                 () => pendingLocationPopup = $"stow:{control}", "Available");
-        // With a Courier plan open, bags and retainers join the item's line as a source; the saddlebag is
-        // not a courier place, so it adds the item with no source like any other plain add.
+        // With a Courier plan open, bags and retainers join the item's line as a pool; the saddlebag is
+        // not a courier place, so it adds the item with no place like any other plain add.
         void AddToPlan(QuartermasterRuntimeSnapshot at)
         {
             if (location.Kind is BrowserScopeKind.Player or BrowserScopeKind.Retainer &&
-                transferPlans.AddCourierSource(at, itemId, row.Item.ItemName, location.Character,
+                transferPlans.AddCourierPlace(at, itemId, row.Item.ItemName, location.Character,
                     location.Kind == BrowserScopeKind.Retainer ? location.RetainerId : null))
                 return;
             if (current is not null)
@@ -2638,13 +2638,13 @@ internal sealed class StockWorkspace
 
     /// <summary>
     /// Adds courier lines for the items' units on <paramref name="source"/> (the logged-in character
-    /// when null), one line per container holding them, to the chosen destination.
+    /// when null), one line per item draining each container holding it into the chosen destination.
     /// </summary>
     private void DrawSendDestinations(QuartermasterRuntimeSnapshot runtime, IReadOnlyList<StockGroup> items, OwnerScope? source, string? controlPrefix = null)
     {
         transferPlans.DrawCourierDestinations(runtime, (character, retainer) =>
         {
-            transferPlans.AddCourier(runtime, items, character, retainer);
+            transferPlans.AddCourier(runtime, items, character, retainer, source);
             stockSelection.Clear();
         }, controlPrefix: controlPrefix, source: source);
     }

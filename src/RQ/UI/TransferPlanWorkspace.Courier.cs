@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Numerics;
+using System.Text.RegularExpressions;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Utility;
@@ -13,14 +14,13 @@ using RQ.Runtime;
 namespace RQ.UI;
 
 /// <summary>
-/// The Courier plan table: one row per item with its sources, then its destinations, listed under it.
-/// Each place may take what it should hold after the run; the moves follow from those numbers (see
-/// <see cref="CourierDistribution"/>).
+/// The Courier plan table: one row per item with the places taking part listed under it. Each place
+/// may take bounds on what it holds after the run, or none to act as a pool; the moves follow from
+/// those bounds (see <see cref="CourierDistribution"/>).
 /// </summary>
 internal sealed partial class TransferPlanWorkspace
 {
-    private const string DestinationPickerPopup = "courier-destination-picker";
-    private const string SourcePickerPopup = "courier-source-picker";
+    private const string PlacePickerPopup = "courier-place-picker";
     private float courierWhoWidth;
     private static readonly string ConfirmIcon = FontAwesomeIcon.Check.ToIconString();
     private static readonly string DismissIcon = FontAwesomeIcon.Times.ToIconString();
@@ -28,12 +28,12 @@ internal sealed partial class TransferPlanWorkspace
     /// <summary>Lines drawn at least once: a line opens the first time it is shown, then keeps the user's choice.</summary>
     private readonly HashSet<Guid> courierSeen = [];
     private readonly Dictionary<Guid, string> courierKeys = [];
-    /// <summary>The Target input being typed in and its text, so a half-typed number survives redraws.</summary>
+    /// <summary>The Target input being typed in and its text, so a half-typed value survives redraws.</summary>
     private string? afterEditKey;
     private string afterEditText = string.Empty;
-    /// <summary>A source picker the agent bridge asked to open; it opens on the line's next draw.</summary>
-    private Guid? sourcePickerOpenRequest;
-    /// <summary>A destination picker the agent bridge asked to open; it opens on the line's next draw.</summary>
+    /// <summary>Target text that did not read as bounds, by place: shown until fixed while the stored bounds stay.</summary>
+    private readonly Dictionary<string, string> rejectedTargets = [];
+    /// <summary>A place picker the agent bridge asked to open; it opens on the line's next draw.</summary>
     private Guid? pickerOpenRequest;
     private OwnerScope? pickerCharacter;
     private (bool Chosen, ulong? Retainer) pickerContainer;
@@ -179,8 +179,7 @@ internal sealed partial class TransferPlanWorkspace
     private static string CourierOutcome(TransferWorkbenchRow row) =>
         !row.Rule.Enabled ? "Paused"
         : row.CourierRefusal is { } refusal && !CourierSession.IsPlanWide(refusal.Code) ? CourierSession.RefusalLabel(refusal.Code)
-        : row.Distribution is { Problem: not CourierProblem.None } ? CourierSession.ProblemLabel(row.Distribution)
-        : row.Distribution is { Moving: > 0 and var moving } ? moving.ToString("N0")
+        : row.Distribution is { } distribution ? CourierSession.Outcome(distribution).Text
         : "In place";
 
     private void DrawCourierMoves(TransferWorkbenchRow row)
@@ -193,10 +192,13 @@ internal sealed partial class TransferPlanWorkspace
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip(courier.RefusalDetail(row.Runtime, refusal));
         }
-        else if (row.Distribution is { Problem: not CourierProblem.None } problem)
-            RightAligned(CourierSession.ProblemLabel(problem), AmberColor);
-        else if (row.Distribution is { Moving: > 0 and var moving })
-            RightAligned(moving.ToString("N0"), null);
+        else if (row.Distribution is { } distribution)
+        {
+            var (text, color, detail) = CourierSession.Outcome(distribution);
+            RightAligned(text, color);
+            if (detail is not null && ImGui.IsItemHovered())
+                ImGui.SetTooltip(detail);
+        }
         else
             RightAligned("In place", QuartermasterPalette.Green);
     }
@@ -214,46 +216,36 @@ internal sealed partial class TransferPlanWorkspace
     }
 
     /// <summary>
-    /// A line's sources then its destinations as rows of the plan table, each list followed by the row
-    /// that adds to it. A line without a source or a destination offers one suggested place above that row.
+    /// A line's places as rows of the plan table in listed order, then the place it suggests (while it
+    /// lists a single place), then the row that adds a place.
     /// </summary>
     private void DrawCourierPlaces(TransferWorkbenchRow row)
     {
         if (row.Distribution is not { } allocation)
             return;
         var rule = row.Rule;
-        var style = ImGui.GetStyle();
-        var indent = CourierIndent();
-        var roleWidth = Math.Max(ImGui.CalcTextSize("From").X, ImGui.CalcTextSize("To").X) + style.ItemSpacing.X * 2f;
         var whoWidth = 0f;
         foreach (var spot in allocation.Places)
             whoWidth = Math.Max(whoWidth, ImGui.CalcTextSize(CourierSession.CharacterLabel(spot.Character)).X);
-        foreach (var offered in new[] { allocation.SourceSuggestion, allocation.Suggestion })
-            if (offered is not null)
-                whoWidth = Math.Max(whoWidth, ImGui.CalcTextSize(CourierSession.CharacterLabel(offered.Character)).X);
+        if (allocation.Suggestion is { } offered)
+            whoWidth = Math.Max(whoWidth, ImGui.CalcTextSize(CourierSession.CharacterLabel(offered.Character)).X);
         // The widest name seen so far, so containers line up across items rather than per item.
         courierWhoWidth = whoWidth = Math.Max(courierWhoWidth, whoWidth);
-        var layout = new PlaceLayout(indent, roleWidth, whoWidth);
-        var sources = allocation.SourceCount;
+        var layout = new PlaceLayout(CourierIndent(), whoWidth);
         ImGui.PushID(CourierKey(rule.Id));
-        for (var index = 0; index < sources; index++)
-            DrawCourierPlace(row, allocation, allocation.Places[index], index, index == 0 ? "From" : null, layout);
-        if (allocation.SourceSuggestion is { } sourceSuggestion)
-            DrawCourierPlace(row, allocation, sourceSuggestion, allocation.Places.Length + 1, "From", layout, suggested: true);
-        DrawAddPlace(row, allocation, PlaceRole.Source, sources == 0 && allocation.SourceSuggestion is null ? "From" : null, layout);
-        for (var index = sources; index < allocation.Places.Length; index++)
-            DrawCourierPlace(row, allocation, allocation.Places[index], index, index == sources ? "To" : null, layout);
+        for (var index = 0; index < allocation.Places.Length; index++)
+            DrawCourierPlace(row, allocation.Places[index], index, layout);
         if (allocation.Suggestion is { } suggestion)
-            DrawCourierPlace(row, allocation, suggestion, allocation.Places.Length, "To", layout, suggested: true);
-        DrawAddPlace(row, allocation, PlaceRole.Destination, allocation.Places.Length == sources && allocation.Suggestion is null ? "To" : null, layout);
+            DrawCourierPlace(row, suggestion, allocation.Places.Length, layout, suggested: true);
+        DrawAddPlace(row, allocation, layout);
         ImGui.PopID();
     }
 
-    /// <summary>Where a place row's role, character and container start, so every row of a line lines up.</summary>
-    private readonly record struct PlaceLayout(float Indent, float RoleWidth, float WhoWidth);
+    /// <summary>Where a place row's character and container start, so every row of a line lines up.</summary>
+    private readonly record struct PlaceLayout(float Indent, float WhoWidth);
 
-    /// <summary>Starts a place row and draws its role, if any, in the item column; returns where the role cell ends.</summary>
-    private float BeginPlaceRow(TransferWorkbenchRow row, string? role, PlaceLayout layout)
+    /// <summary>Starts a place row in the item column; returns where its character starts.</summary>
+    private float BeginPlaceRow(TransferWorkbenchRow row, PlaceLayout layout)
     {
         ImGui.TableNextRow();
         if (!row.Rule.Enabled)
@@ -262,27 +254,19 @@ internal sealed partial class TransferPlanWorkspace
         var start = ImGui.GetCursorPosX() + layout.Indent;
         ImGui.SetCursorPosX(start);
         ImGui.AlignTextToFramePadding();
-        if (role is not null)
-        {
-            ImGui.TextColored(QuartermasterPalette.Dim, role);
-            ImGui.SameLine(start + layout.RoleWidth);
-        }
-        else
-            ImGui.SetCursorPosX(start + layout.RoleWidth);
-        return start + layout.RoleWidth;
+        return start;
     }
 
     /// <summary>
-    /// One listed place: character, container, what it has, its target and its move. A suggested
-    /// source or destination is drawn dimmed with its target locked and offers to be confirmed or dismissed.
+    /// One listed place: character, container, what it has, its bounds and its move. The suggested
+    /// place is drawn dimmed with its bounds locked and offers to be confirmed or dismissed.
     /// </summary>
-    private void DrawCourierPlace(TransferWorkbenchRow row, CourierAllocation allocation, CourierSpot spot, int index, string? role,
-        PlaceLayout layout, bool suggested = false)
+    private void DrawCourierPlace(TransferWorkbenchRow row, CourierSpot spot, int index, PlaceLayout layout, bool suggested = false)
     {
         var runtime = row.Runtime;
         var style = ImGui.GetStyle();
         ImGui.PushID(index);
-        var start = BeginPlaceRow(row, role, layout);
+        var start = BeginPlaceRow(row, layout);
         var rowTop = ImGui.GetCursorScreenPos().Y - style.CellPadding.Y;
         ImGui.TextColored(suggested ? QuartermasterPalette.Dim : spot.Character.Matches(runtime.Owner) ? QuartermasterPalette.Info : QuartermasterPalette.Dim,
             CourierSession.CharacterLabel(spot.Character));
@@ -304,7 +288,7 @@ internal sealed partial class TransferPlanWorkspace
             ImGui.EndDisabled();
         }
         else
-            DrawTargetInput(row, allocation, spot);
+            DrawTargetInput(row, spot);
         ImGui.TableSetColumnIndex(3);
         var delta = spot.Delta;
         RightAligned(delta < 0 ? $"−{-delta:N0}" : delta > 0 ? $"+{delta:N0}" : "—",
@@ -323,68 +307,106 @@ internal sealed partial class TransferPlanWorkspace
     private static string PlaceLabel(QuartermasterRuntimeSnapshot runtime, CourierSpot spot) =>
         $"{CourierSession.CharacterLabel(spot.Character)} · {CourierSession.ContainerLabel(runtime, spot.Retainer)}";
 
-    /// <summary>The line a change starts from: the stored one, or a line in the older shape as it was solved.</summary>
+    /// <summary>The line a change starts from: the stored one, or a line in an older shape as it was solved.</summary>
     private static CourierLine EditableLine(TransferWorkbenchRow row, TargetPlanItem draftRule) =>
-        draftRule.Courier is { HasLegacyPlaces: false } line ? line : row.Distribution?.Line ?? draftRule.Courier ?? new CourierLine();
+        draftRule.Courier is { NeedsResolve: false } line ? line : row.Distribution?.Line ?? draftRule.Courier ?? new CourierLine();
 
     private bool MutateCourierLine(TransferWorkbenchRow row, Func<CourierLine, CourierLine> change) =>
         MutateRules(row.Owner, row.PlanId, [row.Rule.Id], draftRule => draftRule.Courier = change(EditableLine(row, draftRule)));
 
     /// <summary>
-    /// What a place should hold after the run: a whole number, up to what it has for a source and up to
-    /// the line's total for a destination, or empty to leave it to the line's other places. Empty shows
-    /// the place's computed end state.
+    /// The bounds a place keeps after the run, typed as text (<see cref="CourierBoundsText"/>): empty
+    /// makes it a pool and shows its computed end state. Numbers are never capped by what the line holds,
+    /// only to whole units up to <see cref="CourierPlace.Limit"/>. Text that does not read as bounds stays
+    /// in the box, outlined, while the stored bounds are kept.
     /// </summary>
-    private void DrawTargetInput(TransferWorkbenchRow row, CourierAllocation allocation, CourierSpot spot)
+    private void DrawTargetInput(TransferWorkbenchRow row, CourierSpot spot)
     {
         var rule = row.Rule;
         var key = PlaceKey(rule.Id, spot);
-        var limit = !spot.Destination && spot.Has is { } has ? has : allocation.Total;
-        var text = afterEditKey == key ? afterEditText : spot.Typed?.ToString("N0") ?? string.Empty;
+        var stored = CourierBoundsText.Format(spot.Min, spot.Max);
+        var rejected = rejectedTargets.GetValueOrDefault(key);
+        var text = afterEditKey == key ? afterEditText : rejected ?? stored;
         ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##target", spot.End.ToString("N0"), ref text, 16,
-            ImGuiInputTextFlags.CharsDecimal | ImGuiInputTextFlags.AutoSelectAll);
+        if (rejected is not null)
+        {
+            ImGui.PushStyleColor(ImGuiCol.Border, QuartermasterPalette.Amber);
+            ImGui.PushStyleVar(ImGuiStyleVar.FrameBorderSize, 1f);
+        }
+        ImGui.InputTextWithHint("##target", spot.End.ToString("N0"), ref text, 32, ImGuiInputTextFlags.AutoSelectAll);
+        if (rejected is not null)
+        {
+            ImGui.PopStyleVar();
+            ImGui.PopStyleColor();
+        }
         if (ImGui.IsItemActive())
         {
             afterEditKey = key;
             afterEditText = text;
         }
         if (ImGui.IsItemDeactivatedAfterEdit())
-            Set(Parse(text));
+        {
+            if (CourierBoundsText.TryParse(text, out var min, out var max))
+                Set(min, max);
+            else
+                rejectedTargets[key] = text;
+        }
         if (ImGui.IsItemDeactivated() && afterEditKey == key)
             afterEditKey = null;
+        if (ImGui.IsItemHovered() && !ImGui.IsItemActive())
+            ImGui.SetTooltip(rejected is not null
+                ? $"Not a target: {rejected}\n{CourierBoundsText.Describe(spot.Min, spot.Max)} · {CourierBoundsText.Syntax}"
+                : $"{CourierBoundsText.Describe(spot.Min, spot.Max)} · {CourierBoundsText.Syntax}");
 
         reviewRegistry.RegisterLastAction(
             $"quartermaster.courier.place.target.{key}",
-            $"Set how many {rule.ItemName} {PlaceLabel(row.Runtime, spot)} holds after the run; omit quantity to clear",
+            $"Set what {PlaceLabel(row.Runtime, spot)} keeps of {rule.ItemName} after the run: quantity for exactly that many, " +
+            "min and/or max for a range; omit all to make it a pool",
             AgentBridgeUiControlKind.Input,
             true,
             false,
-            spot.Typed?.ToString(CultureInfo.InvariantCulture) ?? string.Empty,
-            new AgentBridgeActionArgumentSchema([new("quantity", AgentBridgeActionArgumentKind.Integer, Required: false, Minimum: 0)]),
+            stored,
+            new AgentBridgeActionArgumentSchema(
+            [
+                new("quantity", AgentBridgeActionArgumentKind.Integer, Required: false, Minimum: 0),
+                new("min", AgentBridgeActionArgumentKind.Integer, Required: false, Minimum: 0),
+                new("max", AgentBridgeActionArgumentKind.Integer, Required: false, Minimum: 0),
+            ]),
             arguments =>
             {
-                if (arguments is not { ValueKind: System.Text.Json.JsonValueKind.Object } value || !value.TryGetProperty("quantity", out var quantity))
-                    return Set(null) ? AgentBridgeUiActionResult.Ok("Cleared.") : AgentBridgeUiActionResult.Fail("Not changed.");
-                if (!quantity.TryGetInt64(out var requested) || requested < 0)
-                    return AgentBridgeUiActionResult.Fail("quantity must be a whole number of at least 0.");
-                var clamped = (int)Math.Min(requested, limit);
-                return Set(clamped) ? AgentBridgeUiActionResult.Ok($"Set to {clamped:N0}.") : AgentBridgeUiActionResult.Fail("Not changed.");
+                string? error = null;
+                int? Argument(string name)
+                {
+                    if (arguments is not { ValueKind: System.Text.Json.JsonValueKind.Object } value || !value.TryGetProperty(name, out var element) ||
+                        element.ValueKind == System.Text.Json.JsonValueKind.Null)
+                        return null;
+                    if (!element.TryGetInt64(out var number) || number < 0)
+                    {
+                        error ??= $"{name} must be a whole number of at least 0.";
+                        return null;
+                    }
+                    return (int)Math.Min(number, CourierPlace.Limit);
+                }
+                var quantity = Argument("quantity");
+                var min = Argument("min");
+                var max = Argument("max");
+                if (error is not null)
+                    return AgentBridgeUiActionResult.Fail(error);
+                if (quantity is not null && (min is not null || max is not null))
+                    return AgentBridgeUiActionResult.Fail("Give quantity, or min and max, not both.");
+                var (low, high) = CourierPlace.Normalize(quantity ?? min, quantity ?? max);
+                return Set(low, high)
+                    ? AgentBridgeUiActionResult.Ok($"{CourierBoundsText.Describe(low, high)}.")
+                    : AgentBridgeUiActionResult.Fail("Not changed.");
             });
 
-        int? Parse(string value)
+        bool Set(int? min, int? max)
         {
-            var digits = new string(value.Where(char.IsAsciiDigit).ToArray());
-            if (digits.Length == 0)
-                return null;
-            return long.TryParse(digits, NumberStyles.None, CultureInfo.InvariantCulture, out var number)
-                ? (int)Math.Min(number, limit)
-                : limit;
+            rejectedTargets.Remove(key);
+            (min, max) = CourierPlace.Normalize(min, max);
+            return min == spot.Min && max == spot.Max ||
+                MutateCourierLine(row, line => line.WithBounds(spot.Character, spot.Retainer, min, max));
         }
-
-        bool Set(int? target) =>
-            target == spot.Typed ||
-            MutateCourierLine(row, line => line.WithTarget(spot.Character, spot.Retainer, target));
     }
 
     private void DrawRemovePlace(TransferWorkbenchRow row, CourierSpot spot, float rowTop, float rowBottom)
@@ -395,34 +417,27 @@ internal sealed partial class TransferPlanWorkspace
             Remove();
         reviewRegistry.RegisterLastButton(
             $"quartermaster.courier.place.remove.{PlaceKey(rule.Id, spot)}",
-            $"Remove {PlaceLabel(row.Runtime, spot)} as a {(spot.Destination ? "destination" : "source")} of {rule.ItemName}",
+            $"Remove {PlaceLabel(row.Runtime, spot)} from {rule.ItemName}",
             true,
             Remove,
             "Available");
     }
 
-    /// <summary>
-    /// Confirms a suggested place in its role on the line, or dismisses it for good. The suggested
-    /// destination keeps its review IDs; the suggested source registers the same pair under "source".
-    /// </summary>
+    /// <summary>Lists the suggested place on the line as a pool, or dismisses the suggestion for good.</summary>
     private void DrawSuggestionChoice(TransferWorkbenchRow row, CourierSpot spot)
     {
         var rule = row.Rule;
-        var destination = spot.Destination;
-        var role = destination ? "destination" : "source";
-        var prefix = destination ? "quartermaster.courier.suggestion" : "quartermaster.courier.source.suggestion";
-        void Confirm() => MutateCourierLine(row, line => destination
-            ? line.WithDestination(spot.Character, spot.Retainer)
-            : line.WithSource(spot.Character, spot.Retainer));
-        void Dismiss() => MutateCourierLine(row, line => destination
-            ? line with { SuggestionDismissed = true }
-            : line with { SourceSuggestionDismissed = true });
+        const string prefix = "quartermaster.courier.suggestion";
+        void Confirm() => MutateCourierLine(row, line => line.WithPlace(spot.Character, spot.Retainer));
+        void Dismiss() => MutateCourierLine(row, line => line with { SuggestionDismissed = true });
         ImGui.PushFont(UiBuilder.IconFont);
         var confirmed = ImGui.SmallButton($"{ConfirmIcon}##confirm-suggestion");
         ImGui.PopFont();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip($"Add {PlaceLabel(row.Runtime, spot)}");
         reviewRegistry.RegisterLastButton(
             $"{prefix}.confirm.{rule.Id:N}",
-            $"Add {PlaceLabel(row.Runtime, spot)} as a {role} of {rule.ItemName}",
+            $"Add {PlaceLabel(row.Runtime, spot)} to {rule.ItemName} as a pool",
             true,
             Confirm,
             PlaceLabel(row.Runtime, spot));
@@ -430,9 +445,11 @@ internal sealed partial class TransferPlanWorkspace
         ImGui.PushFont(UiBuilder.IconFont);
         var dismissed = ImGui.SmallButton($"{DismissIcon}##dismiss-suggestion");
         ImGui.PopFont();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip($"Dismiss {PlaceLabel(row.Runtime, spot)}");
         reviewRegistry.RegisterLastButton(
             $"{prefix}.dismiss.{rule.Id:N}",
-            $"Dismiss {PlaceLabel(row.Runtime, spot)} as the suggested {role} of {rule.ItemName}",
+            $"Dismiss {PlaceLabel(row.Runtime, spot)} as the suggested place of {rule.ItemName}",
             true,
             Dismiss,
             PlaceLabel(row.Runtime, spot));
@@ -442,85 +459,59 @@ internal sealed partial class TransferPlanWorkspace
             Dismiss();
     }
 
-    /// <summary>Which list of a line a picker adds to.</summary>
-    private enum PlaceRole
-    {
-        Source,
-        Destination,
-    }
-
     /// <summary>
-    /// Containers a line can add as a source or destination, by character: none already listed on it.
-    /// Sources put the characters and containers holding the item first, most units first.
+    /// Containers a line can add, by character: none already listed on it. Characters and containers
+    /// holding the item come first, most units first.
     /// </summary>
-    private (OwnerScope Character, CourierContainer[] Containers)[] PlaceChoices(TransferWorkbenchRow row, CourierAllocation allocation, PlaceRole role)
-    {
-        var choices = courier.DestinationCharacters(row.Runtime)
+    private (OwnerScope Character, CourierContainer[] Containers)[] PlaceChoices(TransferWorkbenchRow row, CourierAllocation allocation) =>
+        courier.DestinationCharacters(row.Runtime)
             .Select(character => (Character: character, Containers: courier.Containers(row.Runtime, character, row.Rule.ItemId, row.Rule.Quality)
                 .Where(container => !allocation.Places.Any(spot => spot.Retainer == container.Retainer && spot.Character.Matches(character)))
+                .OrderByDescending(container => container.Has ?? 0)
                 .ToArray()))
-            .Where(choice => choice.Containers.Length > 0);
-        if (role == PlaceRole.Source)
-            choices = choices
-                .Select(choice => (choice.Character, Containers: choice.Containers.OrderByDescending(container => container.Has ?? 0).ToArray()))
-                .OrderByDescending(choice => choice.Containers.Sum(container => (long)(container.Has ?? 0)));
-        return choices.ToArray();
-    }
+            .Where(choice => choice.Containers.Length > 0)
+            .OrderByDescending(choice => choice.Containers.Sum(container => (long)(container.Has ?? 0)))
+            .ToArray();
 
-    /// <summary>The row that adds a source or a destination, opening the place picker for that role.</summary>
-    private void DrawAddPlace(TransferWorkbenchRow row, CourierAllocation allocation, PlaceRole role, string? roleLabel, PlaceLayout layout)
+    /// <summary>The row that adds a place, opening the place picker.</summary>
+    private void DrawAddPlace(TransferWorkbenchRow row, CourierAllocation allocation, PlaceLayout layout)
     {
-        var choices = PlaceChoices(row, allocation, role);
+        var choices = PlaceChoices(row, allocation);
         if (choices.Length == 0)
             return;
         var rule = row.Rule;
-        var source = role == PlaceRole.Source;
-        BeginPlaceRow(row, roleLabel, layout);
-        var label = source ? "+ Add source…" : "+ Add destination…";
+        BeginPlaceRow(row, layout);
+        const string label = "+ Add place…";
         ImGui.PushStyleColor(ImGuiCol.Text, QuartermasterPalette.Dim);
-        var clicked = ImGui.Selectable($"{label}##add-{(source ? "source" : "destination")}", false, ImGuiSelectableFlags.None,
-            new Vector2(ImGui.CalcTextSize(label).X, 0));
+        var clicked = ImGui.Selectable($"{label}##add-place", false, ImGuiSelectableFlags.None, new Vector2(ImGui.CalcTextSize(label).X, 0));
         ImGui.PopStyleColor();
         var ruleId = rule.Id;
         reviewRegistry.RegisterLastButton(
-            $"quartermaster.courier.{(source ? "source" : "destination")}.add.{ruleId:N}",
-            $"Choose a {(source ? "source" : "destination")} for {rule.ItemName}",
+            $"quartermaster.courier.place.add.{ruleId:N}",
+            $"Choose a place for {rule.ItemName}",
             true,
-            () =>
-            {
-                if (source)
-                    sourcePickerOpenRequest = ruleId;
-                else
-                    pickerOpenRequest = ruleId;
-            },
+            () => pickerOpenRequest = ruleId,
             "Available");
-        var requested = source ? sourcePickerOpenRequest == ruleId : pickerOpenRequest == ruleId;
-        if (clicked || requested)
+        if (clicked || pickerOpenRequest == ruleId)
         {
-            if (source)
-                sourcePickerOpenRequest = null;
-            else
-                pickerOpenRequest = null;
+            pickerOpenRequest = null;
             pickerCharacter = null;
             pickerContainer = default;
             pickerClose = false;
-            ImGui.OpenPopup(source ? SourcePickerPopup : DestinationPickerPopup);
+            ImGui.OpenPopup(PlacePickerPopup);
         }
-        DrawPlacePicker(row, role, choices);
+        DrawPlacePicker(row, choices);
     }
 
     /// <summary>
-    /// Picks a source or destination container: a character, then one of its containers with its free
-    /// space and units of the item, beside everything the highlighted container holds.
+    /// Picks a container to list: a character, then one of its containers with its free space and units
+    /// of the item, beside everything the highlighted container holds. It joins the line as a pool.
     /// </summary>
-    private void DrawPlacePicker(TransferWorkbenchRow row, PlaceRole role, (OwnerScope Character, CourierContainer[] Containers)[] choices)
+    private void DrawPlacePicker(TransferWorkbenchRow row, (OwnerScope Character, CourierContainer[] Containers)[] choices)
     {
-        var source = role == PlaceRole.Source;
-        if (!DalamudOwnedPopup.BeginOpaquePopup(source ? SourcePickerPopup : DestinationPickerPopup))
+        if (!DalamudOwnedPopup.BeginOpaquePopup(PlacePickerPopup))
             return;
-        // Destination rows keep their original IDs; source rows mirror them under the source prefix.
-        var ids = source ? "quartermaster.courier.source.picker" : "quartermaster.courier.picker";
-        var roleName = source ? "source" : "destination";
+        const string ids = "quartermaster.courier.picker";
         if (pickerClose)
         {
             pickerClose = false;
@@ -546,7 +537,7 @@ internal sealed partial class TransferPlanWorkspace
         }
         void Add(OwnerScope character, ulong? retainer)
         {
-            MutateCourierLine(row, line => source ? line.WithSource(character, retainer) : line.WithDestination(character, retainer));
+            MutateCourierLine(row, line => line.WithPlace(character, retainer));
             pickerClose = true;
         }
 
@@ -633,7 +624,7 @@ internal sealed partial class TransferPlanWorkspace
             if (ImGui.Button(addLabel))
                 Add(character, retainer);
             reviewRegistry.RegisterLastButton($"{ids}.add",
-                $"Add {character.CharacterName} · {highlighted.Name} as a {roleName} of {rule.ItemName}", true,
+                $"Add {character.CharacterName} · {highlighted.Name} to {rule.ItemName}", true,
                 () => Add(character, retainer), $"{character.CharacterName} · {highlighted.Name}");
             ImGui.Separator();
             if (ImGui.BeginTable("##picker-content-table", 2, ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY))
@@ -730,4 +721,69 @@ internal static class FreeSlotsBar
         draw.AddRectFilled(min, min + size, ImGui.GetColorU32(ImGuiCol.FrameBg));
         draw.AddRectFilled(min, new Vector2(min.X + (size.X * used), min.Y + size.Y), ImGui.GetColorU32(Color(free)));
     }
+}
+
+/// <summary>
+/// A courier place's bounds as the Target cell shows and reads them. Blank is a pool; <c>N</c> or
+/// <c>=N</c> keeps exactly N (0 drains); <c>A-B</c>, <c>A–B</c> or <c>A..B</c> keeps a range, either
+/// way round; <c>N+</c>, <c>&gt;=N</c>, <c>≥N</c>, <c>N-</c> or <c>N..</c> keeps at least N; <c>&lt;=N</c>,
+/// <c>≤N</c>, <c>-N</c> or <c>..N</c> keeps at most N. Spaces and group separators are ignored and numbers
+/// are clamped to [0, <see cref="CourierPlace.Limit"/>].
+/// </summary>
+internal static class CourierBoundsText
+{
+    internal const string Syntax = "blank: pool, N: exact, A-B: range, N+: min, <=N: max";
+
+    private static readonly Regex Exact = new(@"^=?(\d+)$", RegexOptions.CultureInvariant);
+    private static readonly Regex Range = new(@"^(\d+)(?:-|\.\.)(\d+)$", RegexOptions.CultureInvariant);
+    private static readonly Regex Floor = new(@"^(?:>=(\d+)|(\d+)(?:\+|-|\.\.))$", RegexOptions.CultureInvariant);
+    private static readonly Regex Ceiling = new(@"^(?:<=|-|\.\.)(\d+)$", RegexOptions.CultureInvariant);
+
+    internal static string Format(int? min, int? max) => (min, max) switch
+    {
+        (null, null) => string.Empty,
+        ({ } low, { } high) when low == high => Number(low),
+        ({ } low, { } high) => $"{Number(low)}-{Number(high)}",
+        ({ } low, null) => $"{Number(low)}+",
+        (null, { } high) => $"<={Number(high)}",
+    };
+
+    internal static string Describe(int? min, int? max) => (min, max) switch
+    {
+        (null, null) => "Pool",
+        (0, 0) => "Drains",
+        ({ } low, { } high) when low == high => $"Maintains {Number(low)}",
+        ({ } low, { } high) => $"Maintains {Number(low)}–{Number(high)}",
+        ({ } low, null) => $"Keeps at least {Number(low)}",
+        (null, { } high) => $"Keeps at most {Number(high)}",
+    };
+
+    /// <summary>Reads typed bounds; false when the text is not one of the accepted forms.</summary>
+    internal static bool TryParse(string text, out int? min, out int? max)
+    {
+        min = max = null;
+        var compact = new string(text.Where(c => !char.IsWhiteSpace(c) && c is not (',' or '_' or '\'')).ToArray())
+            .Replace('–', '-').Replace('—', '-').Replace('−', '-')
+            .Replace("≥", ">=", StringComparison.Ordinal).Replace("≤", "<=", StringComparison.Ordinal);
+        if (compact.Length == 0)
+            return true;
+        if (Exact.Match(compact) is { Success: true } exact)
+            min = max = Value(exact.Groups[1]);
+        else if (Range.Match(compact) is { Success: true } range)
+            (min, max) = CourierPlace.Normalize(Value(range.Groups[1]), Value(range.Groups[2]));
+        else if (Floor.Match(compact) is { Success: true } floor)
+            min = Value(floor.Groups[1].Success ? floor.Groups[1] : floor.Groups[2]);
+        else if (Ceiling.Match(compact) is { Success: true } ceiling)
+            max = Value(ceiling.Groups[1]);
+        else
+            return false;
+        return true;
+    }
+
+    private static int Value(Group digits) =>
+        long.TryParse(digits.Value, NumberStyles.None, CultureInfo.InvariantCulture, out var number)
+            ? (int)Math.Min(number, CourierPlace.Limit)
+            : CourierPlace.Limit;
+
+    private static string Number(int value) => value.ToString("N0", CultureInfo.InvariantCulture);
 }
