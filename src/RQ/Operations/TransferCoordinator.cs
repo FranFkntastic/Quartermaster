@@ -189,6 +189,7 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
         var retainerOpen = false;
         var retainerSessionOpen = false;
         var movementAttempted = false;
+        var transferred = 0;
         try
         {
             token.ThrowIfCancellationRequested();
@@ -235,7 +236,6 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                 OperationStatuses.Running,
                 "ExecutionStarted",
                 operation.ExecuteImmediately ? "Automatic live retrieval verification started." : "Reviewed live retrieval verification started.");
-            var transferred = 0;
             // Retainers whose live stock this run scanned, and whether the saddlebag leg could run at all: a restricted
             // line is only reported as short of stock when every allowed source was reached or verified empty.
             var visited = new HashSet<ulong>();
@@ -544,9 +544,10 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
             {
                 journal.Transition(
                     operationId,
-                    movementAttempted ? OperationStatuses.Indeterminate : OperationStatuses.Failed,
+                    movementAttempted ? OperationStatuses.Indeterminate : transferred > 0 ? OperationStatuses.PartiallySucceeded : OperationStatuses.Failed,
                     movementAttempted ? "BookkeepingIndeterminate" : "ExecutionFailed",
-                    movementAttempted ? $"Live movement may have occurred, but execution did not finish cleanly: {failure}" : failure);
+                    movementAttempted ? $"Live movement may have occurred, but execution did not finish cleanly: {failure}"
+                        : transferred > 0 ? $"Retrieved {transferred:N0} verified units before execution stopped: {failure}" : failure);
             }
             return new(true, failure);
         }
@@ -590,6 +591,7 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
         var retainerOpen = false;
         var retainerSessionOpen = false;
         var movementAttempted = false;
+        var transferred = 0;
         string? lastZeroMovement = null;
         try
         {
@@ -609,7 +611,6 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
             var remaining = operation.Lines.ToDictionary(
                 OperationJournal.AuthorizationKey,
                 line => line.TargetQuantity);
-            var transferred = 0;
             await driver.RequireRetainerListAsync(token).ConfigureAwait(false);
             retainerSessionOpen = true;
             token.ThrowIfCancellationRequested();
@@ -885,9 +886,10 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
             {
                 journal.Transition(
                     operationId,
-                    movementAttempted ? OperationStatuses.Indeterminate : OperationStatuses.Failed,
+                    movementAttempted ? OperationStatuses.Indeterminate : transferred > 0 ? OperationStatuses.PartiallySucceeded : OperationStatuses.Failed,
                     movementAttempted ? "BookkeepingIndeterminate" : "DepositFailed",
-                    movementAttempted ? $"Live movement may have occurred, but execution did not finish cleanly: {failure}" : failure);
+                    movementAttempted ? $"Live movement may have occurred, but execution did not finish cleanly: {failure}"
+                        : transferred > 0 ? $"Stowed {transferred:N0} verified units before execution stopped: {failure}" : failure);
             }
             return new(true, failure);
         }
