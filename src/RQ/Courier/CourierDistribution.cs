@@ -57,10 +57,14 @@ public static class CourierDistribution
     private static int Count(CourierLocation at, uint item, ItemQualityPolicy quality) =>
         at.Inventory.Stock.Where(s => Wanted(s, item, quality)).Sum(s => s.Units);
 
-    /// <summary>Units of the item a container can still take: the rest of its partial stacks and its free slots.</summary>
-    private static long Room(CourierLocation at, uint item, ItemQualityPolicy quality, int size) =>
-        at.Inventory.Stock.Where(s => Wanted(s, item, quality) && s.Units > 0).Sum(s => (long)((size - s.Units % size) % size)) +
-        (long)Math.Max(0, at.Inventory.FreeSlots) * size;
+    private static int CountQuality(CourierLocation at, uint item, ItemQualityPolicy quality, bool hq) =>
+        quality != ItemQualityPolicy.Any && hq != (quality == ItemQualityPolicy.HqOnly)
+            ? 0
+            : at.Inventory.Stock.Where(s => s.ItemId == item && s.Hq == hq).Sum(s => s.Units);
+
+    /// <summary>Room left in existing partial stacks of one quality of the item.</summary>
+    private static long PartialRoom(CourierLocation at, uint item, bool hq, int size) =>
+        at.Inventory.Stock.Where(s => s.ItemId == item && s.Hq == hq && s.Units > 0).Sum(s => (long)((size - s.Units % size) % size));
 
     private static CourierLocation? Observed(IReadOnlyList<CourierLocation> locations, OwnerScope who, ulong? retainer) =>
         locations.FirstOrDefault(l => l.Retainer == retainer && l.Character.Matches(who));
@@ -188,7 +192,12 @@ public static class CourierDistribution
         var has = new int?[n];
         var min = new int?[n];
         var max = new int?[n];
-        var room = new long?[n];
+        var nq = new int[n];
+        var hq = new int[n];
+        var freeSlots = new int[n];
+        var partialNq = new long[n];
+        var partialHq = new long[n];
+        var knownSize = stackSize is > 0 ? stackSize.Value : 0;
         for (var i = 0; i < n; i++)
         {
             var place = entries[i];
@@ -196,7 +205,17 @@ public static class CourierDistribution
             who[i] = at?.Character ?? place.Character;
             has[i] = at is null ? null : Count(at, item, quality);
             (min[i], max[i]) = CourierPlace.Normalize(place.Min, place.Max);
-            room[i] = at is not null && stackSize is { } size and > 0 ? Room(at, item, quality, size) : null;
+            if (at is not null)
+            {
+                nq[i] = CountQuality(at, item, quality, hq: false);
+                hq[i] = CountQuality(at, item, quality, hq: true);
+                if (knownSize > 0)
+                {
+                    freeSlots[i] = Math.Max(0, at.Inventory.FreeSlots);
+                    partialNq[i] = PartialRoom(at, item, hq: false, knownSize);
+                    partialHq[i] = PartialRoom(at, item, hq: true, knownSize);
+                }
+            }
         }
 
         int Held(int i) => has[i] ?? 0;
@@ -217,11 +236,32 @@ public static class CourierDistribution
         var sent = new int[n];
         var received = new int[n];
         var flows = new List<CourierFlow>();
+        void ConsumePoolRoom(int to, bool isHq, int units)
+        {
+            if (units <= 0 || knownSize <= 0 || has[to] is null)
+                return;
+            var partials = isHq ? partialHq : partialNq;
+            var intoPartial = Math.Min(units, partials[to]);
+            partials[to] -= intoPartial;
+            var overflowUnits = units - intoPartial;
+            if (overflowUnits <= 0)
+                return;
+            var slotsUsed = (int)((overflowUnits + knownSize - 1) / knownSize);
+            freeSlots[to] = Math.Max(0, freeSlots[to] - slotsUsed);
+            partials[to] += (knownSize - (overflowUnits % knownSize)) % knownSize;
+        }
         void Move(int from, int to, int units)
         {
             if (units <= 0) return;
             sent[from] += units;
             received[to] += units;
+            // Match CourierPlanner.Build: NQ units leave first, then HQ.
+            var nqUnits = Math.Min(nq[from], units);
+            var hqUnits = units - nqUnits;
+            nq[from] -= nqUnits;
+            hq[from] = Math.Max(0, hq[from] - hqUnits);
+            ConsumePoolRoom(to, isHq: false, nqUnits);
+            ConsumePoolRoom(to, isHq: true, hqUnits);
             var last = flows.FindIndex(f => f.From == from && f.To == to);
             if (last >= 0)
                 flows[last] = flows[last] with { Units = flows[last].Units + units };
@@ -259,14 +299,29 @@ public static class CourierDistribution
             }
 
         // 3. Surplus still held goes to pools, then to bounded places with room under their Max. With stack
-        // sizes known, pools fill to their physical room in turn and the last observed one takes the rest
-        // (so a full one surfaces on the line); without, the first pool takes everything.
+        // sizes known, pools fill to their physical room in turn (matching incoming quality in NQ-first order)
+        // and the last observed one takes the rest (so a full one surfaces on the line); without, the first
+        // pool takes everything.
         var observedPools = pools.Where(i => has[i] is not null).ToArray();
-        var overflow = stackSize is > 0
+        var overflow = knownSize > 0
             ? observedPools.Length > 0 ? observedPools[^1] : pools.DefaultIfEmpty(-1).Last()
             : observedPools.Length > 0 ? observedPools[0] : pools.DefaultIfEmpty(-1).First();
-        var spill = stackSize is > 0 ? observedPools.Where(i => i != overflow).ToArray() : [];
-        long PoolRoom(int i) => i == overflow ? long.MaxValue : room[i] is { } r ? Math.Max(0, r - received[i]) : 0;
+        var spill = knownSize > 0 ? observedPools.Where(i => i != overflow).ToArray() : [];
+        long PoolRoom(int giver, int taker, int unitsToSend)
+        {
+            if (taker == overflow)
+                return long.MaxValue;
+            if (knownSize <= 0 || has[taker] is null)
+                return 0;
+            var nqWant = Math.Min(unitsToSend, nq[giver]);
+            var hqWant = unitsToSend - nqWant;
+            var nqFit = Math.Min(nqWant, partialNq[taker] + (long)freeSlots[taker] * knownSize);
+            if (nqFit < nqWant)
+                return nqFit;
+            var slotsAfterNq = freeSlots[taker] - (int)((Math.Max(0L, nqFit - partialNq[taker]) + knownSize - 1) / knownSize);
+            var hqFit = Math.Min(hqWant, partialHq[taker] + (long)Math.Max(0, slotsAfterNq) * knownSize);
+            return nqFit + hqFit;
+        }
         foreach (var giver in all.Where(i => give[i] > 0))
         {
             var takers = Prefer(giver, spill)
@@ -275,7 +330,7 @@ public static class CourierDistribution
             foreach (var taker in takers)
             {
                 if (give[giver] == 0) break;
-                var capacity = Pool(taker) ? PoolRoom(taker) : slack[taker];
+                var capacity = Pool(taker) ? PoolRoom(giver, taker, give[giver]) : slack[taker];
                 var units = (int)Math.Min(give[giver], capacity);
                 give[giver] -= units;
                 if (!Pool(taker))
