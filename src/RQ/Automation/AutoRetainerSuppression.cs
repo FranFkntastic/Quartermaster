@@ -11,22 +11,38 @@ namespace RQ.Automation;
 /// When a marker path is given, ownership is also recorded on disk while held,
 /// so a load that died holding it is reclaimed by the next load
 /// (<see cref="ReclaimOrphaned"/>) instead of leaving AutoRetainer suppressed.
+/// When a holder registry is given (Dalamud shared data under <see cref="HolderRegistryKey"/>, shared with the
+/// other Gooseworks plugins), this plugin's owner name is in it while it holds, and AutoRetainer is unsuppressed
+/// only once no owner name is left: a plugin never lifts a suppression another one still needs.
 /// </summary>
 public sealed class AutoRetainerSuppression
 {
+    /// <summary>Dalamud shared-data key of the cross-plugin holder registry: a <see cref="HashSet{T}"/> of owner names, locked on itself.</summary>
+    public const string HolderRegistryKey = "Gooseworks.AutoRetainerSuppression.Holders";
+    /// <summary>This plugin's owner name in the holder registry.</summary>
+    public const string OwnerName = "Quartermaster";
+
     private readonly IAutoRetainerIpc ipc;
     private readonly string? markerPath;
     private readonly Action<string>? warn;
+    private readonly HashSet<string>? registry;
     private readonly object gate = new();
     private int holders;
     private bool weOwnSuppression;
     private bool orphanChecked;
+    // Warned once per hold: a plugin or the user lifting the suppression repeatedly must not log every check.
+    private bool reassertWarned;
+    private bool reassertFailureWarned;
 
-    public AutoRetainerSuppression(IAutoRetainerIpc ipc, string? markerPath = null, Action<string>? warn = null)
+    public AutoRetainerSuppression(IAutoRetainerIpc ipc, string? markerPath = null, Action<string>? warn = null, HashSet<string>? holderRegistry = null)
     {
         this.ipc = ipc;
         this.markerPath = markerPath;
         this.warn = warn;
+        registry = holderRegistry;
+        // A new load holds nothing: an entry under this plugin's name is a dead load's leftover.
+        if (RegistryRemove())
+            warn?.Invoke($"[Quartermaster] AutoRetainerHolderStale: removed '{OwnerName}' from the AutoRetainer holder registry, left by an earlier Quartermaster load.");
     }
 
     public bool IsAvailable
@@ -65,9 +81,17 @@ public sealed class AutoRetainerSuppression
         {
             if (holders == 0)
             {
+                reassertWarned = reassertFailureWarned = false;
+                // Another Gooseworks plugin already holding it makes the suppression shared: the last holder out lifts it.
+                var shared = RegistryAdd();
                 if (!ipc.IsSuppressed)
                 {
                     ipc.SetSuppressed(true);
+                    weOwnSuppression = true;
+                    WriteMarker();
+                }
+                else if (shared)
+                {
                     weOwnSuppression = true;
                     WriteMarker();
                 }
@@ -83,7 +107,7 @@ public sealed class AutoRetainerSuppression
 
     /// <summary>
     /// While a scope is held, suppresses AutoRetainer again if another plugin (or the user) lifted it mid-hold.
-    /// Cheap enough for a per-second tick: one IPC read while held, nothing otherwise.
+    /// Cheap enough for a per-second tick: one IPC read while held, nothing otherwise. Warns once per hold.
     /// </summary>
     public void Reassert()
     {
@@ -103,18 +127,28 @@ public sealed class AutoRetainerSuppression
             ipc.SetSuppressed(true);
             weOwnSuppression = true;
             WriteMarker();
-            warn?.Invoke($"[Quartermaster] AutoRetainerSuppressionReasserted: AutoRetainer was unsuppressed while {holders} Quartermaster scope(s) still needed it suppressed; suppressed again.");
+            if (!reassertWarned)
+            {
+                reassertWarned = true;
+                warn?.Invoke($"[Quartermaster] AutoRetainerSuppressionReasserted: AutoRetainer was unsuppressed while {holders} Quartermaster scope(s) still needed it suppressed; suppressed again (warned once per hold).");
+            }
         }
         catch (Exception exception)
         {
-            warn?.Invoke($"[Quartermaster] AutoRetainerSuppressionReassertFailed: {exception.Message}");
+            if (!reassertFailureWarned)
+            {
+                reassertFailureWarned = true;
+                warn?.Invoke($"[Quartermaster] AutoRetainerSuppressionReassertFailed: {exception.Message} (warned once per hold; retried every check).");
+            }
         }
     }
 
     /// <summary>
     /// Load-time reclaim: with no scope held here and a marker an earlier load left (it died holding suppression it
-    /// set), AutoRetainer is unsuppressed and the marker removed. Returns true once settled (nothing to do, reclaimed,
-    /// or a scope is held so the marker is ours); false while AutoRetainer is not reachable yet, so the caller retries.
+    /// set), AutoRetainer is unsuppressed and the marker removed, unless another plugin's owner name is in the holder
+    /// registry (it still needs AutoRetainer suppressed and lifts it when it is done). Returns true once settled
+    /// (nothing to do, reclaimed, left to another holder, or a scope is held so the marker is ours); false while
+    /// AutoRetainer is not reachable yet, so the caller retries.
     /// </summary>
     public bool ReclaimOrphaned()
     {
@@ -132,9 +166,17 @@ public sealed class AutoRetainerSuppression
                 return false;
             try
             {
+                var since = ReadMarker();
+                if (OtherHolders() is { Length: > 0 } others)
+                {
+                    DeleteMarker();
+                    orphanChecked = true;
+                    warn?.Invoke($"[Quartermaster] AutoRetainerSuppressionLeftToHolder: an earlier Quartermaster load suppressed AutoRetainer{(since is null ? "" : $" at {since}")} and never restored it; " +
+                        $"left suppressed because {string.Join(", ", others)} still hold(s) it.");
+                    return true;
+                }
                 if (!ipc.IsAvailable)
                     return false;
-                var since = ReadMarker();
                 if (ipc.IsSuppressed)
                     ipc.SetSuppressed(false);
                 DeleteMarker();
@@ -152,18 +194,21 @@ public sealed class AutoRetainerSuppression
 
     /// <summary>
     /// Unload: restores suppression this load set even while scopes are still held (their owners are being torn
-    /// down), so a throw elsewhere in the unload never leaves AutoRetainer suppressed. The marker is removed only
-    /// once the restore succeeded; otherwise the next load reclaims it.
+    /// down), so a throw elsewhere in the unload never leaves AutoRetainer suppressed. Another holder in the registry
+    /// keeps it suppressed. The marker is removed only once the restore succeeded (or was left to another holder);
+    /// otherwise the next load reclaims it.
     /// </summary>
     public void RestoreOnUnload()
     {
         lock (gate)
         {
+            RegistryRemove();
             if (!weOwnSuppression)
                 return;
             try
             {
-                ipc.SetSuppressed(false);
+                if (OtherHolders() is not { Length: > 0 })
+                    ipc.SetSuppressed(false);
                 weOwnSuppression = false;
                 DeleteMarker();
             }
@@ -179,11 +224,16 @@ public sealed class AutoRetainerSuppression
         lock (gate)
         {
             holders--;
-            if (holders != 0 || !weOwnSuppression)
+            if (holders != 0)
+                return;
+            RegistryRemove();
+            if (!weOwnSuppression)
                 return;
             try
             {
-                ipc.SetSuppressed(false);
+                // Another Gooseworks plugin still holds it: left suppressed; that plugin lifts it when it is done.
+                if (OtherHolders() is not { Length: > 0 })
+                    ipc.SetSuppressed(false);
                 weOwnSuppression = false;
                 DeleteMarker();
             }
@@ -195,6 +245,37 @@ public sealed class AutoRetainerSuppression
                 scope.RestoreFailure = exception.Message;
             }
         }
+    }
+
+    /// <summary>Adds this plugin's owner name; true when another owner name was already present.</summary>
+    private bool RegistryAdd()
+    {
+        if (registry is null)
+            return false;
+        lock (registry)
+        {
+            var others = registry.Any(name => !string.Equals(name, OwnerName, StringComparison.Ordinal));
+            registry.Add(OwnerName);
+            return others;
+        }
+    }
+
+    /// <summary>Removes this plugin's owner name; true when it was present.</summary>
+    private bool RegistryRemove()
+    {
+        if (registry is null)
+            return false;
+        lock (registry)
+            return registry.Remove(OwnerName);
+    }
+
+    /// <summary>Owner names in the registry other than this plugin's; empty without a registry.</summary>
+    private string[] OtherHolders()
+    {
+        if (registry is null)
+            return [];
+        lock (registry)
+            return [.. registry.Where(name => !string.Equals(name, OwnerName, StringComparison.Ordinal))];
     }
 
     private void WriteMarker()

@@ -27,8 +27,12 @@ internal sealed record CourierContainer(ulong? Retainer, string Name, int Capaci
 /// built before it. A carrier forgets a held run its owner client no longer has.</param>
 /// <param name="OwnerActiveRun">The owner journal's run while it is running; null when none runs or from clients built before
 /// it. A carrier counts it as the owner still working on the run, so a long owner-only step never reads as owner silence.</param>
+/// <param name="AdvertisesOwnerActiveRun">True when this client publishes <paramref name="OwnerActiveRun"/>; null from clients
+/// built before it. A carrier pauses a held run on owner silence only for an owner that advertises it: an older owner's long
+/// owner-only step would otherwise read as silence.</param>
 public sealed record CourierPeer(OwnerScope Character, InventoryView? Bags,IReadOnlyList<OwnerScope>? Roster=null,
-    bool? CarrierOptIn=null,IReadOnlyList<OwnerScope>? PairedOwners=null,bool? CarrierSourcing=null,Guid? OwnerRun=null,Guid? OwnerActiveRun=null);
+    bool? CarrierOptIn=null,IReadOnlyList<OwnerScope>? PairedOwners=null,bool? CarrierSourcing=null,Guid? OwnerRun=null,Guid? OwnerActiveRun=null,
+    bool? AdvertisesOwnerActiveRun=null);
 
 /// <summary>
 /// The live facts only the courier wiring can supply to the UI. Both members are read on the
@@ -841,10 +845,10 @@ public sealed class CourierSession
 
     /// <summary>Clears the run, whatever it holds or awaits: the escape hatch. One click, no acknowledgement.</summary>
     /// <returns>Whether the clear was launched (false when the courier is not loaded or a run is active).</returns>
-    internal bool Clear(Guid expectedRun, Action<CourierSnapshot?, Exception?>? settled = null)
+    internal bool Clear(Guid expectedRun, Action<CourierSnapshot?, Exception?>? settled = null, string clearedBy = CourierClearSource.User)
     {
         if (Conductor is not { } conductor || IsActive) return false;
-        Launch(async () => await conductor.ClearAsync(expectedRun).ConfigureAwait(false), settled);
+        Launch(async () => await conductor.ClearAsync(expectedRun, clearedBy).ConfigureAwait(false), settled);
         return true;
     }
 
@@ -874,7 +878,7 @@ public sealed class CourierSession
         Launch(async () =>
         {
             if (clearFirst is { } previous)
-                await conductor.ClearAsync(previous).ConfigureAwait(false);
+                await conductor.ClearAsync(previous, CourierClearSource.Replace).ConfigureAwait(false);
             return await conductor.StartAsync(courierPlan, settings, runId).ConfigureAwait(false);
         }, settled);
         return true;

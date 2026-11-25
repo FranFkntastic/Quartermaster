@@ -216,12 +216,20 @@ internal sealed class DeliveredStowCourier : IDeliveredStowCourier
     private static IReadOnlyDictionary<Guid, int> PlannedPerLine(IEnumerable<CourierTrip> trips) =>
         trips.SelectMany(trip => trip.Manifest).GroupBy(stack => stack.Line).ToDictionary(group => group.Key, group => group.Sum(stack => stack.Units));
 
+    /// <summary>
+    /// Stops the run: the journaled current run while it runs, or a launch this adapter started that has not journaled
+    /// the run yet (the conductor honours a stop that arrives after its launch was prepared, so the run halts before its
+    /// first step). Idempotent: a stop already requested is requested again harmlessly.
+    /// </summary>
     public bool Stop(Guid run)
     {
         if (session.Conductor is not { } conductor)
             return false;
         var journal = conductor.Journal();
-        if (journal.Run != run || journal.State != "Running" && !session.IsStarting)
+        var current = journal.Run == run && (journal.State == "Running" || session.IsStarting);
+        // Still launching: StartPlan returned and bound the run, but the background start has not written its journal.
+        var launching = !current && session.IsStarting && !settled.ContainsKey(run) && launched.Values.Any(launch => launch.Run == run);
+        if (!current && !launching)
             return false;
         session.Stop();
         return true;

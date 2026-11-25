@@ -502,16 +502,18 @@ public sealed class DeliveredStowService
     /// The requester cancelled this delivered stow (CancelRequestedOperation, or Cancel in Transfer history): its forward,
     /// if one has not begun, records that durably and never starts, even when the local stow then settles normally.
     /// A forward whose run already started is left to <see cref="CancelForward"/>. Unknown ids are ignored.
+    /// Returns true when this call withdrew a forward (it will not start), so the cancel's ack can say so.
     /// </summary>
-    public void RecordRequesterCancel(string requestId, string reason)
+    public bool RecordRequesterCancel(string requestId, string reason)
     {
         lock (gate)
         {
             if (forwards.FirstOrDefault(record => record.RequestId == requestId) is not { } record ||
                 record.State == ForwardStateSettled || record.Run is not null || record.CancelRequestedUtc is not null)
-                return;
+                return false;
             MarkCancel(record, LocalDepositCancelled, reason);
             warn($"[DeliveredStow] {requestId}: {LocalDepositCancelled} recorded ({reason}); its courier forward will not start.");
+            return true;
         }
     }
 
@@ -519,7 +521,8 @@ public sealed class DeliveredStowService
     /// Quartermaster.v1.CancelDeliveredStowForward. Status: cancelled (the forward never starts), stopping (its courier
     /// run is told to stop at its next verified checkpoint; RunId names it), already_terminal, cancel_queued (accepted
     /// but not persisted yet; cancelled once it is), not_found, or rejected (ErrorCode names why). Schema and
-    /// providerInstanceId are optional, and checked when given.
+    /// providerInstanceId are optional, and checked when given; the schema may be this channel's or the generic
+    /// requested-operation cancel schema.
     /// </summary>
     public string CancelForward(string requestJson)
     {
@@ -528,8 +531,9 @@ public sealed class DeliveredStowService
         catch (JsonException exception) { return Serialize(CancelAck(string.Empty, "rejected", exception.Message, errorCode: "invalid_json")); }
         if (request is null)
             return Serialize(CancelAck(string.Empty, "rejected", "Request body is empty.", errorCode: "invalid_json"));
-        if (!string.IsNullOrWhiteSpace(request.Schema) && request.Schema != ForwardCancelSchema)
-            return Serialize(CancelAck(request.RequestId, "rejected", $"Expected schema '{ForwardCancelSchema}'.", errorCode: "unsupported_schema"));
+        // The generic requested-operation cancel schema is accepted too, for requesters that reuse that envelope.
+        if (!string.IsNullOrWhiteSpace(request.Schema) && request.Schema != ForwardCancelSchema && request.Schema != RequestedOperationCancelService.RequestSchema)
+            return Serialize(CancelAck(request.RequestId, "rejected", $"Expected schema '{ForwardCancelSchema}' (or '{RequestedOperationCancelService.RequestSchema}').", errorCode: "unsupported_schema"));
         if (!string.IsNullOrWhiteSpace(request.ProviderInstanceId) && request.ProviderInstanceId != providerInstanceId)
             return Serialize(CancelAck(request.RequestId, "rejected", "providerInstanceId does not match this Quartermaster provider instance.", errorCode: "provider_mismatch"));
         if (string.IsNullOrWhiteSpace(request.RequestId))
@@ -568,6 +572,9 @@ public sealed class DeliveredStowService
         var runId = record.Run?.ToString();
         if (record.State == ForwardStateSettled)
             return CancelAck(requestId, "already_terminal", $"The forward already ended ({record.Code ?? "settled"}: {record.Message}).", runId, record.Code);
+        // The run already finished; the next tick settles the forward from its outcome, so there is nothing left to stop.
+        if (record.Run is { } bound && RunEnded(bound) is { } ended)
+            return CancelAck(requestId, "already_terminal", $"The forward's courier run {bound} already ended ({ended}); the forward settles from its outcome.", runId);
         if (record.CancelRequestedUtc is null)
             MarkCancel(record, ForwardCancelled, reason);
         if (record.Run is { } run)
@@ -578,12 +585,52 @@ public sealed class DeliveredStowService
                 ? $"Courier run {run} was told to stop at its next verified checkpoint; stop or clear it with the courier IPC to settle it."
                 : $"Courier run {run} is not running; resume or clear it with the courier IPC to settle the forward.", runId);
         }
+        if (courier is not null)
+        {
+            // A run started under this request whose binding was not saved (Quartermaster reloaded before the next tick):
+            // the next tick binds it and keeps telling it to stop, so this cancel reports the run instead of "cancelled".
+            var (earlier, loading) = courier.Adopt(CourierRequestId(requestId));
+            if (earlier is not null)
+            {
+                var adoptedId = earlier.Run.ToString();
+                if (RunEnded(earlier.Run) is { } adoptedEnd)
+                    return CancelAck(requestId, "already_terminal", $"The courier run {earlier.Run} started for this forward already ended ({adoptedEnd}); the forward settles from its outcome.", adoptedId);
+                var stopped = courier.Stop(earlier.Run);
+                return CancelAck(requestId, "stopping", stopped
+                    ? $"Courier run {earlier.Run} (started for this forward before Quartermaster reloaded) was told to stop at its next verified checkpoint; stop or clear it with the courier IPC to settle it."
+                    : $"Courier run {earlier.Run} (started for this forward before Quartermaster reloaded) is not running; resume or clear it with the courier IPC to settle the forward.", adoptedId);
+            }
+            if (loading)
+                return CancelAck(requestId, "cancel_queued",
+                    "The cancel is recorded and the forward will not start; the courier's request history is still loading, so whether a run already started for it is not known yet. Send the cancel again for its final status.");
+        }
         var localOpen = record.OperationId is { } operationId &&
             repository.Read(state => state.Operations.FirstOrDefault(candidate => candidate.OperationId == operationId)) is { } operation &&
             !OperationStatuses.IsTerminal(operation.Status);
         return CancelAck(requestId, "cancelled", localOpen
             ? "The forward will not start; the owner's own stow is still running (cancel it with Quartermaster.v1.CancelRequestedOperation)."
             : "The forward will not start.");
+    }
+
+    /// <summary>
+    /// How the run ended (state and code) when it is no longer running or resumable: completed, or closed (cleared or
+    /// replaced) with its archive read. Null while it may still run or be resumed, or while that is not known yet.
+    /// </summary>
+    private string? RunEnded(Guid run)
+    {
+        if (courier is null)
+            return null;
+        try
+        {
+            return courier.Progress(run) is { } progress && (progress.State == "Completed" || !progress.Current && progress.State != "Starting")
+                ? $"{progress.State}{(progress.Code is { Length: > 0 } code ? $" {code}" : "")}"
+                : null;
+        }
+        catch (Exception exception)
+        {
+            warn($"[DeliveredStow] courier run {run}'s state could not be read for a cancel ({exception.Message}); reported as stopping.");
+            return null;
+        }
     }
 
     /// <summary>Records the requester's cancel durably on a forward that has not settled. Holding the gate.</summary>
@@ -959,6 +1006,10 @@ public sealed class DeliveredStowService
             case "Starting":
             case "Running":
             case "Idle":
+                // The requester cancelled after the run was bound (possibly while it was still launching): keep telling it
+                // to stop until it does. Stop is idempotent and halts at the next verified checkpoint, never replaying custody.
+                if (record.CancelRequestedUtc is not null)
+                    courier.Stop(run);
                 if (record.Code is not null)
                 {
                     // Resumed after a stop: the run is carrying again.

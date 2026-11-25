@@ -129,8 +129,10 @@ public sealed class OperationJournal
         {
             try
             {
+                // Only while it is still Accepted: one that started between the read and this write keeps running.
                 cancelled.Add(Transition(operationId, OperationStatuses.Cancelled, "ExpiredBeforeStart",
-                    $"Requested operation not started within {startWindow.TotalMinutes:N0} minutes of submission; cancelled instead of running later. The requester may submit it again."));
+                    $"Requested operation not started within {startWindow.TotalMinutes:N0} minutes of submission; cancelled instead of running later. The requester may submit it again.",
+                    expectedStatus: OperationStatuses.Accepted));
             }
             catch (InvalidOperationException)
             {
@@ -476,13 +478,17 @@ public sealed class OperationJournal
             Owner = entry.Owner with { },
         }).ToArray());
 
-    public OperationRecord Transition(string operationId, string status, string code, string message)
+    /// <param name="expectedStatus">When given, the transition applies only from this status, checked inside the same
+    /// mutation; otherwise it throws <see cref="InvalidOperationException"/> and nothing changes.</param>
+    public OperationRecord Transition(string operationId, string status, string code, string message, string? expectedStatus = null)
     {
         OperationRecord changed = null!;
         repository.Mutate(StateChangeKind.Operations, state =>
         {
             var operation = state.Operations.SingleOrDefault(candidate => candidate.OperationId == operationId)
                 ?? throw new KeyNotFoundException($"Operation '{operationId}' was not found.");
+            if (expectedStatus is not null && operation.Status != expectedStatus)
+                throw new InvalidOperationException($"Operation '{operationId}' is {operation.Status}, not {expectedStatus}.");
             ValidateTransition(operation.Status, status);
             operation.Status = status;
             operation.Revision = checked(operation.Revision + 1);

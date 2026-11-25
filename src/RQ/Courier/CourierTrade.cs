@@ -133,7 +133,8 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                 var checkpoint=store.Load();
                 if(checkpoint.Recovery.CancellationPending)
                 {
-                    if(checkpoint.Recovery.AwaitingVerification!=null)return Result<bool>.Ok(false);
+                    // Observe-only recovery (or a confirmation awaiting verification) is the run's to settle, never cleared here.
+                    if(checkpoint.Recovery.AwaitingVerification!=null || checkpoint.Recovery.ObserveOnly)return Result<bool>.Ok(false);
                     if(inFlight || !WindowClosed())return null;
                     checkpoint.Recovery.CancellationPending=false;store.Save(checkpoint);
                     log.Warning($"CourierTradeCancellationSettledOnLoad: step {checkpoint.Step}'s trade cancellation was left pending by an earlier load; " +

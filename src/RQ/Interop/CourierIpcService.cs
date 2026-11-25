@@ -515,7 +515,7 @@ public sealed class CourierIpcService
         {
             if (fault != null)
                 warn($"CourierIpcClear {requestId}: run {run} not cleared: {fault.Message}");
-        });
+        }, CourierClearSource.Ipc);
         return launched
             ? Ack(requestId, run, "clearing", null, $"Clearing run {run}.")
             : Ack(requestId, run, "rejected", "CourierAlreadyRunning", "The run is active; stop it before clearing.", journal);

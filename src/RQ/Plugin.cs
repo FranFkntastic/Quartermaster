@@ -70,6 +70,8 @@ public sealed class Plugin : IDalamudPlugin
     private readonly VendorCatalogLocationObserver vendorCatalogObserver;
     private readonly DalamudExternalUiAutomationSuppression externalUiSuppression;
     private readonly AutoRetainerSuppression autoRetainerSuppression;
+    /// <summary>The cross-plugin AutoRetainer holder registry (Dalamud shared data); null when it could not be obtained.</summary>
+    private readonly HashSet<string>? autoRetainerHolders;
     private readonly AutomaticRetrievalQueue automaticRetrievals;
     private readonly QuartermasterRuntimeSnapshotSource runtimeSnapshots;
     private readonly SnapshotPublisher snapshots;
@@ -227,8 +229,15 @@ public sealed class Plugin : IDalamudPlugin
                 objects));
         var driver = new RetainerLiveDriver(retainerSession, retainerBellRoute, message => log.Warning(message));
         // The marker records that this load suppressed AutoRetainer, so a load that dies holding it is reclaimed by the next.
+        // The holder registry is shared with other Gooseworks plugins, so none unsuppresses AutoRetainer while another holds it.
+        try { autoRetainerHolders = pluginInterface.GetOrCreateData(AutoRetainerSuppression.HolderRegistryKey, () => new HashSet<string>(StringComparer.Ordinal)); }
+        catch (Exception exception)
+        {
+            log.Warning($"[Quartermaster] AutoRetainerHolderRegistryUnavailable: {AutoRetainerSuppression.HolderRegistryKey}: {exception.Message}; " +
+                "AutoRetainer suppression works without it, but may lift another plugin's suppression.");
+        }
         autoRetainerSuppression = new AutoRetainerSuppression(autoRetainerIpc,
-            Path.Combine(configDirectory, "autoretainer-suppression.marker"), message => log.Warning(message));
+            Path.Combine(configDirectory, "autoretainer-suppression.marker"), message => log.Warning(message), autoRetainerHolders);
         listingNavigation = new(
             retainerSession,
             autoRetainerIpc,
@@ -1036,17 +1045,16 @@ public sealed class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
-        // Every step runs whatever an earlier one threw. Restores of other plugins' state come first, so neither a
-        // throw nor a stalled drain further down can leave AutoRetainer or TextAdvance suppressed. The courier's trade
-        // pauses (YesAlready, Dropbox) stay with the courier trade below: they belong to a live trade window and are
-        // lifted once the courier has drained, never while a window may still hold its items.
+        // Every step runs whatever an earlier one threw. Everything that drives the game (courier, retrievals, market
+        // runs, transfers, vendors) is stopped and drained first, and only then are other plugins' automations
+        // (TextAdvance and the rest of the external UI suppression, AutoRetainer) given back, so none of them goes live
+        // while Quartermaster still holds a retainer or trade window. The courier's trade pauses (YesAlready, Dropbox)
+        // are lifted by the courier trade once the courier has drained. A step that throws never skips the restores.
         void Step(string name, Action action)
         {
             try { action(); }
             catch (Exception exception) { pluginLog.Warning($"[Quartermaster] UnloadStepFailed: {name}: {exception.GetType().Name}: {exception.Message}"); }
         }
-        Step("external UI suppression", externalUiSuppression.Dispose);
-        Step("AutoRetainer suppression", autoRetainerSuppression.RestoreOnUnload);
         Step("courier conductor unload", () => courier.Conductor?.Unload());
         Step("courier peer link", courierPeer.Dispose);
         Step("courier game", courierGame.Dispose);
@@ -1063,6 +1071,8 @@ public sealed class Plugin : IDalamudPlugin
         Step("retainer bell route", retainerBellRoute.Dispose);
         Step("vendor procurement", vendorProcurement.Dispose);
         Step("vendor shop", vendorShop.Dispose);
+        Step("external UI suppression", externalUiSuppression.Dispose);
+        Step("AutoRetainer suppression", autoRetainerSuppression.RestoreOnUnload);
         Step("agent bridge", agentBridge.Dispose);
         Step("agent bridge viewport capture", agentBridgeViewportCapture.Dispose);
         Step("framework update", () => framework.Update -= OnFrameworkUpdate);
@@ -1092,6 +1102,7 @@ public sealed class Plugin : IDalamudPlugin
         Step("external account stock", externalAccountStock.Dispose);
         // A scope a failed step never released still leaves AutoRetainer as this load found it.
         Step("AutoRetainer suppression (final)", autoRetainerSuppression.RestoreOnUnload);
+        Step("AutoRetainer holder registry", () => { if (autoRetainerHolders is not null) pluginInterface.RelinquishData(AutoRetainerSuppression.HolderRegistryKey); });
         Step("windows", windows.RemoveAllWindows);
     }
 }
