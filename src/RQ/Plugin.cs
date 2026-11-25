@@ -237,7 +237,8 @@ public sealed class Plugin : IDalamudPlugin
                 "AutoRetainer suppression works without it, but may lift another plugin's suppression.");
         }
         autoRetainerSuppression = new AutoRetainerSuppression(autoRetainerIpc,
-            Path.Combine(configDirectory, "autoretainer-suppression.marker"), message => log.Warning(message), autoRetainerHolders);
+            Path.Combine(configDirectory, "autoretainer-suppression.marker"), message => log.Warning(message), autoRetainerHolders,
+            message => log.Information(message));
         listingNavigation = new(
             retainerSession,
             autoRetainerIpc,

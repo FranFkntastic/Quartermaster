@@ -25,6 +25,7 @@ public sealed class AutoRetainerSuppression
     private readonly IAutoRetainerIpc ipc;
     private readonly string? markerPath;
     private readonly Action<string>? warn;
+    private readonly Action<string>? info;
     private readonly HashSet<string>? registry;
     private readonly object gate = new();
     private int holders;
@@ -34,11 +35,13 @@ public sealed class AutoRetainerSuppression
     private bool reassertWarned;
     private bool reassertFailureWarned;
 
-    public AutoRetainerSuppression(IAutoRetainerIpc ipc, string? markerPath = null, Action<string>? warn = null, HashSet<string>? holderRegistry = null)
+    public AutoRetainerSuppression(IAutoRetainerIpc ipc, string? markerPath = null, Action<string>? warn = null, HashSet<string>? holderRegistry = null,
+        Action<string>? info = null)
     {
         this.ipc = ipc;
         this.markerPath = markerPath;
         this.warn = warn;
+        this.info = info ?? warn;
         registry = holderRegistry;
         // A new load holds nothing: an entry under this plugin's name is a dead load's leftover.
         if (RegistryRemove())
@@ -207,7 +210,9 @@ public sealed class AutoRetainerSuppression
                 return;
             try
             {
-                if (OtherHolders() is not { Length: > 0 })
+                if (OtherHolders() is { Length: > 0 } others)
+                    LeftToOthers(others, "unload");
+                else
                     ipc.SetSuppressed(false);
                 weOwnSuppression = false;
                 DeleteMarker();
@@ -232,7 +237,9 @@ public sealed class AutoRetainerSuppression
             try
             {
                 // Another Gooseworks plugin still holds it: left suppressed; that plugin lifts it when it is done.
-                if (OtherHolders() is not { Length: > 0 })
+                if (OtherHolders() is { Length: > 0 } others)
+                    LeftToOthers(others, "release");
+                else
                     ipc.SetSuppressed(false);
                 weOwnSuppression = false;
                 DeleteMarker();
@@ -246,6 +253,9 @@ public sealed class AutoRetainerSuppression
             }
         }
     }
+
+    private void LeftToOthers(IEnumerable<string> others, string when) =>
+        info?.Invoke($"[Quartermaster] AutoRetainerSuppressionLeftToOthers: on {when}, left AutoRetainer suppressed for {string.Join(", ", others)}; that holder lifts it when it is done.");
 
     /// <summary>Adds this plugin's owner name; true when another owner name was already present.</summary>
     private bool RegistryAdd()

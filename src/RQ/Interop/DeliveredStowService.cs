@@ -108,6 +108,8 @@ public sealed class DeliveredStowService
     private readonly List<DeliveredStowForwardRecord> forwards = [];
     private readonly Dictionary<string, DateTime> automationWaitSince = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTime> courierWaitSince = new(StringComparer.Ordinal);
+    // Forwards whose cancel re-stop was already warned about (once per forward; not persisted).
+    private readonly HashSet<string> cancelRestopWarned = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> progressFailures = new(StringComparer.Ordinal);
     /// <summary>Request ids (and hashes when known) of an unreadable forward journal that was moved aside.</summary>
     private readonly List<DeliveredStowLostRequest> lost = [];
@@ -582,8 +584,8 @@ public sealed class DeliveredStowService
             // Normal Stop: the run halts at its next verified checkpoint and keeps its custody; nothing is replayed.
             var stopped = courier?.Stop(run) == true;
             return CancelAck(requestId, "stopping", stopped
-                ? $"Courier run {run} was told to stop at its next verified checkpoint; stop or clear it with the courier IPC to settle it."
-                : $"Courier run {run} is not running; resume or clear it with the courier IPC to settle the forward.", runId);
+                ? $"Courier run {run} was told to stop at its next verified checkpoint; once it has stopped, clear it with the courier IPC to settle the forward, or resume it to carry on with the delivery."
+                : $"Courier run {run} is not running; clear it with the courier IPC to settle the forward, or resume it to carry on with the delivery.", runId);
         }
         if (courier is not null)
         {
@@ -597,8 +599,8 @@ public sealed class DeliveredStowService
                     return CancelAck(requestId, "already_terminal", $"The courier run {earlier.Run} started for this forward already ended ({adoptedEnd}); the forward settles from its outcome.", adoptedId);
                 var stopped = courier.Stop(earlier.Run);
                 return CancelAck(requestId, "stopping", stopped
-                    ? $"Courier run {earlier.Run} (started for this forward before Quartermaster reloaded) was told to stop at its next verified checkpoint; stop or clear it with the courier IPC to settle it."
-                    : $"Courier run {earlier.Run} (started for this forward before Quartermaster reloaded) is not running; resume or clear it with the courier IPC to settle the forward.", adoptedId);
+                    ? $"Courier run {earlier.Run} (started for this forward before Quartermaster reloaded) was told to stop at its next verified checkpoint; once it has stopped, clear it with the courier IPC to settle the forward, or resume it to carry on with the delivery."
+                    : $"Courier run {earlier.Run} (started for this forward before Quartermaster reloaded) is not running; clear it with the courier IPC to settle the forward, or resume it to carry on with the delivery.", adoptedId);
             }
             if (loading)
                 return CancelAck(requestId, "cancel_queued",
@@ -782,7 +784,7 @@ public sealed class DeliveredStowService
                     Bind(record, earlier, open);
                     var stopped = courier.Stop(earlier.Run);
                     warn($"[DeliveredStow] {record.RequestId}: {record.CancelCode} found courier run {earlier.Run} already started; " +
-                         (stopped ? "told it to stop at its next verified checkpoint." : "it is not running; resume or clear it in Courier."));
+                         (stopped ? "told it to stop at its next verified checkpoint." : "it is not running; clear it in Courier to settle the forward, or resume it to carry on."));
                     return true;
                 }
             }
@@ -1001,15 +1003,31 @@ public sealed class DeliveredStowService
                 changed = true;
             }
         }
+        if (record.CancelRequestedUtc is not null && record.CancelStopObservedUtc is null)
+        {
+            if (progress.State is "Starting" or "Running")
+            {
+                // The requester cancelled after the run was bound, possibly while it was still launching (a launching run
+                // can miss the cancel's own Stop): keep telling it to stop until it is first seen not running. Stop is
+                // idempotent and halts at the next verified checkpoint, never replaying custody.
+                if (courier.Stop(run) && cancelRestopWarned.Add(record.RequestId))
+                    warn($"[DeliveredStow] CancelRestop: {record.RequestId}: courier run {run} is {progress.State} after the requester's " +
+                         $"{record.CancelCode ?? ForwardCancelled}; the cancel is stopping it at its next verified checkpoint (warned once per forward).");
+            }
+            else
+            {
+                // Seen stopped (Idle, interrupted, failed or ended): the cancel's stop is done. Saved, so a reload does not
+                // stop the run again; a later resume is the operator's explicit choice and carries on.
+                record.CancelStopObservedUtc = now;
+                cancelRestopWarned.Remove(record.RequestId);
+                changed = true;
+            }
+        }
         switch (progress.State)
         {
             case "Starting":
             case "Running":
             case "Idle":
-                // The requester cancelled after the run was bound (possibly while it was still launching): keep telling it
-                // to stop until it does. Stop is idempotent and halts at the next verified checkpoint, never replaying custody.
-                if (record.CancelRequestedUtc is not null)
-                    courier.Stop(run);
                 if (record.Code is not null)
                 {
                     // Resumed after a stop: the run is carrying again.
@@ -1467,6 +1485,11 @@ public sealed class DeliveredStowForwardRecord
     public DateTime? CancelRequestedUtc { get; set; }
     public string? CancelCode { get; set; }
     public string? CancelReason { get; set; }
+    /// <summary>
+    /// When the bound run was first seen not running after the cancel; from then on the cancel no longer stops it, so a
+    /// resume carries on. Null until then, and in journals written before this field existed (the next tick observes it).
+    /// </summary>
+    public DateTime? CancelStopObservedUtc { get; set; }
     public List<DeliveredStowForwardRecordLine> Lines { get; set; } = [];
 }
 

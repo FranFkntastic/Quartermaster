@@ -100,6 +100,8 @@ public sealed class CourierSession
     private CarrierView? carried;
     private long polledAt;
     private Task? starting;
+    // The run the current launch starts or resumes, when known before it journals (StartPlan's id, Resume's journal run).
+    private Guid? startingRun;
     private long? settingsRequestedAt;
     private int? testSlotCap;
     internal void SetTestSlotCap(int? value)
@@ -781,6 +783,11 @@ public sealed class CourierSession
     internal CarrierView? Carried { get { Poll(); return carried; } }
 
     internal bool IsStarting => starting is { IsCompleted: false };
+    /// <summary>
+    /// The run being launched, while a launch is in flight and its run is known (StartPlan, Resume); null otherwise,
+    /// including for a stowage-view start or a clear. IsStarting alone does not say which run is starting.
+    /// </summary>
+    internal Guid? StartingRun => IsStarting ? startingRun : null;
     internal bool IsActive => IsStarting || Run?.State == "Running";
     internal bool IsUnresolved => Run?.State is "Interrupted" or "Failed" or "Indeterminate";
 
@@ -859,7 +866,7 @@ public sealed class CourierSession
         Poll(force: true);
         if (Conductor is not { } conductor || IsActive || conductor.IsBusy || Run?.CanResume!=true)
             return false;
-        Launch(async () => await conductor.StartAsync(new(Guid.Empty, 0, [], []), new()).ConfigureAwait(false), quiet: true);
+        Launch(async () => await conductor.StartAsync(new(Guid.Empty, 0, [], []), new()).ConfigureAwait(false), quiet: true, run: Run?.Run);
         return true;
     }
 
@@ -880,7 +887,7 @@ public sealed class CourierSession
             if (clearFirst is { } previous)
                 await conductor.ClearAsync(previous, CourierClearSource.Replace).ConfigureAwait(false);
             return await conductor.StartAsync(courierPlan, settings, runId).ConfigureAwait(false);
-        }, settled);
+        }, settled, run: runId);
         return true;
     }
 
@@ -889,8 +896,10 @@ public sealed class CourierSession
     /// <summary>Why the last Resume could not start, in plain words: a quiet note beside Resume, not an error.</summary>
     internal string? ResumeNote { get; private set; }
 
-    private void Launch(Func<Task<CourierSnapshot?>> start, Action<CourierSnapshot?, Exception?>? settled = null, bool quiet = false)
+    private void Launch(Func<Task<CourierSnapshot?>> start, Action<CourierSnapshot?, Exception?>? settled = null, bool quiet = false, Guid? run = null)
     {
+        // Set before the launch task exists, so StartingRun never pairs a new launch with the previous run's id.
+        startingRun = run is { } id && id != Guid.Empty ? id : null;
         Error = null;
         ErrorDetail = null;
         ResumeNote = null;

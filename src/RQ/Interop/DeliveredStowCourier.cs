@@ -226,9 +226,12 @@ internal sealed class DeliveredStowCourier : IDeliveredStowCourier
         if (session.Conductor is not { } conductor)
             return false;
         var journal = conductor.Journal();
-        var current = journal.Run == run && (journal.State == "Running" || session.IsStarting);
+        // Only this run's own launch counts: session.Stop() halts whatever runs, so a launch of another run (a manual or
+        // IPC start while the journal still shows this one) must never be stopped on this run's behalf.
+        var startingThis = session.StartingRun == run;
+        var current = journal.Run == run && (journal.State == "Running" || startingThis);
         // Still launching: StartPlan returned and bound the run, but the background start has not written its journal.
-        var launching = !current && session.IsStarting && !settled.ContainsKey(run) && launched.Values.Any(launch => launch.Run == run);
+        var launching = !current && startingThis && !settled.ContainsKey(run) && launched.Values.Any(launch => launch.Run == run);
         if (!current && !launching)
             return false;
         session.Stop();
@@ -253,9 +256,13 @@ internal sealed class DeliveredStowCourier : IDeliveredStowCourier
         if (session.Conductor is not { } conductor)
             return new("Missing", "CourierNotLoaded", "The courier is not loaded.", none);
         var current = conductor.PolledSnapshot();
+        var startingThis = session.StartingRun == run;
         if (current.Run == run)
-            return new(current.State, current.Code, current.Detail, current.Lines.ToDictionary(line => line.Line, line => line.Moved), Current: true);
-        if (!settled.ContainsKey(run) && session.IsStarting)
+            // A launch of this run that has not reached Running yet (a new run sits Idle, a resumed one keeps its stopped
+            // state) is still starting, not stopped.
+            return new(startingThis && current.State != "Running" ? "Starting" : current.State, current.Code, current.Detail,
+                current.Lines.ToDictionary(line => line.Line, line => line.Moved), Current: true);
+        if (!settled.ContainsKey(run) && startingThis)
             return new("Starting", "", "", none);
         // No longer the current run: it was cleared or replaced, and its archive says how it ended.
         var read = closedReads.GetOrAdd(run, id => Task.Run(() => conductor.Closed(id)));
