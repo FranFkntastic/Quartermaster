@@ -45,11 +45,18 @@ public sealed class RetainerLiveDriver : IRetainerTransferDriver
     {
     }
 
-    internal RetainerLiveDriver(IRetainerAutomationSession session, IRetainerBellRoute? bellRoute = null)
+    internal RetainerLiveDriver(IRetainerAutomationSession session, IRetainerBellRoute? bellRoute = null, Action<string>? warn = null)
     {
         this.session = session;
         this.bellRoute = bellRoute;
+        this.warn = warn;
     }
+
+    private readonly Action<string>? warn;
+
+    // Opening the list moves nothing; a bell interaction swallowed right after login, a zone change or a previous
+    // retainer session is retried until this budget instead of stopping the run on the first timeout.
+    private static readonly TimeSpan RetainerListPendingBudget = TimeSpan.FromSeconds(30);
 
     public async Task<MarketPlayerInventory> ReadPlacementBagsAsync(CancellationToken token)
     {
@@ -59,24 +66,60 @@ public sealed class RetainerLiveDriver : IRetainerTransferDriver
 
     public async Task RequireRetainerListAsync(CancellationToken cancellationToken)
     {
-        var result = await session.EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);
-        // A bell interaction sent while the game is still releasing the previous retainer session is swallowed.
-        // Opening the list moves nothing, so one more attempt is safe.
-        if (!result.Success && string.Equals(result.Code, "RetainerListTimeout", StringComparison.Ordinal))
-            result = await session.EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);
+        var result = await OpenRetainerListPendingAsync(cancellationToken).ConfigureAwait(false);
         if (result.Success)
             return;
         if (bellRoute is null || !RequiresBellRoute(result.Code))
         {
-            RequireSuccess(result);
+            RequireListSuccess(result);
             return;
         }
 
         var route = await bellRoute.EnsureBellInRangeAsync(cancellationToken).ConfigureAwait(false);
         if (!route.Success)
+        {
+            warn?.Invoke($"[Quartermaster] Retainer list unavailable: {route.Code}: {route.Message}");
             throw new InvalidOperationException($"{route.Code}: {route.Message}");
+        }
 
-        RequireSuccess(await session.EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false));
+        RequireListSuccess(await OpenRetainerListPendingAsync(cancellationToken).ConfigureAwait(false));
+    }
+
+    /// <summary>
+    /// Opens the retainer list once the character can act, treating a swallowed bell interaction
+    /// (<c>RetainerListTimeout</c>) as pending until <see cref="RetainerListPendingBudget"/>.
+    /// </summary>
+    private async Task<RetainerAutomationResult> OpenRetainerListPendingAsync(CancellationToken cancellationToken)
+    {
+        var deadline = DateTime.UtcNow.Add(RetainerListPendingBudget);
+        var attempts = 0;
+        while (true)
+        {
+            if (bellRoute is not null)
+            {
+                var remaining = deadline - DateTime.UtcNow;
+                var ready = await bellRoute.WaitUntilPlayerCanActAsync(
+                    remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero, cancellationToken).ConfigureAwait(false);
+                if (!ready.Success)
+                    return RetainerAutomationResult.Failed(ready.Code, ready.Message);
+            }
+            var result = await session.EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);
+            attempts++;
+            if (result.Success || !string.Equals(result.Code, "RetainerListTimeout", StringComparison.Ordinal))
+                return result;
+            if (DateTime.UtcNow >= deadline)
+                return RetainerAutomationResult.Failed(
+                    result.Code,
+                    $"{result.Message} Gave up after {attempts} attempts over {RetainerListPendingBudget.TotalSeconds:N0}s.");
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private void RequireListSuccess(RetainerAutomationResult result)
+    {
+        if (!result.Success)
+            warn?.Invoke($"[Quartermaster] Retainer list unavailable: {result.Code}: {result.Message}");
+        RequireSuccess(result);
     }
 
     public async Task OpenRetainerAsync(RetainerRouteCandidate candidate, CancellationToken cancellationToken) =>

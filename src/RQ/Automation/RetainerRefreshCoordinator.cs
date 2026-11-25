@@ -15,6 +15,7 @@ public sealed class RetainerRefreshCoordinator : IDisposable
     private static readonly TimeSpan DisposeJoinTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan AutoRetainerBusyBudget = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan EvidenceBudget = TimeSpan.FromSeconds(12);
+    private static readonly TimeSpan RosterAfterListBudget = TimeSpan.FromSeconds(5);
     private static readonly RetainerEvidenceDomain RequiredEvidence =
         RetainerEvidenceDomain.Inventory | RetainerEvidenceDomain.Crystals | RetainerEvidenceDomain.Gil;
     private const string Consumer = "Quartermaster";
@@ -225,7 +226,7 @@ public sealed class RetainerRefreshCoordinator : IDisposable
                 Status = "Opening the retainer list to populate the assigned roster...";
                 list = await EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);
                 RequireSuccess(list);
-                roster = await session.ScanRetainerRosterAsync(cancellationToken).ConfigureAwait(false);
+                roster = await ScanRosterAfterListOpenAsync(cancellationToken).ConfigureAwait(false);
             }
             if (!roster.Success || !roster.IsComplete)
                 throw new InvalidOperationException($"{roster.Code}: {roster.Message}");
@@ -393,11 +394,37 @@ public sealed class RetainerRefreshCoordinator : IDisposable
         }
     }
 
+    private async Task<RetainerRosterResult> ScanRosterAfterListOpenAsync(CancellationToken cancellationToken)
+    {
+        // The roster fills in a moment after the list opens; a not-ready read is pending, not a failure.
+        var deadline = DateTime.UtcNow.Add(RosterAfterListBudget);
+        var roster = await session.ScanRetainerRosterAsync(cancellationToken).ConfigureAwait(false);
+        while ((!roster.Success || !roster.IsComplete) &&
+               roster.Code is "RetainerManagerUnavailable" or "RetainerRosterNotReady" &&
+               DateTime.UtcNow < deadline)
+        {
+            await framework.DelayTicks(10, cancellationToken).ConfigureAwait(false);
+            roster = await session.ScanRetainerRosterAsync(cancellationToken).ConfigureAwait(false);
+        }
+        return roster.Success && roster.IsComplete
+            ? roster
+            : roster with { Message = $"{roster.Message} Still not ready {RosterAfterListBudget.TotalSeconds:N0}s after the retainer list opened." };
+    }
+
     private async Task RecoverRetainerListAsync(CancellationToken cancellationToken)
     {
         try { session.CancelActive(); }
         catch { }
         var list = await EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);
+        if (!list.Success)
+        {
+            // Returning to the list moves nothing; one more try keeps a single stuck window from abandoning the rest.
+            log.Warning("Could not return to the retainer list ({Code}: {Message}); retrying once.", list.Code, list.Message);
+            await framework.DelayTicks(60, cancellationToken).ConfigureAwait(false);
+            try { session.CancelActive(); }
+            catch { }
+            list = await EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);
+        }
         RequireSuccess(list);
     }
 

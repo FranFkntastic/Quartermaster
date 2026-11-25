@@ -307,7 +307,10 @@ internal sealed class MarketRunLiveDriver(
                     // (authority, source change, opening the session) must not masquerade as full storage.
                     var noRoom = outcome.Status is OperationStatuses.Succeeded or OperationStatuses.PartiallySucceeded ||
                         outcome.Message.StartsWith("Stowed ", StringComparison.Ordinal);
-                    Report(noRoom ? prefix + "LeftInBagsNoRoom" : prefix + "SkippedExecutionFailed", left, outcome.Message);
+                    // A settled route that left a dropped deposit in bags says so instead of claiming no room.
+                    var zeroMovement = outcome.Message.Contains(TransferCoordinator.DepositZeroMovementCode, StringComparison.Ordinal);
+                    Report(!noRoom ? prefix + "SkippedExecutionFailed" : zeroMovement ? prefix + "LeftInBagsZeroMovement" : prefix + "LeftInBagsNoRoom",
+                        left, outcome.Message);
                     if (!noRoom) throw new InvalidOperationException(outcome.Message);
                 }
                 await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
@@ -487,9 +490,15 @@ internal sealed class MarketRunLiveDriver(
             {
                 Guard();
                 var result = await market.deadline.RunAsync(t => inner.DepositAsync(stack, quantity, t)).ConfigureAwait(false);
+                // A dropped dispatch shows no movement through the verifier's window and late tail. With the source
+                // stack still intact this attempt moved nothing; the coordinator retries or settles it and marks the
+                // run uncertain itself if a later read disagrees.
+                var zeroMovement = !result.Success && result.Transferred == 0 && result.Code == "VerificationWindowExpired" &&
+                    await SourceIntactAsync(stack).ConfigureAwait(false);
                 receipt.Outcome = result.Success && result.Transferred > 0 ? MarketMutationOutcome.Committed :
-                    result.Code == "NoCapacity" ? MarketMutationOutcome.Unchanged : MarketMutationOutcome.Indeterminate;
+                    result.Code == "NoCapacity" || zeroMovement ? MarketMutationOutcome.Unchanged : MarketMutationOutcome.Indeterminate;
                 receipt.Code = receipt.Outcome == MarketMutationOutcome.Committed ? (relocation ? "MarketRunRelocated" : "MarketRunStowed") :
+                    zeroMovement ? Prefix + "ZeroMovement" :
                     receipt.Outcome == MarketMutationOutcome.Unchanged ? Prefix + "LeftInBagsNoRoom" : Prefix + "Indeterminate";
                 receipt.Message = $"{result.Transferred} units stowed at {CurrentRetainerName}; {result.Code}: {result.Message}";
                 return result;
@@ -506,6 +515,11 @@ internal sealed class MarketRunLiveDriver(
                     market.logWarning?.Invoke($"{receipt.Code}: {request.ItemName} × {quantity} to {CurrentRetainerName}: {receipt.Message}");
                 receiptChanged(receipt);
             }
+        }
+        private async Task<bool> SourceIntactAsync(DalamudInventoryStack stack)
+        {
+            try { return (await market.deadline.RunAsync(market.PlayerAsync).ConfigureAwait(false)).Stacks.Contains(stack); }
+            catch (Exception e) when (e is not OperationCanceledException) { return false; }
         }
         public void MarkIndeterminate(string reason)
         {
