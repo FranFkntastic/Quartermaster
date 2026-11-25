@@ -31,6 +31,7 @@ public sealed class AutoRetainerSuppression
     private int holders;
     private bool weOwnSuppression;
     private bool orphanChecked;
+    private bool deferredToHolderLogged;
     // Warned once per hold: a plugin or the user lifting the suppression repeatedly must not log every check.
     private bool reassertWarned;
     private bool reassertFailureWarned;
@@ -148,10 +149,12 @@ public sealed class AutoRetainerSuppression
 
     /// <summary>
     /// Load-time reclaim: with no scope held here and a marker an earlier load left (it died holding suppression it
-    /// set), AutoRetainer is unsuppressed and the marker removed, unless another plugin's owner name is in the holder
-    /// registry (it still needs AutoRetainer suppressed and lifts it when it is done). Returns true once settled
-    /// (nothing to do, reclaimed, left to another holder, or a scope is held so the marker is ours); false while
-    /// AutoRetainer is not reachable yet, so the caller retries.
+    /// set), AutoRetainer is unsuppressed and the marker removed. While another plugin's owner name is in the holder
+    /// registry the reclaim waits (that holder may have found AutoRetainer already suppressed and so never owned it, so
+    /// it will not lift it) and runs once the registry has no other owner. Returns true once settled (nothing to do,
+    /// reclaimed, or a scope is held so the marker is ours); false while AutoRetainer is not reachable yet, another
+    /// holder is registered, or a scope is held, so the caller retries. Without a registry no other holder can be
+    /// seen, so the reclaim lifts the suppression outright.
     /// </summary>
     public bool ReclaimOrphaned()
     {
@@ -170,13 +173,18 @@ public sealed class AutoRetainerSuppression
             try
             {
                 var since = ReadMarker();
+                // Another holder may have joined after the dead load's suppression and so never took ownership of it
+                // (it found AutoRetainer already suppressed with no registered holder): keep the marker and retry, and
+                // reclaim once that holder is gone, or nobody would ever lift it.
                 if (OtherHolders() is { Length: > 0 } others)
                 {
-                    DeleteMarker();
-                    orphanChecked = true;
-                    warn?.Invoke($"[Quartermaster] AutoRetainerSuppressionLeftToHolder: an earlier Quartermaster load suppressed AutoRetainer{(since is null ? "" : $" at {since}")} and never restored it; " +
-                        $"left suppressed because {string.Join(", ", others)} still hold(s) it.");
-                    return true;
+                    if (!deferredToHolderLogged)
+                    {
+                        deferredToHolderLogged = true;
+                        info?.Invoke($"[Quartermaster] AutoRetainerSuppressionReclaimDeferred: an earlier Quartermaster load suppressed AutoRetainer{(since is null ? "" : $" at {since}")} and never restored it; " +
+                            $"{string.Join(", ", others)} hold(s) it now, so it is reclaimed once they release (logged once per load).");
+                    }
+                    return false;
                 }
                 if (!ipc.IsAvailable)
                     return false;
@@ -184,7 +192,8 @@ public sealed class AutoRetainerSuppression
                     ipc.SetSuppressed(false);
                 DeleteMarker();
                 orphanChecked = true;
-                warn?.Invoke($"[Quartermaster] AutoRetainerSuppressionReclaimed: an earlier Quartermaster load suppressed AutoRetainer{(since is null ? "" : $" at {since}")} and never restored it; unsuppressed now.");
+                warn?.Invoke($"[Quartermaster] AutoRetainerSuppressionReclaimed: an earlier Quartermaster load suppressed AutoRetainer{(since is null ? "" : $" at {since}")} and never restored it; unsuppressed now" +
+                    (registry is null ? " (holder registry unavailable: another plugin's suppression could not be checked and may have been lifted)." : "."));
                 return true;
             }
             catch (Exception exception)
