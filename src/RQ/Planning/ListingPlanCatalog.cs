@@ -139,9 +139,21 @@ public static class ListingPlanCatalog
     public static ListingPlan DuplicatePlan(QuartermasterState state, OwnerScope owner, Guid sourcePlanId, DateTime nowUtc)
     {
         var source = FindPlan(state, owner, sourcePlanId) ?? throw new InvalidOperationException("That Listing Plan no longer exists.");
-        var name = $"{source.Name} (copy)";
-        for (var n = 2; NameIssue(state, owner, name) is not null; n++)
-            name = $"{source.Name} (copy {n})";
+        var baseName = string.IsNullOrWhiteSpace(source.Name) ? "Default" : source.Name.Trim();
+        var existingNames = OwnerPlans(state, owner)
+            .Select(existing => existing.Name.Trim())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        string Candidate(string suffix)
+        {
+            var room = Math.Max(0, MaxNameLength - suffix.Length);
+            var prefix = baseName.Length > room ? baseName[..room].TrimEnd() : baseName;
+            return $"{prefix}{suffix}".Trim();
+        }
+        var name = Candidate(" (copy)");
+        for (var n = 2; existingNames.Contains(name); n++)
+            name = Candidate($" (copy {n})");
+        if (NameIssue(state, owner, name) is { } issue)
+            throw new InvalidOperationException(issue);
         var plan = new ListingPlan
         {
             Owner = owner with { },
