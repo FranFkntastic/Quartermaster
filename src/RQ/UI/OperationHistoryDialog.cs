@@ -5,12 +5,17 @@ using Dalamud.Bindings.ImGui;
 using Franthropy.Dalamud.UI.Windows;
 using RQ.Domain;
 using RQ.Operations;
+using Franthropy.Dalamud.AgentBridge;
 
 namespace RQ.UI;
 
-internal sealed class OperationHistoryDialog(OperationJournal journal)
+internal sealed class OperationHistoryDialog(OperationJournal journal, AgentBridgeUiReviewRegistry reviewRegistry)
 {
     private const string PopupLabel = "Transfer history##RQ";
+
+    /// <summary>Cancels an accepted requested operation by request id (the requester cancel path); returns the outcome.</summary>
+    public Func<string, string>? CancelRequestedOperation { get; set; }
+    private readonly Dictionary<string, string> cancelOutcomes = new(StringComparer.Ordinal);
 
     private bool openRequested;
     private bool closeRequested;
@@ -94,7 +99,23 @@ internal sealed class OperationHistoryDialog(OperationJournal journal)
                 ImGui.SameLine();
                 ImGui.TextDisabled(operation.UpdatedAtUtc.ToLocalTime().ToString("g", CultureInfo.CurrentCulture));
                 ImGui.TextUnformatted(operation.SourcePlanName ?? "Quartermaster transfer");
+                if (operation.Status == OperationStatuses.Accepted && operation.ExecuteImmediately &&
+                    operation.RequestId is { Length: > 0 } requestId && CancelRequestedOperation is { } cancel)
+                {
+                    ImGui.SameLine();
+                    void Cancel() => cancelOutcomes[requestId] = cancel(requestId);
+                    if (ImGui.SmallButton($"Cancel##RQHistoryCancel{operation.OperationId}"))
+                        Cancel();
+                    reviewRegistry.RegisterLastButton(
+                        $"quartermaster.history.cancel.{operation.OperationId}",
+                        $"Cancel requested operation {operation.OperationId}",
+                        true,
+                        Cancel,
+                        operation.Status);
+                }
                 ImGui.TextWrapped(operation.Message);
+                if (cancelOutcomes.TryGetValue(operation.RequestId, out var outcome))
+                    ImGui.TextDisabled(outcome);
                 ImGui.Separator();
             }
         }

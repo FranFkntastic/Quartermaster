@@ -75,6 +75,7 @@ public sealed class QuartermasterIpcProvider : IDisposable
         deliveredStowAttached = true;
         registrar.Register(DeliveredStowIpcChannels.SubmitDeliveredStow, deliveredStow.Submit);
         registrar.Register(DeliveredStowIpcChannels.GetDeliveredStow, deliveredStow.Get);
+        registrar.Register(DeliveredStowIpcChannels.CancelDeliveredStowForward, deliveredStow.CancelForward);
     }
 
     /// <summary>Registers the requester cancel channel (capability requestedOperationCancel.v1).</summary>
@@ -128,6 +129,7 @@ public sealed class QuartermasterIpcProvider : IDisposable
         {
             registrar.Unregister(DeliveredStowIpcChannels.SubmitDeliveredStow);
             registrar.Unregister(DeliveredStowIpcChannels.GetDeliveredStow);
+            registrar.Unregister(DeliveredStowIpcChannels.CancelDeliveredStowForward);
         }
     }
 }

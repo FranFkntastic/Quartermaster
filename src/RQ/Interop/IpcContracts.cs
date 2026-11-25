@@ -167,6 +167,15 @@ public sealed record CourierTransferAcknowledgement
     public string Status { get; init; } = string.Empty;
     public string? ErrorCode { get; init; }
     public string Message { get; init; } = string.Empty;
+    /// <summary>
+    /// On a refusal caused by another (or this request's own) courier run: the request id that started that run, when
+    /// known (a delivered-stow request id, or a courier transfer request id). Absent otherwise.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? BlockingRequestId { get; init; }
+    /// <summary>With <see cref="BlockingRequestId"/>: what started the blocking run (delivered-stow, ipc or manual).</summary>
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? BlockingSource { get; init; }
 }
 
 public sealed record ElementalDepositRequest
@@ -280,6 +289,7 @@ public static class DeliveredStowIpcChannels
 {
     public const string SubmitDeliveredStow = "Quartermaster.v1.SubmitDeliveredStow";
     public const string GetDeliveredStow = "Quartermaster.v1.GetDeliveredStow";
+    public const string CancelDeliveredStowForward = "Quartermaster.v1.CancelDeliveredStowForward";
 }
 
 /// <summary>

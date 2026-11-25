@@ -106,17 +106,18 @@ public sealed class OperationJournal
     }
 
     /// <summary>
-    /// Cancels externally requested delivered-stow operations that have not started within
-    /// <paramref name="startWindow"/> of submission, so a stale stow never deposits later (for example on the
-    /// owner's next login). Requested retrievals and elemental deposits keep waiting as before; their
-    /// requesters withdraw them through the cancel channel. <paramref name="activeOperationId"/> is skipped.
+    /// Cancels externally requested automatic operations (delivered stows, requested retrievals and elemental
+    /// deposits) that have not started within <paramref name="startWindow"/> of submission, so a stale request
+    /// never runs later (for example on the owner's next login) and never blocks a requester's restart.
+    /// Only operations with a submitted request record are eligible; operator-created plans never expire.
+    /// <paramref name="activeOperationId"/> is skipped.
     /// </summary>
     public IReadOnlyList<OperationRecord> ExpireUnstartedRequestedOperations(TimeSpan startWindow, string? activeOperationId)
     {
         var cutoff = utcNow() - startWindow;
         var expired = repository.Read(state => state.Operations
             .Where(operation => operation.ExecuteImmediately &&
-                                operation.Kind == OperationKinds.StowageSurplus &&
+                                (operation.Kind is OperationKinds.StowageSurplus or OperationKinds.Retrieval or OperationKinds.Deposit) &&
                                 operation.Status == OperationStatuses.Accepted &&
                                 operation.OperationId != activeOperationId &&
                                 state.Requests.FirstOrDefault(record => record.OperationId == operation.OperationId) is { } request &&
@@ -129,7 +130,7 @@ public sealed class OperationJournal
             try
             {
                 cancelled.Add(Transition(operationId, OperationStatuses.Cancelled, "ExpiredBeforeStart",
-                    $"Not started within {startWindow.TotalMinutes:N0} minutes of submission; cancelled instead of running later."));
+                    $"Requested operation not started within {startWindow.TotalMinutes:N0} minutes of submission; cancelled instead of running later. The requester may submit it again."));
             }
             catch (InvalidOperationException)
             {

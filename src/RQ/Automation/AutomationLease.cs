@@ -6,13 +6,30 @@ public sealed class AutomationLease(Func<string?>? refusalReason = null)
     private Guid activeToken;
 
     public string? Holder { get; private set; }
+    /// <summary>What the holder is doing, when it says (for example the custody it keeps); part of the busy reason.</summary>
+    public string? HolderDetail { get; private set; }
     public string? RefusalReason => refusalReason?.Invoke();
     public string? AcquisitionBlockReason
     {
         get
         {
             lock (gate)
-                return Holder is { } holder ? $"Automation is busy with {holder}." : RefusalReason;
+                return Holder is { } holder
+                    ? HolderDetail is { Length: > 0 } detail ? $"Automation is busy with {holder} ({detail})." : $"Automation is busy with {holder}."
+                    : RefusalReason;
+        }
+    }
+
+    /// <summary>
+    /// Sets (or clears, with null) what the holder of <paramref name="lease"/> is doing, without changing
+    /// <see cref="Holder"/>. Ignored unless that lease is the active one.
+    /// </summary>
+    public void Describe(IDisposable lease, string? detail)
+    {
+        lock (gate)
+        {
+            if (lease is Releaser releaser && releaser.IsActive(this, activeToken) && Holder is not null)
+                HolderDetail = detail;
         }
     }
     public bool CanAcquire => AcquisitionBlockReason is null;
@@ -39,6 +56,7 @@ public sealed class AutomationLease(Func<string?>? refusalReason = null)
 
             activeToken = Guid.NewGuid();
             Holder = holder;
+            HolderDetail = null;
             lease = new Releaser(this, activeToken);
             return true;
         }
@@ -51,6 +69,7 @@ public sealed class AutomationLease(Func<string?>? refusalReason = null)
             if (token != activeToken)
                 return;
             Holder = null;
+            HolderDetail = null;
             activeToken = Guid.Empty;
         }
     }

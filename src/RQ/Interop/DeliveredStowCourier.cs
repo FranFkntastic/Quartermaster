@@ -50,6 +50,8 @@ internal interface IDeliveredStowCourier
     /// <summary>Why no forward can start now (another job holds automation), or null.</summary>
     string? AutomationBlock { get; }
     DeliveredStowForwardRefusal? Blocked();
+    /// <summary>Stops the courier run a forward started (normal Stop: at the next verified checkpoint); false when it is not running.</summary>
+    bool Stop(Guid run) => false;
     (Guid? Run, DeliveredStowForwardRefusal? Refusal, IReadOnlyDictionary<ulong, DeliveredStowForwardRefusal> Refused) Start(
         string courierRequestId, string requestHash, OwnerScope owner, IReadOnlyList<(OwnerScope Destination, IReadOnlyList<DeliveredStowForwardUnit> Units)> groups);
     (DeliveredStowAdoptedRun? Run, bool Loading) Adopt(string courierRequestId);
@@ -95,13 +97,20 @@ internal sealed class DeliveredStowCourier : IDeliveredStowCourier
         if (session.Conductor is not { } conductor)
             return new("CourierNotLoaded", "The courier is not loaded.");
         var current = conductor.PolledSnapshot();
+        var journal = conductor.PolledJournal();
         if (session.IsStarting || current.State == "Running")
-            return new("CourierBusy", "Another courier run is active.", Wait: true);
+            return new("CourierBusy", $"Another courier run is active: {CourierIpcService.DescribeRun(journal)}.", Wait: true);
         if (conductor.IsBusy)
             return new("CourierBusy", "The previous courier run is still finishing cleanup.", Wait: true);
-        var unresolved = current.Run != Guid.Empty && current.State is "Failed" or "Interrupted" or "Indeterminate";
-        if (unresolved && (!current.Custody.IsEmpty || current.Unverified?.Step is nameof(CourierPhase.HandOut) or nameof(CourierPhase.HandIn)))
-            return new("CourierRunUnresolved", $"The previous courier run is {current.State} ({current.Code}); resume or clear it in Courier.", Wait: true);
+        // A run started under this forward's own request id was adopted before this check, so any unresolved run here is
+        // another request's: it is archived only when it holds no custody and has no pending step (Start), else it blocks.
+        var unresolved = journal.Run != Guid.Empty && journal.State is "Failed" or "Interrupted" or "Indeterminate";
+        if (unresolved && CourierIpcService.Replaceable(journal, null) is null)
+            return new("CourierRunUnresolved",
+                $"The previous courier {CourierIpcService.DescribeRun(journal)} is {journal.State} ({journal.Code})" +
+                (!journal.Custody.IsEmpty ? $" holding {journal.Custody.Sum(s => (long)s.Units):N0} unit(s) in custody"
+                    : journal.Pending is { } pending ? $" with its {pending.Action.Phase} step unverified" : "") +
+                "; resume or clear it in Courier.", Wait: true);
         var cfg = settings();
         if (cfg.Carrier is not { HasStableIdentity: true })
             return new("CarrierNotConfigured", "No carrier is chosen.");
@@ -165,9 +174,8 @@ internal sealed class DeliveredStowCourier : IDeliveredStowCourier
 
         var plan = new CourierPlan(Guid.NewGuid(), 0, trips.ToImmutable(), [], ReturnDestinationHome: true, courierRequestId) { RequestHash = requestHash };
         var journal = conductor.Journal();
-        var unresolved = journal.Run != Guid.Empty && journal.State is "Failed" or "Interrupted" or "Indeterminate";
-        // A finished or zero-custody unresolved previous run is archived first, exactly as the courier IPC does.
-        Guid? clear = journal.Run != Guid.Empty && (journal.State is "Completed" or "Refused" || unresolved) && journal.Custody.IsEmpty ? journal.Run : null;
+        // A finished, or unresolved but provably idle, previous run is archived first, exactly as the courier IPC does.
+        var clear = CourierIpcService.Replaceable(journal, courierRequestId);
         var run = Guid.NewGuid();
         // The owner asked for this stow: the run ends back on the owner.
         if (!session.StartPlan(plan, cfg with { ReturnOwner = true }, clear, run, (outcome, fault) => settled[run] = (outcome, fault)))
@@ -207,6 +215,17 @@ internal sealed class DeliveredStowCourier : IDeliveredStowCourier
 
     private static IReadOnlyDictionary<Guid, int> PlannedPerLine(IEnumerable<CourierTrip> trips) =>
         trips.SelectMany(trip => trip.Manifest).GroupBy(stack => stack.Line).ToDictionary(group => group.Key, group => group.Sum(stack => stack.Units));
+
+    public bool Stop(Guid run)
+    {
+        if (session.Conductor is not { } conductor)
+            return false;
+        var journal = conductor.Journal();
+        if (journal.Run != run || journal.State != "Running" && !session.IsStarting)
+            return false;
+        session.Stop();
+        return true;
+    }
 
     /// <summary>Drops what this adapter keeps about a run whose forward has settled.</summary>
     public void Forget(Guid run, string courierRequestId)

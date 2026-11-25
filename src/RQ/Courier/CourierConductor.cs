@@ -303,7 +303,9 @@ public sealed class CourierConductor
     internal CourierSnapshot PolledSnapshot() => Project(PolledJournal());
     /// <summary>The current journal's run (<see cref="Guid.Empty"/> for none), for the peer presence; parsed as for <see cref="PolledSnapshot"/>.</summary>
     internal Guid? CurrentRun() => PolledJournal().Run;
-    private CourierJournal PolledJournal()
+    /// <summary>The current run while it is running (null otherwise), advertised so its carrier knows the owner is still working on it.</summary>
+    internal Guid? ActiveRun() => PolledJournal() is { State: "Running", Run: var run } && run != Guid.Empty ? run : null;
+    internal CourierJournal PolledJournal()
     {
         var file = new FileInfo(Path.Combine(directory, "courier-run.json"));
         var (stamp, length) = file.Exists ? (file.LastWriteTimeUtc, file.Length) : (DateTime.MinValue, -1L);
@@ -619,11 +621,22 @@ public sealed class CourierConductor
             var status = await CarrierStatus();
             var carrier = status.Bags ?? throw Fault("CarrierBagsMissing", "Fresh observation required.");
             if (!carrierless && !CourierPlanner.Exact(carrier.Character, r.Settings.Carrier)) throw Fault("CarrierIdentityMismatch", "Unexpected carrier.");
-            if(status.ActiveRun is {} other && other!=r.Run && !resume && status.Custody.IsEmpty && status.Unconfirmed==null)
+            if(status.ActiveRun is {} other && other!=r.Run && !resume)
             {
                 var closed=new CourierStore<CourierJournal>(Path.Combine(directory,$"courier-closed-{other:N}.json")).Load();
-                if(closed.Run==other && closed.Custody.IsEmpty && closed.Pending==null && CourierPlanner.Exact(closed.Settings.Carrier,r.Settings.Carrier))
+                var ours=closed.Run==other && CourierPlanner.Exact(closed.Settings.Carrier,r.Settings.Carrier);
+                // This client closed that run: an empty one is forgotten on the carrier as before, and one this client cleared
+                // (archived Abandoned, settled as-is by its owner) is forgotten whatever the carrier still holds or awaits,
+                // exactly as that Clear asked; its units stay in the carrier's bags as the carrier's own.
+                var empty=status.Custody.IsEmpty && status.Unconfirmed==null && closed.Custody.IsEmpty && closed.Pending==null;
+                var abandoned=closed.State=="Abandoned";
+                if(ours && (empty || abandoned))
+                {
+                    if(!empty)
+                        warning($"{r.Run} CarrierAbandonedRunCleared: {r.Settings.Carrier!.CharacterName} still held run {other} that this client cleared " +
+                            $"({closed.Detail}); carrier custody {status.Custody.Sum(s=>(long)s.Units):N0} unit(s){(status.Unconfirmed is {} u?$", hand-off {u} unconfirmed":"")}. Told it to forget the run.");
                     await Send(closed,CourierCommand.Clear,closed.Start,[]);
+                }
             }
             if (resume)
             {

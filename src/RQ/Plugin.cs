@@ -69,6 +69,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly TransferVendorProcurementService vendorProcurement;
     private readonly VendorCatalogLocationObserver vendorCatalogObserver;
     private readonly DalamudExternalUiAutomationSuppression externalUiSuppression;
+    private readonly AutoRetainerSuppression autoRetainerSuppression;
     private readonly AutomaticRetrievalQueue automaticRetrievals;
     private readonly QuartermasterRuntimeSnapshotSource runtimeSnapshots;
     private readonly SnapshotPublisher snapshots;
@@ -85,6 +86,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly QuartermasterWindow window;
     private readonly RuntimeReconciliationQueue reconciliation = new();
     private DateTime nextSnapshotAt;
+    private DateTime nextSuppressionCheckAt;
     private DateTime nextPlayerInventoryFlushAt;
 
     public Plugin(
@@ -224,7 +226,9 @@ public sealed class Plugin : IDalamudPlugin
                 condition,
                 objects));
         var driver = new RetainerLiveDriver(retainerSession, retainerBellRoute, message => log.Warning(message));
-        var autoRetainerSuppression = new AutoRetainerSuppression(autoRetainerIpc);
+        // The marker records that this load suppressed AutoRetainer, so a load that dies holding it is reclaimed by the next.
+        autoRetainerSuppression = new AutoRetainerSuppression(autoRetainerIpc,
+            Path.Combine(configDirectory, "autoretainer-suppression.marker"), message => log.Warning(message));
         listingNavigation = new(
             retainerSession,
             autoRetainerIpc,
@@ -332,7 +336,8 @@ public sealed class Plugin : IDalamudPlugin
             retainers: cache.Snapshot, warn: message => log.Warning(message));
         deposits = new ElementalDepositSubmissionService(providerInstanceId, state, workQueue, journal, cache.Snapshot, CurrentOwner);
         ipc = new(new DalamudIpcRegistrar(pluginInterface), snapshots, submissions, deposits);
-        ipc.AttachRequestedOperationCancel(new RequestedOperationCancelService(providerInstanceId, journal, workQueue, message => log.Warning(message)));
+        var requestedOperationCancel = new RequestedOperationCancelService(providerInstanceId, journal, workQueue, message => log.Warning(message));
+        ipc.AttachRequestedOperationCancel(requestedOperationCancel);
         window = new(
             state,
             runtimeSnapshots,
@@ -373,6 +378,7 @@ public sealed class Plugin : IDalamudPlugin
         courier.Conductor = new(configDirectory,courierPeer,courierTrade,courierGame,courierGame,courierGame,courierGame,
             transfers,automation,autoRetainerSuppression,s=>log.Warning(s),s=>log.Information(s),AutoRetainerLoaded,courierGame.LifestreamBusy);
         courierPeer.OwnerRun = courier.Conductor.CurrentRun;
+        courierPeer.OwnerActiveRun = courier.Conductor.ActiveRun;
         var courierWorldRegion = courier.WorldRegion!;
         ipc.AttachCourier(new Interop.CourierIpcService(providerInstanceId, courier,
             () => state.ReadConfiguration(s => s.Courier), () => courierPeer.LocalBags, courierGame.Bridge,
@@ -391,6 +397,9 @@ public sealed class Plugin : IDalamudPlugin
                 courierGame.Bridge, courierWorldRegion, scanner.ResolveItemMetadata, () => runtimeSnapshots.Current, automation),
             forwardStorePath: Path.Combine(configDirectory, "delivered-stow-forwards.json"));
         ipc.AttachDeliveredStow(deliveredStow);
+        // A requester's cancel of a delivered stow is recorded on its forward too, so the forward never starts afterwards.
+        requestedOperationCancel.RequesterCancelled = deliveredStow.RecordRequesterCancel;
+        window.CancelRequestedOperation = requestedOperationCancel.CancelByOperator;
         var workbenchStock = new Interop.WorkbenchStockService(providerInstanceId, () => runtimeSnapshots.Current, playerInventory,
             () => externalAccountStock.Current, state, workQueue, s => log.Warning(s), StackSize);
         var placementEditor = new PlacementEditorWindow(() => runtimeSnapshots.Current, workbenchStock, courier);
@@ -563,6 +572,8 @@ public sealed class Plugin : IDalamudPlugin
         automaticRetrievals.Tick();
         updateTimings.Section("delivered stow forwards");
         deliveredStow.Tick();
+        updateTimings.Section("AutoRetainer suppression");
+        TickAutoRetainerSuppression();
         updateTimings.Section("vendor observer");
         vendorCatalogObserver.Tick();
         updateTimings.Section("vendor procurement");
@@ -1009,46 +1020,78 @@ public sealed class Plugin : IDalamudPlugin
         await completion.Task.ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Reclaims an AutoRetainer suppression an earlier load died holding (retried until AutoRetainer answers) and
+    /// re-asserts the suppression while Quartermaster holds it, every couple of seconds.
+    /// </summary>
+    private void TickAutoRetainerSuppression()
+    {
+        var now = DateTime.UtcNow;
+        if (now < nextSuppressionCheckAt)
+            return;
+        nextSuppressionCheckAt = now.AddSeconds(2);
+        autoRetainerSuppression.ReclaimOrphaned();
+        autoRetainerSuppression.Reassert();
+    }
+
     public void Dispose()
     {
-        courier.Conductor?.Unload();
-        courierPeer.Dispose();
-        courierGame.Dispose();
-        courier.Conductor?.DrainUnload();
-        courier.Follower?.Dispose();
-        courierTrade.Dispose();
-        playerInventory.Flush();
-        automaticRetrievals.Dispose();
-        marketCompetition.Dispose();
-        listingNavigation.Dispose();
-        marketRuns.CancelAndWait(TimeSpan.FromSeconds(2));
-        window.CancelAndWaitForActiveTransfer(TimeSpan.FromSeconds(2));
-        inventoryMover.Dispose();
-        retainerBellRoute.Dispose();
-        vendorProcurement.Dispose();
-        vendorShop.Dispose();
-        externalUiSuppression.Dispose();
-        agentBridge.Dispose();
-        agentBridgeViewportCapture.Dispose();
-        framework.Update -= OnFrameworkUpdate;
-        pluginInterface.UiBuilder.Draw -= DrawWindows;
-        pluginInterface.UiBuilder.OpenMainUi -= OpenMainUi;
-        commands.RemoveHandler(Command);
-        submissions.OperationChanged -= OnSubmittedOperationChanged;
-        deposits.OperationChanged -= OnSubmittedOperationChanged;
-        deliveredStow.OperationChanged -= OnSubmittedOperationChanged;
-        state.Changed -= OnStateChanged;
-        playerInventory.Changed -= OnPlayerInventoryChanged;
-        cache.Changed -= OnCacheChanged;
-        cache.ListingCaptured -= OnListingCaptured;
-        journal.OperationChanged -= OnOperationChanged;
-        observationClient.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        ipc.Dispose();
-        retainerRefresh.Dispose();
-        observationHost?.Dispose();
-        cache.Dispose();
-        playerInventory.Dispose();
-        externalAccountStock.Dispose();
-        windows.RemoveAllWindows();
+        // Every step runs whatever an earlier one threw. Restores of other plugins' state come first, so neither a
+        // throw nor a stalled drain further down can leave AutoRetainer or TextAdvance suppressed. The courier's trade
+        // pauses (YesAlready, Dropbox) stay with the courier trade below: they belong to a live trade window and are
+        // lifted once the courier has drained, never while a window may still hold its items.
+        void Step(string name, Action action)
+        {
+            try { action(); }
+            catch (Exception exception) { pluginLog.Warning($"[Quartermaster] UnloadStepFailed: {name}: {exception.GetType().Name}: {exception.Message}"); }
+        }
+        Step("external UI suppression", externalUiSuppression.Dispose);
+        Step("AutoRetainer suppression", autoRetainerSuppression.RestoreOnUnload);
+        Step("courier conductor unload", () => courier.Conductor?.Unload());
+        Step("courier peer link", courierPeer.Dispose);
+        Step("courier game", courierGame.Dispose);
+        Step("courier conductor drain", () => courier.Conductor?.DrainUnload());
+        Step("courier follower", () => courier.Follower?.Dispose());
+        Step("courier trade", courierTrade.Dispose);
+        Step("player inventory flush", playerInventory.Flush);
+        Step("automatic retrievals", automaticRetrievals.Dispose);
+        Step("market competition", marketCompetition.Dispose);
+        Step("listing navigation", listingNavigation.Dispose);
+        Step("market runs", () => marketRuns.CancelAndWait(TimeSpan.FromSeconds(2)));
+        Step("active transfer", () => window.CancelAndWaitForActiveTransfer(TimeSpan.FromSeconds(2)));
+        Step("inventory mover", inventoryMover.Dispose);
+        Step("retainer bell route", retainerBellRoute.Dispose);
+        Step("vendor procurement", vendorProcurement.Dispose);
+        Step("vendor shop", vendorShop.Dispose);
+        Step("agent bridge", agentBridge.Dispose);
+        Step("agent bridge viewport capture", agentBridgeViewportCapture.Dispose);
+        Step("framework update", () => framework.Update -= OnFrameworkUpdate);
+        Step("UI draw", () => pluginInterface.UiBuilder.Draw -= DrawWindows);
+        Step("open main UI", () => pluginInterface.UiBuilder.OpenMainUi -= OpenMainUi);
+        Step("command", () => commands.RemoveHandler(Command));
+        Step("operation events", () =>
+        {
+            submissions.OperationChanged -= OnSubmittedOperationChanged;
+            deposits.OperationChanged -= OnSubmittedOperationChanged;
+            deliveredStow.OperationChanged -= OnSubmittedOperationChanged;
+        });
+        Step("state events", () =>
+        {
+            state.Changed -= OnStateChanged;
+            playerInventory.Changed -= OnPlayerInventoryChanged;
+            cache.Changed -= OnCacheChanged;
+            cache.ListingCaptured -= OnListingCaptured;
+            journal.OperationChanged -= OnOperationChanged;
+        });
+        Step("observation client", () => observationClient.DisposeAsync().AsTask().GetAwaiter().GetResult());
+        Step("IPC", ipc.Dispose);
+        Step("retainer refresh", retainerRefresh.Dispose);
+        Step("observation host", () => observationHost?.Dispose());
+        Step("cache", cache.Dispose);
+        Step("player inventory", playerInventory.Dispose);
+        Step("external account stock", externalAccountStock.Dispose);
+        // A scope a failed step never released still leaves AutoRetainer as this load found it.
+        Step("AutoRetainer suppression (final)", autoRetainerSuppression.RestoreOnUnload);
+        Step("windows", windows.RemoveAllWindows);
     }
 }
