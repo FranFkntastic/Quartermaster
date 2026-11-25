@@ -164,6 +164,7 @@ internal sealed partial class TransferPlanWorkspace
             renamingPlanId = null;
             showPlacement = false;
             pickerOpenRequest = null;
+            ResetCourierView();
         }
         workbench.SelectedStowagePlanId = planId;
     }
@@ -659,11 +660,16 @@ internal sealed partial class TransferPlanWorkspace
             retainedSelectionCount = selection.Count;
         }
         if (selection.Count >= 2)
-            DrawBulkBar(owner, selected, projection);
+            DrawBulkBar(runtime, selected, projection);
         else
             DrawSummary(runtime, selected, projection);
+        if (selected.Kind == StowagePlanKind.Courier)
+            DrawCourierControls(runtime, projection);
         DrawUndoStrip(owner, selected);
-        DrawTable(runtime, selected, projection);
+        if (selected.Kind == StowagePlanKind.Courier && workbench.CourierMatrixView)
+            DrawCourierMatrix(runtime, selected, projection);
+        else
+            DrawTable(runtime, selected, projection);
     }
 
     // ---- Placement ------------------------------------------------------------------------
@@ -763,7 +769,8 @@ internal sealed partial class TransferPlanWorkspace
         // A courier plan offers no Start while a run is active or unsettled; the run pane owns that state.
         CourierStartGate? courierGate = isCourier ? courier.StartGate(runtime, projection?.Courier) : null;
         var offerExecute = courierGate?.Offer != false;
-        var trailing = ButtonWidth(menuLabel) + (isCourier ? 0 : ButtonWidth(placementLabel)) + (offerExecute ? ButtonWidth(executeLabel) : 0) +
+        var viewLabel = CourierViewLabel();
+        var trailing = ButtonWidth(menuLabel) + (isCourier ? ButtonWidth(viewLabel) : ButtonWidth(placementLabel)) + (offerExecute ? ButtonWidth(executeLabel) : 0) +
                        (isCourier ? 0 : ButtonWidth(buyLabel)) + (style.ItemSpacing.X * 4f);
         var selectorWidth = Math.Max(120f, ImGui.GetContentRegionAvail().X - trailing);
 
@@ -775,7 +782,9 @@ internal sealed partial class TransferPlanWorkspace
         ImGui.SameLine();
         DrawPlanMenu(runtime, selected, projection, menuLabel);
 
-        if (!isCourier)
+        if (isCourier)
+            DrawCourierViewToggle(viewLabel);
+        else
         {
             var canPlace = selected is not null && projection is not null && (lines > 0 || projection.Rules.Count == 0);
             DalamudUiLayout.SameLineIfFits(placementLabel);
@@ -1217,8 +1226,9 @@ internal sealed partial class TransferPlanWorkspace
         }
     }
 
-    private void DrawBulkBar(OwnerScope owner, StowagePlan plan, TransferWorkbenchProjection projection)
+    private void DrawBulkBar(QuartermasterRuntimeSnapshot runtime, StowagePlan plan, TransferWorkbenchProjection projection)
     {
+        var owner = runtime.Owner;
         var selectedIds = projection.Rules
             .Where(rule => selection.IsSelected(rule.Id))
             .Select(rule => rule.Id)
@@ -1226,8 +1236,10 @@ internal sealed partial class TransferPlanWorkspace
         ImGui.AlignTextToFramePadding();
         ImGui.TextUnformatted($"{selectedIds.Length:N0} selected");
 
-        // A courier line's numbers belong to its places, so the bulk bar sets none.
-        if (plan.Kind != StowagePlanKind.Courier)
+        // A courier line's numbers belong to its places: the bar sets one container's bounds on every selected line.
+        if (plan.Kind == StowagePlanKind.Courier)
+            DrawCourierBulkPlace(runtime, plan, projection, selectedIds);
+        else
         {
             ImGui.SameLine();
             ImGui.TextDisabled("Target");
@@ -1237,7 +1249,8 @@ internal sealed partial class TransferPlanWorkspace
                 bulkTarget = new string(bulkTarget.Where(char.IsAsciiDigit).ToArray());
         }
 
-        ImGui.SameLine();
+        DalamudUiLayout.SameLineIfFits(ImGui.CalcTextSize("Quality").X + 84 + ImGui.GetStyle().ItemSpacing.X);
+        ImGui.AlignTextToFramePadding();
         ImGui.TextDisabled("Quality");
         ImGui.SameLine();
         ImGui.SetNextItemWidth(84);
@@ -1274,10 +1287,12 @@ internal sealed partial class TransferPlanWorkspace
             }
         }
         ImGui.EndDisabled();
-        ImGui.SameLine();
+        if (plan.Kind == StowagePlanKind.Courier && !workbench.CourierMatrixView)
+            DrawCourierBulkExpand(selectedIds);
+        DalamudUiLayout.SameLineIfFits("Remove");
         if (ImGui.Button("Remove##RQBulk"))
             RemoveRules(owner, plan.Id, selectedIds);
-        ImGui.SameLine();
+        DalamudUiLayout.SameLineIfFits("Clear");
         if (ImGui.Button("Clear##RQBulk"))
         {
             selection.Clear();
@@ -1329,7 +1344,7 @@ internal sealed partial class TransferPlanWorkspace
         IReadOnlyList<TransferWorkbenchRow> rows;
         unsafe
         {
-            rows = table.Apply(projection.Rows, ImGui.TableGetSortSpecs());
+            rows = table.Apply(isCourier ? CourierVisibleRows(projection) : projection.Rows, ImGui.TableGetSortSpecs());
         }
         // Apply returns the same list until the lines, sort or filters change; reuse the keys with it.
         if (!ReferenceEquals(drawingRowKeysSource, rows) || drawingRowKeys is null)
@@ -1634,7 +1649,10 @@ internal sealed partial class TransferPlanWorkspace
             });
     }
 
-    private void DrawLineMenu(TransferWorkbenchRow row)
+    private void DrawLineMenu(TransferWorkbenchRow row) => DrawLineMenu(row, hoverRemove: true);
+
+    /// <param name="hoverRemove">Whether the row's hover × follows the menu button; a narrow column registers Remove on the button instead.</param>
+    private void DrawLineMenu(TransferWorkbenchRow row, bool hoverRemove)
     {
         var rule = row.Rule;
         if (ImGui.SmallButton("…##line-menu"))
@@ -1643,7 +1661,20 @@ internal sealed partial class TransferPlanWorkspace
             noteBuffer = rule.Notes;
             ImGui.OpenPopup("line-menu");
         }
-        DrawHoverRemove(row);
+        if (hoverRemove)
+            DrawHoverRemove(row);
+        else
+        {
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip($"{rule.ItemName} options");
+            var (owner, planId, ruleId) = (row.Owner, row.PlanId, rule.Id);
+            reviewRegistry.RegisterLastButton(
+                $"quartermaster.transfer.line.remove.{ruleId:N}",
+                $"Remove {rule.ItemName} from the plan",
+                true,
+                () => RemoveRules(owner, planId, [ruleId]),
+                "Available");
+        }
         if (!DalamudOwnedPopup.BeginOpaquePopup("line-menu"))
             return;
         Guid[] ids = [rule.Id];

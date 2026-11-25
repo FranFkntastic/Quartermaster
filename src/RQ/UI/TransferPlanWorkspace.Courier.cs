@@ -88,7 +88,25 @@ internal sealed partial class TransferPlanWorkspace
         return key;
     }
 
-    private bool CourierExpanded(Guid ruleId) => !courierSeen.Contains(ruleId) || courierExpansion.IsExpanded(CourierKey(ruleId));
+    private bool CourierExpanded(Guid ruleId) => courierExpansion.IsExpanded(CourierKey(ruleId));
+
+    /// <summary>
+    /// The first time a line is shown it opens only when it needs the user (a shortfall, surplus with
+    /// nowhere to go, nothing to move between, or its own refusal); quiet lines start closed. A line
+    /// opened before it was first shown (just added or sent) stays open.
+    /// </summary>
+    private void EnsureCourierSeen(TransferWorkbenchRow row)
+    {
+        if (!courierSeen.Add(row.Rule.Id))
+            return;
+        var key = CourierKey(row.Rule.Id);
+        if (!courierExpansion.IsExpanded(key))
+            courierExpansion.SetExpanded(key, CourierNeedsUser(row));
+    }
+
+    private static bool CourierNeedsUser(TransferWorkbenchRow row) =>
+        row.Distribution is { NeedsAttention: true } ||
+        row.CourierRefusal is { } refusal && !CourierSession.IsPlanWide(refusal.Code);
 
     /// <summary>
     /// Draws the item rows clipped to the viewport. An open row has its places under it, so the
@@ -101,6 +119,8 @@ internal sealed partial class TransferPlanWorkspace
         var start = 0;
         for (var index = 0; index <= rows.Count; index++)
         {
+            if (index < rows.Count)
+                EnsureCourierSeen(rows[index]);
             if (index < rows.Count && !CourierExpanded(rows[index].Rule.Id))
                 continue;
             if (index > start)
@@ -126,11 +146,12 @@ internal sealed partial class TransferPlanWorkspace
     {
         var rule = row.Rule;
         var key = CourierKey(rule.Id);
-        if (courierSeen.Add(rule.Id))
-            courierExpansion.SetExpanded(key, true);
+        EnsureCourierSeen(row);
         var cell = ImGui.GetCursorPos();
         var style = ImGui.GetStyle();
+        var rowTop = ImGui.GetCursorScreenPos().Y - style.CellPadding.Y;
         var open = courierExpansion.DrawToggle(key);
+        var expanderHovered = ImGui.IsItemHovered();
         reviewRegistry.RegisterLastButton(
             $"quartermaster.courier.line.expand.{rule.Id:N}",
             $"{(open ? "Collapse" : "Expand")} the places of {rule.ItemName}",
@@ -139,21 +160,45 @@ internal sealed partial class TransferPlanWorkspace
             open ? "Expanded" : "Collapsed");
         ImGui.SetCursorPos(cell);
         // The selection target goes after the expander, which keeps its clicks.
+        var targetHovered = false;
         if (drawingRows && drawingRowKeys is { } keys && (uint)drawingRowIndex < (uint)keys.Length && keys[drawingRowIndex] == rule.Id)
+        {
             DalamudTableSelectionRenderer.DrawRow(selection, keys, drawingRowIndex, $"##courier-select:{key}",
                 new Vector2(0, ImGui.GetFrameHeight()));
+            targetHovered = ImGui.IsItemHovered();
+        }
+        // A double-click anywhere on the item row opens or closes it, except on its own buttons or the trailing menu column.
+        if (!expanderHovered && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left) && ImGui.IsWindowHovered() &&
+            (targetHovered || !ImGui.IsAnyItemHovered()))
+        {
+            var mouse = ImGui.GetMousePos();
+            var menuLeft = ImGui.GetWindowPos().X + ImGui.GetWindowContentRegionMax().X - 56f;
+            if (mouse.X < menuLeft && mouse.Y >= rowTop && mouse.Y < rowTop + ImGui.GetFrameHeight() + (style.CellPadding.Y * 2f))
+                courierExpansion.Toggle(key);
+        }
         ImGui.SetCursorPos(new Vector2(cell.X + CourierIndent(), cell.Y));
         ImGui.AlignTextToFramePadding();
         ImGui.TextUnformatted(rule.ItemName);
         if (rule.Quality != ItemQualityPolicy.Any)
             Tag(TransferPresentation.QualityLabel(rule.Quality));
-        if (rule.Enabled && row.Distribution is { Moving: > 0 } distribution)
-            Tag(CourierSession.RouteSummary(row.Runtime, distribution));
         if (!string.IsNullOrWhiteSpace(rule.Notes))
         {
             Tag("note");
-            if (ImGui.IsItemHovered())
+            if (ImGui.IsMouseHoveringRect(ImGui.GetItemRectMin(), ImGui.GetItemRectMax()))
                 ImGui.SetTooltip(rule.Notes);
+        }
+        if (row.Distribution is { } distribution && (rule.Enabled && distribution.Moving > 0 || !open))
+        {
+            // Moving lines name their route; a closed line still says where it stands.
+            var summary = CourierLineSummary(row, distribution);
+            if (summary.Length > 0)
+            {
+                ImGui.SameLine();
+                var shown = ElideCached(rule.Id, summary, ImGui.GetContentRegionAvail().X);
+                ImGui.TextDisabled(shown);
+                if (shown.Length < summary.Length && ImGui.IsMouseHoveringRect(ImGui.GetItemRectMin(), ImGui.GetItemRectMax()))
+                    ImGui.SetTooltip(summary);
+            }
         }
         if (lineErrors.TryGetValue(rule.Id, out var error))
         {
