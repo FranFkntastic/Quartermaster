@@ -262,7 +262,7 @@ internal sealed class MarketRunLiveDriver(
         check();
         var player = await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
         var requests = MarketRunPlanner.StowRequests(planId, reserves,
-            player.Stacks.Select(s => (s.ItemId, s.IsHighQuality, s.Quantity)));
+            player.Stacks.Select(s => (s.ItemId, s.IsHighQuality, s.Quantity)), owner);
         var reports = (await DepositRequestsAsync(requests, lease, check, token, receiptChanged, reportChanged, false).ConfigureAwait(false)).ToList();
         if (reorganizeRetainers)
             reports.AddRange(await RelocateAsync(planId, reserves, lease, check, token, receiptChanged, reportChanged).ConfigureAwait(false));
@@ -280,13 +280,12 @@ internal sealed class MarketRunLiveDriver(
             check();
             var destinations = string.Join(", ", request.Routing.PreferredRetainerIds.Select(id =>
                 cache.Snapshot().GetValueOrDefault(id)?.RetainerName ?? $"Retainer {id}"));
-            if (request.Routing.AnySpace) destinations += (destinations.Length > 0 ? ", " : "") + "Any space";
-            // Plan one variant at a time so the preceding deposit's observations feed capacity math.
-            var batch = StowageRouter.BuildBatch([request], cache.Snapshot(), owner,
+            // Plan one variant at a time so the preceding deposit's observations feed capacity math. One route per home
+            // with exactly its planned units, so a capped home is never filled past its cap.
+            var batch = PlacementRouter.LocalBatch([request], cache.Snapshot(), owner,
                 maxStackSize ?? throw new InvalidOperationException("Item stack-size authority unavailable."), DateTime.UtcNow);
-            var route = batch.Routes.Single();
             var guarded = new StowDriver(transferDriver, this, check, request, receiptChanged, relocation);
-            if (route.RoutedQuantity > 0)
+            if (batch.PlannedQuantity > 0)
             {
                 var operation = journal.CreateDeposit(owner, batch, OperationKinds.StowageSurplus);
                 var coordinator = new TransferCoordinator(journal, guarded, cache, currentOwner,
@@ -348,7 +347,7 @@ internal sealed class MarketRunLiveDriver(
                             .SelectMany(b => b.Items).Any(i => i.ItemId == request.ItemId && i.IsHq == request.IsHighQuality && i.Quantity > 0)) break;
                     var player = await deadline.RunAsync(PlayerAsync).ConfigureAwait(false);
                     var stackSize = Math.Max(1, (maxStackSize ?? throw new InvalidOperationException("Item stack-size authority unavailable."))(request.ItemId));
-                    var capacity = StowageRouter.Route(request, cache.Snapshot(), owner, stackSize).RoutedQuantity;
+                    var capacity = PlacementRouter.LocalBatch([request], cache.Snapshot(), owner, _ => stackSize, DateTime.UtcNow).PlannedQuantity;
                     // Empty slots are a conservative bound: do not assume a partial bag stack can merge.
                     var batchUnits = (int)Math.Min(capacity, Math.Min(int.MaxValue, (long)player.FreeSlots * stackSize));
                     if (batchUnits <= 0)

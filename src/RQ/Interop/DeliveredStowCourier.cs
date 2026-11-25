@@ -45,7 +45,19 @@ internal sealed record DeliveredStowAdoptedRun(Guid Run, IReadOnlyDictionary<Gui
 /// Run state comes from <see cref="CourierConductor.PolledSnapshot"/> (a file stat per call unless the journal
 /// changed); a closed run's archive is read once, off the framework thread.
 /// </summary>
-internal sealed class DeliveredStowCourier
+internal interface IDeliveredStowCourier
+{
+    /// <summary>Why no forward can start now (another job holds automation), or null.</summary>
+    string? AutomationBlock { get; }
+    DeliveredStowForwardRefusal? Blocked();
+    (Guid? Run, DeliveredStowForwardRefusal? Refusal, IReadOnlyDictionary<ulong, DeliveredStowForwardRefusal> Refused) Start(
+        string courierRequestId, string requestHash, OwnerScope owner, IReadOnlyList<(OwnerScope Destination, IReadOnlyList<DeliveredStowForwardUnit> Units)> groups);
+    (DeliveredStowAdoptedRun? Run, bool Loading) Adopt(string courierRequestId);
+    void Forget(Guid run, string courierRequestId);
+    DeliveredStowForwardProgress? Progress(Guid run);
+}
+
+internal sealed class DeliveredStowCourier : IDeliveredStowCourier
 {
     private readonly CourierSession session;
     private readonly Func<CourierSettings> settings;

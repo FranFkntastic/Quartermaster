@@ -259,7 +259,7 @@ public sealed class MarketRunExecutor(
             unavailableRetainers.Clear();
             plannedListings.Clear();
             reserveHomes.Clear();
-            reserveHomes.UnionWith(reserves.Where(r => r.Enabled && r.ItemId > 0 && (r.Location.AnySpace || r.Location.PreferredRetainerIds.Count > 0)).Select(r => r.ItemId));
+            reserveHomes.UnionWith(reserves.Where(r => r.Enabled && r.ItemId > 0 && MarketRunPlanner.HasOwnerHome(r, plan.Owner)).Select(r => r.ItemId));
             topUpActive = false;
             Volatile.Write(ref posted, 0);
             ListingTarget = evaluation.Retainers.Sum(r => r.RefillListings.IsKnown ? r.RefillListings.Value : 0);
@@ -401,7 +401,7 @@ public sealed class MarketRunExecutor(
             warning?.Invoke(relocation);
         }
         // One line per skip; bags are not scanned, so quantities are unknown here.
-        var eligible = reserves.Where(r => r.Enabled && r.ItemId > 0 && (r.Location.AnySpace || r.Location.PreferredRetainerIds.Count > 0))
+        var eligible = reserves.Where(r => r.Enabled && r.ItemId > 0 && MarketRunPlanner.HasOwnerHome(r, record.Owner))
             .Select(r => r.ItemName).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         if (eligible.Length == 0)
         {

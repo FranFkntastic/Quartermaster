@@ -269,36 +269,44 @@ internal sealed class ListingWorkspace
             () => placementView = false, "Ready");
         if (session.Draft is not { } draft) return;
         var items = runPane.Items(runtime, session);
+        var owner = runtime.Owner;
         var rows = items.Select(item =>
         {
             var reserve = draft.Reserves.FirstOrDefault(r => r.ItemId == item.ItemId && r.Quality == item.Quality);
+            var homes = reserve?.Homes ?? [];
+            var (routing, ranks, caps) = PlacementMatrixData.Homes(homes, owner);
             return new PlacementMatrixRow<(uint, ItemQualityPolicy)>(
                 (item.ItemId, item.Quality),
                 $"{item.ItemId}-{item.Quality}",
                 $"{item.ItemName} {TransferPresentation.QualityLabel(item.Quality, anyLabel: "NQ")}",
                 MarketRunPresentation.Number(item.SpareUnits),
-                reserve?.Location ?? new StowageRoutingPolicy(),
+                routing,
                 PlacementMatrixData.Holdings(runtime, item.ItemId, item.Quality))
             {
+                Ranks = ranks,
+                Caps = caps,
+                NextRank = homes.Count + 1,
                 // Homed only on another character: it goes there, not nowhere.
-                Elsewhere = reserve is { Location.AnySpace: false, Location.PreferredRetainerIds.Count: 0, RemoteHomes.RetainerIds.Count: > 0 }
-                    ? PlacementEditorWindow.RemoteSummary(runtime, reserve.RemoteHomes)
-                    : null,
+                Elsewhere = ranks.Count == 0 && homes.Count > 0 ? PlacementMatrixData.HomesSummary(runtime, homes, owner) : null,
             };
         }).ToArray();
         var visible = rows.Where(row => string.IsNullOrWhiteSpace(search) ||
             row.Label.Contains(search.Trim(), StringComparison.OrdinalIgnoreCase)).ToArray();
         var columns = PlacementMatrixData.Columns(runtime, rows.Select(row => row.Routing));
-        placement.Draw(rows, visible, columns, changes =>
+        placement.DrawHomes(rows, visible, columns, (operation, retainerId, cap, keys) =>
         {
-            foreach (var (key, routing) in changes)
+            foreach (var key in keys)
             {
                 var item = items.FirstOrDefault(i => i.ItemId == key.ItemId && i.Quality == key.Quality);
                 if (item is null) continue;
+                var existing = draft.Reserves.FirstOrDefault(r => r.ItemId == key.ItemId && r.Quality == key.Quality);
+                var holdings = PlacementMatrixData.Holdings(runtime, item.ItemId, item.Quality)
+                    .Select(entry => new PlacementHolding(owner, entry.Key, entry.Value));
+                var next = ReservePlacement.Operate(operation, existing?.Homes ?? [], owner, retainerId, cap, holdings);
+                if (ReservePlacement.Same(existing?.Homes, next)) continue;
                 // Placing an item without a reserve rule creates the rule, as typing a level does.
-                var reserve = draft.Reserves.FirstOrDefault(r => r.ItemId == key.ItemId && r.Quality == key.Quality)
-                    ?? session.AddReserve(item.ItemId, item.ItemName, item.Quality);
-                session.SetReserveLocation(reserve.Id, routing);
+                var reserve = existing ?? session.AddReserve(item.ItemId, item.ItemName, item.Quality);
+                session.SetReserveHomes(reserve.Id, next);
             }
             return true;
         });

@@ -70,16 +70,19 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         stowByItem = [];
         var bags = MarketRunPlanner.ProjectedStowRequests(plan.Id, plan.Reserves, run, runtime.Browser.Items
             .SelectMany(i => i.Stacks).Where(s => s.ScopeKind == BrowserScopeKind.Player)
-            .Select(s => (s.ItemId, s.Quality == FfxivItemQuality.HQ, s.Quantity)));
+            .Select(s => (s.ItemId, s.Quality == FfxivItemQuality.HQ, s.Quantity)), runtime.Owner);
         stowKnown = bags is not null;
         if (bags is not null)
         {
             IReadOnlyList<StowageDepositRequest> moves = reorganizeRetainers
                 ? MarketRunPlanner.RelocationRequests(plan.Id, plan.Reserves, runtime.Retainers, runtime.Owner) : [];
-            // Bag requests route first so relocation only gets the room stowing leaves.
-            var batch = StowageRouter.BuildBatch(bags.Concat(moves), runtime.Retainers, runtime.Owner,
-                id => session.MaxStack(runtime.Browser, id), DateTime.UtcNow);
-            foreach (var route in batch.Routes.Take(bags.Count).Where(r => r.RoutedQuantity > 0))
+            // Bag requests route first so relocation only gets the room stowing leaves (one projection for both):
+            // the bag share is the same with or without the moves behind it.
+            int Stack(uint id) => session.MaxStack(runtime.Browser, id);
+            var stowed = PlacementRouter.LocalBatch(bags, runtime.Retainers, runtime.Owner, Stack, DateTime.UtcNow);
+            var moved = moves.Count == 0 ? 0
+                : PlacementRouter.LocalBatch(bags.Concat(moves), runtime.Retainers, runtime.Owner, Stack, DateTime.UtcNow).PlannedQuantity - stowed.PlannedQuantity;
+            foreach (var route in stowed.Routes.Where(r => r.RoutedQuantity > 0))
             {
                 if (plan.Reserves.FirstOrDefault(r => r.Id == route.Request.SourceRuleId) is not { } reserve) continue;
                 var itemKey = (reserve.ItemId, reserve.Quality);
@@ -88,7 +91,7 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
             run = run with
             {
                 StowUnits = stowByItem.Values.Sum(),
-                MoveUnits = batch.Routes.Skip(bags.Count).Sum(r => r.RoutedQuantity),
+                MoveUnits = Math.Max(0, moved),
             };
         }
         items = MarketRunPresentation.DisplayItems(run, draft);
@@ -460,12 +463,8 @@ internal sealed class MarketRunPane(Func<uint, uint?> resolveWorkshopProject, st
         DrawReserve(item, reserve, session, layout);
         ImGui.TableNextColumn();
         DrawCraft(item, noProject.Contains((item.ItemId, item.Quality)));
-        var goesTo = reserve is null ? string.Empty : string.Join(" → ", new[]
-        {
-            TransferPresentation.RouteSummary(reserve.Location, runtime.Retainers, runtime.Owner),
-            // Homes on another character take what the owner's own homes leave.
-            reserve.RemoteHomes is { RetainerIds.Count: > 0 } remote ? PlacementEditorWindow.RemoteSummary(runtime, remote) : string.Empty,
-        }.Where(part => part.Length > 0));
+        // The ranked homes across characters, in the order they take units.
+        var goesTo = reserve is null ? string.Empty : PlacementMatrixData.HomesSummary(runtime, reserve.Homes, runtime.Owner);
         if (showGoesTo) { ImGui.TableNextColumn(); DrawGoesTo(item, goesTo, "column"); }
         if (open)
         {

@@ -264,11 +264,8 @@ public static class ListingPlanCatalog
                 issues.Add(new(reserve.Id, nameof(reserve.Quality), "Reserve quality must be explicitly NQ or HQ."));
             if (reserve.ReserveUnits is < 0 or > ListingReserveRule.MaxReserveUnits)
                 issues.Add(new(reserve.Id, nameof(reserve.ReserveUnits), $"Reserve must be between 0 and {ListingReserveRule.MaxReserveUnits:N0} units."));
-            if (reserve.Location is null || reserve.Location.PreferredRetainerIds.Any(id => !ownerRetainerIds.Contains(id)))
-                issues.Add(new(reserve.Id, nameof(reserve.Location), "Reserve location must name retainers owned by this character."));
-            if (reserve.RemoteHomes is { RetainerIds.Count: > 0 } remote &&
-                (!remote.Character.HasStableIdentity || remote.RetainerIds.Any(ownerRetainerIds.Contains)))
-                issues.Add(new(reserve.Id, nameof(reserve.RemoteHomes), "Remote homes must name another character's retainers."));
+            if (HomesIssue(reserve.Homes) is { } homesIssue)
+                issues.Add(new(reserve.Id, nameof(reserve.Homes), homesIssue));
         }
         foreach (var duplicate in enabled.GroupBy(reserve => (reserve.ItemId, reserve.Quality)).Where(group => group.Count() > 1))
         {
@@ -278,6 +275,23 @@ public static class ListingPlanCatalog
                 issues.Add(new(reserve.Id, "ReserveDuplicate", $"{name} has more than one enabled reserve rule for this quality."));
         }
         return issues;
+    }
+
+    /// <summary>Why a home chain is invalid, or null: explicit retainers of identified characters, caps of 0 or more, each home once.</summary>
+    public static string? HomesIssue(IReadOnlyList<PlacementHome>? homes)
+    {
+        if (homes is null)
+            return "Reserve homes are missing.";
+        if (homes.Any(home => home is null || home.RetainerId == 0))
+            return "Every reserve home must name a retainer.";
+        if (homes.Any(home => home.Character is not { HasStableIdentity: true }))
+            return "Every reserve home must name a character by content id and home world.";
+        if (homes.Any(home => home.MaxUnits is < 0))
+            return "A reserve home cap cannot be negative.";
+        for (var index = 1; index < homes.Count; index++)
+            if (homes.Take(index).Any(earlier => earlier.SameHome(homes[index].Character, homes[index].RetainerId)))
+                return "A reserve home is listed more than once.";
+        return null;
     }
 
     public static TransferPlanListingLink Link(
@@ -368,18 +382,15 @@ public static class ListingPlanCatalog
         ItemName = source.ItemName,
         Quality = source.Quality,
         ReserveUnits = source.ReserveUnits,
-        Location = CopyLocation(source.Location),
-        RemoteHomes = ReserveRemoteHomes.CopyOf(source.RemoteHomes),
+        Homes = ReservePlacement.Copy(source.Homes),
+        Consolidate = source.Consolidate,
         Enabled = source.Enabled,
     };
-
-    public static StowageRoutingPolicy CopyLocation(StowageRoutingPolicy? source) => StowageRoutingPolicy.CopyOf(source);
 
     public static bool ReserveEquals(ListingReserveRule left, ListingReserveRule right) =>
         left.Id == right.Id && left.ItemId == right.ItemId && left.ItemName == right.ItemName &&
         left.Quality == right.Quality && left.ReserveUnits == right.ReserveUnits &&
-        LocationComparer.Instance.Equals(left.Location, right.Location) &&
-        ReserveRemoteHomes.Same(left.RemoteHomes, right.RemoteHomes) && left.Enabled == right.Enabled;
+        ReservePlacement.Same(left.Homes, right.Homes) && left.Consolidate == right.Consolidate && left.Enabled == right.Enabled;
 
     private static IReadOnlyList<ListingPlanAssignment> MergeAssignments(
         IReadOnlyList<ListingPlanAssignment> baseline,
@@ -462,9 +473,9 @@ public static class ListingPlanCatalog
         result.ItemName = Merge(original.ItemName, edited.ItemName, canonical.ItemName, id, nameof(result.ItemName), conflicts);
         result.Quality = Merge(original.Quality, edited.Quality, canonical.Quality, id, nameof(result.Quality), conflicts);
         result.ReserveUnits = Merge(original.ReserveUnits, edited.ReserveUnits, canonical.ReserveUnits, id, nameof(result.ReserveUnits), conflicts);
-        result.Location = CopyLocation(Merge(original.Location, edited.Location, canonical.Location, id, nameof(result.Location), conflicts, LocationComparer.Instance));
-        result.RemoteHomes = ReserveRemoteHomes.CopyOf(Merge(original.RemoteHomes, edited.RemoteHomes, canonical.RemoteHomes, id,
-            nameof(result.RemoteHomes), conflicts, RemoteHomesComparer.Instance));
+        result.Homes = ReservePlacement.Copy(Merge<IReadOnlyList<PlacementHome>>(original.Homes, edited.Homes, canonical.Homes, id,
+            nameof(result.Homes), conflicts, HomesComparer.Instance));
+        result.Consolidate = Merge(original.Consolidate, edited.Consolidate, canonical.Consolidate, id, nameof(result.Consolidate), conflicts);
         result.Enabled = Merge(original.Enabled, edited.Enabled, canonical.Enabled, id, nameof(result.Enabled), conflicts);
         return result;
     }
@@ -518,23 +529,12 @@ public static class ListingPlanCatalog
         left.QuantityPerListing == right.QuantityPerListing && left.UnitPrice == right.UnitPrice &&
         left.Enabled == right.Enabled;
 
-    private sealed class LocationComparer : IEqualityComparer<StowageRoutingPolicy>
+    private sealed class HomesComparer : IEqualityComparer<IReadOnlyList<PlacementHome>>
     {
-        public static readonly LocationComparer Instance = new();
+        public static readonly HomesComparer Instance = new();
 
-        public bool Equals(StowageRoutingPolicy? left, StowageRoutingPolicy? right) =>
-            ReferenceEquals(left, right) ||
-            (left is not null && left.SameAs(right));
+        public bool Equals(IReadOnlyList<PlacementHome>? left, IReadOnlyList<PlacementHome>? right) => ReservePlacement.Same(left, right);
 
-        public int GetHashCode(StowageRoutingPolicy value) => HashCode.Combine(value.AnySpace, value.PreferredRetainerIds.Count);
-    }
-
-    private sealed class RemoteHomesComparer : IEqualityComparer<ReserveRemoteHomes?>
-    {
-        public static readonly RemoteHomesComparer Instance = new();
-
-        public bool Equals(ReserveRemoteHomes? left, ReserveRemoteHomes? right) => ReserveRemoteHomes.Same(left, right);
-
-        public int GetHashCode(ReserveRemoteHomes? value) => value?.RetainerIds.Count ?? 0;
+        public int GetHashCode(IReadOnlyList<PlacementHome> value) => value.Count;
     }
 }

@@ -254,7 +254,7 @@ public sealed class StowagePlan
     public int Priority { get; set; }
 }
 
-public sealed class ListingPlan
+public sealed class ListingPlan : IJsonOnDeserialized
 {
     public Guid Id { get; set; } = Guid.NewGuid();
     public long Revision { get; set; } = 1;
@@ -262,6 +262,40 @@ public sealed class ListingPlan
     public List<ListingPlanAssignment> Assignments { get; set; } = [];
     public List<ListingReserveRule> Reserves { get; set; } = [];
     public DateTime UpdatedAtUtc { get; set; }
+
+    /// <summary>Rules written before ranked cross-character homes are read once into <see cref="ListingReserveRule.Homes"/>.</summary>
+    void IJsonOnDeserialized.OnDeserialized() => MigrateLegacyHomes();
+
+    /// <summary>Moves every rule's legacy Location/RemoteHomes into Homes. Idempotent; true when any rule changed.</summary>
+    public bool MigrateLegacyHomes()
+    {
+        Reserves ??= [];
+        var changed = false;
+        foreach (var reserve in Reserves)
+            changed |= reserve.MigrateLegacyHomes(Owner);
+        return changed;
+    }
+}
+
+/// <summary>One ranked deposition home retainer on any character of the service account, with an optional stock cap.</summary>
+public sealed record PlacementHome(
+    OwnerScope Character,
+    ulong RetainerId,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? MaxUnits = null)
+{
+    /// <summary>The same home: the same retainer on the same character (by content id when both carry one).</summary>
+    public bool SameHome(OwnerScope character, ulong retainerId) => RetainerId == retainerId && SameCharacter(Character, character);
+
+    /// <summary>
+    /// The same character for placement: by content id when both carry one (a world transfer keeps it, so homes stored
+    /// under the old world stay with the character), else by name and world.
+    /// </summary>
+    public static bool SameCharacter(OwnerScope left, OwnerScope right) =>
+        left.LocalContentId is > 0 && right.LocalContentId is > 0
+            ? left.LocalContentId == right.LocalContentId
+            : left.Matches(right);
+
+    public PlacementHome Copy() => new(Character with { }, RetainerId, MaxUnits);
 }
 
 /// <summary>Spare stock of one exact-quality item the market run keeps on hand beyond its listings.</summary>
@@ -274,23 +308,61 @@ public sealed class ListingReserveRule
     public string ItemName { get; set; } = string.Empty;
     public ItemQualityPolicy Quality { get; set; } = ItemQualityPolicy.NqOnly;
     public int ReserveUnits { get; set; }
-    /// <summary>Ranked homes among the owner's own retainers (and Any space). Never names another character's retainer.</summary>
-    public StowageRoutingPolicy Location { get; set; } = new();
     /// <summary>
-    /// Ranked homes on one other character of this service account, filled after <see cref="Location"/>:
-    /// units the owner's homes do not take are carried there by the courier. Absent (null) when the item
-    /// has none, which is how every rule written before remote homes reads.
+    /// The item's deposition homes: one ranked chain across every character of the service account (rank = index + 1).
+    /// Each home is an explicit retainer with an optional stock cap; arriving units fill rank 1 up to its cap and room,
+    /// then spill down the chain. What no home takes stays in the owner's bags. There is no "any space" home.
     /// </summary>
+    public List<PlacementHome> Homes { get; set; } = [];
+    /// <summary>Owner-side stowage consolidation, carried from the legacy location.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool Consolidate { get; set; }
+    /// <summary>Legacy ranked owner homes (and Any space). Read once on load into <see cref="Homes"/>; never written.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public StowageRoutingPolicy? Location { get; set; }
+    /// <summary>Legacy ranked homes on one other character. Read once on load into <see cref="Homes"/>; never written.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [EditorBrowsable(EditorBrowsableState.Never)]
     public ReserveRemoteHomes? RemoteHomes { get; set; }
     public bool Enabled { get; set; } = true;
 
     /// <summary>Whether the rule names any home, here or on another character.</summary>
     [JsonIgnore]
-    public bool HasAnyHome => Location.AnySpace || Location.PreferredRetainerIds.Count > 0 || RemoteHomes is { RetainerIds.Count: > 0 };
+    public bool HasAnyHome => Homes.Count > 0;
+
+    /// <summary>
+    /// Reads legacy <see cref="Location"/> (the owner's ranked retainers) then <see cref="RemoteHomes"/> into
+    /// <see cref="Homes"/> uncapped, dropping Any space and duplicates, then clears both so only Homes is written.
+    /// Homes already present win: legacy fields are then only cleared. Idempotent; true when anything changed.
+    /// </summary>
+    public bool MigrateLegacyHomes(OwnerScope owner)
+    {
+        Homes ??= [];
+        if (Location is null && RemoteHomes is null)
+            return false;
+        if (Homes.Count == 0)
+        {
+            void Add(OwnerScope character, ulong retainerId)
+            {
+                if (retainerId == 0 || Homes.Any(home => home.SameHome(character, retainerId)))
+                    return;
+                Homes.Add(new(character with { }, retainerId));
+            }
+            foreach (var id in Location?.PreferredRetainerIds ?? [])
+                Add(owner, id);
+            if (RemoteHomes is { } remote)
+                foreach (var id in remote.RetainerIds ?? [])
+                    Add(remote.Character ?? new OwnerScope(), id);
+        }
+        Consolidate |= Location?.Consolidate == true;
+        Location = null;
+        RemoteHomes = null;
+        return true;
+    }
 }
 
-/// <summary>A reserve item's ranked home retainers on another character than the plan owner.</summary>
+/// <summary>Legacy (read-once) ranked home retainers on another character than the plan owner.</summary>
 public sealed class ReserveRemoteHomes
 {
     public OwnerScope Character { get; set; } = new();

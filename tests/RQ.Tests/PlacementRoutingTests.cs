@@ -34,8 +34,13 @@ public sealed class PlacementRoutingTests
             Expect(rules[2], true, 11, 10);
             Expect(rules[3], false, 10);
             Expect(rules[4], false, 12);
-            var reserve = Assert.Single(Assert.Single(state.ListingPlans).Reserves).Location;
-            Expect(reserve, false, 12);
+            // A reserve's legacy location becomes its ranked homes (explicit retainers only; any space is dropped).
+            var reserve = Assert.Single(Assert.Single(state.ListingPlans).Reserves);
+            Assert.Null(reserve.Location);
+            Assert.Null(reserve.RemoteHomes);
+            var home = Assert.Single(reserve.Homes);
+            Assert.Equal(12UL, home.RetainerId);
+            Assert.Null(home.MaxUnits);
         }
 
         var repository = TestData.Repository(directory.Path);
@@ -45,6 +50,7 @@ public sealed class PlacementRoutingTests
         var saved = File.ReadAllText(statePath);
         Assert.DoesNotContain("\"overflow\"", saved, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("\"mode\"", saved, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("\"location\"", saved, StringComparison.OrdinalIgnoreCase);
         AssertMapped(TestData.Repository(directory.Path).FullSnapshot());
     }
 
