@@ -567,7 +567,7 @@ public sealed class CourierSession
 
     /// <summary>
     /// Where a courier line's item sits and where it would move, as the planner sees it: the listed
-    /// places with their observed units, typed values and end states. Cached per runtime revision and line.
+    /// places with their observed units, bounds and end states. Cached per runtime revision and line.
     /// </summary>
     internal CourierAllocation Allocation(QuartermasterRuntimeSnapshot runtime, OwnerScope planOwner, TargetPlanItem rule)
     {
@@ -578,7 +578,7 @@ public sealed class CourierSession
         if (cache.Lines.TryGetValue(rule.Id, out var hit) && ReferenceEquals(hit.Line, line) && hit.Quality == rule.Quality && hit.Owner.Matches(planOwner))
             return hit.Allocation;
         var allocation = CourierDistribution.Allocate(line, rule.ItemId, rule.Quality, planOwner, Locations(runtime),
-            who => CourierPlanner.Listable(who, settings, WorldRegion));
+            who => CourierPlanner.Listable(who, settings, WorldRegion), CourierPlanner.StackSize(metadata(rule.ItemId)));
         cache.Lines[rule.Id] = (line, rule.Quality, planOwner, allocation);
         return allocation;
     }
@@ -586,7 +586,7 @@ public sealed class CourierSession
     private long rolesChecked = -1;
 
     /// <summary>
-    /// Writes back courier lines whose places predate listing sources and destinations apart, converted
+    /// Writes back courier lines still in an older shape (places predating roles, or roles), converted
     /// against observed stock (<see cref="CourierDistribution.Resolve"/>). A line waits while its plan
     /// owner's bags or any of its typed places are unobserved; until then it is converted afresh wherever
     /// it is solved. Checked once per runtime revision.
@@ -596,7 +596,7 @@ public sealed class CourierSession
         if (runtime.Revision == rolesChecked || !runtime.Owner.HasStableIdentity)
             return;
         rolesChecked = runtime.Revision;
-        var pending = runtime.State.PlanItems.Where(rule => rule.Courier is { IsLegacy: false, HasLegacyPlaces: true }).ToArray();
+        var pending = runtime.State.PlanItems.Where(rule => rule.Courier is { IsLegacy: false, NeedsResolve: true }).ToArray();
         if (pending.Length == 0)
             return;
         var locations = Locations(runtime);
@@ -622,15 +622,25 @@ public sealed class CourierSession
         });
     }
 
-    /// <summary>A courier line's problem as its outcome label; empty when it has none.</summary>
-    internal static string ProblemLabel(CourierAllocation allocation) => allocation.Problem switch
-    {
-        CourierProblem.NoSource => "No source",
-        CourierProblem.NoDestination => "No destination",
-        CourierProblem.Short => $"Short {allocation.Short:N0}",
-        CourierProblem.Unplaced => $"{allocation.Stuck:N0} · no destination",
-        _ => string.Empty,
-    };
+    /// <summary>
+    /// A courier line's moves as the plan table words them, with their colour (null: plain) and, when
+    /// targets stay unmet, what is left on hover. Every solved move runs even while some are left.
+    /// </summary>
+    internal static (string Text, System.Numerics.Vector4? Color, string? Detail) Outcome(CourierAllocation allocation) =>
+        (allocation.Moving, allocation.Short, allocation.Stuck) switch
+        {
+            ( > 0 and var moving, > 0 and var shortfall, _) => ($"{moving:N0} · {shortfall:N0} short", QuartermasterPalette.Amber,
+                $"Moves {moving:N0}, everything the listed places can give.\nTargets still want {shortfall:N0} more."),
+            ( > 0 and var moving, _, > 0 and var stuck) => ($"{moving:N0} · {stuck:N0} unplaced", QuartermasterPalette.Amber,
+                $"Moves {moving:N0}, everything the listed places can take.\n{stuck:N0} above targets has no listed place to go."),
+            ( > 0 and var moving, _, _) => (moving.ToString("N0"), null, null),
+            (_, > 0 and var shortfall, _) => ($"Short {shortfall:N0}", QuartermasterPalette.Amber,
+                $"Targets want {shortfall:N0} more than the listed places can give."),
+            (_, _, > 0 and var stuck) => ($"Unplaced {stuck:N0}", QuartermasterPalette.Amber,
+                $"{stuck:N0} above targets has no listed place to go."),
+            _ when allocation.Line.Entries.Length < 2 => ("Add a place", QuartermasterPalette.Amber, null),
+            _ => ("In place", QuartermasterPalette.Green, null),
+        };
 
     /// <summary>Observed containers of every known character; unobserved ones are omitted. Cached per runtime revision.</summary>
     internal IReadOnlyList<CourierLocation> Locations(QuartermasterRuntimeSnapshot runtime)

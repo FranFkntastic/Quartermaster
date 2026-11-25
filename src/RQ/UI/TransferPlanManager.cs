@@ -231,10 +231,10 @@ internal sealed class TransferPlanManager
         var rows = resolveProjection(runtime, plan).Rows;
         if (courier)
         {
+            // Characters a run brings units to, once per line.
             var destinations = rows
-                .SelectMany(row => row.Rule.Courier is { } line
-                    ? line.Destinations.Select(place => place.Character)
-                        .Concat(line.LegacyPlaces.Where(place => place.Destination).Select(place => place.Character))
+                .SelectMany(row => row.Distribution is { } distribution
+                    ? distribution.Places.Where(place => place.Delta > 0).Select(place => place.Character)
                         .DistinctBy(character => (character.LocalContentId, character.HomeWorldId))
                     : [])
                 .GroupBy(character => (character.LocalContentId, character.HomeWorldId))
@@ -335,8 +335,8 @@ internal sealed class TransferPlanManager
         ImGui.TableNextColumn();
         var destination = rule.Courier is null
             ? StowTo(runtime, rule.Routing)
-            : row.Distribution is { Problem: not Courier.CourierProblem.None } problem
-                ? CourierSession.ProblemLabel(problem)
+            : row.Distribution is { NeedsAttention: true } attention
+                ? CourierSession.Outcome(attention).Text
                 : row.Distribution is { Moving: > 0 } distribution
                     ? CourierSession.RouteSummary(runtime, distribution)
                     : "In place";

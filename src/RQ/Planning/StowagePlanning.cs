@@ -131,12 +131,22 @@ public static class StowagePlanMigration
     /// line that sent N moves nothing until a number is typed. Ranked fallbacks and Any space are
     /// dropped. Quality is kept when the lines agree, otherwise Any. Kept amounts carry over only when
     /// the lines shared one destination, quality and enabled state; lines that differed fold into a
-    /// line with their destinations and no numbers. Returns whether anything changed; running it again
-    /// changes nothing.
+    /// line with their destinations and no numbers. Lines that list places by source and destination
+    /// first fold those into their entries (<see cref="Courier.CourierDistribution.ConvertRoles"/>).
+    /// Returns whether anything changed; running it again changes nothing.
     /// </summary>
     public static bool CollapseCourierLines(QuartermasterState state)
     {
         var plans = new HashSet<Guid>();
+        // Folding roles into entries changes the line's shape, not what it moves, so plan revisions (and
+        // any recovery pinned to one) stay as they are.
+        var converted = false;
+        foreach (var rule in state.PlanItems.Where(rule => rule.Courier is { IsLegacy: false } line &&
+                     (!line.Sources.IsDefault || !line.Destinations.IsDefault)))
+        {
+            rule.Courier = Courier.CourierDistribution.ConvertRoles(rule.Courier!);
+            converted = true;
+        }
         foreach (var group in state.PlanItems.Where(rule => rule.Courier is not null)
                      .GroupBy(rule => (rule.StowagePlanId, rule.ItemId))
                      .Where(group => group.Count() > 1 || group.Any(rule => rule.Courier!.IsLegacy)).ToArray())
@@ -144,19 +154,13 @@ public static class StowagePlanMigration
             var lines = group.ToList();
             var owner = state.StowagePlans.FirstOrDefault(plan => plan.Id == group.Key.StowagePlanId)?.Owner;
             var survivor = lines.FirstOrDefault(rule => !rule.Courier!.IsLegacy) ?? lines[0];
-            // Lines that list sources and destinations keep them, in line order; a place keeps its first role.
+            // Lines that list places keep them, in line order; a place keeps its first bounds.
             var explicitLines = lines.Where(rule => !rule.Courier!.IsLegacy).Select(rule => rule.Courier!).ToList();
-            var sources = new List<Courier.CourierPlace>();
-            var destinations = new List<Courier.CourierPlace>();
-            bool Listed(OwnerScope who, ulong? retainer) =>
-                sources.Any(known => known.Is(who, retainer)) || destinations.Any(known => known.Is(who, retainer));
+            var entries = new List<Courier.CourierPlace>();
+            bool Listed(OwnerScope who, ulong? retainer) => entries.Any(known => known.Is(who, retainer));
             foreach (var line in explicitLines)
-            {
-                foreach (var place in line.Sources.Where(place => !Listed(place.Character, place.Retainer)))
-                    sources.Add(place);
-                foreach (var place in line.Destinations.Where(place => !Listed(place.Character, place.Retainer)))
-                    destinations.Add(place);
-            }
+                foreach (var place in line.Entries.Where(place => !Listed(place.Character, place.Retainer)))
+                    entries.Add(place);
             var places = new List<Courier.LegacyCourierPlace>();
             void Add(Courier.LegacyCourierPlace place)
             {
@@ -174,7 +178,7 @@ public static class StowagePlanMigration
             // destination for everything, one quality, one enabled state, and no kept source that is also
             // that destination. Otherwise the destinations alone carry over and the line moves nothing
             // until numbers are typed, rather than sending one line's surplus to another line's destination.
-            var faithful = places.Count(place => place.Destination) + destinations.Count == 1 &&
+            var faithful = places.Count(place => place.Destination) + entries.Count == 1 &&
                 lines.Select(rule => rule.Quality).Distinct().Count() == 1 &&
                 lines.Select(rule => rule.Enabled).Distinct().Count() == 1;
             if (faithful)
@@ -185,10 +189,8 @@ public static class StowagePlanMigration
             // Places in the older shape are converted once stock is known (CourierDistribution.Resolve).
             survivor.Courier = new Courier.CourierLine
             {
-                Sources = [.. sources],
-                Destinations = [.. destinations],
+                Entries = [.. entries],
                 SuggestionDismissed = explicitLines.Any(line => line.SuggestionDismissed),
-                SourceSuggestionDismissed = explicitLines.Any(line => line.SourceSuggestionDismissed),
                 Places = places.Count > 0 ? [.. places] : default,
             };
             survivor.Quality = lines.Select(rule => rule.Quality).Distinct().Count() == 1 ? survivor.Quality : ItemQualityPolicy.Any;
@@ -204,7 +206,7 @@ public static class StowagePlanMigration
             plan.Revision = checked(plan.Revision + 1);
         if (plans.Count > 0)
             StowagePlanCatalog.ClearStaleRecovery(state);
-        return plans.Count > 0;
+        return plans.Count > 0 || converted;
     }
 
     /// <summary>
