@@ -204,8 +204,10 @@ j.Task.IsFaulted?Result<CourierReceipt>.Fail("CarrierStepFault",j.Task.Exception
             targets=presences.Where(p=>CourierPlanner.Exact(p.Identity.Deserialize<CourierPeer>()?.Character,m.Carrier)).ToArray();
             if(targets.Length==1)break;
             // Two matching carriers are a real ambiguity; none is waited out briefly.
-            if(targets.Length>1 || DateTimeOffset.UtcNow>=looking || DateTimeOffset.UtcNow>=d.Expires)
+            if(targets.Length>1)
                 return Result<CourierReceipt>.Fail("CarrierEndpointAmbiguous",$"Matched {targets.Length} carriers.");
+            if(DateTimeOffset.UtcNow>=looking || DateTimeOffset.UtcNow>=d.Expires)
+                return Result<CourierReceipt>.Fail("CarrierNotFound",$"No linked client showed {m.Carrier.CharacterName} within {DiscoveryGrace.TotalSeconds:0}s.");
             await Task.Delay(500,unload.Token);
         }
         var ep=await endpoint;var conn=Connect(ep,targets[0]);carriers[m.Run]=targets[0].InstanceId;

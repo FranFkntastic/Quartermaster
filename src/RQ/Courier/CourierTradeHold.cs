@@ -57,7 +57,14 @@ internal sealed class CourierTradeHold(string holder, Func<bool> loaded, Func<bo
                 regaining = true; loss = null; held = false; timer?.Dispose(); timer = null;
             }
             if (held) return;
-            if (!framework || !loaded()) return;
+            if (!framework) return;
+            if (!loaded())
+            {
+                // Re-acquiring a lapsed hold with MarketMafioso gone is a refused re-acquire: never a trade without the hold.
+                if (!regaining) return;
+                loss = new(CourierOutcome.Failed,"TradeHoldUnavailable","MarketMafioso not loaded; the lapsed hold cannot be re-acquired.");
+                throw loss;
+            }
             try
             {
                 if (!available())

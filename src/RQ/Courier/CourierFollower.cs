@@ -40,6 +40,8 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     private volatile bool stopped;
     private volatile bool disposed;
     private volatile CourierMessage? active;
+    // Counts every stop, so a step that waited can tell whether a Stop arrived during its wait.
+    private int stops;
     // When the last owner command arrived: a presence that says the owner no longer has the run is trusted only after
     // this long without commands, so an owner presence published just before a Begin never forgets the run it began.
     private DateTimeOffset lastCommand = DateTimeOffset.MinValue;
@@ -87,6 +89,13 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         var remaining = deadline.Expires - DateTimeOffset.UtcNow;
         if (remaining <= TimeSpan.Zero) return Refuse("CommandExpired");
         lastCommand = DateTimeOffset.UtcNow;
+        // A trade step starts its trade within the budget it shares with the owner, or not at all; until it starts, a
+        // heartbeat tells the owner what it is still waiting on, so the owner's wait extends instead of expiring.
+        bool tradeStep = m.Command is CourierCommand.Receive or CourierCommand.Send, opened = false;
+        var startBy = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(CourierTradeStart.CarrierSeconds);
+        using var heartbeat = tradeStep && started != null
+            ? new CourierTradeStartHeartbeat(reason => started!(new(m.Run, m.Step, CourierTradeStart.Preparing, reason))) : null;
+        void Waiting(string reason) { if (heartbeat != null) heartbeat.Reason = reason; }
         if (m.Command is CourierCommand.Stop or CourierCommand.Clear && store.Load().Run == m.Run) await StopLocalAsync(false);
         if (!await gate.WaitAsync(remaining)) return Refuse("CommandQueueDeadline");
         active = m;
@@ -161,8 +170,12 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             // Stop moves nothing and only releases: it never takes the locks it is about to drop.
             if (lease == null && m.Command != CourierCommand.Stop)
             {
+                Waiting("AutomationLease");
+                var stopsBefore = Volatile.Read(ref stops);
                 if (!automation.TryAcquire("courier carrier", out lease) && !await AwaitOwnLeaseAsync(m.Command, deadline))
                     return Refuse("AutomationBusy", automation.AcquisitionBlockReason);
+                // A stale stop from before this command is cleared; one that arrived while it waited for the lease stands.
+                if (Volatile.Read(ref stops) != stopsBefore) return Refuse("CarrierStopped", "A Stop arrived while this step waited for the automation lease.");
                 if(needsSuppression?.Invoke()!=false)suppress = suppression.Acquire();
                 stopped = false;
             }
@@ -172,13 +185,22 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             if (m.Command is CourierCommand.Travel or CourierCommand.Receive or CourierCommand.Send or CourierCommand.ReturnHome or CourierCommand.Claim)
             {
                 var budget = CourierBusyGate.Within(deadline.Expires, TimeSpan.FromSeconds(StepSeconds(cfg, m)));
+                // A trade step's busy wait also leaves its later pre-trade calls inside the start budget it shares with the owner.
+                if (tradeStep)
+                {
+                    var left = startBy - DateTimeOffset.UtcNow - TimeSpan.FromSeconds(CourierTradeStart.AfterBusySeconds);
+                    if (left < budget) budget = left > TimeSpan.Zero ? left : TimeSpan.Zero;
+                }
+                Waiting("AutoRetainerOrLifestreamIdle");
                 if (await CourierBusyGate.WaitIdleAsync(suppression, lifestreamBusy, () => stopped || disposed, budget) is { } busy)
                     return stopped || disposed ? Refuse("CarrierDisarmed") : Refuse(busy.Code, busy.Detail);
             }
             if (trade is ICourierHoldPort holds && m.Command is not (CourierCommand.Stop or CourierCommand.Finish or CourierCommand.Confirm or CourierCommand.Unclaim or CourierCommand.SettleSent))
             {
                 if(tradeHold==null && m.Command is not (CourierCommand.Begin or CourierCommand.Settle or CourierCommand.VerifySettlement)) return Refuse("TradeHoldScopeMissing");
+                if (tradeHold == null) Waiting("TradeHold");
                 tradeHold ??= await calls.Call("CarrierTradeHold",30,d=>holds.BeginHold(m.Run,d));
+                Waiting("TradeHoldCheck");
                 // A trade asks again for a hold MarketMafioso let lapse between steps; any other step only checks it.
                 if (m.Command is CourierCommand.Receive or CourierCommand.Send) await calls.Call("CarrierTradeHoldCheck", 15, holds.RegainHoldAsync);
                 else holds.CheckHold();
@@ -187,6 +209,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             InventoryView before = null!;
             if (m.Command != CourierCommand.Stop)
             {
+                Waiting("CarrierBags");
                 before = await Observe(observation: true);
                 if (!CourierPlanner.Exact(before.Character, m.Carrier)) return Refuse("CarrierIdentityMismatch");
             }
@@ -195,8 +218,10 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             ledger.Run = m.Run;
             if (m.Command == CourierCommand.Begin) { ledger.OwnerEndpoint = endpoint; ledger.RunKey ??= m.RunKey; }
             CourierGame.Step.Value = m.Step;
+            // A trade that has not started by the shared start budget never starts: the owner has stopped waiting for it.
             CourierGame.CanContinue.Value=()=>!stopped && !disposed && settings() is {} current &&
-                current.CarrierOptIn && Authorized(current,ledger) && CourierPlanner.Exact(current.Carrier,m.Carrier);
+                current.CarrierOptIn && Authorized(current,ledger) && CourierPlanner.Exact(current.Carrier,m.Carrier) &&
+                (!tradeStep || opened || DateTimeOffset.UtcNow < startBy);
             information?.Invoke($"{m.Run}/{m.Step} carrier {m.Command} ({deadline.Name}, expires {deadline.Expires:O})");
             var step = new CarrierStep(hash, m, null, m.Command is CourierCommand.Receive or CourierCommand.Send ? before : null);
             if (m.Command is not (CourierCommand.Receive or CourierCommand.Send)) { ledger.Steps[m.Step]=step; store.Save(ledger); }
@@ -235,11 +260,16 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                         ledger.Steps[m.Step] = step with { Result = refusal }; store.Save(ledger); return refusal;
                     }
                     // Before the trade's intent is saved: running out of time here dispatched nothing.
+                    Waiting("TradePartner");
                     await calls.Call("CarrierPartner", 30, d => bells.ObserveTradeableAsync(m.Partner, d), observation: true);
                     if (stopped || !settings().CarrierOptIn || !Authorized(settings(),ledger)) return Refuse("CarrierDisarmed");
+                    if (DateTimeOffset.UtcNow >= startBy)
+                        return Refuse("CarrierTradeStartWindowElapsed", $"{CourierTradeStart.CarrierSeconds}s start budget spent before dispatch; last waiting on {heartbeat?.Reason ?? "unknown"}.");
+                    Waiting("TradeOpening");
                     ledger.Unconfirmed = m.Step;
                     ledger.Steps[m.Step]=step; store.Save(ledger);
-                    CourierGame.TradeStarted.Value=()=>started?.Invoke(new(m.Run,m.Step,"TradeStarted"));
+                    // The heartbeat stops before TradeStarted is reported, so no later beat replaces it.
+                    CourierGame.TradeStarted.Value=()=>{opened=true;heartbeat?.Dispose();started?.Invoke(new(m.Run,m.Step,"TradeStarted"));};
                     try
                     {
                         await calls.Call("CarrierTrade", Deadline.TradeSeconds(m.Manifest), d => send ? trade.SendAsync(m.Partner, m.Manifest, d) : trade.ReceiveAsync(m.Partner, m.Manifest, d));
@@ -485,7 +515,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     };
     public async Task StopLocalAsync(bool notifyOwner = true)
     {
-        stopped = true;
+        stopped = true; Interlocked.Increment(ref stops);
         if (notifyOwner && store.Load().Run is { } run) StopRequested?.Invoke(run);
         await calls.Call("CarrierCancelPreLock", 10, trade.CancelPreLockAsync);
         if (notifyOwner)
@@ -526,7 +556,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     /// </summary>
     public async Task ForgetLocalAsync()
     {
-        stopped = true;
+        stopped = true; Interlocked.Increment(ref stops);
         try { await calls.Call("CarrierCancelPreLock", 10, trade.CancelPreLockAsync); }
         catch (Exception e) { warning($"CarrierClearCancelPreLock: {e.Message}"); }
         var entered = await gate.WaitAsync(TimeSpan.FromSeconds(15));

@@ -58,3 +58,63 @@ internal static class CourierBusyGate
         catch { return false; }
     }
 }
+
+/// <summary>
+/// The one budget both sides of a hand-off share for the time between the owner sending Receive/Send and the carrier's
+/// TradeStarted. The carrier never starts its trade later than <see cref="CarrierSeconds"/> after the command reached it
+/// (it refuses instead), and the owner waits for TradeStarted, extending on each carrier heartbeat, up to
+/// <see cref="OwnerCapSeconds"/>: strictly later, so the two budgets can never cross.
+/// </summary>
+internal static class CourierTradeStart
+{
+    /// <summary>Carrier: command arrival to TradeStarted, at most. Covers the busy wait, hold, bag read and partner sighting.</summary>
+    internal const int CarrierSeconds = 165;
+    /// <summary>Carrier: what the calls after the busy wait (hold 30, re-acquire 15, bags 15, partner 30) and the trade's opening keep back.</summary>
+    internal const int AfterBusySeconds = 30 + 15 + 15 + 30 + 15;
+    /// <summary>Owner: the hard cap, past the carrier's own by the link's delivery of the command and of its acknowledgement.</summary>
+    internal const int OwnerCapSeconds = CarrierSeconds + 15;
+    /// <summary>
+    /// Owner: this long with no heartbeat (nor TradeStarted) ends the wait before the cap. Longer than the peer link's
+    /// discovery grace (30s) plus its step-start request (5s), which run before the carrier can beat at all.
+    /// </summary>
+    internal const int QuietSeconds = 45;
+    /// <summary>The carrier's heartbeat phase while it waits ahead of TradeStarted; <see cref="CourierProgress.Waiting"/> names on what.</summary>
+    internal const string Preparing = "TradePreparing";
+    internal static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(3);
+}
+
+/// <summary>
+/// The carrier's heartbeat ahead of TradeStarted: every few seconds reports what it is waiting on. Disposing it (at
+/// TradeStarted, or when the command ends) stops it for good; no beat lands after, so it never overwrites TradeStarted.
+/// </summary>
+internal sealed class CourierTradeStartHeartbeat : IDisposable
+{
+    private readonly object gate = new();
+    private readonly Action<string> beat;
+    private Timer? timer;
+    private bool disposed;
+    private volatile string reason = "CommandQueue";
+    internal CourierTradeStartHeartbeat(Action<string> beat)
+    {
+        this.beat = beat;
+        timer = new Timer(_ => Beat(), null, TimeSpan.Zero, CourierTradeStart.HeartbeatInterval);
+    }
+    internal string Reason { get => reason; set { reason = value; Beat(); } }
+    private void Beat()
+    {
+        lock (gate)
+        {
+            if (disposed) return;
+            try { beat(reason); } catch { /* A heartbeat is advisory; the owner's cap still bounds the wait. */ }
+        }
+    }
+    public void Dispose()
+    {
+        lock (gate)
+        {
+            if (disposed) return;
+            disposed = true;
+            timer?.Dispose(); timer = null;
+        }
+    }
+}

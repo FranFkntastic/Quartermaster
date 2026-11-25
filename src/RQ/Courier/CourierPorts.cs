@@ -61,7 +61,8 @@ public sealed record CourierMessage(int Version, Guid Run, Guid Step, CourierCom
     Guid? ConfirmStep = null, TradeEvidence? OwnerEvidence = null, string? RunKey = null, [property:System.Text.Json.Serialization.JsonIgnore(Condition=System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] InventoryView? CarrierBaseline=null);
 public sealed record CourierReceipt(Guid Run, Guid Step, InventoryView? Bags = null, TradeEvidence? Evidence = null,
     ImmutableArray<Shipment> Custody = default, Guid? Unconfirmed = null, Guid? LastConfirmed = null, Guid? ActiveRun = null);
-public sealed record CourierProgress(Guid Run, Guid Step, string Phase);
+/// <summary>A carrier step's progress; <paramref name="Waiting"/> names what a <see cref="CourierTradeStart.Preparing"/> heartbeat waits on.</summary>
+public sealed record CourierProgress(Guid Run, Guid Step, string Phase, string? Waiting = null);
 public interface ICourierPeerPort
 {
     event Action<CourierProgress> Progress;
@@ -321,8 +322,11 @@ internal sealed class CourierCalls(Action<string> warning)
                 CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
             throw new CourierFault(observation ? CourierOutcome.Failed : CourierOutcome.Indeterminate, name + "Deadline", $"{name}: {seconds}s elapsed.");
         }
-        if (r.Outcome != CourierOutcome.Succeeded || r.Value == null || r.Value is false)
-            throw new CourierFault(r.Outcome == CourierOutcome.Succeeded ? CourierOutcome.Failed : r.Outcome, r.Code,
+        // A pure read whose own poll ran out of time (its *Deadline, reported within the grace) changed nothing either.
+        var outcome = observation && r.Outcome == CourierOutcome.Indeterminate && r.Code.EndsWith("Deadline", StringComparison.Ordinal)
+            ? CourierOutcome.Failed : r.Outcome;
+        if (outcome != CourierOutcome.Succeeded || r.Value == null || r.Value is false)
+            throw new CourierFault(outcome == CourierOutcome.Succeeded ? CourierOutcome.Failed : outcome, r.Code,
                 $"{name} ({seconds}s): {r.Detail}");
         return r.Value;
     }
