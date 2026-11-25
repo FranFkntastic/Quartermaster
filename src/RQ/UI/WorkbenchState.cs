@@ -24,6 +24,8 @@ public sealed class WorkbenchState
             field = value;
         }
     }
+    /// <summary>Courier plans open as the allocation matrix; false shows the compact list. Kept across plan switches.</summary>
+    public bool CourierMatrixView { get; set; } = true;
     public string ScopeKey { get; set; } = BrowserScope.AllKey;
     public DalamudFilterAutocompleteState ItemFilterState { get; } = new();
     public DalamudFilterAutocompleteState ListingFilterState { get; } = new();
