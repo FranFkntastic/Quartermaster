@@ -35,6 +35,9 @@ public sealed class QuartermasterWindow : Window
     private readonly WorkbenchState workbench = new();
     private readonly DalamudRootConfirmationDialog confirmationDialog = new("RQConfirm");
     private readonly OperationHistoryDialog historyDialog;
+
+    /// <summary>Cancel in Transfer history: withdraws an accepted requested operation by request id.</summary>
+    public Func<string, string>? CancelRequestedOperation { set => historyDialog.CancelRequestedOperation = value; }
     private readonly ItemGroupWorkspace itemGroupWorkspace;
     private readonly RestockPlanEditor restockPlanEditor;
     private readonly StockWorkspace stockWorkspace;
@@ -101,7 +104,7 @@ public sealed class QuartermasterWindow : Window
         confirmationDialog.ControlSubmitted = RegisterConfirmationControl;
         marketRunPane = new(resolveWorkshopProject, configDirectory, marketImporter);
         var gameCatalog = new GameItemCatalog(dataManager, log);
-        historyDialog = new(journal);
+        historyDialog = new(journal, reviewRegistry);
         RestockPlanEditor? restockEditor = null;
         itemGroupWorkspace = new(
             state,

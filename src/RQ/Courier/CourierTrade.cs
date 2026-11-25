@@ -121,13 +121,25 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
         if(set!=null)lock(set)set.Remove(CourierOwner);
         held=null;
     }
-    // On load: a YesAlready or Dropbox pause a previous load left behind is lifted once no trade window is open or locked and no
-    // cancellation is pending. A pending cancellation keeps it (its settlement lifts it); a window that is open, locked
-    // or unreadable keeps it until it closes.
+    // On load: a YesAlready or Dropbox pause a previous load left behind is lifted once no trade window is open or locked. A
+    // cancellation a dead load left pending with no confirmation submitted is settled here once the window is observed
+    // closed: without our confirmation that window moved nothing, so the checkpoint drops the pending flag (exactly as
+    // the trade runner does when it observes the closure) and new trades no longer refuse SettlementRequired over it.
+    // A pending cancellation awaiting confirmation verification keeps the pause (the run's settlement lifts it); a
+    // window that is open, locked or unreadable keeps it until it closes.
     public void RestoreLeftoverSuppression()=>_=Task.Run(async()=>{
         try{
             var done=await game.Poll<bool>(new("CourierTradeLoadRestore",DateTimeOffset.MaxValue),()=>{
-                if(store.Load().Recovery.CancellationPending)return Result<bool>.Ok(false);
+                var checkpoint=store.Load();
+                if(checkpoint.Recovery.CancellationPending)
+                {
+                    // Observe-only recovery (or a confirmation awaiting verification) is the run's to settle, never cleared here.
+                    if(checkpoint.Recovery.AwaitingVerification!=null || checkpoint.Recovery.ObserveOnly)return Result<bool>.Ok(false);
+                    if(inFlight || !WindowClosed())return null;
+                    checkpoint.Recovery.CancellationPending=false;store.Save(checkpoint);
+                    log.Warning($"CourierTradeCancellationSettledOnLoad: step {checkpoint.Step}'s trade cancellation was left pending by an earlier load; " +
+                        "the window is closed and no confirmation was submitted, so nothing moved in it. The pending flag is cleared and the auto-confirm pauses are lifted.");
+                }
                 if(!WindowClosed())return null;
                 if(!inFlight)RestoreTradeAutoConfirm();
                 return Result<bool>.Ok(true);

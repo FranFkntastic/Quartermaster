@@ -62,6 +62,13 @@ public sealed class CourierJournal
     public string State { get; set; } = "Idle";
     public string Code { get; set; } = "";
     public string Detail { get; set; } = "";
+    /// <summary>
+    /// Who cleared the run, on a journal archived by Clear: <see cref="CourierClearSource.User"/> (the Courier pane),
+    /// <see cref="CourierClearSource.Ipc"/> (the courier IPC) or <see cref="CourierClearSource.Replace"/> (archived
+    /// automatically before a new run). Null on archives written before it, and on runs archived without a Clear.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? ClearedBy { get; set; }
     public RunIntent? Pending { get; set; }
     public List<HandOff> Evidence { get; set; } = [];
     public ImmutableArray<CourierStep> Schedule { get; set; } = [];
@@ -90,6 +97,13 @@ public sealed class CourierJournal
     [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
     public CourierOutsideSettlement? OutsideSettlement { get; set; }
     public List<CourierPlacedOutside> PlacedOutside { get; set; } = [];
+}
+/// <summary>Who cleared a courier run, as recorded on its archived journal (<see cref="CourierJournal.ClearedBy"/>).</summary>
+public static class CourierClearSource
+{
+    public const string User = "user";
+    public const string Ipc = "ipc";
+    public const string Replace = "replace";
 }
 public sealed record CourierCarrierMove(Guid Id, CourierCommand Command, OwnerScope Partner, MeetingBell? Bell);
 /// <summary>A run an IPC request started, as the request index keeps it (and the current journal projects).</summary>
@@ -303,7 +317,9 @@ public sealed class CourierConductor
     internal CourierSnapshot PolledSnapshot() => Project(PolledJournal());
     /// <summary>The current journal's run (<see cref="Guid.Empty"/> for none), for the peer presence; parsed as for <see cref="PolledSnapshot"/>.</summary>
     internal Guid? CurrentRun() => PolledJournal().Run;
-    private CourierJournal PolledJournal()
+    /// <summary>The current run while it is running (null otherwise), advertised so its carrier knows the owner is still working on it.</summary>
+    internal Guid? ActiveRun() => PolledJournal() is { State: "Running", Run: var run } && run != Guid.Empty ? run : null;
+    internal CourierJournal PolledJournal()
     {
         var file = new FileInfo(Path.Combine(directory, "courier-run.json"));
         var (stamp, length) = file.Exists ? (file.LastWriteTimeUtc, file.Length) : (DateTime.MinValue, -1L);
@@ -424,7 +440,7 @@ public sealed class CourierConductor
     /// pane returns to no run. Bags stay exactly as they are: nothing is reconciled or credited. The carrier is told to
     /// forget too, best effort; one that cannot be reached forgets the run once it links with this client again.
     /// </summary>
-    public async Task<CourierSnapshot> ClearAsync(Guid expectedRun)
+    public async Task<CourierSnapshot> ClearAsync(Guid expectedRun, string clearedBy = CourierClearSource.User)
     {
         await EnterForClearAsync();
         try
@@ -432,6 +448,7 @@ public sealed class CourierConductor
             var r=store.Load();
             if(r.State=="Running") throw new InvalidOperationException("CourierAlreadyRunning");
             if(r.Run!=expectedRun) throw new InvalidOperationException("RunNotClearable");
+            r.ClearedBy=clearedBy;
             var abandoned=r.State is not ("Idle" or "Completed" or "Refused");
             // A run refused after its carrier joined it still closes the carrier's side.
             var tellCarrier=(abandoned || r.State=="Refused" && r.PeerClaimed) && !Carrierless(r) && r.Start.HasStableIdentity && r.Settings.Carrier is {HasStableIdentity:true};
@@ -619,11 +636,24 @@ public sealed class CourierConductor
             var status = await CarrierStatus();
             var carrier = status.Bags ?? throw Fault("CarrierBagsMissing", "Fresh observation required.");
             if (!carrierless && !CourierPlanner.Exact(carrier.Character, r.Settings.Carrier)) throw Fault("CarrierIdentityMismatch", "Unexpected carrier.");
-            if(status.ActiveRun is {} other && other!=r.Run && !resume && status.Custody.IsEmpty && status.Unconfirmed==null)
+            if(status.ActiveRun is {} other && other!=r.Run && !resume)
             {
                 var closed=new CourierStore<CourierJournal>(Path.Combine(directory,$"courier-closed-{other:N}.json")).Load();
-                if(closed.Run==other && closed.Custody.IsEmpty && closed.Pending==null && CourierPlanner.Exact(closed.Settings.Carrier,r.Settings.Carrier))
+                var ours=closed.Run==other && CourierPlanner.Exact(closed.Settings.Carrier,r.Settings.Carrier);
+                // This client closed that run: an empty one is forgotten on the carrier as before. One the carrier still holds
+                // units of is forgotten only when a person (the Courier pane) or the courier IPC cleared it, settling it as-is:
+                // exactly as that Clear asked, its units stay in the carrier's bags as the carrier's own. A run archived
+                // automatically to make way for a new one (or archived before ClearedBy existed) is never force-forgotten.
+                var carrierEmpty=status.Custody.IsEmpty && status.Unconfirmed==null;
+                var empty=carrierEmpty && closed.Custody.IsEmpty && closed.Pending==null;
+                var forced=!carrierEmpty && closed.State=="Abandoned" && closed.ClearedBy is CourierClearSource.User or CourierClearSource.Ipc;
+                if(ours && (empty || forced))
+                {
+                    if(forced)
+                        warning($"{r.Run} CarrierAbandonedRunCleared: {r.Settings.Carrier!.CharacterName} still held run {other} that this client cleared " +
+                            $"({closed.Detail}); carrier custody {status.Custody.Sum(s=>(long)s.Units):N0} unit(s){(status.Unconfirmed is {} u?$", hand-off {u} unconfirmed":"")}. Told it to forget the run.");
                     await Send(closed,CourierCommand.Clear,closed.Start,[]);
+                }
             }
             if (resume)
             {

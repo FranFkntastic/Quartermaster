@@ -41,6 +41,8 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     public IReadOnlyList<CourierPeer> Peers => peers;
     /// <summary>The run this client's owner journal holds (<see cref="Guid.Empty"/> for none), advertised so a carrier forgets a run cleared here.</summary>
     internal Func<Guid?>? OwnerRun { get; set; }
+    /// <summary>The owner journal's run while it is running, advertised so its carrier never mistakes a long owner-only step for owner silence.</summary>
+    internal Func<Guid?>? OwnerActiveRun { get; set; }
     /// <summary>The logged-in character's bags as last observed by the presence tick; null when logged out.</summary>
     public InventoryView? LocalBags {get;private set;}
     public event Action<CourierProgress>? Progress;
@@ -77,9 +79,10 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
     {
         var cfg=settings();
         var carrying=cfg.CarrierOptIn && cfg.Carrier is {} self && CourierPlanner.Exact(self,who);
-        Guid? run=null;
-        try{run=OwnerRun?.Invoke();}catch(Exception e){warn("CourierPresenceRun: "+e.Message);}
-        return new CourierPeer(who,bags,cfg.LocalRoster,carrying,carrying?[..cfg.Owners]:Array.Empty<OwnerScope>(),carrying?true:null,run);
+        Guid? run=null,active=null;
+        try{run=OwnerRun?.Invoke();active=OwnerActiveRun?.Invoke();}catch(Exception e){warn("CourierPresenceRun: "+e.Message);}
+        return new CourierPeer(who,bags,cfg.LocalRoster,carrying,carrying?[..cfg.Owners]:Array.Empty<OwnerScope>(),carrying?true:null,run,active,
+            OwnerActiveRun!=null?true:null);
     }
     private bool CarryingRun()
     {
@@ -97,9 +100,16 @@ internal sealed class CourierPeerLink : ICourierPeerPort, ICourierLink, IDisposa
             view=seen.Select(x=>x.Item2).ToArray();
             presences=list; var json=JsonSerializer.Serialize(view);
             if(json!=projected){ peers=view; projected=json; }
-        }catch(Exception e){presences=[];peers=[];projected=""; if(!unload.IsCancellationRequested)warn("PeerDiscovery: "+e.Message);return;}
+        }catch(Exception e){
+            presences=[];peers=[];projected="";
+            if(!unload.IsCancellationRequested){warn("PeerDiscovery: "+e.Message);follower.PauseOnOwnerSilence([]);}
+            return;
+        }
         // A run its owner client cleared while this carrier was unreachable is forgotten once that client is linked again.
-        follower.ForgetOrphaned(seen.Where(x=>!CourierPlanner.Exact(x.Item2.Character,self)));
+        var others=seen.Where(x=>!CourierPlanner.Exact(x.Item2.Character,self)).ToArray();
+        follower.ForgetOrphaned(others);
+        // A run whose owner stopped commanding it (and does not advertise it as running) stops holding this client's locks.
+        follower.PauseOnOwnerSilence(others);
     }
     private PeerResult Delivered(Result<CourierReceipt>? result,CourierProgress? ack=null)=>new PeerResult.Delivered(JsonSerializer.SerializeToElement(new Reply(result,ack??follower.Progress)));
     private PeerResult Handle(PeerMessage envelope)

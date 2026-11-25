@@ -24,6 +24,13 @@ public sealed class RequestedOperationCancelService
     private readonly IFrameworkWorkQueue workQueue;
     private readonly Action<string> warn;
 
+    /// <summary>
+    /// Told of every accepted requester cancel (request id, reason), so a delivered stow's courier forward records it
+    /// durably and never starts afterwards, even when the local stow settles normally after the stop request.
+    /// Returns true when it withdrew a forward, so an ack for an already-ended local stow says the forward was withdrawn.
+    /// </summary>
+    public Func<string, string, bool>? RequesterCancelled { get; set; }
+
     public RequestedOperationCancelService(string providerInstanceId, OperationJournal journal, IFrameworkWorkQueue workQueue, Action<string> warn)
     {
         this.providerInstanceId = providerInstanceId;
@@ -47,6 +54,7 @@ public sealed class RequestedOperationCancelService
             return Serialize(Ack(string.Empty, "rejected", "requestId is required.", errorCode: "missing_request_id"));
 
         var reason = string.IsNullOrWhiteSpace(request.Reason) ? "Cancelled by its requester." : $"Cancelled by its requester: {request.Reason.Trim()}";
+        var forwardWithdrawn = Notify(request.RequestId, reason);
         var result = journal.CancelRequested(request.RequestId, reason);
         if (result is null)
         {
@@ -55,12 +63,21 @@ public sealed class RequestedOperationCancelService
             var requestId = request.RequestId;
             workQueue.Enqueue(() =>
             {
+                Notify(requestId, reason);
                 if (journal.CancelRequested(requestId, reason) is { } deferred)
                     warn($"[Quartermaster] CancelledByRequester: request {requestId} ({deferred.Operation.OperationId}) {deferred.Outcome} after it persisted.");
             });
             return Serialize(Ack(request.RequestId, "cancel_queued", "No persisted operation yet; any queued request is cancelled once it persists."));
         }
         var (outcome, operation) = result.Value;
+        if (outcome == "already_terminal" && forwardWithdrawn)
+        {
+            // The owner's own stow had already ended, but its courier forward had not begun: that is what was cancelled.
+            warn($"[Quartermaster] CancelledByRequester: request {request.RequestId} ({operation.OperationId}, {operation.Kind}) already ended ({operation.Status}); its delivered-stow courier forward was withdrawn. {reason}");
+            return Serialize(Ack(request.RequestId, "cancelled",
+                $"The operation already ended ({operation.Status}); its delivered-stow courier forward had not started and was withdrawn, so it never starts.",
+                operation.OperationId, operation.Status));
+        }
         if (outcome != "already_terminal")
             warn($"[Quartermaster] CancelledByRequester: request {request.RequestId} ({operation.OperationId}, {operation.Kind}) {outcome}. {reason}");
         return Serialize(Ack(request.RequestId, outcome, outcome switch
@@ -69,6 +86,41 @@ public sealed class RequestedOperationCancelService
             "stopping" => "The operation is running; it stops after the current retainer.",
             _ => $"The operation already ended ({operation.Status}).",
         }, operation.OperationId, operation.Status));
+    }
+
+    /// <summary>
+    /// Cancel in Transfer history: the operator withdraws an accepted (not started) requested operation through the same
+    /// path as the IPC, so a delivered stow's forward records it too. Returns what happened, for the operator.
+    /// </summary>
+    public string CancelByOperator(string requestId)
+    {
+        const string reason = "Cancelled by the operator.";
+        var forwardWithdrawn = Notify(requestId, reason);
+        if (journal.CancelRequested(requestId, reason) is not { } result)
+        {
+            warn($"[Quartermaster] OperatorCancelUnknown: request {requestId} has no requested operation to cancel.");
+            return "No requested operation with this request id.";
+        }
+        var (outcome, operation) = result;
+        warn($"[Quartermaster] CancelledByOperator: request {requestId} ({operation.OperationId}, {operation.Kind}) {outcome}.");
+        return outcome switch
+        {
+            "cancelled" => "Cancelled before it started.",
+            "stopping" => "It had started; it stops after the current retainer.",
+            _ when forwardWithdrawn => $"It already ended ({operation.Status}); its courier forward had not started and was withdrawn.",
+            _ => $"It already ended ({operation.Status}).",
+        };
+    }
+
+    /// <summary>Tells the delivered-stow forward of the cancel; true when that withdrew a forward.</summary>
+    private bool Notify(string requestId, string reason)
+    {
+        try { return RequesterCancelled?.Invoke(requestId, reason) == true; }
+        catch (Exception exception)
+        {
+            warn($"[Quartermaster] CancelForwardMarkFailed: request {requestId}: {exception.Message}");
+            return false;
+        }
     }
 
     private CancelAcknowledgement Ack(string requestId, string status, string message, string? operationId = null, string? operationStatus = null, string? errorCode = null) => new()

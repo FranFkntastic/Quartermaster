@@ -30,6 +30,10 @@ public sealed class DeliveredStowService
 {
     public const string Capability = "deliveredStow.v1";
     public const string ForwardCapability = "deliveredStowForward.v1";
+    /// <summary>Quartermaster.v1.CancelDeliveredStowForward: the requester withdraws a request's courier forward.</summary>
+    public const string ForwardCancelCapability = "deliveredStowForwardCancel.v1";
+    public const string ForwardCancelSchema = "gooseworks-quartermaster-delivered-stow-forward-cancel/v1";
+    public const string ForwardCancelAckSchema = "gooseworks-quartermaster-delivered-stow-forward-cancel-ack/v1";
     public const string RequestSchema = "gooseworks-quartermaster-delivered-stow/v1";
     public const string AckSchema = "gooseworks-quartermaster-delivered-stow-ack/v1";
     public const string StatusSchema = "gooseworks-quartermaster-delivered-stow-status/v1";
@@ -56,6 +60,12 @@ public sealed class DeliveredStowService
     public const string ForwardSentDirect = "SentDirect";
     public const string ForwardNotInRun = "NotInRun";
     public const string ForwardJournalLost = "forward_journal_lost";
+    /// <summary>Forward refusal: the requester cancelled the delivered stow (CancelRequestedOperation) before the forward began.</summary>
+    public const string LocalDepositCancelled = "LocalDepositCancelled";
+    /// <summary>Forward refusal: the requester cancelled the forward itself (CancelDeliveredStowForward).</summary>
+    public const string ForwardCancelled = "ForwardCancelled";
+    /// <summary>Forward outcome: its courier run was cleared (settled as-is) in Courier before it completed.</summary>
+    public const string RunAbandoned = "RunAbandoned";
 
     private const string ForwardStatePending = "pending";
     private const string ForwardStateRunning = "running";
@@ -98,6 +108,8 @@ public sealed class DeliveredStowService
     private readonly List<DeliveredStowForwardRecord> forwards = [];
     private readonly Dictionary<string, DateTime> automationWaitSince = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTime> courierWaitSince = new(StringComparer.Ordinal);
+    // Forwards whose cancel re-stop was already warned about (once per forward; not persisted).
+    private readonly HashSet<string> cancelRestopWarned = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> progressFailures = new(StringComparer.Ordinal);
     /// <summary>Request ids (and hashes when known) of an unreadable forward journal that was moved aside.</summary>
     private readonly List<DeliveredStowLostRequest> lost = [];
@@ -486,6 +498,170 @@ public sealed class DeliveredStowService
     private static IEnumerable<DeliveredStowForwardLine> ForwardsOf(DeliveredStowLine line) =>
         line.Forwards ?? (line.Forward is { } forward ? [forward] : []);
 
+    // ---- Requester cancel ---------------------------------------------------------------------
+
+    /// <summary>
+    /// The requester cancelled this delivered stow (CancelRequestedOperation, or Cancel in Transfer history): its forward,
+    /// if one has not begun, records that durably and never starts, even when the local stow then settles normally.
+    /// A forward whose run already started is left to <see cref="CancelForward"/>. Unknown ids are ignored.
+    /// Returns true when this call withdrew a forward (it will not start), so the cancel's ack can say so.
+    /// </summary>
+    public bool RecordRequesterCancel(string requestId, string reason)
+    {
+        lock (gate)
+        {
+            if (forwards.FirstOrDefault(record => record.RequestId == requestId) is not { } record ||
+                record.State == ForwardStateSettled || record.Run is not null || record.CancelRequestedUtc is not null)
+                return false;
+            MarkCancel(record, LocalDepositCancelled, reason);
+            warn($"[DeliveredStow] {requestId}: {LocalDepositCancelled} recorded ({reason}); its courier forward will not start.");
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Quartermaster.v1.CancelDeliveredStowForward. Status: cancelled (the forward never starts), stopping (its courier
+    /// run is told to stop at its next verified checkpoint; RunId names it), already_terminal, cancel_queued (accepted
+    /// but not persisted yet; cancelled once it is), not_found, or rejected (ErrorCode names why). Schema and
+    /// providerInstanceId are optional, and checked when given; the schema may be this channel's or the generic
+    /// requested-operation cancel schema.
+    /// </summary>
+    public string CancelForward(string requestJson)
+    {
+        DeliveredStowForwardCancelRequest? request;
+        try { request = JsonSerializer.Deserialize<DeliveredStowForwardCancelRequest>(requestJson, JsonOptions); }
+        catch (JsonException exception) { return Serialize(CancelAck(string.Empty, "rejected", exception.Message, errorCode: "invalid_json")); }
+        if (request is null)
+            return Serialize(CancelAck(string.Empty, "rejected", "Request body is empty.", errorCode: "invalid_json"));
+        // The generic requested-operation cancel schema is accepted too, for requesters that reuse that envelope.
+        if (!string.IsNullOrWhiteSpace(request.Schema) && request.Schema != ForwardCancelSchema && request.Schema != RequestedOperationCancelService.RequestSchema)
+            return Serialize(CancelAck(request.RequestId, "rejected", $"Expected schema '{ForwardCancelSchema}' (or '{RequestedOperationCancelService.RequestSchema}').", errorCode: "unsupported_schema"));
+        if (!string.IsNullOrWhiteSpace(request.ProviderInstanceId) && request.ProviderInstanceId != providerInstanceId)
+            return Serialize(CancelAck(request.RequestId, "rejected", "providerInstanceId does not match this Quartermaster provider instance.", errorCode: "provider_mismatch"));
+        if (string.IsNullOrWhiteSpace(request.RequestId))
+            return Serialize(CancelAck(string.Empty, "rejected", "requestId is required.", errorCode: "missing_request_id"));
+        var requestId = request.RequestId;
+        var reason = string.IsNullOrWhiteSpace(request.Reason) ? "Cancelled by its requester." : $"Cancelled by its requester: {request.Reason.Trim()}";
+        lock (gate)
+        {
+            var ack = CancelForwardLocked(requestId, reason);
+            warn($"[DeliveredStow] {requestId}: CancelDeliveredStowForward {ack.Status}{(ack.RunId is null ? "" : $" (run {ack.RunId})")}: {ack.Message} {reason}");
+            return Serialize(ack);
+        }
+    }
+
+    private DeliveredStowForwardCancelAcknowledgement CancelForwardLocked(string requestId, string reason)
+    {
+        if (forwards.FirstOrDefault(candidate => candidate.RequestId == requestId) is not { } record)
+        {
+            if (pending.ContainsKey(requestId))
+            {
+                // Persisted on the framework thread; that queue is FIFO, so this runs once the forward is journaled.
+                workQueue.Enqueue(() =>
+                {
+                    lock (gate)
+                    {
+                        var deferred = CancelForwardLocked(requestId, reason);
+                        warn($"[DeliveredStow] {requestId}: queued CancelDeliveredStowForward {deferred.Status} after it persisted: {deferred.Message}");
+                    }
+                });
+                return CancelAck(requestId, "cancel_queued", "The request is not persisted yet; its forward is cancelled once it is.");
+            }
+            if (repository.Read(state => state.Requests.Any(candidate => candidate.RequestId == requestId)))
+                return CancelAck(requestId, "already_terminal", "This delivered stow has no courier forward.");
+            return CancelAck(requestId, "not_found", "No delivered-stow request with this ID.");
+        }
+        var runId = record.Run?.ToString();
+        if (record.State == ForwardStateSettled)
+            return CancelAck(requestId, "already_terminal", $"The forward already ended ({record.Code ?? "settled"}: {record.Message}).", runId, record.Code);
+        // The run already finished; the next tick settles the forward from its outcome, so there is nothing left to stop.
+        if (record.Run is { } bound && RunEnded(bound) is { } ended)
+            return CancelAck(requestId, "already_terminal", $"The forward's courier run {bound} already ended ({ended}); the forward settles from its outcome.", runId);
+        if (record.CancelRequestedUtc is null)
+            MarkCancel(record, ForwardCancelled, reason);
+        if (record.Run is { } run)
+        {
+            // Normal Stop: the run halts at its next verified checkpoint and keeps its custody; nothing is replayed.
+            var stopped = courier?.Stop(run) == true;
+            return CancelAck(requestId, "stopping", stopped
+                ? $"Courier run {run} was told to stop at its next verified checkpoint; once it has stopped, clear it with the courier IPC to settle the forward, or resume it to carry on with the delivery."
+                : $"Courier run {run} is not running; clear it with the courier IPC to settle the forward, or resume it to carry on with the delivery.", runId);
+        }
+        if (courier is not null)
+        {
+            // A run started under this request whose binding was not saved (Quartermaster reloaded before the next tick):
+            // the next tick binds it and keeps telling it to stop, so this cancel reports the run instead of "cancelled".
+            var (earlier, loading) = courier.Adopt(CourierRequestId(requestId));
+            if (earlier is not null)
+            {
+                var adoptedId = earlier.Run.ToString();
+                if (RunEnded(earlier.Run) is { } adoptedEnd)
+                    return CancelAck(requestId, "already_terminal", $"The courier run {earlier.Run} started for this forward already ended ({adoptedEnd}); the forward settles from its outcome.", adoptedId);
+                var stopped = courier.Stop(earlier.Run);
+                return CancelAck(requestId, "stopping", stopped
+                    ? $"Courier run {earlier.Run} (started for this forward before Quartermaster reloaded) was told to stop at its next verified checkpoint; once it has stopped, clear it with the courier IPC to settle the forward, or resume it to carry on with the delivery."
+                    : $"Courier run {earlier.Run} (started for this forward before Quartermaster reloaded) is not running; clear it with the courier IPC to settle the forward, or resume it to carry on with the delivery.", adoptedId);
+            }
+            if (loading)
+                return CancelAck(requestId, "cancel_queued",
+                    "The cancel is recorded and the forward will not start; the courier's request history is still loading, so whether a run already started for it is not known yet. Send the cancel again for its final status.");
+        }
+        var localOpen = record.OperationId is { } operationId &&
+            repository.Read(state => state.Operations.FirstOrDefault(candidate => candidate.OperationId == operationId)) is { } operation &&
+            !OperationStatuses.IsTerminal(operation.Status);
+        return CancelAck(requestId, "cancelled", localOpen
+            ? "The forward will not start; the owner's own stow is still running (cancel it with Quartermaster.v1.CancelRequestedOperation)."
+            : "The forward will not start.");
+    }
+
+    /// <summary>
+    /// How the run ended (state and code) when it is no longer running or resumable: completed, or closed (cleared or
+    /// replaced) with its archive read. Null while it may still run or be resumed, or while that is not known yet.
+    /// </summary>
+    private string? RunEnded(Guid run)
+    {
+        if (courier is null)
+            return null;
+        try
+        {
+            return courier.Progress(run) is { } progress && (progress.State == "Completed" || !progress.Current && progress.State != "Starting")
+                ? $"{progress.State}{(progress.Code is { Length: > 0 } code ? $" {code}" : "")}"
+                : null;
+        }
+        catch (Exception exception)
+        {
+            warn($"[DeliveredStow] courier run {run}'s state could not be read for a cancel ({exception.Message}); reported as stopping.");
+            return null;
+        }
+    }
+
+    /// <summary>Records the requester's cancel durably on a forward that has not settled. Holding the gate.</summary>
+    private void MarkCancel(DeliveredStowForwardRecord record, string code, string reason)
+    {
+        record.CancelRequestedUtc = utcNow();
+        record.CancelCode = code;
+        record.CancelReason = reason;
+        // Saved now so a reload before the next tick still refuses to start; a failed save is retried by Tick.
+        try { SaveForwards(); }
+        catch (Exception exception)
+        {
+            forwardsDirty = true;
+            warn($"[DeliveredStow] {record.RequestId}: {code} kept in memory, the forward journal save failed ({exception.Message}); retrying every tick.");
+        }
+    }
+
+    private DeliveredStowForwardCancelAcknowledgement CancelAck(string requestId, string status, string message, string? runId = null, string? errorCode = null) => new()
+    {
+        ProviderInstanceId = providerInstanceId,
+        RequestId = requestId ?? string.Empty,
+        Status = status,
+        RunId = runId,
+        ErrorCode = errorCode,
+        Message = message,
+    };
+
+    private static string Serialize(DeliveredStowForwardCancelAcknowledgement ack) => JsonSerializer.Serialize(ack, JsonOptions);
+
     // ---- Courier forward ----------------------------------------------------------------------
 
     private static string CourierRequestId(string requestId) => $"delivered-stow:{requestId}";
@@ -592,7 +768,31 @@ public sealed class DeliveredStowService
                 return Refuse(record, "LocalDepositUnverified",
                     "The owner's own stow ended unverified, so where the goods are is unknown; nothing was forwarded.", now);
             if (operation.Status == OperationStatuses.Cancelled)
-                return Refuse(record, "LocalDepositCancelled", "The owner's own stow was cancelled; nothing was forwarded.", now);
+                return Refuse(record, LocalDepositCancelled, "The owner's own stow was cancelled; nothing was forwarded.", now);
+        }
+        if (record.CancelRequestedUtc is not null)
+        {
+            // The requester cancelled: never started now, whatever the local stow did after the cancel. A run already
+            // started under this request (its binding unsaved) is followed and told to stop, never left unowned.
+            if (courier is not null)
+            {
+                var (earlier, loading) = courier.Adopt(CourierRequestId(record.RequestId));
+                if (loading)
+                    return false;
+                if (earlier is not null)
+                {
+                    Bind(record, earlier, open);
+                    var stopped = courier.Stop(earlier.Run);
+                    warn($"[DeliveredStow] {record.RequestId}: {record.CancelCode} found courier run {earlier.Run} already started; " +
+                         (stopped ? "told it to stop at its next verified checkpoint." : "it is not running; clear it in Courier to settle the forward, or resume it to carry on."));
+                    return true;
+                }
+            }
+            var code = record.CancelCode ?? LocalDepositCancelled;
+            var by = record.CancelReason is { Length: > 0 } why ? $" ({why.TrimEnd('.')})" : "";
+            return Refuse(record, code, code == ForwardCancelled
+                ? $"The requester cancelled the courier forward{by}; nothing was forwarded."
+                : $"The requester cancelled this delivered stow{by}; nothing was forwarded.", now);
         }
         if (courier is null)
             return Refuse(record, "CourierNotLoaded", "The courier is not loaded.", now);
@@ -803,6 +1003,26 @@ public sealed class DeliveredStowService
                 changed = true;
             }
         }
+        if (record.CancelRequestedUtc is not null && record.CancelStopObservedUtc is null)
+        {
+            if (progress.State is "Starting" or "Running")
+            {
+                // The requester cancelled after the run was bound, possibly while it was still launching (a launching run
+                // can miss the cancel's own Stop): keep telling it to stop until it is first seen not running. Stop is
+                // idempotent and halts at the next verified checkpoint, never replaying custody.
+                if (courier.Stop(run) && cancelRestopWarned.Add(record.RequestId))
+                    warn($"[DeliveredStow] CancelRestop: {record.RequestId}: courier run {run} is {progress.State} after the requester's " +
+                         $"{record.CancelCode ?? ForwardCancelled}; the cancel is stopping it at its next verified checkpoint (warned once per forward).");
+            }
+            else
+            {
+                // Seen stopped (Idle, interrupted, failed or ended): the cancel's stop is done. Saved, so a reload does not
+                // stop the run again; a later resume is the operator's explicit choice and carries on.
+                record.CancelStopObservedUtc = now;
+                cancelRestopWarned.Remove(record.RequestId);
+                changed = true;
+            }
+        }
         switch (progress.State)
         {
             case "Starting":
@@ -856,6 +1076,7 @@ public sealed class DeliveredStowService
                     "Failed" => ("RunFailed", $"The courier run failed ({progress.Code}: {progress.Detail}); resume or clear it in Courier."),
                     "Interrupted" => ("RunInterrupted", $"The courier run was interrupted ({progress.Code}: {progress.Detail}); resume or clear it in Courier."),
                     "Indeterminate" => ("RunIndeterminate", $"The courier run ended unverified ({progress.Code}: {progress.Detail}); check its custody in Courier."),
+                    "Abandoned" => (RunAbandoned, $"The courier run was cleared in Courier and settled as-is ({progress.Code}: {progress.Detail}); what it had not deposited stays where the run left it."),
                     _ => ("RunNotStarted", $"The courier run never began ({progress.Code}: {progress.Detail})."),
                 };
                 foreach (var line in running)
@@ -980,6 +1201,9 @@ public sealed class DeliveredStowService
         var tried = record.Lines.Where(line => line.Character is not null && (line.Planned > 0 || !NeutralForwardCodes.Contains(line.Code))).ToArray();
         if (tried.Length == 0)
             return null;
+        // Cancelled by its requester before anything was carried.
+        if (record.CancelRequestedUtc is not null && tried.All(line => line.Planned <= 0))
+            return OperationStatuses.Cancelled;
         if (tried.Any(line => line.Code == "RunIndeterminate"))
             return OperationStatuses.Indeterminate;
         if (tried.All(line => line.Code == ForwardDelivered))
@@ -995,6 +1219,9 @@ public sealed class DeliveredStowService
         if (forward is null)
             return local;
         if (local == OperationStatuses.Cancelled)
+            return local;
+        // The requester cancelled the forward only: the owner's own stow stands as it settled.
+        if (forward == OperationStatuses.Cancelled)
             return local;
         if (local == OperationStatuses.Indeterminate || forward == OperationStatuses.Indeterminate)
             return OperationStatuses.Indeterminate;
@@ -1251,7 +1478,40 @@ public sealed class DeliveredStowForwardRecord
     public string? Code { get; set; }
     public string Message { get; set; } = string.Empty;
     public DateTime? SettledUtc { get; set; }
+    /// <summary>
+    /// Set when the requester cancelled the delivered stow or its forward; the forward then never starts. CancelCode is
+    /// LocalDepositCancelled or ForwardCancelled. Absent (null) in journals written before these fields existed.
+    /// </summary>
+    public DateTime? CancelRequestedUtc { get; set; }
+    public string? CancelCode { get; set; }
+    public string? CancelReason { get; set; }
+    /// <summary>
+    /// When the bound run was first seen not running after the cancel; from then on the cancel no longer stops it, so a
+    /// resume carries on. Null until then, and in journals written before this field existed (the next tick observes it).
+    /// </summary>
+    public DateTime? CancelStopObservedUtc { get; set; }
     public List<DeliveredStowForwardRecordLine> Lines { get; set; } = [];
+}
+
+/// <summary>Quartermaster.v1.CancelDeliveredStowForward request; Schema and ProviderInstanceId are optional.</summary>
+public sealed record DeliveredStowForwardCancelRequest
+{
+    public string? Schema { get; init; }
+    public string? ProviderInstanceId { get; init; }
+    public string RequestId { get; init; } = string.Empty;
+    public string? Reason { get; init; }
+}
+
+/// <summary>Status: cancelled, stopping, already_terminal, cancel_queued, not_found or rejected (ErrorCode names why).</summary>
+public sealed record DeliveredStowForwardCancelAcknowledgement
+{
+    public string Schema { get; init; } = DeliveredStowService.ForwardCancelAckSchema;
+    public string ProviderInstanceId { get; init; } = string.Empty;
+    public string RequestId { get; init; } = string.Empty;
+    public string Status { get; init; } = string.Empty;
+    public string? RunId { get; init; }
+    public string? ErrorCode { get; init; }
+    public string Message { get; init; } = string.Empty;
 }
 
 /// <summary>

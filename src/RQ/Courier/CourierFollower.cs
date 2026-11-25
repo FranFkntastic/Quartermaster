@@ -46,6 +46,13 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     // this long without commands, so an owner presence published just before a Begin never forgets the run it began.
     private DateTimeOffset lastCommand = DateTimeOffset.MinValue;
     private static readonly TimeSpan OrphanQuiet = TimeSpan.FromSeconds(30);
+    // A held run whose owner neither commands it nor advertises it as running for this long stops holding this client's locks.
+    internal static readonly TimeSpan OwnerSilence = TimeSpan.FromMinutes(5);
+    // When a linked owner client last advertised the held run as running: it is working on it (an owner-only step).
+    private DateTimeOffset ownerSeenActive = DateTimeOffset.MinValue;
+    // Whether the held run's owner client, when last linked, advertised its active run (AdvertisesOwnerActiveRun). Only such
+    // an owner is paused on silence: an older one never advertises its owner-only steps, so its silence proves nothing.
+    private (Guid Run, bool Advertises)? ownerAdvertises;
     internal CourierProgress? Progress => active is {} m ? new(m.Run,m.Step,m.Command.ToString()) : null;
     public event Action<Guid>? StopRequested;
 
@@ -137,7 +144,9 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             if (ledger.Run != null && ledger.Run != m.Run)
             {
                 // An owner client runs one run at a time: its Begin of another run means it no longer has the one held here.
-                if (m.Command != CourierCommand.Begin || !SameOwnerClient(ledger, m.Owner, peerOwner, endpoint)) return Refuse("CarrierRunConflict");
+                if (m.Command != CourierCommand.Begin || !SameOwnerClient(ledger, m.Owner, peerOwner, endpoint))
+                    return Refuse("CarrierRunConflict", $"{m.Carrier.CharacterName} still holds run {ledger.Run} for {RunOwner(ledger)?.CharacterName ?? "another owner"}" +
+                        $" ({Held(ledger)}); that owner resumes or clears it, or Clear on {m.Carrier.CharacterName}'s Courier pane forgets it.");
                 Forget(ledger, $"the owner began run {m.Run} instead");
             }
             if (m.Command == CourierCommand.NotDelivered && m.ConfirmStep is {} fence && ledger.Run == m.Run)
@@ -444,11 +453,13 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         finally
         {
             active=null;
+            // A long command (travel, a trade) counts as heard from the owner until it ends, not only when it began.
+            lastCommand = DateTimeOffset.UtcNow;
             try
             {
                 if(stopped && store.Load() is {Run:not null,Paused:false} held){held.Paused=true;store.Save(held);}
             }
-            finally{try{if(refused || stopped || PausedRun())Release();}finally{gate.Release();}}
+            finally{try{if(refused || stopped || PausedRun())Release();DescribeLease();}finally{gate.Release();}}
         }
     }
     // The carrier always ends a run on its home world: at its own meeting bell when one is saved, otherwise back where
@@ -601,6 +612,68 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         }
         catch (Exception e) { warning($"CarrierOrphanCheck: {e.Message}"); }
         finally { gate.Release(); }
+    }
+    /// <summary>
+    /// From the link's presence tick: a held run with custody, unpaused and holding this client's locks, whose owner sent no
+    /// command for <see cref="OwnerSilence"/> and is not seen advertising the run as running, is paused and drops the
+    /// automation lease, AutoRetainer suppression and trade hold, exactly as a Stop does. The ledger keeps every unit, and
+    /// the owner's next Begin re-takes the locks. Only between commands, and only for an owner client last seen advertising
+    /// its active run (<see cref="CourierPeer.AdvertisesOwnerActiveRun"/>); an older owner is never paused on silence.
+    /// </summary>
+    internal void PauseOnOwnerSilence(IEnumerable<(Guid Instance, CourierPeer Peer)> owners)
+    {
+        if (disposed || active != null) return;
+        if (Volatile.Read(ref lease) == null && Volatile.Read(ref suppress) == null && Volatile.Read(ref tradeHold) == null) return;
+        if (!gate.Wait(0)) return;
+        try
+        {
+            var ledger = store.Load();
+            if (ledger.Run is not { } run || ledger.Paused || ledger.Units.IsEmpty && ledger.Unconfirmed == null) return;
+            var now = DateTimeOffset.UtcNow;
+            var linked = owners as IReadOnlyCollection<(Guid Instance, CourierPeer Peer)> ?? owners.ToArray();
+            if (linked.Any(o => o.Peer.OwnerActiveRun == run)) { ownerSeenActive = now; ownerAdvertises = (run, true); return; }
+            // The run's owner client: the endpoint that began it, failing that (it restarted) the run owner logged in.
+            var owner = linked.Where(o => ledger.OwnerEndpoint is { } ep && o.Instance == ep).Select(o => o.Peer).FirstOrDefault()
+                ?? (RunOwner(ledger) is { } scope ? linked.Select(o => o.Peer).FirstOrDefault(p => CourierPlanner.Exact(p.Character, scope)) : null);
+            if (owner != null) ownerAdvertises = (run, owner.AdvertisesOwnerActiveRun == true);
+            // An owner that does not advertise its active run (built before it), or one never seen linked, is never paused
+            // on silence: the carrier keeps its locks until that owner settles, stops or clears the run, as before.
+            if (ownerAdvertises != (run, true)) return;
+            var heard = lastCommand > ownerSeenActive ? lastCommand : ownerSeenActive;
+            if (heard == DateTimeOffset.MinValue) { lastCommand = now; return; }
+            var silent = now - heard;
+            if (silent < OwnerSilence) return;
+            ledger.Paused = true; store.Save(ledger);
+            Release();
+            warning($"{run} CarrierOwnerSilent: no command from {RunOwner(ledger)?.CharacterName ?? "the run's owner"} for {silent.TotalMinutes:N0} min " +
+                $"(limit {OwnerSilence.TotalMinutes:N0} min) while holding {Held(ledger)}{(ledger.Unconfirmed is { } u ? $", hand-off {u} unconfirmed" : "")}; " +
+                "paused and released the automation lease, AutoRetainer suppression and trade hold. The ledger keeps the units; the owner's next Begin re-takes the locks, " +
+                "or Clear on the Courier pane keeps them on this character.");
+        }
+        catch (Exception e) { warning($"CarrierOwnerSilenceCheck: {e.Message}"); }
+        finally { gate.Release(); }
+    }
+    /// <summary>
+    /// While this carrier holds the automation lease with custody, the lease's busy reason names what it carries, for whom
+    /// and the escape hatch, so every "automation busy" refusal (here and in other plugins) reads correctly. Call holding the gate.
+    /// </summary>
+    private void DescribeLease()
+    {
+        if (Volatile.Read(ref lease) is not { } held) return;
+        try
+        {
+            var ledger = store.Load();
+            automation.Describe(held, ledger.Run is { } run && (!ledger.Units.IsEmpty || ledger.Unconfirmed != null)
+                ? $"carrying {Held(ledger)} for courier run {run} from {RunOwner(ledger)?.CharacterName ?? "its owner"}; Clear on the Courier pane to keep them"
+                : null);
+        }
+        catch (Exception e) { warning($"CarrierLeaseDescribe: {e.Message}"); }
+    }
+    private static string Held(CarrierLedger ledger)
+    {
+        var items = ledger.Units.Where(s => !s.IsGil).Sum(s => (long)s.Units);
+        var gil = ledger.Units.Where(s => s.IsGil).Sum(s => (long)s.Units);
+        return gil > 0 ? $"{items:N0} item(s) and {gil:N0} gil" : $"{items:N0} item(s)";
     }
     /// <summary>The character that owns the held run, from the commands it sent.</summary>
     private static OwnerScope? RunOwner(CarrierLedger ledger) =>
