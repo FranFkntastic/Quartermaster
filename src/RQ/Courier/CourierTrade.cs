@@ -57,20 +57,40 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
     private volatile bool retainSuppression;
     private Guid stalledStep;
     private CourierTradeHold? hold;
-    public Task<Result<IDisposable>> BeginHold(Guid run, Deadline deadline) => game.Poll<IDisposable>(deadline, () => {
-        var next = new CourierTradeHold(pi, $"Quartermaster.Courier/{run:N}/{Guid.NewGuid():N}", s=>log.Warning(s));
-        var result=next.Begin();
-        if(result.Outcome!=CourierOutcome.Succeeded)return result;
-        hold=next;
-        // Releasing the scope also forgets it, so a later trade refuses TradeHoldLost instead of checking a dead hold.
-        return Result<IDisposable>.Ok(new HoldScope(()=>{try{next.Dispose();}finally{Interlocked.CompareExchange(ref hold,null,next);}}));
+    public Task<Result<IDisposable>> BeginHold(Guid run, Deadline deadline)
+    {
+        var last="";
+        return game.Poll<IDisposable>(deadline, () => {
+            var next = new CourierTradeHold(pi, $"Quartermaster.Courier/{run:N}/{Guid.NewGuid():N}", s=>log.Warning(s));
+            var result=next.Begin();
+            // MarketMafioso refuses while its own trade window or queue is busy, which clears on its own: ask again until the deadline.
+            if(result.Outcome!=CourierOutcome.Succeeded)
+            {
+                if(result.Code!="TradeHoldRefused")return result;
+                if(last.Length==0)log.Warning($"TradeHoldRefused: {result.Detail}; asking again until {deadline.Expires:O}.");
+                last=$"{result.Code}: {result.Detail}";return null;
+            }
+            hold=next;
+            // Releasing the scope also forgets it, so a later trade refuses TradeHoldLost instead of checking a dead hold.
+            return Result<IDisposable>.Ok(new HoldScope(()=>{try{next.Dispose();}finally{Interlocked.CompareExchange(ref hold,null,next);}}));
+        },pollMilliseconds:500,waiting:()=>last,expiry:CourierOutcome.Failed);
+    }
+    /// <summary>
+    /// Before a trade is dispatched: a hold MarketMafioso let lapse while no trade was open here is asked for again,
+    /// once, on the framework thread where MarketMafioso can see its own window and queue.
+    /// </summary>
+    public Task<Result<bool>> RegainHoldAsync(Deadline deadline) => game.Poll<bool>(deadline, () => {
+        if (hold is not { } held) return Result<bool>.Fail("TradeHoldLost","Missing courier work scope.");
+        try { held.Check(true, between: !inFlight && WindowClosed()); return Result<bool>.Ok(true); }
+        catch (CourierFault e) { return new(e.Outcome, e.Code, e.Message); }
     });
     private sealed class HoldScope(Action release) : IDisposable
     {
         private Action? pending = release;
         public void Dispose() => Interlocked.Exchange(ref pending, null)?.Invoke();
     }
-    public void CheckHold() => hold?.Check(false);
+    // Between steps: a lapsed hold is left for RegainHoldAsync ahead of the next trade.
+    public void CheckHold() => hold?.Check(false, between: true);
     public void SuppressTradeAutoConfirm()
     {
 
@@ -134,6 +154,10 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
     // A step credited nothing when no receive window is armed, no confirmation marker was ever persisted (the
     // runner saves it before submitting confirmation) and every queued unit is still queued. Whether the step
     // ended Cancelled, Failed or otherwise, a window that closed in that state moved nothing.
+    // No window awaits verification, cancellation or a receive baseline: whatever earlier windows moved is already credited.
+    private static bool BatchUnsettled(TradeCheckpoint state) =>
+        state.Arm==null && state.Recovery.AwaitingVerification==null && !state.Recovery.CancellationPending &&
+        state.Items.Any(i=>i.Quantity>0);
     private static bool NothingCredited(TradeCheckpoint state) =>
         state.Arm==null && state.Recovery.AwaitingVerification==null && !state.Recovery.CancellationPending &&
         state.Items.Sum(i=>(long)i.Quantity)==state.Original.Sum(x=>(long)x.Units);
@@ -263,8 +287,10 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
                     if(sender.IsActive)return null;
                     // The partner's window opened and closed again before this side locked anything (e.g. the
                     // partner was still settling after a login). A fresh runner offers the same unchanged queue.
+                    // Only the window that bounced must be untouched: windows this step already verified stay credited,
+                    // and the fresh runner offers just the remaining queue.
                     if(result is {Status:OperationStatus.Failed} bounced && phase is TradeExecutionState.OfferingItems or TradeExecutionState.WaitingForPartner &&
-                        !locked && !io.IsRemoteLocked && !io.IsTradeOpen && NothingCredited(state))
+                        !locked && !io.IsRemoteLocked && !io.IsTradeOpen && BatchUnsettled(state))
                     {
                         var now=DateTimeOffset.UtcNow;
                         if(bounces<MaxTradeOpenBounces && !stopped && allowed?.Invoke()!=false && now+BounceBackoff<d.Expires)

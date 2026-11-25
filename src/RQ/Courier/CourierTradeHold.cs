@@ -7,6 +7,8 @@ internal interface ICourierHoldPort
 {
     Task<Result<IDisposable>> BeginHold(Guid run, Deadline deadline);
     void CheckHold();
+    /// <summary>Ahead of a trade: re-acquires, once, a hold that lapsed between steps; refuses when it cannot.</summary>
+    Task<Result<bool>> RegainHoldAsync(Deadline deadline) { CheckHold(); return Task.FromResult(Result<bool>.Ok(true)); }
 }
 
 // Acquire on the framework thread where MMF can inspect its live runner/window.
@@ -30,23 +32,31 @@ internal sealed class CourierTradeHold(string holder, Func<bool> loaded, Func<bo
     }
     private readonly object gate = new();
     private Timer? timer;
-    private bool held, disposed;
+    private bool held, disposed, regaining;
     private CourierFault? loss;
     private long expires;
 
 
-    internal void Check(bool framework = true)
+    /// <summary>
+    /// Throws when the hold is lost. <paramref name="between"/> says no trade is open or in flight here: a hold lost
+    /// then (MarketMafioso lets a hold lapse) is asked for once more, on the framework thread; off it, the loss waits
+    /// for that framework check ahead of the next trade. A loss mid-trade, or a refused re-acquire, still throws.
+    /// </summary>
+    internal void Check(bool framework = true, bool between = false)
     {
         lock (gate)
         {
-            if (loss != null) throw loss;
             if (disposed) throw new CourierFault(CourierOutcome.Failed,"TradeHoldLost","Courier hold was released.");
-            if (held)
+            if (held && loss == null && (Environment.TickCount64 >= expires || (framework && !loaded())))
+                loss = new(CourierOutcome.Failed,"TradeHoldLost","MarketMafioso hold expired or provider unloaded.");
+            if (loss != null)
             {
-                if (Environment.TickCount64 >= expires || (framework && !loaded()))
-                    throw loss = new(CourierOutcome.Failed,"TradeHoldLost","MarketMafioso hold expired or provider unloaded.");
-                return;
+                if (!between || regaining || loss.Code != "TradeHoldLost") throw loss;
+                if (!framework) return;
+                warn($"TradeHoldReacquire: {holder}: {loss.Message}; no trade is open, asking MarketMafioso again.");
+                regaining = true; loss = null; held = false; timer?.Dispose(); timer = null;
             }
+            if (held) return;
             if (!framework || !loaded()) return;
             try
             {
@@ -56,12 +66,18 @@ internal sealed class CourierTradeHold(string holder, Func<bool> loaded, Func<bo
                 using var json = JsonDocument.Parse(acquire());
                 if (!json.RootElement.GetProperty("Acknowledged").GetBoolean())
                     throw new CourierFault(CourierOutcome.Failed,"TradeHoldRefused",json.RootElement.GetProperty("Reason").GetString() ?? "Refused");
-                held = true;
+                held = true; regaining = false;
                 expires = start + Seconds*1000;
                 timer = new Timer(_ => Renew(),null,3000,3000);
             }
-            catch (CourierFault) { throw; }
-            catch (Exception e) { throw new CourierFault(CourierOutcome.Failed,"TradeHoldUnavailable",e.Message); }
+            // A refused re-acquire is the hold's loss for good.
+            catch (CourierFault e) { if (regaining) loss = e; throw; }
+            catch (Exception e)
+            {
+                var fault = new CourierFault(CourierOutcome.Failed,"TradeHoldUnavailable",e.Message);
+                if (regaining) loss = fault;
+                throw fault;
+            }
         }
     }
     private void Renew()

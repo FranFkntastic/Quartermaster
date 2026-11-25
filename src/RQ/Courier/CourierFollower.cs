@@ -119,7 +119,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                 && m.Command is not (CourierCommand.Stop or CourierCommand.Status or CourierCommand.NotDelivered)) return Refuse("CarrierIntentUnsettled");
             if (m.Command == CourierCommand.Status)
             {
-                var snap = await Observe();
+                var snap = await Observe(observation: true);
                 // The open (else last confirmed) hand-off's completed send reports its own receipt, so the owner can show what it proves.
                 var sentProof = (ledger.Unconfirmed ?? ledger.LastConfirmed) is { } open && ledger.Steps.TryGetValue(open, out var openStep) &&
                     openStep.Command.Command == CourierCommand.Send && openStep.Result?.Outcome == CourierOutcome.Succeeded ? openStep.Result.Value?.Evidence : null;
@@ -158,31 +158,40 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             if (ledger.Paused && m.Command is not (CourierCommand.Begin or CourierCommand.Confirm or CourierCommand.Stop or CourierCommand.Settle or CourierCommand.VerifySettlement or CourierCommand.Unclaim or CourierCommand.SettleSent))
                 return Refuse("CarrierStopped");
             if (ledger.Unconfirmed != null && m.Command is not (CourierCommand.Confirm or CourierCommand.Stop or CourierCommand.Settle or CourierCommand.VerifySettlement or CourierCommand.SettleSent)) return Refuse("UnsettledHandOff");
-            if (lease == null)
+            // Stop moves nothing and only releases: it never takes the locks it is about to drop.
+            if (lease == null && m.Command != CourierCommand.Stop)
             {
-                if (!automation.TryAcquire("courier carrier", out lease)) return Refuse("AutomationBusy");
+                if (!automation.TryAcquire("courier carrier", out lease) && !await AwaitOwnLeaseAsync(m.Command, deadline))
+                    return Refuse("AutomationBusy", automation.AcquisitionBlockReason);
                 if(needsSuppression?.Invoke()!=false)suppress = suppression.Acquire();
                 stopped = false;
             }
             // Only a step that moves the character, trades or takes a bag baseline waits for AutoRetainer and Lifestream
             // to settle; ledger-only steps (Finish, Stop, settlements, Unclaim) move nothing and are never held back by them.
+            // The wait may use whatever the command's deadline leaves beyond the step's own calls, never less than the base budget.
             if (m.Command is CourierCommand.Travel or CourierCommand.Receive or CourierCommand.Send or CourierCommand.ReturnHome or CourierCommand.Claim)
             {
-                var budget = deadline.Expires - DateTimeOffset.UtcNow;
-                if (budget > CourierBusyGate.Budget) budget = CourierBusyGate.Budget;
+                var budget = CourierBusyGate.Within(deadline.Expires, TimeSpan.FromSeconds(StepSeconds(cfg, m)));
                 if (await CourierBusyGate.WaitIdleAsync(suppression, lifestreamBusy, () => stopped || disposed, budget) is { } busy)
                     return stopped || disposed ? Refuse("CarrierDisarmed") : Refuse(busy.Code, busy.Detail);
             }
             if (trade is ICourierHoldPort holds && m.Command is not (CourierCommand.Stop or CourierCommand.Finish or CourierCommand.Confirm or CourierCommand.Unclaim or CourierCommand.SettleSent))
             {
                 if(tradeHold==null && m.Command is not (CourierCommand.Begin or CourierCommand.Settle or CourierCommand.VerifySettlement)) return Refuse("TradeHoldScopeMissing");
-                tradeHold ??= await calls.Call("CarrierTradeHold",10,d=>holds.BeginHold(m.Run,d));
-                holds.CheckHold();
+                tradeHold ??= await calls.Call("CarrierTradeHold",30,d=>holds.BeginHold(m.Run,d));
+                // A trade asks again for a hold MarketMafioso let lapse between steps; any other step only checks it.
+                if (m.Command is CourierCommand.Receive or CourierCommand.Send) await calls.Call("CarrierTradeHoldCheck", 15, holds.RegainHoldAsync);
+                else holds.CheckHold();
             }
-            var before = await Observe();
-            if (!CourierPlanner.Exact(before.Character, m.Carrier)) return Refuse("CarrierIdentityMismatch");
+            // Stop reads no bags: it moves nothing, and a stalled read must never keep a run from pausing. Only Stop leaves it unset.
+            InventoryView before = null!;
+            if (m.Command != CourierCommand.Stop)
+            {
+                before = await Observe(observation: true);
+                if (!CourierPlanner.Exact(before.Character, m.Carrier)) return Refuse("CarrierIdentityMismatch");
+            }
             if (ledger.Run == null && m.Command != CourierCommand.Stop)
-                ledger.Start = await calls.Call("CarrierStartPosition", 15, bells.PositionAsync);
+                ledger.Start = await calls.Call("CarrierStartPosition", 15, bells.PositionAsync, observation: true);
             ledger.Run = m.Run;
             if (m.Command == CourierCommand.Begin) { ledger.OwnerEndpoint = endpoint; ledger.RunKey ??= m.RunKey; }
             CourierGame.Step.Value = m.Step;
@@ -204,7 +213,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                     ledger.Paused = false; stopped = false; break;
                 case CourierCommand.Travel:
                     if (m.Bell == null) return Refuse("BellMissing");
-                    if ((await calls.Call("CarrierPosition", 15, bells.PositionAsync)).World != m.Bell.World)
+                    if ((await calls.Call("CarrierPosition", 15, bells.PositionAsync, observation: true)).World != m.Bell.World)
                         await calls.Call("CarrierWorld", Deadline.WorldSeconds(m.Bell), d => worlds.EnsureWorldAsync(m.Bell.World, d));
                     await calls.Call(m.Bell.Ward.HasValue ? "WardTravel" : m.Bell.IsPlaza ? "CarrierPlaza" : "CarrierBell", m.Bell.ApproachSeconds, d => bells.GoInRangeAsync(m.Bell, d)); break;
                 case CourierCommand.Receive:
@@ -225,7 +234,8 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                         var refusal = Refuse("CustodyInsufficient");
                         ledger.Steps[m.Step] = step with { Result = refusal }; store.Save(ledger); return refusal;
                     }
-                    await calls.Call("CarrierPartner", 30, d => bells.ObserveTradeableAsync(m.Partner, d));
+                    // Before the trade's intent is saved: running out of time here dispatched nothing.
+                    await calls.Call("CarrierPartner", 30, d => bells.ObserveTradeableAsync(m.Partner, d), observation: true);
                     if (stopped || !settings().CarrierOptIn || !Authorized(settings(),ledger)) return Refuse("CarrierDisarmed");
                     ledger.Unconfirmed = m.Step;
                     ledger.Steps[m.Step]=step; store.Save(ledger);
@@ -389,7 +399,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                     Release(force: true); break;
                 default: return Recorded("UnknownCommand");
             }
-            var result = Result<CourierReceipt>.Ok(new(m.Run, m.Step, before, evidence, ledger.Units));
+            var result = Result<CourierReceipt>.Ok(new(m.Run, m.Step, m.Command == CourierCommand.Stop ? null : before, evidence, ledger.Units));
             ledger.Steps[m.Step] = step with { Result = result };
             store.Save(ledger);
             return result;
@@ -442,7 +452,37 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             warning($"{at}: ReturnStartUnreachable: territory {start.Territory} ({start.X:0.0}, {start.Y:0.0}, {start.Z:0.0}) on home world {home}: {fault.Message}; carrier left on home world.");
         }
     }
-    private Task<InventoryView> Observe() => calls.Call("CarrierBags", 15, inventory.ObserveAsync);
+    // Only a read taken before anything of the command ran is an observation; one after a trade keeps a timeout unverified.
+    private Task<InventoryView> Observe(bool observation = false) => calls.Call("CarrierBags", 15, inventory.ObserveAsync, observation);
+    /// <summary>
+    /// A ledger-only step (it moves nothing) that finds the automation lease still held by this carrier's own last
+    /// command, whose release waits for a late call to settle, waits a bounded time for that release instead of refusing.
+    /// </summary>
+    private async Task<bool> AwaitOwnLeaseAsync(CourierCommand command, Deadline deadline)
+    {
+        if (command is not (CourierCommand.Begin or CourierCommand.Finish or CourierCommand.Confirm or CourierCommand.Settle or CourierCommand.VerifySettlement or CourierCommand.SettleSent))
+            return false;
+        // Leave the step its own settlement calls (about 45s) inside the owner's deadline.
+        var until = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(60);
+        if (deadline.Expires - TimeSpan.FromSeconds(45) < until) until = deadline.Expires - TimeSpan.FromSeconds(45);
+        while (!deferredReleases.IsEmpty && !disposed && DateTimeOffset.UtcNow < until)
+        {
+            await Task.Delay(250).ConfigureAwait(false);
+            if (deferredReleases.IsEmpty) break;
+        }
+        if (automation.TryAcquire("courier carrier", out lease)) return true;
+        warning($"{command}: AutomationBusy: {(deferredReleases.IsEmpty ? "held by other automation" : "this carrier's last command still holds it")}; {automation.AcquisitionBlockReason}");
+        return false;
+    }
+    /// <summary>Seconds a command's own calls can take after its busy wait: the wait may use only what its deadline leaves beyond them.</summary>
+    private static int StepSeconds(CourierSettings cfg, CourierMessage m) => m.Command switch
+    {
+        CourierCommand.Travel => 15 + Deadline.WorldSeconds(m.Bell) + (m.Bell?.ApproachSeconds ?? 150) + 15,
+        CourierCommand.Receive or CourierCommand.Send => 15 + 30 + Deadline.TradeSeconds(m.Manifest) + 30 + 15,
+        CourierCommand.ReturnHome => Deadline.DataCenterSeconds + (cfg.Bells.GetValueOrDefault(m.Carrier.LocalContentId ?? 0)?.ApproachSeconds ?? 150)
+            + (int)CourierBusyGate.Budget.TotalSeconds + 15,
+        _ => 30,
+    };
     public async Task StopLocalAsync(bool notifyOwner = true)
     {
         stopped = true;

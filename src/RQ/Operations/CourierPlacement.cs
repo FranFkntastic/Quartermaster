@@ -154,6 +154,8 @@ public sealed partial class TransferCoordinator : ICourierPlacementPort
                 listUsed = true;
                 var result = await ExecuteRetrievalUnderLeaseAsync(id, lease, cancel.Token, leg);
                 var record = journal.Get(id);
+                if (NeverStarted(result.Started, record))
+                    return Result<bool>.Fail("PlacementNotStarted", $"{shipments[0].Name}: {id}: {record!.Message ?? result.Message}");
                 if (!result.Started || record?.Status != OperationStatuses.Succeeded ||
                     record.Lines.Sum(l => l.TransferredQuantity) != shipments.Sum(s => s.Units))
                     return new(CourierOutcome.Indeterminate, "PlacementNotVerified", $"{shipments[0].Name}: {id}: {record?.Message ?? result.Message}");
@@ -192,10 +194,18 @@ public sealed partial class TransferCoordinator : ICourierPlacementPort
         recordOperation(id);
         var result = await ExecuteDepositUnderLeaseAsync(id, lease, cancel.Token, leg);
         var record = journal.Get(id);
+        if (NeverStarted(result.Started, record))
+            return Result<bool>.Fail("PlacementNotStarted", $"{routes[0].Shipments[0].Name}: {id}: {record!.Message ?? result.Message}");
         return result.Started && record?.Status == OperationStatuses.Succeeded &&
             record.Lines.Sum(l => l.TransferredQuantity) == requests.Sum(r => r.Quantity) ? Result<bool>.Ok(true) :
             new(CourierOutcome.Indeterminate, "PlacementNotVerified", $"{routes[0].Shipments[0].Name}: {id}: {record?.Message ?? result.Message}");
     }
+    /// <summary>
+    /// The operation was journaled but refused before it began (still Accepted, nothing transferred): it moved nothing,
+    /// so the step failed rather than went unverified. A resume settles Accepted as zero moved.
+    /// </summary>
+    private static bool NeverStarted(bool started, OperationRecord? record) =>
+        !started && record is { Status: OperationStatuses.Accepted } && record.Lines.All(l => l.TransferredQuantity == 0);
     async Task<Result<bool>> ICourierPlacementPort.ConsolidateAsync(StowagePlan plan, ImmutableArray<CourierConsolidation> lines,
         IDisposable lease, Func<bool> authorized, Deadline deadline, Action<string> recordOperation)
     {

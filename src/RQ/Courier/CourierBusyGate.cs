@@ -11,7 +11,23 @@ internal static class CourierBusyGate
 {
     /// <summary>Matches the retainer refresh's AutoRetainer budget.</summary>
     internal static readonly TimeSpan Budget = TimeSpan.FromSeconds(20);
+    /// <summary>
+    /// Before a run's first step nothing is dispatched and no peer deadline runs, so the owner waits longer for a
+    /// login or travel to finish; a stop still ends the wait at once.
+    /// </summary>
+    internal static readonly TimeSpan RunStartBudget = TimeSpan.FromSeconds(120);
     private static readonly TimeSpan Poll = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
+    /// The wait a command can afford: what its deadline at <paramref name="expires"/> leaves once <paramref name="reserve"/>
+    /// is kept for the command's own calls, never less than <see cref="Budget"/> (nor more than the deadline leaves).
+    /// </summary>
+    internal static TimeSpan Within(DateTimeOffset expires, TimeSpan reserve)
+    {
+        var remaining = expires - DateTimeOffset.UtcNow;
+        var spare = remaining - reserve;
+        return spare > Budget ? spare : remaining < Budget ? remaining : Budget;
+    }
 
     /// <summary>
     /// Null once both are idle. Otherwise, when the budget runs out or <paramref name="cancelled"/> turns true,
