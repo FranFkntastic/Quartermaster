@@ -3,6 +3,7 @@ using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Franthropy.Dalamud.Automation;
 using Franthropy.Dalamud.Automation.Trades;
+using Franthropy.Dalamud.Runtime;
 using RQ.Automation;
 using RQ.Domain;
 
@@ -432,5 +433,11 @@ internal sealed class CourierTrade(CourierGame game,ITradeIo io,AutomationLease 
     }
     // Unloading keeps the auto-confirm suppression while a trade window is open, locked or unreadable, whatever holds
     // it; the next load lifts it once the window is closed.
-    public void Dispose(){try{hold?.Dispose();sender?.Dispose();if(!locked && !io.IsRemoteLocked)receiver?.Stop();}finally{if(WindowClosed())RestoreTradeAutoConfirm();}}
+    // Each step runs whatever an earlier one threw; the auto-confirm pauses are lifted last, and only with the window closed.
+    public void Dispose()=>DisposalSteps.DisposeAll(
+        (name,e)=>log.Warning($"[Quartermaster] UnloadStepFailed: courier trade {name}: {e.GetType().Name}: {e.Message}"),
+        ("hold",()=>hold?.Dispose()),
+        ("sender",()=>sender?.Dispose()),
+        ("receiver",()=>{if(!locked && !io.IsRemoteLocked)receiver?.Stop();}),
+        ("auto-confirm restore",()=>{if(WindowClosed())RestoreTradeAutoConfirm();}));
 }

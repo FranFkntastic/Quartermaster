@@ -621,8 +621,8 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     }
     // Lifestream finishing a login or travel refuses a switch as busy: waiting it out here keeps that refusal from being the switch's answer.
     public Task<Result<string>> SwitchRefusalAsync(Deadline deadline)=>Poll<string>(deadline,()=>
-        Result<string>.Ok(CharacterSwitchPolicy.GetRefusal(CharacterSwitchGameState.Observe(client,objects,conditions,false,null))??
-            (LifestreamBusy() ? "Lifestream is busy" : "")),expiry:CourierOutcome.Failed);
+        Result<string>.Ok(CharacterSwitchPolicy.GetRefusal(CharacterSwitchGameState.Observe(client,objects,conditions,false,null,pi))??""),
+        expiry:CourierOutcome.Failed);
     private static Result<T>? Translate<T>(OperationResult result, Func<T> success) => !result.IsTerminal ? null :
         result.Status == OperationStatus.Succeeded ? Result<T>.Ok(success()) :
         new(result.Status == OperationStatus.Indeterminate ? CourierOutcome.Indeterminate : CourierOutcome.Failed,result.Code,result.Message);
@@ -632,16 +632,19 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         catch(OperationCanceledException) when(unload.IsCancellationRequested){}
         catch(Exception e){warn(name+"LateObservation: "+e.Message);}
     }
-    private (bool Already,Action Save) Marker(string leg,Guid step)
+    // Clear drops the leg's marker once the request was demonstrably not taken, so a restart never reads an unsent request as sent.
+    private (bool Already,Action Save,Action Clear) Marker(string leg,Guid step)
     {
         if (step==Guid.Empty) throw new InvalidOperationException("TravelStepMissing");
         var record=submissions.Load();
-        return (record.GetValueOrDefault(leg)==step,()=>{var latest=submissions.Load();latest[leg]=step; submissions.Save(latest);});
+        return (record.GetValueOrDefault(leg)==step,()=>{var latest=submissions.Load();latest[leg]=step; submissions.Save(latest);},
+            ()=>{var latest=submissions.Load();if(latest.GetValueOrDefault(leg)==step && latest.Remove(leg))submissions.Save(latest);});
     }
     public Task<Result<OwnerScope>> SwitchAsync(OwnerScope target, Deadline d)
     {
         CharacterSwitchOperation? op=null;var idle=new IdleWindow();var marker=Marker("Switch",Step.Value);bool submitted=marker.Already;
         void Save(){marker.Save();submitted=true;}
+        void Clear(){marker.Clear();submitted=false;}
         var step=Step.Value;
         var allowed=CanContinue.Value;
         int notReady=0;
@@ -649,19 +652,15 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
         {
             if(allowed?.Invoke()==false)return new(CourierOutcome.Cancelled,"SwitchStopped",d.Name);
             var retry=submitted && !CourierPlanner.Exact(owner(),target) && idle.Ready(this);
-            if (op==null || retry) { op=new(login,new(target.CharacterName,target.HomeWorldName),d.Expires,warn,Save,submitted && !retry); }
-            OperationResult Tick()=>op.Tick(CharacterSwitchGameState.Observe(client,objects,conditions,false,null),DateTimeOffset.UtcNow);
+            if (op==null || retry) { op=new(login,new(target.CharacterName,target.HomeWorldName),d.Expires,warn,Save,Clear,submitted && !retry); }
+            // Sampling Lifestream.IsBusy and targetability keeps the switch from being requested while Lifestream or the
+            // client is still finishing a login or travel; the operation waits for eligibility to hold before asking.
+            OperationResult Tick()=>op.Tick(CharacterSwitchGameState.Observe(client,objects,conditions,false,null,pi),DateTimeOffset.UtcNow);
             var result=Tick();
-            if(result is {Status:OperationStatus.Failed,Code:"NotReady"})
-            {
-                // Lifestream refused before doing anything (busy finishing a login or travel, or its login workflow not
-                // ready): nothing was dispatched. The retry above submits again after an idle window, until the deadline.
-                if(CourierPlanner.Exact(owner(),target))return Result<OwnerScope>.Ok(owner());
-                if(DateTimeOffset.UtcNow>=d.Expires)
-                    return Result<OwnerScope>.Fail("CharacterSwitchDeadline",$"Character switch deadline {d.Expires:O} expired; last refusal NotReady: {result.Message}");
-                if(notReady++==0)warn($"SwitchNotReadyRetrying: {target.CharacterName}: {result.Message}; retrying once the character settles.");
-                return null;
-            }
+            // Lifestream refused before doing anything: nothing was dispatched, the marker is cleared, and the operation
+            // asks again on its own interval until the deadline (whose message carries the last refusal).
+            if(result is {Status:OperationStatus.Pending,Code:"SwitchNotReady"} && notReady++==0)
+                warn($"SwitchNotReadyRetrying: {target.CharacterName}: {result.Message}; retrying once the character settles.");
             if(result.Status==OperationStatus.Indeterminate)WatchLate(d.Name,()=>{Tick();return op.LateIdentityObserved;});
             return Translate(result,owner);
         },true);
@@ -681,8 +680,10 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
     {
         WorldVisitOperation? op=null;var idle=new IdleWindow();var marker=Marker(world==null?"VisitHome":"Visit",Step.Value);bool submitted=marker.Already;
         void Save(){marker.Save();submitted=true;}
+        void Clear(){marker.Clear();submitted=false;}
         var homeMarker=Marker("VisitReturnHome",Step.Value);bool homeSubmitted=homeMarker.Already;
         void SaveHome(){homeMarker.Save();homeSubmitted=true;}
+        void ClearHome(){homeMarker.Clear();homeSubmitted=false;}
         WorldVisitOperation? homeOp=null;var homeIdle=new IdleWindow();bool homeChecked=world==null,homeFirst=false;
         var allowed=CanContinue.Value;
         return Poll<bool>(d,()=>
@@ -699,7 +700,7 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
             {
                 var homeRetry=Position() is {} away && away.World!=player.HomeWorld.RowId && homeSubmitted && homeIdle.Ready(this);
                 if(homeOp==null || homeRetry)
-                    homeOp=WorldVisitOperation.ReturnHome(worlds,player,commands,client,conditions,d.Expires,warn,SaveHome,homeSubmitted && !homeRetry);
+                    homeOp=WorldVisitOperation.ReturnHome(worlds,player,commands,client,conditions,pi,d.Expires,warn,SaveHome,ClearHome,homeSubmitted && !homeRetry);
                 var home=homeOp.Tick(DateTimeOffset.UtcNow);
                 if(!home.IsTerminal)return null;
                 if(home.Status!=OperationStatus.Succeeded)
@@ -711,9 +712,11 @@ internal sealed class CourierGame(IDalamudPluginInterface pi, IPlayerState playe
                 return null;
             }
             var retry=Position() is {} here && here.World!=(world??player.HomeWorld.RowId) && submitted && idle.Ready(this);
+            // The plugin-interface overloads wait for Lifestream and the player to be ready before sending the world
+            // command, and send it again (clearing the marker) when Lifestream never starts on it.
             if(op==null || retry){
-                op=world is {} id ? new(worlds,data.GetExcelSheet<World>().GetRow(id).Name.ToString(),player,commands,client,conditions,d.Expires,player.ContentId,warn,Save,submitted && !retry) :
-                    WorldVisitOperation.ReturnHome(worlds,player,commands,client,conditions,d.Expires,warn,Save,submitted && !retry); }
+                op=world is {} id ? new(worlds,data.GetExcelSheet<World>().GetRow(id).Name.ToString(),player,commands,client,conditions,pi,d.Expires,player.ContentId,warn,Save,Clear,submitted && !retry) :
+                    WorldVisitOperation.ReturnHome(worlds,player,commands,client,conditions,pi,d.Expires,warn,Save,Clear,submitted && !retry); }
             var result=op.Tick(DateTimeOffset.UtcNow);
             if(result.Status==OperationStatus.Indeterminate)WatchLate(d.Name,()=>{op.Tick(DateTimeOffset.UtcNow);return op.LateArrivalObserved;});
             return Translate(result,()=>true);

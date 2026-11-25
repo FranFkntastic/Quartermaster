@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Security.Cryptography;
 using System.Text.Json;
+using Franthropy.Dalamud.Runtime;
 using RQ.Automation;
 using RQ.Domain;
 using RQ.Persistence;
@@ -709,8 +710,11 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         var drained=gate.Wait(TimeSpan.FromSeconds(2));
         if (!drained) warning("CarrierUnloadDrainDeadline: 2s elapsed.");
         try {
-            Release(force:true);
-            foreach(var release in deferredReleases.Keys)if(deferredReleases.TryRemove(release,out _))release();
+            // A throwing release never strands the deferred lease releases behind it.
+            DisposalSteps.DisposeAll(
+                (name,e)=>warning($"[Quartermaster] UnloadStepFailed: courier follower {name}: {e.GetType().Name}: {e.Message}"),
+                [("release",()=>Release(force:true)),
+                 ..deferredReleases.Keys.Select(release=>("deferred release",(Action)(()=>{if(deferredReleases.TryRemove(release,out _))release();})))]);
         } finally { if (drained) gate.Release(); }
     }
 }
