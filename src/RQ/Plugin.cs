@@ -10,6 +10,7 @@ using Franthropy.Dalamud.Automation.Vendors;
 using Franthropy.Dalamud.Automation.Vendors.Coordination;
 using Franthropy.Dalamud.Diagnostics;
 using Franthropy.Dalamud.Observations;
+using Franthropy.Dalamud.Runtime;
 using Franthropy.Dalamud.Travel;
 using Franthropy.Observations.V1;
 using RQ.AgentBridge;
@@ -1051,59 +1052,56 @@ public sealed class Plugin : IDalamudPlugin
         // (TextAdvance and the rest of the external UI suppression, AutoRetainer) given back, so none of them goes live
         // while Quartermaster still holds a retainer or trade window. The courier's trade pauses (YesAlready, Dropbox)
         // are lifted by the courier trade once the courier has drained. A step that throws never skips the restores.
-        void Step(string name, Action action)
-        {
-            try { action(); }
-            catch (Exception exception) { pluginLog.Warning($"[Quartermaster] UnloadStepFailed: {name}: {exception.GetType().Name}: {exception.Message}"); }
-        }
-        Step("courier conductor unload", () => courier.Conductor?.Unload());
-        Step("courier peer link", courierPeer.Dispose);
-        Step("courier game", courierGame.Dispose);
-        Step("courier conductor drain", () => courier.Conductor?.DrainUnload());
-        Step("courier follower", () => courier.Follower?.Dispose());
-        Step("courier trade", courierTrade.Dispose);
-        Step("player inventory flush", playerInventory.Flush);
-        Step("automatic retrievals", automaticRetrievals.Dispose);
-        Step("market competition", marketCompetition.Dispose);
-        Step("listing navigation", listingNavigation.Dispose);
-        Step("market runs", () => marketRuns.CancelAndWait(TimeSpan.FromSeconds(2)));
-        Step("active transfer", () => window.CancelAndWaitForActiveTransfer(TimeSpan.FromSeconds(2)));
-        Step("inventory mover", inventoryMover.Dispose);
-        Step("retainer bell route", retainerBellRoute.Dispose);
-        Step("vendor procurement", vendorProcurement.Dispose);
-        Step("vendor shop", vendorShop.Dispose);
-        Step("external UI suppression", externalUiSuppression.Dispose);
-        Step("AutoRetainer suppression", autoRetainerSuppression.RestoreOnUnload);
-        Step("agent bridge", agentBridge.Dispose);
-        Step("agent bridge viewport capture", agentBridgeViewportCapture.Dispose);
-        Step("framework update", () => framework.Update -= OnFrameworkUpdate);
-        Step("UI draw", () => pluginInterface.UiBuilder.Draw -= DrawWindows);
-        Step("open main UI", () => pluginInterface.UiBuilder.OpenMainUi -= OpenMainUi);
-        Step("command", () => commands.RemoveHandler(Command));
-        Step("operation events", () =>
-        {
-            submissions.OperationChanged -= OnSubmittedOperationChanged;
-            deposits.OperationChanged -= OnSubmittedOperationChanged;
-            deliveredStow.OperationChanged -= OnSubmittedOperationChanged;
-        });
-        Step("state events", () =>
-        {
-            state.Changed -= OnStateChanged;
-            playerInventory.Changed -= OnPlayerInventoryChanged;
-            cache.Changed -= OnCacheChanged;
-            cache.ListingCaptured -= OnListingCaptured;
-            journal.OperationChanged -= OnOperationChanged;
-        });
-        Step("observation client", () => observationClient.DisposeAsync().AsTask().GetAwaiter().GetResult());
-        Step("IPC", ipc.Dispose);
-        Step("retainer refresh", retainerRefresh.Dispose);
-        Step("observation host", () => observationHost?.Dispose());
-        Step("cache", cache.Dispose);
-        Step("player inventory", playerInventory.Dispose);
-        Step("external account stock", externalAccountStock.Dispose);
-        // A scope a failed step never released still leaves AutoRetainer as this load found it.
-        Step("AutoRetainer suppression (final)", autoRetainerSuppression.RestoreOnUnload);
-        Step("AutoRetainer holder registry", () => { if (autoRetainerHolders is not null) pluginInterface.RelinquishData(AutoRetainerSuppression.HolderRegistryKey); });
-        Step("windows", windows.RemoveAllWindows);
+        DisposalSteps.DisposeAll(
+            (name, exception) => pluginLog.Warning($"[Quartermaster] UnloadStepFailed: {name}: {exception.GetType().Name}: {exception.Message}"),
+            ("courier conductor unload", () => courier.Conductor?.Unload()),
+            ("courier peer link", courierPeer.Dispose),
+            ("courier game", courierGame.Dispose),
+            ("courier conductor drain", () => courier.Conductor?.DrainUnload()),
+            ("courier follower", () => courier.Follower?.Dispose()),
+            ("courier trade", courierTrade.Dispose),
+            ("player inventory flush", playerInventory.Flush),
+            ("automatic retrievals", automaticRetrievals.Dispose),
+            ("market competition", marketCompetition.Dispose),
+            ("listing navigation", listingNavigation.Dispose),
+            ("market runs", () => marketRuns.CancelAndWait(TimeSpan.FromSeconds(2))),
+            ("active transfer", () => window.CancelAndWaitForActiveTransfer(TimeSpan.FromSeconds(2))),
+            ("inventory mover", inventoryMover.Dispose),
+            ("retainer bell route", retainerBellRoute.Dispose),
+            ("vendor procurement", vendorProcurement.Dispose),
+            ("vendor shop", vendorShop.Dispose),
+            ("external UI suppression", externalUiSuppression.Dispose),
+            ("AutoRetainer suppression", autoRetainerSuppression.RestoreOnUnload),
+            ("agent bridge", agentBridge.Dispose),
+            ("agent bridge viewport capture", agentBridgeViewportCapture.Dispose),
+            ("framework update", () => framework.Update -= OnFrameworkUpdate),
+            ("UI draw", () => pluginInterface.UiBuilder.Draw -= DrawWindows),
+            ("open main UI", () => pluginInterface.UiBuilder.OpenMainUi -= OpenMainUi),
+            ("command", () => commands.RemoveHandler(Command)),
+            ("operation events", () =>
+            {
+                submissions.OperationChanged -= OnSubmittedOperationChanged;
+                deposits.OperationChanged -= OnSubmittedOperationChanged;
+                deliveredStow.OperationChanged -= OnSubmittedOperationChanged;
+            }),
+            ("state events", () =>
+            {
+                state.Changed -= OnStateChanged;
+                playerInventory.Changed -= OnPlayerInventoryChanged;
+                cache.Changed -= OnCacheChanged;
+                cache.ListingCaptured -= OnListingCaptured;
+                journal.OperationChanged -= OnOperationChanged;
+            }),
+            ("observation client", () => observationClient.DisposeAsync().AsTask().GetAwaiter().GetResult()),
+            ("IPC", ipc.Dispose),
+            ("retainer refresh", retainerRefresh.Dispose),
+            ("observation host", () => observationHost?.Dispose()),
+            ("cache", cache.Dispose),
+            ("player inventory", playerInventory.Dispose),
+            ("external account stock", externalAccountStock.Dispose),
+            // A scope a failed step never released still leaves AutoRetainer as this load found it.
+            ("AutoRetainer suppression (final)", autoRetainerSuppression.RestoreOnUnload),
+            ("AutoRetainer holder registry", () => { if (autoRetainerHolders is not null) pluginInterface.RelinquishData(AutoRetainerSuppression.HolderRegistryKey); }),
+            ("windows", windows.RemoveAllWindows));
     }
 }
