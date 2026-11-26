@@ -88,7 +88,29 @@ internal sealed class CourierAutoResume
         "InvalidManifest",                // the carrier refused the manifest
         "OwnerNotPaired",                 // the owner is not paired on the carrier
         "CarrierOptInOff",                // the carrier no longer carries for others
-        "NoAttunedAetheryte");            // no attuned aetheryte to travel by
+        "NoAttunedAetheryte",             // no attuned aetheryte to travel by
+        // Hand-off, settlement and trade-record evidence that does not settle (the pane labels these mismatch/unverified).
+        "ManifestDeltaMismatch",          // bag deltas differ from the manifest
+        "ManifestDeltaOutOfRange",        // a delta falls outside the manifest's bounds
+        "TradeRecordDisagrees",           // the trade record contradicts the bags
+        "TradeRecordUnsettled",           // the trade record cannot settle the step
+        "TradeRecordMissing",             // no trade record for a dispatched trade
+        "TradeSettlementUnproven",        // the trade's settlement cannot be proven
+        "TradeManifestUnsettled",         // the traded manifest is not settled
+        "UnmanifestedTransfer",           // items moved that no manifest names
+        "SettlementIdentityMismatch",     // the settlement names another run, step or character
+        "SettlementEvidenceMissing",      // the evidence a settlement needs is gone
+        "SettlementUnavailable",          // the settlement cannot be read
+        "SettleBagsChanged",              // bags changed while settling
+        "ResumeUnsettled",                // the resume could not settle the pending step
+        "ReceiveBaselineMismatch",        // the receive baseline differs from the bags
+        "ReceiveCancellationUnsettled",   // a cancelled receive's outcome is unknown
+        // Carrier refusals over custody it cannot reconcile.
+        "UnclaimCustodyChanged",          // the carrier's custody changed before an unclaim
+        "UnclaimBagsChanged",             // the carrier's bags changed before an unclaim
+        "SettledReceiptChanged",          // a settled receipt no longer matches
+        "CarrierIntentUnsettled",         // the carrier's last intent has no proven outcome
+        "CarrierTradeUnsettled");         // the carrier's last trade has no proven outcome
 
     private readonly CourierSession session;
     private readonly object gate = new();
@@ -96,6 +118,8 @@ internal sealed class CourierAutoResume
     private int highWater;
     private int attempts;
     private bool watching, fired;
+    /// <summary>Set by any cancel (an escape hatch, Cancel auto-retry): this run's next halt is not retried until a launch watches it again.</summary>
+    private bool suppressed;
     private (DateTimeOffset At, string State, string Code, string Detail)? pending;
     private CourierAutoResumeAttempt? exhausted;
     private ImmutableArray<CourierAutoResumeAttempt> history = [];
@@ -136,6 +160,7 @@ internal sealed class CourierAutoResume
             // A halt not yet evaluated is dropped too: nothing stopped, cleared or replaced is resumed afterwards. A launch
             // that follows (Resume, a new run) watches again.
             watching = false;
+            suppressed = true;
             if (pending is not { } p)
                 return;
             pending = null;
@@ -146,7 +171,16 @@ internal sealed class CourierAutoResume
     /// <summary>A start or resume is launching: its halt, however quick, is watched.</summary>
     internal void Watch()
     {
-        lock (gate) watching = true;
+        lock (gate) { watching = true; suppressed = false; }
+    }
+
+    /// <summary>
+    /// Whether the automatic attempt being fired is still wanted. Called under the session's launch lock, which every
+    /// cancel also takes, so a cancel either lands before this (and the launch is refused) or after the launch exists.
+    /// </summary>
+    internal bool TryClaim()
+    {
+        lock (gate) return !disposed && pending is not null && !suppressed;
     }
 
     /// <summary>Stops every future attempt; called first on unload.</summary>
@@ -173,7 +207,7 @@ internal sealed class CourierAutoResume
             if (journal.Run != run)
             {
                 // A watched launch keeps its watch: it is what wrote the new run.
-                run = journal.Run; highWater = journal.Cursor; attempts = 0; fired = false;
+                run = journal.Run; highWater = journal.Cursor; attempts = 0; fired = false; suppressed = false;
                 pending = null; exhausted = null; history = [];
             }
             if (journal.Cursor > highWater)
@@ -233,6 +267,11 @@ internal sealed class CourierAutoResume
         exhausted = null;
         if (!Enabled())
             return;
+        if (suppressed)
+        {
+            Warn($"{run} AutoResumeSkipped {code}: automatic retry was cancelled for this run.");
+            return;
+        }
         if (conductor.StopCause is CourierStopCause.User or CourierStopCause.Carrier)
         {
             Warn($"{run} AutoResumeSkipped {code}: the {(conductor.StopCause == CourierStopCause.User ? "user" : "carrier")} stopped the run.");

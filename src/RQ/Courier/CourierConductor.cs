@@ -174,7 +174,8 @@ public sealed class CourierConductor
     /// <see cref="CourierStopCause.Carrier"/> (the carrier asked) or <see cref="CourierStopCause.LinkLost"/>. Null when nothing asked.
     /// </summary>
     internal string? StopCause { get; private set; }
-    private void Stopped(string cause) { StopCause ??= cause; stop = true; }
+    // A user stop always wins: it may follow a link loss or carrier stop that recorded first, and must still block a retry.
+    private void Stopped(string cause) { StopCause = cause == CourierStopCause.User ? cause : StopCause ?? cause; stop = true; }
     private Action? releaseOwner;
     internal void Unload(){unloaded=stop=true;}
     internal void DrainUnload()

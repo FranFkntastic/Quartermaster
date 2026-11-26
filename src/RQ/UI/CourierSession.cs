@@ -148,7 +148,17 @@ public sealed class CourierSession
     public void DisposeAutoResume() => autoResume.Dispose();
 
     /// <summary>Drops a pending automatic resume (the run pane's Cancel auto-retry, or a stop of a run already halted); Resume stays available.</summary>
-    internal void CancelAutoResume(string why = "Cancel auto-retry") => autoResume.Cancel(why);
+    internal void CancelAutoResume(string why = "Cancel auto-retry")
+    {
+        // Under the launch lock: an automatic attempt claims itself under it, so a cancel lands before or after its launch, never between.
+        lock (launchGate) autoResume.Cancel(why);
+    }
+
+    /// <summary>Runs a check-then-stop decision under the launch lock, so no launch (manual or automatic) slips between them.</summary>
+    internal T UnderLaunchGate<T>(Func<T> decide)
+    {
+        lock (launchGate) return decide();
+    }
 
     /// <summary>The last start, stop, resume or clear failure in plain words; cleared by the next request.</summary>
     internal string? Error { get; private set; }
@@ -870,8 +880,13 @@ public sealed class CourierSession
         if (Conductor is not { } conductor || !StartGate(runtime, courierPlan).CanStart)
             return;
         var settings = runtime.State.Courier;
-        autoResume.Cancel("a new run starts");
-        Launch(async () => await conductor.StartAsync(courierPlan!, settings).ConfigureAwait(false), watch: true);
+        lock (launchGate)
+        {
+            if (IsActive)
+                return;
+            autoResume.Cancel("a new run starts");
+            Launch(async () => await conductor.StartAsync(courierPlan!, settings).ConfigureAwait(false), watch: true);
+        }
     }
 
     /// <summary>Clears the run, whatever it holds or awaits: the escape hatch. One click, no acknowledgement.</summary>
@@ -899,6 +914,9 @@ public sealed class CourierSession
         {
             Poll(force: true);
             if (Conductor is not { } conductor || IsActive || conductor.IsBusy || Run?.CanResume!=true)
+                return false;
+            // An automatic attempt launches only if no cancel (Stop, Clear, Cancel auto-retry) has landed since it was due.
+            if (automatic && !autoResume.TryClaim())
                 return false;
             if (!automatic)
                 autoResume.Cancel("Resume started");
@@ -985,7 +1003,7 @@ public sealed class CourierSession
         if (Conductor is not { } conductor)
             return;
         // An escape hatch: it never waits on, and is never undone by, an automatic resume.
-        autoResume.Cancel("Stop");
+        lock (launchGate) autoResume.Cancel("Stop");
         var carrier = CarrierName();
         _ = Task.Run(async () =>
         {

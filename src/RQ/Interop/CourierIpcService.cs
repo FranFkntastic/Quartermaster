@@ -489,14 +489,19 @@ public sealed class CourierIpcService
         var journal = conductor.Journal();
         if (wanted is { } run && run != journal.Run)
             return Ack("", journal.Run, "rejected", "RunMismatch", "That run is not the current courier run.");
-        if (journal.State != "Running" && !session.IsStarting)
+        // Decided under the launch lock, so an automatic resume cannot launch between "not running" and the cancel.
+        return session.UnderLaunchGate(() =>
         {
-            // A halted run is not resumed automatically after a Stop.
-            session.CancelAutoResume("IPC Stop");
-            return Ack(journal.RequestId ?? "", journal.Run, "idle", null, $"No run is active ({journal.State}).");
-        }
-        session.Stop();
-        return Ack(journal.RequestId ?? "", journal.Run, "stopping", null, "Stopping at the next verified checkpoint.");
+            var current = conductor.Journal();
+            if (current.State != "Running" && !session.IsStarting)
+            {
+                // A halted run is not resumed automatically after a Stop.
+                session.CancelAutoResume("IPC Stop");
+                return Ack(current.RequestId ?? "", current.Run, "idle", null, $"No run is active ({current.State}).");
+            }
+            session.Stop();
+            return Ack(current.RequestId ?? "", current.Run, "stopping", null, "Stopping at the next verified checkpoint.");
+        });
     }
 
     /// <summary>
