@@ -289,7 +289,9 @@ internal sealed class CourierAutoResume
             Warn($"{run} AutoResumeSkipped {code}: a retry cannot change this outcome ({state}: {detail}).");
             return;
         }
-        if (!conductor.PolledSnapshot().CanResume)
+        // A carrier briefly gone from discovery makes the run unresumable only until it is back: schedule anyway, and let
+        // the due attempt wait for it within the readiness budget. Only a run that cannot resume with its carrier present is skipped.
+        if (conductor.PolledSnapshot() is { CanResume: false, CarrierConnected: true })
         {
             Warn($"{run} AutoResumeSkipped {code}: the run cannot resume ({state}: {detail}).");
             return;

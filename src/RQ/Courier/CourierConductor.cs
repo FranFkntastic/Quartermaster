@@ -132,7 +132,12 @@ public sealed class CourierRequestIndex
 public sealed record LineProgress(Guid Line, string Name, int Moved, int Remaining, Shipment? Route = null, bool Nq = false, bool Hq = false);
 public sealed record CourierSnapshot(Guid Run, string State, string OwnerPhase, string CarrierPhase, int Trip, int Trips,
     string Code, string Detail, ImmutableArray<LineProgress> Lines, ImmutableArray<Refusal> Refusals,bool CanResume,bool CanClear,ImmutableArray<CustodyRow> Custody,
-    CourierUnverified? Unverified=null, Guid PlanId=default, string? RequestId=null);
+    CourierUnverified? Unverified=null, Guid PlanId=default, string? RequestId=null)
+{
+    /// <summary>Whether the run's carrier is reachable now (always true for a carrierless run). <see cref="CanResume"/> needs it;
+    /// the automatic resume uses it to tell a carrier that is briefly gone from a run that cannot resume at all.</summary>
+    public bool CarrierConnected { get; init; } = true;
+}
 public sealed record CustodyRow(string Item,string Quality,int Quantity,string Holder);
 /// <summary>The journaled step whose outcome is not yet proven; Rows hold its batch at the last verified holder (From).</summary>
 public sealed record CourierUnverified(string Step,string From,string To,ImmutableArray<CustodyRow> Rows);
@@ -307,7 +312,7 @@ public sealed class CourierConductor
             connected && attempt && r.State is "Failed" or "Interrupted" or "Indeterminate" && r.Code != HandInNeedsSettlement,
             // Clear is the escape hatch: any run that is not running, whatever it holds, awaits or can reach.
             r.State is "Completed" or "Failed" or "Interrupted" or "Indeterminate" or "Refused",Rows(r.Custody,r.Settings.Carrier),
-            Unverified(r),r.Plan.PlanId,r.RequestId);
+            Unverified(r),r.Plan.PlanId,r.RequestId) { CarrierConnected = connected };
     }
     /// <summary>A resume found a hand-in the carrier holds unconfirmed that neither fresh bags nor the owner's journal settle.</summary>
     internal const string HandInNeedsSettlement = "HandInNeedsSettlement";
