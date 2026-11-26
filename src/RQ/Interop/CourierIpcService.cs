@@ -165,6 +165,17 @@ public sealed class CourierIpcService
                     custodyGil = journal.Custody.Where(s => s.IsGil).Sum(s => (long)s.Units),
                     // The carrier itself is the source: one delivery leg, no pickup.
                     fromCarrier = journal.Plan.Trips.Any(t => CourierConductor.FromCarrier(journal, t)),
+                    // Additive: the run resumes itself under the same runId. Null when no automatic resume applies to it.
+                    autoResume = session.AutoResume is { } auto && auto.Run == journal.Run ? new
+                    {
+                        pending = auto.Pending,
+                        attempt = auto.Attempt,
+                        maxAttempts = auto.MaxAttempts,
+                        dueInSeconds = auto.Pending ? auto.DueInSeconds : (int?)null,
+                        code = auto.Pending ? auto.Code : null,
+                        exhausted = auto.Exhausted is { } last ? new { code = last.Code, detail = last.Detail } : null,
+                        history = auto.History.Select(a => new { attempt = a.Attempt, at = a.At, state = a.State, code = a.Code, detail = a.Detail }),
+                    } : null,
                 };
             }
             return JsonSerializer.Serialize(new
@@ -478,10 +489,19 @@ public sealed class CourierIpcService
         var journal = conductor.Journal();
         if (wanted is { } run && run != journal.Run)
             return Ack("", journal.Run, "rejected", "RunMismatch", "That run is not the current courier run.");
-        if (journal.State != "Running" && !session.IsStarting)
-            return Ack(journal.RequestId ?? "", journal.Run, "idle", null, $"No run is active ({journal.State}).");
-        session.Stop();
-        return Ack(journal.RequestId ?? "", journal.Run, "stopping", null, "Stopping at the next verified checkpoint.");
+        // Decided under the launch lock, so an automatic resume cannot launch between "not running" and the cancel.
+        return session.UnderLaunchGate(() =>
+        {
+            var current = conductor.Journal();
+            if (current.State != "Running" && !session.IsStarting)
+            {
+                // A halted run is not resumed automatically after a Stop.
+                session.CancelAutoResume("IPC Stop");
+                return Ack(current.RequestId ?? "", current.Run, "idle", null, $"No run is active ({current.State}).");
+            }
+            session.Stop();
+            return Ack(current.RequestId ?? "", current.Run, "stopping", null, "Stopping at the next verified checkpoint.");
+        });
     }
 
     /// <summary>

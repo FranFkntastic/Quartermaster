@@ -98,6 +98,13 @@ public sealed class CourierJournal
     public CourierOutsideSettlement? OutsideSettlement { get; set; }
     public List<CourierPlacedOutside> PlacedOutside { get; set; } = [];
 }
+/// <summary>Who asked a courier run to stop (<see cref="CourierConductor.StopCause"/>).</summary>
+public static class CourierStopCause
+{
+    public const string User = "user";
+    public const string Carrier = "carrier";
+    public const string LinkLost = "link-lost";
+}
 /// <summary>Who cleared a courier run, as recorded on its archived journal (<see cref="CourierJournal.ClearedBy"/>).</summary>
 public static class CourierClearSource
 {
@@ -125,7 +132,12 @@ public sealed class CourierRequestIndex
 public sealed record LineProgress(Guid Line, string Name, int Moved, int Remaining, Shipment? Route = null, bool Nq = false, bool Hq = false);
 public sealed record CourierSnapshot(Guid Run, string State, string OwnerPhase, string CarrierPhase, int Trip, int Trips,
     string Code, string Detail, ImmutableArray<LineProgress> Lines, ImmutableArray<Refusal> Refusals,bool CanResume,bool CanClear,ImmutableArray<CustodyRow> Custody,
-    CourierUnverified? Unverified=null, Guid PlanId=default, string? RequestId=null);
+    CourierUnverified? Unverified=null, Guid PlanId=default, string? RequestId=null)
+{
+    /// <summary>Whether the run's carrier is reachable now (always true for a carrierless run). <see cref="CanResume"/> needs it;
+    /// the automatic resume uses it to tell a carrier that is briefly gone from a run that cannot resume at all.</summary>
+    public bool CarrierConnected { get; init; } = true;
+}
 public sealed record CustodyRow(string Item,string Quality,int Quantity,string Holder);
 /// <summary>The journaled step whose outcome is not yet proven; Rows hold its batch at the last verified holder (From).</summary>
 public sealed record CourierUnverified(string Step,string From,string To,ImmutableArray<CustodyRow> Rows);
@@ -160,7 +172,15 @@ public sealed class CourierConductor
     /// Clears a previous stop before a launch is scheduled, so a Stop arriving while the launch is still
     /// archiving or starting is honored instead of reset by <see cref="StartAsync"/>.
     /// </summary>
-    internal void PrepareLaunch() { if (IsBusy) return; stop = false; launchPrepared = true; }
+    internal void PrepareLaunch() { if (IsBusy) return; stop = false; StopCause = null; launchPrepared = true; }
+    /// <summary>
+    /// Who asked the last run to stop, for the automatic resume only (it never changes how the run settles):
+    /// <see cref="CourierStopCause.User"/> (Stop on this client: the pane, the courier IPC, a delivered-stow forward),
+    /// <see cref="CourierStopCause.Carrier"/> (the carrier asked) or <see cref="CourierStopCause.LinkLost"/>. Null when nothing asked.
+    /// </summary>
+    internal string? StopCause { get; private set; }
+    // A user stop always wins: it may follow a link loss or carrier stop that recorded first, and must still block a retry.
+    private void Stopped(string cause) { StopCause = cause == CourierStopCause.User ? cause : StopCause ?? cause; stop = true; }
     private Action? releaseOwner;
     internal void Unload(){unloaded=stop=true;}
     internal void DrainUnload()
@@ -292,7 +312,7 @@ public sealed class CourierConductor
             connected && attempt && r.State is "Failed" or "Interrupted" or "Indeterminate" && r.Code != HandInNeedsSettlement,
             // Clear is the escape hatch: any run that is not running, whatever it holds, awaits or can reach.
             r.State is "Completed" or "Failed" or "Interrupted" or "Indeterminate" or "Refused",Rows(r.Custody,r.Settings.Carrier),
-            Unverified(r),r.Plan.PlanId,r.RequestId);
+            Unverified(r),r.Plan.PlanId,r.RequestId) { CarrierConnected = connected };
     }
     /// <summary>A resume found a hand-in the carrier holds unconfirmed that neither fresh bags nor the owner's journal settle.</summary>
     internal const string HandInNeedsSettlement = "HandInNeedsSettlement";
@@ -500,7 +520,7 @@ public sealed class CourierConductor
     }
     public async Task StopAsync()
     {
-        stop = true;
+        Stopped(CourierStopCause.User);
         try { await calls.Call("OwnerCancelPreLock",10,trade.CancelPreLockAsync); }
         finally {var r=store.Load();if(r.State=="Running" && !Carrierless(r))await StopCarrierAsync(r);}
     }
@@ -563,8 +583,8 @@ public sealed class CourierConductor
             try { await calls.Call("OwnerCancelPreLock", 10, trade.CancelPreLockAsync); }
             catch (Exception e) { warning($"Cancel pre-lock: {e.Message}"); }
         }
-        void Lost() { stop = true; warning($"CourierLinkLost: {r.Run}"); _ = CancelLocal(); }
-        void RemoteStop(Guid run) { if (run == r.Run) { stop = true; _ = CancelLocal(); } }
+        void Lost() { Stopped(CourierStopCause.LinkLost); warning($"CourierLinkLost: {r.Run}"); _ = CancelLocal(); }
+        void RemoteStop(Guid run) { if (run == r.Run) { Stopped(CourierStopCause.Carrier); _ = CancelLocal(); } }
         void Progress(CourierProgress p) { if (p.Run == r.Run) peerPhase = p.Phase; }
         bool beginAttempted = false, existingRun=false, carrierless=false, finishLanded=false;
         // A carrier-sourced run that cannot claim what it must deliver ends Refused: nothing held, not resumable.
@@ -605,7 +625,7 @@ public sealed class CourierConductor
         try
         {
             // A prepared launch already cleared stop; any Stop since then stands.
-            if (!launchPrepared) stop = false;
+            if (!launchPrepared) { stop = false; StopCause = null; }
             launchPrepared = false;
             if(unloaded)throw new OperationCanceledException("Courier unloaded.");
             var resume = existingRun = r.State is not ("Idle" or "Completed" or "Refused");

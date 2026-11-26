@@ -225,6 +225,12 @@ internal sealed class DeliveredStowCourier : IDeliveredStowCourier
     {
         if (session.Conductor is not { } conductor)
             return false;
+        // Decided under the launch lock, so an automatic resume cannot launch between the check and the cancel.
+        return session.UnderLaunchGate(() => StopLocked(conductor, run));
+    }
+
+    private bool StopLocked(RQ.Courier.CourierConductor conductor, Guid run)
+    {
         var journal = conductor.Journal();
         // Only this run's own launch counts: session.Stop() halts whatever runs, so a launch of another run (a manual or
         // IPC start while the journal still shows this one) must never be stopped on this run's behalf.
@@ -233,7 +239,12 @@ internal sealed class DeliveredStowCourier : IDeliveredStowCourier
         // Still launching: StartPlan returned and bound the run, but the background start has not written its journal.
         var launching = !current && startingThis && !settled.ContainsKey(run) && launched.Values.Any(launch => launch.Run == run);
         if (!current && !launching)
+        {
+            // A halted run this forward was told to stop is never resumed automatically afterwards.
+            if (journal.Run == run)
+                session.CancelAutoResume("delivered-stow forward stopped");
             return false;
+        }
         session.Stop();
         return true;
     }

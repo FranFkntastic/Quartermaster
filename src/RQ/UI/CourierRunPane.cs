@@ -135,8 +135,24 @@ internal sealed class CourierRunPane(CourierSession courier, AgentBridgeUiReview
         ImGui.TextColored(QuartermasterPalette.Amber, !run.CanResume && run.Unverified is { } step ? CourierSession.UnverifiedLabel(step) : StateLabel(run.State));
         // A refused Resume reads as a quiet note here, not as an error.
         var outcome = courier.ResumeNote is { } note ? $"Resume: {note}" : CourierSession.OutcomeLabel(run.Code, carrier);
+        var auto = courier.AutoResume is { } view && view.Run == run.Run ? view : null;
+        if (auto is { Pending: true })
+            outcome += auto.DueInSeconds > 0
+                ? $" · Retrying automatically in {auto.DueInSeconds:N0}s (attempt {auto.Attempt} of {auto.MaxAttempts})"
+                : $" · Retrying automatically (attempt {auto.Attempt} of {auto.MaxAttempts})";
+        else if (auto?.Exhausted is { } last && courier.ResumeNote is null)
+            outcome = $"Stopped after {last.Attempt} automatic retries: {CourierSession.OutcomeLabel(last.Code, carrier)}";
         ImGui.TextDisabled(run.Trips > 0 ? $"{outcome} · Trip {Math.Max(1, run.Trip):N0} of {run.Trips:N0}" : outcome);
         ImGui.EndGroup();
+        if (auto is { Pending: true })
+        {
+            ImGui.SameLine(0, 16);
+            ImGui.SetCursorPosY(top + Math.Max(0, (height - ImGui.GetFrameHeight()) / 2));
+            if (ImGui.SmallButton("Cancel auto-retry##RQCourierCancelAutoResume"))
+                courier.CancelAutoResume();
+            reviewRegistry.RegisterLastButton("quartermaster.courier.run.cancel-auto-resume", "Cancel the pending automatic resume", true,
+                () => courier.CancelAutoResume(), $"Attempt {auto.Attempt} of {auto.MaxAttempts} in {auto.DueInSeconds:N0}s");
+        }
     }
 
     /// <summary>The finished run's outcome; the line counts sit in the tooltip.</summary>
