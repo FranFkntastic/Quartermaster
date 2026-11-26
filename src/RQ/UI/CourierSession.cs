@@ -118,6 +118,7 @@ public sealed class CourierSession
         this.state = state;
         this.cachedBags = cachedBags;
         this.metadata = metadata;
+        autoResume = new(this) { Enabled = () => state.ReadConfiguration(document => document.Courier.AutoResume) };
     }
 
     public ICourierLink Link { get; set; } = NullCourierLink.Instance;
@@ -126,6 +127,28 @@ public sealed class CourierSession
 
     /// <summary>Warning-level log sink for failure detail that never reaches the visible status.</summary>
     public Action<string>? Warn { get; set; }
+
+    /// <summary>Information-level log sink.</summary>
+    public Action<string>? Inform { get; set; }
+
+    private readonly CourierAutoResume autoResume;
+    // Serializes the check-then-launch of Resume, StartPlan and Clear across the UI, the IPC and the automatic resume.
+    private readonly object launchGate = new();
+
+    /// <summary>Whether the owner client could run a resume now (logged in, character loaded, not switching).</summary>
+    public Func<bool> OwnerReady { set => autoResume.Ready = value; }
+
+    /// <summary>The current run's automatic resume, for the run pane and the courier IPC; null when there is none to show.</summary>
+    internal CourierAutoResumeView? AutoResume => autoResume.View;
+
+    /// <summary>Runs the automatic resume's schedule; called every framework tick.</summary>
+    public void TickAutoResume() => autoResume.Tick();
+
+    /// <summary>Drops any pending automatic resume for good; called first on unload.</summary>
+    public void DisposeAutoResume() => autoResume.Dispose();
+
+    /// <summary>Drops a pending automatic resume (the run pane's Cancel auto-retry, or a stop of a run already halted); Resume stays available.</summary>
+    internal void CancelAutoResume(string why = "Cancel auto-retry") => autoResume.Cancel(why);
 
     /// <summary>The last start, stop, resume or clear failure in plain words; cleared by the next request.</summary>
     internal string? Error { get; private set; }
@@ -847,27 +870,41 @@ public sealed class CourierSession
         if (Conductor is not { } conductor || !StartGate(runtime, courierPlan).CanStart)
             return;
         var settings = runtime.State.Courier;
-        Launch(async () => await conductor.StartAsync(courierPlan!, settings).ConfigureAwait(false));
+        autoResume.Cancel("a new run starts");
+        Launch(async () => await conductor.StartAsync(courierPlan!, settings).ConfigureAwait(false), watch: true);
     }
 
     /// <summary>Clears the run, whatever it holds or awaits: the escape hatch. One click, no acknowledgement.</summary>
     /// <returns>Whether the clear was launched (false when the courier is not loaded or a run is active).</returns>
     internal bool Clear(Guid expectedRun, Action<CourierSnapshot?, Exception?>? settled = null, string clearedBy = CourierClearSource.User)
     {
-        if (Conductor is not { } conductor || IsActive) return false;
-        Launch(async () => await conductor.ClearAsync(expectedRun, clearedBy).ConfigureAwait(false), settled);
-        return true;
+        lock (launchGate)
+        {
+            if (Conductor is not { } conductor || IsActive) return false;
+            autoResume.Cancel("Clear");
+            Launch(async () => await conductor.ClearAsync(expectedRun, clearedBy).ConfigureAwait(false), settled);
+            return true;
+        }
     }
 
-    /// <summary>Resumes an interrupted run from its journal; the journal owns the plan and settings.</summary>
+    /// <summary>
+    /// Resumes an interrupted run from its journal; the journal owns the plan and settings. The run pane, the courier
+    /// IPC and the automatic resume all come through here; one that is not automatic drops a pending automatic attempt.
+    /// The check and the launch are atomic, so of two concurrent resumes the second is refused (false).
+    /// </summary>
     /// <returns>Whether a resume was launched (false when active, busy draining, or not resumable).</returns>
-    internal bool Resume()
+    internal bool Resume(bool automatic = false)
     {
-        Poll(force: true);
-        if (Conductor is not { } conductor || IsActive || conductor.IsBusy || Run?.CanResume!=true)
-            return false;
-        Launch(async () => await conductor.StartAsync(new(Guid.Empty, 0, [], []), new()).ConfigureAwait(false), quiet: true, run: Run?.Run);
-        return true;
+        lock (launchGate)
+        {
+            Poll(force: true);
+            if (Conductor is not { } conductor || IsActive || conductor.IsBusy || Run?.CanResume!=true)
+                return false;
+            if (!automatic)
+                autoResume.Cancel("Resume started");
+            Launch(async () => await conductor.StartAsync(new(Guid.Empty, 0, [], []), new()).ConfigureAwait(false), quiet: true, run: Run?.Run, watch: true);
+            return true;
+        }
     }
 
     /// <summary>
@@ -879,16 +916,20 @@ public sealed class CourierSession
     internal bool StartPlan(CourierPlan courierPlan, CourierSettings settings, Guid? clearFirst, Guid runId,
         Action<CourierSnapshot?, Exception?>? settled = null)
     {
-        Poll(force: true);
-        if (Conductor is not { } conductor || IsActive)
-            return false;
-        Launch(async () =>
+        lock (launchGate)
         {
-            if (clearFirst is { } previous)
-                await conductor.ClearAsync(previous, CourierClearSource.Replace).ConfigureAwait(false);
-            return await conductor.StartAsync(courierPlan, settings, runId).ConfigureAwait(false);
-        }, settled, run: runId);
-        return true;
+            Poll(force: true);
+            if (Conductor is not { } conductor || IsActive)
+                return false;
+            autoResume.Cancel("a new run replaces it");
+            Launch(async () =>
+            {
+                if (clearFirst is { } previous)
+                    await conductor.ClearAsync(previous, CourierClearSource.Replace).ConfigureAwait(false);
+                return await conductor.StartAsync(courierPlan, settings, runId).ConfigureAwait(false);
+            }, settled, run: runId, watch: true);
+            return true;
+        }
     }
 
     private string? CarrierName() => state.ReadConfiguration(document => document.Courier.Carrier?.CharacterName);
@@ -896,8 +937,11 @@ public sealed class CourierSession
     /// <summary>Why the last Resume could not start, in plain words: a quiet note beside Resume, not an error.</summary>
     internal string? ResumeNote { get; private set; }
 
-    private void Launch(Func<Task<CourierSnapshot?>> start, Action<CourierSnapshot?, Exception?>? settled = null, bool quiet = false, Guid? run = null)
+    private void Launch(Func<Task<CourierSnapshot?>> start, Action<CourierSnapshot?, Exception?>? settled = null, bool quiet = false, Guid? run = null,
+        bool watch = false)
     {
+        if (watch)
+            autoResume.Watch();
         // Set before the launch task exists, so StartingRun never pairs a new launch with the previous run's id.
         startingRun = run is { } id && id != Guid.Empty ? id : null;
         Error = null;
@@ -940,6 +984,8 @@ public sealed class CourierSession
     {
         if (Conductor is not { } conductor)
             return;
+        // An escape hatch: it never waits on, and is never undone by, an automatic resume.
+        autoResume.Cancel("Stop");
         var carrier = CarrierName();
         _ = Task.Run(async () =>
         {

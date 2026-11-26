@@ -217,6 +217,8 @@ public sealed record CourierSettings
     public bool CarrierOptIn { get; init; }
     public bool ReturnOwner { get; init; } = true;
     public bool ReturnCarrier { get; init; } = true;
+    /// <summary>A halted run the resume checks would accept is resumed automatically, a bounded number of times.</summary>
+    public bool AutoResume { get; init; } = true;
     public ImmutableDictionary<ulong, MeetingBell> Bells { get; init; } = ImmutableDictionary<ulong, MeetingBell>.Empty;
 }
 public sealed record BagStock(uint ItemId, bool Hq, int Units);

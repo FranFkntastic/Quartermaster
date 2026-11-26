@@ -98,6 +98,13 @@ public sealed class CourierJournal
     public CourierOutsideSettlement? OutsideSettlement { get; set; }
     public List<CourierPlacedOutside> PlacedOutside { get; set; } = [];
 }
+/// <summary>Who asked a courier run to stop (<see cref="CourierConductor.StopCause"/>).</summary>
+public static class CourierStopCause
+{
+    public const string User = "user";
+    public const string Carrier = "carrier";
+    public const string LinkLost = "link-lost";
+}
 /// <summary>Who cleared a courier run, as recorded on its archived journal (<see cref="CourierJournal.ClearedBy"/>).</summary>
 public static class CourierClearSource
 {
@@ -160,7 +167,14 @@ public sealed class CourierConductor
     /// Clears a previous stop before a launch is scheduled, so a Stop arriving while the launch is still
     /// archiving or starting is honored instead of reset by <see cref="StartAsync"/>.
     /// </summary>
-    internal void PrepareLaunch() { if (IsBusy) return; stop = false; launchPrepared = true; }
+    internal void PrepareLaunch() { if (IsBusy) return; stop = false; StopCause = null; launchPrepared = true; }
+    /// <summary>
+    /// Who asked the last run to stop, for the automatic resume only (it never changes how the run settles):
+    /// <see cref="CourierStopCause.User"/> (Stop on this client: the pane, the courier IPC, a delivered-stow forward),
+    /// <see cref="CourierStopCause.Carrier"/> (the carrier asked) or <see cref="CourierStopCause.LinkLost"/>. Null when nothing asked.
+    /// </summary>
+    internal string? StopCause { get; private set; }
+    private void Stopped(string cause) { StopCause ??= cause; stop = true; }
     private Action? releaseOwner;
     internal void Unload(){unloaded=stop=true;}
     internal void DrainUnload()
@@ -500,7 +514,7 @@ public sealed class CourierConductor
     }
     public async Task StopAsync()
     {
-        stop = true;
+        Stopped(CourierStopCause.User);
         try { await calls.Call("OwnerCancelPreLock",10,trade.CancelPreLockAsync); }
         finally {var r=store.Load();if(r.State=="Running" && !Carrierless(r))await StopCarrierAsync(r);}
     }
@@ -563,8 +577,8 @@ public sealed class CourierConductor
             try { await calls.Call("OwnerCancelPreLock", 10, trade.CancelPreLockAsync); }
             catch (Exception e) { warning($"Cancel pre-lock: {e.Message}"); }
         }
-        void Lost() { stop = true; warning($"CourierLinkLost: {r.Run}"); _ = CancelLocal(); }
-        void RemoteStop(Guid run) { if (run == r.Run) { stop = true; _ = CancelLocal(); } }
+        void Lost() { Stopped(CourierStopCause.LinkLost); warning($"CourierLinkLost: {r.Run}"); _ = CancelLocal(); }
+        void RemoteStop(Guid run) { if (run == r.Run) { Stopped(CourierStopCause.Carrier); _ = CancelLocal(); } }
         void Progress(CourierProgress p) { if (p.Run == r.Run) peerPhase = p.Phase; }
         bool beginAttempted = false, existingRun=false, carrierless=false, finishLanded=false;
         // A carrier-sourced run that cannot claim what it must deliver ends Refused: nothing held, not resumable.
@@ -605,7 +619,7 @@ public sealed class CourierConductor
         try
         {
             // A prepared launch already cleared stop; any Stop since then stands.
-            if (!launchPrepared) stop = false;
+            if (!launchPrepared) { stop = false; StopCause = null; }
             launchPrepared = false;
             if(unloaded)throw new OperationCanceledException("Courier unloaded.");
             var resume = existingRun = r.State is not ("Idle" or "Completed" or "Refused");

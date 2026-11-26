@@ -62,6 +62,12 @@ internal sealed class CourierSettingsSection
             reviewRegistry.RegisterLastItem("quartermaster.courier.return-carrier", "Carrier returns home",
                 AgentBridgeUiControlKind.Toggle, true, settings.ReturnCarrier, settings.ReturnCarrier ? "on" : "off",
                 () => courier.UpdateSettings(current => current with { ReturnCarrier = !current.ReturnCarrier }));
+            var autoResume = settings.AutoResume;
+            if (ImGui.Checkbox("Retry halted courier runs automatically", ref autoResume))
+                courier.UpdateSettings(current => current with { AutoResume = autoResume });
+            reviewRegistry.RegisterLastItem("quartermaster.courier.auto-resume", "Retry halted courier runs automatically",
+                AgentBridgeUiControlKind.Toggle, true, settings.AutoResume, settings.AutoResume ? "on" : "off",
+                () => courier.UpdateSettings(current => current with { AutoResume = !current.AutoResume }));
         }
         DrawBells(runtime, settings);
     }

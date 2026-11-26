@@ -233,7 +233,12 @@ internal sealed class DeliveredStowCourier : IDeliveredStowCourier
         // Still launching: StartPlan returned and bound the run, but the background start has not written its journal.
         var launching = !current && startingThis && !settled.ContainsKey(run) && launched.Values.Any(launch => launch.Run == run);
         if (!current && !launching)
+        {
+            // A halted run this forward was told to stop is never resumed automatically afterwards.
+            if (journal.Run == run)
+                session.CancelAutoResume("delivered-stow forward stopped");
             return false;
+        }
         session.Stop();
         return true;
     }

@@ -377,6 +377,12 @@ public sealed class Plugin : IDalamudPlugin
         courierTrade.RestoreLeftoverSuppression();
         bool AutoRetainerLoaded()=>pluginInterface.InstalledPlugins.Any(p=>p.IsLoaded && p.InternalName=="AutoRetainer");
         courier.Warn = s => log.Warning(s);
+        courier.Inform = s => log.Information(s);
+        // An automatic resume waits (without spending an attempt) while the client is logged out, loading or switching.
+        courier.OwnerReady = () => clientState.IsLoggedIn && playerState.IsLoaded && playerState.ContentId != 0 &&
+            !condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.BetweenAreas] &&
+            !condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.BetweenAreas51] &&
+            !condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.LoggingOut];
         courier.WorldRegion = worldId => dataManager.GetExcelSheet<Lumina.Excel.Sheets.World>()?.GetRowOrDefault(worldId)?.DataCenter.ValueNullable?.Region.RowId ?? 0;
         // Sibling XIVLauncher profiles' caches: read-only stock browser visibility, never courier stock.
         courier.LocalOwners = playerInventory.Owners;
@@ -568,6 +574,7 @@ public sealed class Plugin : IDalamudPlugin
             state.Mutate(s=>s.Courier=s.Courier with {LocalRoster=[..s.Courier.LocalRoster.Where(o=>o.LocalContentId!=actor),seen]});
         courierPeer.Tick(actor!=courierActor);
         courierActor=actor;
+        courier.TickAutoResume();
         using var timing = updateTimings.Start("owner and migrations");
         var liveOwner = CurrentOwner();
         StowagePlanMigration.EnsureOwnerPlan(state, liveOwner);
@@ -1056,6 +1063,7 @@ public sealed class Plugin : IDalamudPlugin
         // are lifted by the courier trade once the courier has drained. A step that throws never skips the restores.
         DisposalSteps.DisposeAll(
             (name, exception) => pluginLog.Warning($"[Quartermaster] UnloadStepFailed: {name}: {exception.GetType().Name}: {exception.Message}"),
+            ("courier auto-resume", courier.DisposeAutoResume),
             ("courier conductor unload", () => courier.Conductor?.Unload()),
             ("courier peer link", courierPeer.Dispose),
             ("courier game", courierGame.Dispose),
