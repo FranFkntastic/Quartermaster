@@ -366,14 +366,18 @@ internal sealed partial class TransferPlanWorkspace
         var text = moving
             ? CourierSession.RouteSummary(runtime, allocation)
             : string.Join(" · ", allocation.Places.Select(spot =>
-                $"{CourierSession.Side(runtime, spot.Character, spot.Retainer)} {PlaceBoundsShort(spot)}"));
+            {
+                var side = CourierSession.Side(runtime, spot.Character, spot.Retainer);
+                var bounds = PlaceBoundsShort(spot);
+                return bounds.Length == 0 ? side : $"{side} {bounds}";
+            }));
         courierSummaries[row.Rule.Id] = (allocation, moving, text);
         return text;
     }
 
     private static string PlaceBoundsShort(CourierSpot spot) => (spot.Min, spot.Max) switch
     {
-        (null, null) => "Pool",
+        (null, null) => string.Empty,
         ({ } low, { } high) when low == high => $"={low:N0}",
         ({ } low, { } high) => $"{low:N0}–{high:N0}",
         ({ } low, null) => $"{low:N0}+",
@@ -600,7 +604,11 @@ internal sealed partial class TransferPlanWorkspace
         if (spot is { Min: 0, Max: 0 })
             return new(CourierCellKind.Drain, place, spot.Has, "Drain", hasText, null, deltaText, deltaColor);
         if (spot.IsPool)
-            return new(CourierCellKind.Pool, place, spot.Has, "Pool", hasText, null, deltaText, deltaColor);
+        {
+            var topHas = spot.Has is { } units ? CompactNumber(units) : "—";
+            var deltaOnly = delta > 0 ? $"+{CompactNumber(delta)}" : delta < 0 ? $"−{CompactNumber(-delta)}" : string.Empty;
+            return new(CourierCellKind.Pool, place, spot.Has, topHas, deltaOnly, deltaColor);
+        }
         var full = CourierBoundsText.Format(spot.Min, spot.Max)
             .Replace("<=", "≤", StringComparison.Ordinal)
             .Replace("-", "–", StringComparison.Ordinal);
@@ -1178,7 +1186,7 @@ internal sealed partial class TransferPlanWorkspace
                 Chip(cell.Top, QuartermasterPalette.Info with { W = .18f }, QuartermasterPalette.Info with { W = .6f }, QuartermasterPalette.Info);
                 break;
             case CourierCellKind.Pool:
-                Chip(cell.Top, Vector4.Zero, QuartermasterPalette.Info with { W = .45f }, QuartermasterPalette.Info with { W = .85f });
+                Chip(cell.Top, Vector4.Zero, QuartermasterPalette.Info with { W = .50f }, ImGui.GetStyle().Colors[(int)ImGuiCol.Text]);
                 break;
         }
         if (cell.Delta.Length > 0)
@@ -1241,8 +1249,8 @@ internal sealed partial class TransferPlanWorkspace
         }
         var holds = cell.Held?.ToString("N0") ?? "—";
         return cell.Kind == CourierCellKind.Suggested
-            ? $"{column.Label} · Suggested · Holds {holds} · {FreeSlotsText(column)}\nClick to add as Pool · Right-click to set bounds"
-            : $"{column.Label} · Holds {holds} · {FreeSlotsText(column)}\nClick to add as Pool · Right-click to set bounds";
+            ? $"{column.Label} · Suggested · Holds {holds} · {FreeSlotsText(column)}\nClick to include · Right-click to set target"
+            : $"{column.Label} · Holds {holds} · {FreeSlotsText(column)}\nClick to include · Right-click to set target";
     }
 
     private void RegisterMatrixCell(TransferWorkbenchRow row, CourierColumn column, CourierSpot? spot)
@@ -1361,7 +1369,7 @@ internal sealed partial class TransferPlanWorkspace
                 ImGui.PushStyleVar(ImGuiStyleVar.FrameBorderSize, 1f);
             }
             ImGui.SetNextItemWidth(170f * scale);
-            var entered = ImGui.InputTextWithHint("##courier-cell-input", "Pool", ref courierCellText, 32,
+            var entered = ImGui.InputTextWithHint("##courier-cell-input", "No target", ref courierCellText, 32,
                 ImGuiInputTextFlags.AutoSelectAll | ImGuiInputTextFlags.EnterReturnsTrue);
             if (courierCellInvalid)
             {
@@ -1396,9 +1404,9 @@ internal sealed partial class TransferPlanWorkspace
             reviewRegistry.RegisterLastButton($"{ids}.drain", $"Drain {label}", true,
                 () => { MutateCourierLine(row, line => UpsertPlace(line, character, retainer, 0, 0)); courierCellEdit = null; });
             ImGui.SameLine();
-            if (ImGui.Button("Pool##courier-cell"))
+            if (ImGui.Button("No target##courier-cell"))
                 Commit(null, null);
-            reviewRegistry.RegisterLastButton($"{ids}.pool", $"Make {label} a pool", true,
+            reviewRegistry.RegisterLastButton($"{ids}.pool", $"Include {label} with no target", true,
                 () => { MutateCourierLine(row, line => UpsertPlace(line, character, retainer, null, null)); courierCellEdit = null; });
             if (spot is not null)
             {
@@ -1502,7 +1510,7 @@ internal sealed partial class TransferPlanWorkspace
         var name = target?.Label ?? "the container";
         Button("Drain (0)##RQCourierBulk", "drain", $"Drain {name} on the selected lines",
             (line, character, retainer) => UpsertPlace(line, character, retainer, 0, 0));
-        Button("Pool##RQCourierBulk", "pool", $"Make {name} a pool on the selected lines",
+        Button("No target##RQCourierBulk", "pool", $"Include {name} with no target on the selected lines",
             (line, character, retainer) => UpsertPlace(line, character, retainer, null, null));
 
         var boundsWidth = 80f * scale;

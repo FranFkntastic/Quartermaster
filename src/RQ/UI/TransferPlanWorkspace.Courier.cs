@@ -636,7 +636,7 @@ internal sealed partial class TransferPlanWorkspace
         draw.AddText(new Vector2(text.X + nameSize.X + inner, text.Y), ImGui.GetColorU32(ImGuiCol.Text), count);
         void Add() => MutateCourierLine(row, line => line.WithPlace(holder.Character, holder.Retainer));
         if (hovered)
-            ImGui.SetTooltip($"Add {PlaceLabel(runtime, holder)} ({(holder.Has ?? 0):N0}) as Pool");
+            ImGui.SetTooltip($"Include {PlaceLabel(runtime, holder)} ({(holder.Has ?? 0):N0})");
         reviewRegistry.RegisterLastButton(
             $"quartermaster.courier.holder.add.{key}",
             $"Add {PlaceLabel(runtime, holder)}, which holds {(holder.Has ?? 0):N0}, to {rule.ItemName} as a pool",
@@ -891,7 +891,7 @@ internal static class FreeSlotsBar
 /// </summary>
 internal static class CourierBoundsText
 {
-    internal const string Syntax = "blank: pool, N: exact, A-B: range, N+: min, <=N: max";
+    internal const string Syntax = "blank: no target, N: exact, A-B: range, N+: min, <=N: max";
 
     private static readonly Regex Exact = new(@"^=?(\d+)$", RegexOptions.CultureInvariant);
     private static readonly Regex Range = new(@"^(\d+)(?:-|\.\.)(\d+)$", RegexOptions.CultureInvariant);
@@ -909,7 +909,7 @@ internal static class CourierBoundsText
 
     internal static string Describe(int? min, int? max) => (min, max) switch
     {
-        (null, null) => "Pool",
+        (null, null) => "No target",
         (0, 0) => "Drains",
         ({ } low, { } high) when low == high => $"Maintains {Number(low)}",
         ({ } low, { } high) => $"Maintains {Number(low)}–{Number(high)}",
