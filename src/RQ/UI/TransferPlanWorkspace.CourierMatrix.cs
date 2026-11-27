@@ -37,7 +37,6 @@ internal sealed partial class TransferPlanWorkspace
         string ColumnId,
         string CellId,
         int? Free,
-        string FreeText,
         bool IsOwner,
         float LabelWidth)
     {
@@ -50,7 +49,8 @@ internal sealed partial class TransferPlanWorkspace
 
     /// <summary>
     /// A matrix cell as drawn: the listed place (an index into the allocation's places, -1 when unlisted),
-    /// what the container holds (null when never observed), and the text it shows.
+    /// what the container holds (null when never observed), and the text it shows. A listed cell's bottom
+    /// line is what it has, then its move beside it when something moves.
     /// </summary>
     private readonly record struct CourierCellView(
         CourierCellKind Kind,
@@ -58,12 +58,18 @@ internal sealed partial class TransferPlanWorkspace
         int? Held,
         string Top,
         string Bottom,
-        Vector4? BottomColor);
+        Vector4? BottomColor,
+        string Delta = "",
+        Vector4? DeltaColor = null);
 
     private static readonly Vector4 BandDividerColor = new(.32f, .32f, .32f, 1f);
     private static readonly Vector4 MatrixHoverColor = new(.14f, .19f, .23f, 1f);
     private const float MatrixHeaderAngle = 48f * MathF.PI / 180f;
     private const string CourierCellPopup = "##courier-cell-bounds";
+    private const string CourierMatrixPickerPopup = "##courier-matrix-picker";
+
+    /// <summary>Frozen columns before the first container: Item (with its moves under it) and the line's actions.</summary>
+    private const int MatrixLead = 2;
 
     private static readonly AgentBridgeActionArgumentSchema CellArguments = new(
     [
@@ -104,6 +110,9 @@ internal sealed partial class TransferPlanWorkspace
     private CourierColumn[] courierReachableColumns = [];
     private CourierColumn[] courierBulkChoices = [];
     private AgentBridgeActionArgumentSchema courierBulkSchema = new([]);
+    private readonly HashSet<(ulong? Character, ulong? Retainer)> courierReachableKeys = [];
+    /// <summary>Whether some reachable container is not shown as a column yet: the matrix's + header adds one.</summary>
+    private bool courierHiddenReachable;
 
     private CourierColumn[]? courierCellsColumns;
     private float courierCellsWidth;
@@ -112,6 +121,13 @@ internal sealed partial class TransferPlanWorkspace
     private readonly Dictionary<Guid, (CourierAllocation Allocation, bool Moving, string Text)> courierSummaries = [];
     private readonly Dictionary<Guid, (string Full, float Width, string Shown)> courierElided = [];
     private readonly Dictionary<Guid, (string Full, float Width, string Shown)> courierMatrixNames = [];
+    private readonly Dictionary<Guid, (TransferWorkbenchRow Row, string Text, Vector4? Color, string? Detail)> courierMatrixVerdicts = [];
+    private readonly Dictionary<Guid, (string Full, float Width, string Shown)> courierMatrixVerdictShown = [];
+
+    /// <summary>The matrix's container picker: for one line (its id) or, when null, for a new column.</summary>
+    private Guid? courierPickerRule;
+    private bool courierPickerOpenRequested;
+    private Vector2 courierPickerAnchor;
 
     /// <summary>The cell whose bounds popover is open: its line and container.</summary>
     private (Guid RuleId, OwnerScope Character, ulong? Retainer)? courierCellEdit;
@@ -135,6 +151,10 @@ internal sealed partial class TransferPlanWorkspace
         courierSummaries.Clear();
         courierElided.Clear();
         courierMatrixNames.Clear();
+        courierMatrixVerdicts.Clear();
+        courierMatrixVerdictShown.Clear();
+        courierPickerRule = null;
+        courierPickerOpenRequested = false;
     }
 
     // ---- View toggle ---------------------------------------------------------------------
@@ -198,7 +218,7 @@ internal sealed partial class TransferPlanWorkspace
     /// The strip under the summary: filter pills, then the view's own controls (containers shown in
     /// the matrix, expand or collapse every visible line in the list).
     /// </summary>
-    private void DrawCourierControls(QuartermasterRuntimeSnapshot runtime, TransferWorkbenchProjection projection)
+    private void DrawCourierControls(TransferWorkbenchProjection projection)
     {
         var rows = CourierVisibleRows(projection);
         var (all, moving, attention) = courierCounts;
@@ -206,6 +226,7 @@ internal sealed partial class TransferPlanWorkspace
         DrawFilterPill(CourierFilter.All, $"All · {all:N0}", all, null, first: true);
         DrawFilterPill(CourierFilter.Moving, $"Moving · {moving:N0}", moving, TransferPresentation.SendColor);
         DrawFilterPill(CourierFilter.Attention, $"Attention · {attention:N0}", attention, AmberColor);
+        DrawCourierSelectAll(rows);
 
         if (workbench.CourierMatrixView)
         {
@@ -219,8 +240,6 @@ internal sealed partial class TransferPlanWorkspace
                 true,
                 () => courierAllContainers = !courierAllContainers,
                 courierAllContainers ? "All containers" : "Used containers");
-            if (!courierAllContainers)
-                DrawAddColumn(runtime);
             return;
         }
 
@@ -283,23 +302,53 @@ internal sealed partial class TransferPlanWorkspace
             $"{count:N0}");
     }
 
-    /// <summary>Shows one more container as a column without listing it on any line.</summary>
-    private void DrawAddColumn(QuartermasterRuntimeSnapshot runtime)
+    /// <summary>
+    /// Selects every visible line for the bulk bar, or clears the selection once they all are. Offered
+    /// while there are lines to select together or a selection to clear.
+    /// </summary>
+    private void DrawCourierSelectAll(IReadOnlyList<TransferWorkbenchRow> rows)
     {
-        const string label = "+ Container…##RQCourierAddColumn";
-        const string popup = "RQCourierAddColumn";
+        if (rows.Count < 2 && selection.Count == 0)
+            return;
+        var all = rows.Count > 0;
+        foreach (var row in rows)
+            if (!selection.IsSelected(row.Rule.Id)) { all = false; break; }
+        // The bulk bar already carries Clear when two or more lines are selected; don't stack a second one under it.
+        if (all && selection.Count >= 2)
+            return;
+        var label = all ? "Clear selection##RQCourierSelectAll" : "Select all##RQCourierSelectAll";
         DalamudUiLayout.SameLineIfFits(label);
         if (ImGui.SmallButton(label))
-            ImGui.OpenPopup(popup);
-        if (!DalamudOwnedPopup.BeginOpaquePopup(popup))
-            return;
-        DrawContainerMenus(runtime, courier.DestinationCharacters(runtime), (character, retainer) =>
+            ToggleSelectAll(rows, all);
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.courier.selection.toggle-all",
+            all ? "Clear the line selection" : "Select every visible courier line for bulk edits",
+            true,
+            () =>
             {
-                courierPinnedColumns[(character.LocalContentId, retainer)] = character with { };
-                courierPinnedVersion++;
+                var current = courierFilteredRows;
+                ToggleSelectAll(current, current.Count > 0 && current.All(row => selection.IsSelected(row.Rule.Id)));
             },
-            null, null, "quartermaster.courier.matrix.add-column", "Show");
-        ImGui.EndPopup();
+            all ? "All selected" : $"{selection.Count:N0} selected");
+
+        void ToggleSelectAll(IReadOnlyList<TransferWorkbenchRow> visible, bool clear)
+        {
+            if (clear)
+            {
+                selection.Clear();
+                return;
+            }
+            foreach (var row in visible)
+                selection.SetSelected(row.Rule.Id, true);
+        }
+    }
+
+    private void PinCourierColumn(OwnerScope character, ulong? retainer)
+    {
+        if (character.LocalContentId is null)
+            return;
+        courierPinnedColumns[(character.LocalContentId, retainer)] = character with { };
+        courierPinnedVersion++;
     }
 
     // ---- Compact-list summaries ----------------------------------------------------------
@@ -347,8 +396,8 @@ internal sealed partial class TransferPlanWorkspace
     // ---- Columns -------------------------------------------------------------------------
 
     /// <summary>
-    /// The matrix's columns: every container a line lists or is offered (its suggested place), plus any
-    /// shown by hand; every reachable container when asked, or when the plan uses none yet. The owner's
+    /// The matrix's columns: every container a line lists, is offered (its suggested place) or that
+    /// already holds a line's item and is reachable, plus any shown by hand; every reachable container when asked, or when the plan uses none yet. The owner's
     /// containers come first, then other characters by name; each character's bags, then its retainers in
     /// game order. Rebuilt only when the projection or the shown set changes.
     /// </summary>
@@ -371,6 +420,13 @@ internal sealed partial class TransferPlanWorkspace
             if (character.LocalContentId is not null)
                 into.TryAdd((character.LocalContentId, retainer), (character, retainer));
         }
+        var reachable = new Dictionary<(ulong?, ulong?), (OwnerScope, ulong?)>();
+        foreach (var character in courier.DestinationCharacters(runtime))
+        {
+            Use(reachable, character, null);
+            foreach (var retainer in CourierSession.Retainers(runtime, character))
+                Use(reachable, character, retainer.RetainerId);
+        }
         foreach (var row in projection.Rows)
         {
             if (row.Distribution is not { } allocation)
@@ -379,13 +435,10 @@ internal sealed partial class TransferPlanWorkspace
                 Use(used, spot.Character, spot.Retainer);
             if (allocation.Suggestion is { } suggestion)
                 Use(used, suggestion.Character, suggestion.Retainer);
-        }
-        var reachable = new Dictionary<(ulong?, ulong?), (OwnerScope, ulong?)>();
-        foreach (var character in courier.DestinationCharacters(runtime))
-        {
-            Use(reachable, character, null);
-            foreach (var retainer in CourierSession.Retainers(runtime, character))
-                Use(reachable, character, retainer.RetainerId);
+            // A reachable container already holding the item shows its count, one click from listing it.
+            foreach (var holder in allocation.Holders)
+                if (reachable.ContainsKey((holder.Character.LocalContentId, holder.Retainer)))
+                    Use(used, holder.Character, holder.Retainer);
         }
 
         courierPlanColumns = Order(runtime, used, free);
@@ -397,6 +450,10 @@ internal sealed partial class TransferPlanWorkspace
             foreach (var (key, value) in reachable)
                 shown.TryAdd(key, value);
         courierShownColumns = Order(runtime, shown, free);
+        courierReachableKeys.Clear();
+        foreach (var key in reachable.Keys)
+            courierReachableKeys.Add(key);
+        courierHiddenReachable = reachable.Keys.Any(key => !shown.ContainsKey(key));
         courierBulkChoices = courierPlanColumns.Concat(courierReachableColumns).DistinctBy(column => column.Key).ToArray();
         courierBulkSchema = new AgentBridgeActionArgumentSchema(
             [new("container", AgentBridgeActionArgumentKind.Enum, AllowedValues: courierBulkChoices.Select(column => column.Label).Distinct().ToArray())]);
@@ -433,7 +490,7 @@ internal sealed partial class TransferPlanWorkspace
                 var slug = $"{who.LocalContentId?.ToString(CultureInfo.InvariantCulture) ?? "unknown"}.{retainer?.ToString(CultureInfo.InvariantCulture) ?? "bags"}";
                 int? slots = free.TryGetValue((who.LocalContentId, retainer), out var value) ? value : null;
                 columns.Add(new CourierColumn(who, retainer, characterLabel, containerLabel, $"{characterLabel} · {containerLabel}",
-                    slug, $"##c-{slug}", $"##cell-{slug}", slots, slots?.ToString("N0") ?? "—", who.LocalContentId == ownerId,
+                    slug, $"##c-{slug}", $"##cell-{slug}", slots, who.LocalContentId == ownerId,
                     ImGui.CalcTextSize(containerLabel).X) { Band = band, BandStart = start });
             }
             for (var index = start; index < columns.Count; index++)
@@ -530,24 +587,57 @@ internal sealed partial class TransferPlanWorkspace
             : new(CourierCellKind.Blank, -1, held, string.Empty, string.Empty, null);
     }
 
+    /// <summary>
+    /// A listed cell: its target as a chip (drained, bounds, or pool), then what it has, with its move
+    /// beside it when something moves. Never-observed stock reads as a dash.
+    /// </summary>
     private static CourierCellView ListedCell(CourierSpot spot, int place, float cellWidth)
     {
         var delta = spot.Delta;
-        var deltaText = delta > 0 ? $"+{CompactNumber(delta)}" : delta < 0 ? $"−{CompactNumber(-delta)}" : string.Empty;
+        var room = cellWidth - (8f * ImGuiHelpers.GlobalScale);
+        var (hasText, deltaText) = CellBottom(spot.Has, delta, room);
         Vector4? deltaColor = delta > 0 ? QuartermasterPalette.Green : delta < 0 ? QuartermasterPalette.Amber : null;
         if (spot is { Min: 0, Max: 0 })
-            return new(CourierCellKind.Drain, place, spot.Has, "0", delta < 0 ? deltaText : string.Empty, deltaColor);
-        if (!spot.IsPool)
+            return new(CourierCellKind.Drain, place, spot.Has, "Drain", hasText, null, deltaText, deltaColor);
+        if (spot.IsPool)
+            return new(CourierCellKind.Pool, place, spot.Has, "Pool", hasText, null, deltaText, deltaColor);
+        var full = CourierBoundsText.Format(spot.Min, spot.Max)
+            .Replace("<=", "≤", StringComparison.Ordinal)
+            .Replace("-", "–", StringComparison.Ordinal);
+        var text = ImGui.CalcTextSize(full).X * .85f <= room ? full : CompactBounds(spot.Min, spot.Max);
+        return new(CourierCellKind.Bounded, place, spot.Has, text, hasText, null, deltaText, deltaColor);
+    }
+
+    /// <summary>Gap between a cell's held count and its move on the bottom line.</summary>
+    private static float CellPairGap => 4f * ImGuiHelpers.GlobalScale;
+
+    /// <summary>
+    /// A listed cell's bottom line, held count then signed move: compact numbers, tightened further when
+    /// both together would not fit the cell at the small font. The tooltip keeps the exact numbers.
+    /// </summary>
+    private static (string Has, string Delta) CellBottom(int? has, int delta, float room)
+    {
+        static string Signed(int value, Func<int, string> number) =>
+            value > 0 ? $"+{number(value)}" : value < 0 ? $"−{number(-value)}" : string.Empty;
+        static float Width(string text) => ImGui.CalcTextSize(text).X * .85f;
+        var hasText = has is { } units ? CompactNumber(units) : "—";
+        var deltaText = Signed(delta, CompactNumber);
+        if (deltaText.Length == 0 || Width(hasText) + CellPairGap + Width(deltaText) <= room)
+            return (hasText, deltaText);
+        return (has is { } tight ? TightNumber(tight) : "—", Signed(delta, TightNumber));
+    }
+
+    /// <summary>"999", "4.7k", "44k", "438k", "1.2M": two to four characters for a crowded cell.</summary>
+    private static string TightNumber(int value)
+    {
+        var culture = CultureInfo.InvariantCulture;
+        return value switch
         {
-            var full = CourierBoundsText.Format(spot.Min, spot.Max)
-                .Replace("<=", "≤", StringComparison.Ordinal)
-                .Replace("-", "–", StringComparison.Ordinal);
-            var room = cellWidth - (8f * ImGuiHelpers.GlobalScale);
-            var text = ImGui.CalcTextSize(full).X * .85f <= room ? full : CompactBounds(spot.Min, spot.Max);
-            return new(CourierCellKind.Bounded, place, spot.Has, text, deltaText, deltaColor);
-        }
-        var bottom = delta != 0 ? deltaText : spot.Has is { } has ? CompactNumber(has) : "—";
-        return new(CourierCellKind.Pool, place, spot.Has, "Pool", bottom, delta != 0 ? deltaColor : null);
+            < 1000 => value.ToString(culture),
+            < 9_950 => (value / 1000d).ToString("0.#", culture) + "k",
+            < 999_500 => (value / 1000d).ToString("0", culture) + "k",
+            _ => (value / 1_000_000d).ToString("0.#", culture) + "M",
+        };
     }
 
     /// <summary>"2,426" below ten thousand, else "43.9k", "120k", "1.2M".</summary>
@@ -592,8 +682,9 @@ internal sealed partial class TransferPlanWorkspace
     private readonly record struct MatrixLayout(float RowHeight, float Inner, float CellWidth, float LineHeight);
 
     /// <summary>
-    /// Items down, containers across under their character, with Item, Moves and the line menu frozen
-    /// on the left. Rows are virtualized; the add box sits under the table so adding never needs a scroll.
+    /// Items down, containers across under their character, with Item (its moves on a second line) and
+    /// the line's actions frozen on the left, and a + column after the containers to show another one.
+    /// Rows are virtualized; the add box sits under the table so adding never needs a scroll.
     /// </summary>
     private void DrawCourierMatrix(QuartermasterRuntimeSnapshot runtime, StowagePlan plan, TransferWorkbenchProjection projection)
     {
@@ -606,10 +697,10 @@ internal sealed partial class TransferPlanWorkspace
         var style = ImGui.GetStyle();
         var lineHeight = ImGui.GetTextLineHeight();
         var avail = ImGui.GetContentRegionAvail();
-        var itemWidth = Math.Clamp(avail.X * .24f, 155f * scale, 185f * scale);
-        var movesWidth = 78f * scale;
-        var menuWidth = Math.Max(22f * scale, DalamudUiLayout.ButtonWidth("…"));
-        var cellWidth = 60f * scale;
+        var itemWidth = Math.Clamp(avail.X * .30f, 175f * scale, 225f * scale);
+        var menuWidth = Math.Max(22f * scale, DalamudUiLayout.ButtonWidth("…")) + style.ItemSpacing.X + DalamudRowRemoveButton.Width;
+        var addWidth = Math.Max(24f * scale, DalamudUiLayout.ButtonWidth("+"));
+        var cellWidth = 78f * scale;
         var longest = 0f;
         foreach (var column in columns)
             longest = Math.Max(longest, column.LabelWidth);
@@ -622,21 +713,20 @@ internal sealed partial class TransferPlanWorkspace
         var height = Math.Max(120f * scale, avail.Y - reserve);
         var flags = ImGuiTableFlags.ScrollX | ImGuiTableFlags.ScrollY | ImGuiTableFlags.BordersInnerH |
                     ImGuiTableFlags.SizingFixedFit | ImGuiTableFlags.BordersOuter | ImGuiTableFlags.NoSavedSettings;
-        if (ImGui.BeginTable("##RQCourierMatrix", 3 + columns.Length + 1, flags, new Vector2(0f, height)))
+        if (ImGui.BeginTable("##RQCourierMatrix", MatrixLead + columns.Length + 2, flags, new Vector2(0f, height)))
         {
             try
             {
-                ImGui.TableSetupScrollFreeze(3, 3);
+                ImGui.TableSetupScrollFreeze(MatrixLead, 2);
                 ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthFixed, itemWidth);
-                ImGui.TableSetupColumn("Moves", ImGuiTableColumnFlags.WidthFixed, movesWidth);
-                ImGui.TableSetupColumn("##line-menu", ImGuiTableColumnFlags.WidthFixed, menuWidth);
+                ImGui.TableSetupColumn("##line-actions", ImGuiTableColumnFlags.WidthFixed, menuWidth);
                 foreach (var column in columns)
                     ImGui.TableSetupColumn(column.ColumnId, ImGuiTableColumnFlags.WidthFixed, cellWidth);
+                ImGui.TableSetupColumn("##add-column", ImGuiTableColumnFlags.WidthFixed, addWidth);
                 ImGui.TableSetupColumn("##spacer", ImGuiTableColumnFlags.WidthFixed, spacerWidth);
 
                 DrawMatrixBands(columns, lineHeight);
                 DrawMatrixNames(columns, headerHeight, lineHeight);
-                DrawMatrixFreeSlots(columns);
 
                 if (rows.Length == 0)
                 {
@@ -658,6 +748,7 @@ internal sealed partial class TransferPlanWorkspace
             }
         }
         DrawCourierCellPopover(runtime, projection);
+        DrawCourierMatrixPicker(runtime, projection);
         DrawAddInput(runtime, plan);
     }
 
@@ -666,7 +757,7 @@ internal sealed partial class TransferPlanWorkspace
     {
         var style = ImGui.GetStyle();
         ImGui.TableNextRow(ImGuiTableRowFlags.Headers, lineHeight + (style.CellPadding.Y * 2f));
-        ImGui.TableSetColumnIndex(2);
+        ImGui.TableSetColumnIndex(MatrixLead - 1);
         courierFrozenRight = ImGui.GetCursorScreenPos().X + ImGui.GetContentRegionAvail().X + style.CellPadding.X;
         var rowTop = ImGui.GetCursorScreenPos().Y - style.CellPadding.Y;
         var rowBottom = rowTop + lineHeight + (style.CellPadding.Y * 2f);
@@ -674,7 +765,7 @@ internal sealed partial class TransferPlanWorkspace
         var drawn = -1;
         for (var index = 0; index < columns.Length; index++)
         {
-            if (!ImGui.TableSetColumnIndex(3 + index))
+            if (!ImGui.TableSetColumnIndex(MatrixLead + index))
                 continue;
             var column = columns[index];
             var cell = ImGui.GetCursorScreenPos();
@@ -701,8 +792,9 @@ internal sealed partial class TransferPlanWorkspace
     }
 
     /// <summary>
-    /// Header row 2: Item and Moves (click to sort), then each container's name slanted over its
-    /// column. Clicking a container makes it the bulk bar's target.
+    /// Header row 2: Item and Moves (click to sort) over the item column, then each container's name
+    /// slanted over its column, then the + that shows another container. Clicking a container makes it
+    /// the bulk bar's target; hovering it tells its free slots.
     /// </summary>
     private void DrawMatrixNames(CourierColumn[] columns, float headerHeight, float lineHeight)
     {
@@ -717,8 +809,7 @@ internal sealed partial class TransferPlanWorkspace
             courierMatrixSort == CourierMatrixSort.ItemDescending,
             () => courierMatrixSort = courierMatrixSort == CourierMatrixSort.ItemAscending ? CourierMatrixSort.ItemDescending : CourierMatrixSort.ItemAscending,
             rightAligned: false);
-        ImGui.TableSetColumnIndex(1);
-        ImGui.SetCursorPosY(ImGui.GetCursorPosY() + labelOffset);
+        ImGui.SameLine();
         SortHeader("Moves", "moves", courierMatrixSort is CourierMatrixSort.MovesAscending or CourierMatrixSort.MovesDescending,
             courierMatrixSort == CourierMatrixSort.MovesDescending,
             () => courierMatrixSort = courierMatrixSort == CourierMatrixSort.MovesAscending ? CourierMatrixSort.MovesDescending : CourierMatrixSort.MovesAscending,
@@ -730,7 +821,7 @@ internal sealed partial class TransferPlanWorkspace
         var target = courierBulkContainer ?? (courierPlanColumns.Length > 0 ? courierPlanColumns[0].Key : null);
         for (var index = 0; index < columns.Length; index++)
         {
-            if (!ImGui.TableSetColumnIndex(3 + index))
+            if (!ImGui.TableSetColumnIndex(MatrixLead + index))
                 continue;
             var column = columns[index];
             var cell = ImGui.GetCursorScreenPos();
@@ -762,6 +853,39 @@ internal sealed partial class TransferPlanWorkspace
                 () => courierBulkContainer = target2,
                 column.Free is { } slots ? $"{slots:N0} free" : "Not observed");
         }
+
+        if (!ImGui.TableSetColumnIndex(MatrixLead + columns.Length))
+            return;
+        ImGui.SetCursorPosY(ImGui.GetCursorPosY() + labelOffset);
+        CenterSmallButton("+");
+        ImGui.BeginDisabled(!courierHiddenReachable);
+        var clicked = ImGui.SmallButton("+##matrix-add-column");
+        ImGui.EndDisabled();
+        if (clicked)
+            RequestCourierPicker(null, new Vector2(ImGui.GetItemRectMin().X, ImGui.GetItemRectMax().Y));
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(courierHiddenReachable ? "Add container column" : "Every reachable container is shown");
+        var anchor = new Vector2(ImGui.GetItemRectMin().X, ImGui.GetItemRectMax().Y);
+        reviewRegistry.RegisterLastButton(
+            "quartermaster.courier.matrix.add-column",
+            "Add container column: choose a container to show in the matrix",
+            courierHiddenReachable,
+            () => RequestCourierPicker(null, anchor),
+            courierHiddenReachable ? "Available" : "Every reachable container is shown");
+    }
+
+    /// <summary>Moves the cursor so a small button with <paramref name="label"/> sits centered in the cell.</summary>
+    private static void CenterSmallButton(string label)
+    {
+        var width = ImGui.CalcTextSize(label).X + (ImGui.GetStyle().FramePadding.X * 2f);
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + Math.Max(0f, (ImGui.GetContentRegionAvail().X - width) / 2f));
+    }
+
+    private void RequestCourierPicker(Guid? ruleId, Vector2 anchor)
+    {
+        courierPickerRule = ruleId;
+        courierPickerAnchor = anchor;
+        courierPickerOpenRequested = true;
     }
 
     private void SortHeader(string label, string id, bool active, bool descending, Action toggle, bool rightAligned)
@@ -792,28 +916,6 @@ internal sealed partial class TransferPlanWorkspace
             active ? descending ? "Descending" : "Ascending" : "Not sorted");
     }
 
-    /// <summary>Header row 3: each container's free slots; a dash when never observed.</summary>
-    private void DrawMatrixFreeSlots(CourierColumn[] columns)
-    {
-        var style = ImGui.GetStyle();
-        ImGui.TableNextRow(ImGuiTableRowFlags.Headers);
-        ImGui.TableSetColumnIndex(0);
-        var rowTop = ImGui.GetCursorScreenPos().Y - style.CellPadding.Y;
-        var rowBottom = rowTop + ImGui.GetTextLineHeight() + (style.CellPadding.Y * 2f);
-        DalamudUiLayout.DrawRightAligned("Free slots", QuartermasterPalette.Dim);
-        for (var index = 0; index < columns.Length; index++)
-        {
-            if (!ImGui.TableSetColumnIndex(3 + index))
-                continue;
-            var column = columns[index];
-            if (index > 0 && column.BandStart == index)
-                DrawBandDivider(ImGui.GetCursorScreenPos().X - style.CellPadding.X, rowTop, rowBottom);
-            var text = column.FreeText;
-            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + Math.Max(0f, (ImGui.GetContentRegionAvail().X - ImGui.CalcTextSize(text).X) / 2f));
-            ImGui.TextColored(column.Free is { } free && free < FreeSlotsBar.Tight ? FreeSlotsBar.Color(free) : QuartermasterPalette.Dim, text);
-        }
-    }
-
     private static void DrawBandDivider(float x, float top, float bottom) =>
         ImGui.GetWindowDrawList().AddLine(new Vector2(x, top), new Vector2(x, bottom), ImGui.GetColorU32(BandDividerColor), 2f * ImGuiHelpers.GlobalScale);
 
@@ -833,24 +935,22 @@ internal sealed partial class TransferPlanWorkspace
             DrawMatrixItem(row, index, keys, layout);
 
             ImGui.TableSetColumnIndex(1);
-            ImGui.SetCursorPosY(ImGui.GetCursorPosY() + Math.Max(0f, (layout.Inner - ImGui.GetFrameHeight()) / 2f));
-            DrawCourierMoves(row);
-
-            ImGui.TableSetColumnIndex(2);
             ImGui.SetCursorPosY(ImGui.GetCursorPosY() + Math.Max(0f, (layout.Inner - layout.LineHeight) / 2f));
-            DrawLineMenu(row, hoverRemove: false);
+            DrawLineMenu(row, alwaysShowRemove: true);
 
             if (row.Distribution is not { } allocation)
                 return;
             var cells = CourierCellsFor(row, allocation, columns, layout.CellWidth);
             for (var column = 0; column < columns.Length; column++)
             {
-                if (!ImGui.TableSetColumnIndex(3 + column))
+                if (!ImGui.TableSetColumnIndex(MatrixLead + column))
                     continue;
                 if (column > 0 && columns[column].BandStart == column)
                     DrawBandDivider(ImGui.GetCursorScreenPos().X - style.CellPadding.X, rowTop, rowBottom);
                 DrawMatrixCell(row, allocation, cells[column], columns[column], layout);
             }
+            if (ImGui.TableSetColumnIndex(MatrixLead + columns.Length))
+                DrawMatrixRowAdd(row, allocation, layout);
         }
         finally
         {
@@ -858,7 +958,84 @@ internal sealed partial class TransferPlanWorkspace
         }
     }
 
-    /// <summary>The item cell: the row's selection target, with name, quality and marks drawn over it.</summary>
+    /// <summary>A row's + cell: picks a container to list on this line, its column shown with it.</summary>
+    private void DrawMatrixRowAdd(TransferWorkbenchRow row, CourierAllocation allocation, MatrixLayout layout)
+    {
+        var rule = row.Rule;
+        var listed = 0;
+        foreach (var spot in allocation.Places)
+            if (courierReachableKeys.Contains((spot.Character.LocalContentId, spot.Retainer)))
+                listed++;
+        var open = listed < courierReachableKeys.Count;
+        ImGui.SetCursorPosY(ImGui.GetCursorPosY() + Math.Max(0f, (layout.Inner - layout.LineHeight) / 2f));
+        CenterSmallButton("+");
+        ImGui.PushStyleColor(ImGuiCol.Text, QuartermasterPalette.Dim);
+        ImGui.PushStyleColor(ImGuiCol.Button, Vector4.Zero);
+        ImGui.BeginDisabled(!open);
+        var clicked = ImGui.SmallButton("+##matrix-row-add");
+        ImGui.EndDisabled();
+        ImGui.PopStyleColor(2);
+        var anchor = new Vector2(ImGui.GetItemRectMin().X, ImGui.GetItemRectMax().Y);
+        var ruleId = rule.Id;
+        if (clicked)
+            RequestCourierPicker(ruleId, anchor);
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(open ? $"Add container to {rule.ItemName}" : $"Every reachable container is listed on {rule.ItemName}");
+        reviewRegistry.RegisterLastButton(
+            $"quartermaster.courier.matrix.row-add.{ruleId:N}",
+            $"Add container to {rule.ItemName}: choose a container to list on this line as a pool",
+            open,
+            () => RequestCourierPicker(ruleId, anchor),
+            open ? "Available" : "Every reachable container is listed");
+    }
+
+    /// <summary>
+    /// The matrix's container picker, opened and drawn outside the table so its ID always matches. For a
+    /// line it offers the containers not listed yet with their units of the item, and the pick joins the
+    /// line as a pool; for a new column it offers the containers not shown yet, and the pick is shown.
+    /// </summary>
+    private void DrawCourierMatrixPicker(QuartermasterRuntimeSnapshot runtime, TransferWorkbenchProjection projection)
+    {
+        if (courierPickerOpenRequested)
+        {
+            courierPickerOpenRequested = false;
+            pickerCharacter = null;
+            pickerContainer = default;
+            pickerClose = false;
+            ImGui.OpenPopup(CourierMatrixPickerPopup);
+        }
+        if (!ImGui.IsPopupOpen(CourierMatrixPickerPopup))
+            return;
+        ImGui.SetNextWindowPos(courierPickerAnchor, ImGuiCond.Appearing);
+        const string ids = "quartermaster.courier.matrix.picker";
+        if (courierPickerRule is { } ruleId)
+        {
+            var row = projection.Rows.FirstOrDefault(candidate => candidate.Rule.Id == ruleId);
+            var choices = row?.Distribution is { } allocation ? PlaceChoices(row, allocation) : [];
+            DrawContainerPicker(CourierMatrixPickerPopup, ids, choices, showHas: true,
+                (character, retainer) =>
+                {
+                    if (row is not null && MutateCourierLine(row, line => line.WithPlace(character, retainer)))
+                        PinCourierColumn(character, retainer);
+                },
+                (character, name) => $"Add {character.CharacterName} · {name} to {row?.Rule.ItemName}");
+            return;
+        }
+        var shown = new HashSet<(ulong?, ulong?)>(courierShownColumns.Select(column => column.Key));
+        var hidden = courier.DestinationCharacters(runtime)
+            .Select(character => (Character: character, Containers: courier.Containers(runtime, character, 0, ItemQualityPolicy.Any)
+                .Where(container => !shown.Contains((character.LocalContentId, container.Retainer)))
+                .ToArray()))
+            .Where(choice => choice.Containers.Length > 0)
+            .ToArray();
+        DrawContainerPicker(CourierMatrixPickerPopup, ids, hidden, showHas: false, PinCourierColumn,
+            (character, name) => $"Show {character.CharacterName} · {name} as a matrix column");
+    }
+
+    /// <summary>
+    /// The item cell: the row's selection target, with name, quality and marks on its first line and
+    /// what its moves come to on the second. Hover tells the full name, the outcome's detail and notes.
+    /// </summary>
     private void DrawMatrixItem(TransferWorkbenchRow row, int index, Guid[] keys, MatrixLayout layout)
     {
         var rule = row.Rule;
@@ -883,7 +1060,9 @@ internal sealed partial class TransferPlanWorkspace
                    (noted ? ImGui.CalcTextSize("note").X + spacing : 0f) +
                    (error is null ? 0f : ImGui.CalcTextSize("!").X + spacing);
         var name = ElideCached(courierMatrixNames, rule.Id, rule.ItemName, Math.Max(0f, width - tags));
-        var y = origin.Y + ((layout.Inner - layout.LineHeight) / 2f);
+        var small = ImGui.GetFontSize() * .85f;
+        var smallLine = layout.LineHeight * .85f;
+        var y = origin.Y + Math.Max(0f, (layout.Inner - layout.LineHeight - smallLine) / 2f);
         var x = origin.X;
         var dim = ImGui.GetColorU32(QuartermasterPalette.Dim);
         drawList.AddText(new Vector2(x, y), rule.Enabled ? ImGui.GetColorU32(ImGuiCol.Text) : dim, name);
@@ -900,13 +1079,43 @@ internal sealed partial class TransferPlanWorkspace
         }
         if (error is not null)
             drawList.AddText(new Vector2(x, y), ImGui.GetColorU32(ErrorColor), "!");
-        if (hovered && (name.Length < rule.ItemName.Length || noted || error is not null))
-            ImGui.SetTooltip(string.Join("\n", new[] { rule.ItemName, noted ? rule.Notes : null, error }.OfType<string>()));
+
+        // Line 2: what the moves come to, at the small size; elided to the cell, never clipped.
+        var (verdict, color, detail) = MatrixVerdict(row);
+        var shown = ElideCached(courierMatrixVerdictShown, rule.Id, verdict, Math.Max(0f, width / .85f));
+        drawList.AddText(ImGui.GetFont(), small, new Vector2(origin.X, y + layout.LineHeight),
+            ImGui.GetColorU32(color ?? ImGui.GetStyle().Colors[(int)ImGuiCol.Text]), shown);
+
+        if (!hovered)
+            return;
+        if (detail is null && row.CourierRefusal is not null)
+            detail = CourierVerdict(row, withDetail: true).Detail;
+        var elided = name.Length < rule.ItemName.Length || shown.Length < verdict.Length;
+        if (elided || detail is not null || noted || error is not null)
+            ImGui.SetTooltip(string.Join("\n", new[]
+            {
+                rule.ItemName,
+                elided || detail is not null ? verdict : null,
+                detail,
+                noted ? rule.Notes : null,
+                error,
+            }.OfType<string>()));
+    }
+
+    /// <summary>A row's verdict as the matrix shows it, kept while the row stays the same.</summary>
+    private (string Text, Vector4? Color, string? Detail) MatrixVerdict(TransferWorkbenchRow row)
+    {
+        if (courierMatrixVerdicts.TryGetValue(row.Rule.Id, out var hit) && ReferenceEquals(hit.Row, row))
+            return (hit.Text, hit.Color, hit.Detail);
+        var (text, color, detail) = CourierVerdict(row, withDetail: false);
+        courierMatrixVerdicts[row.Rule.Id] = (row, text, color, detail);
+        return (text, color, detail);
     }
 
     /// <summary>
     /// One cell, in one of four shapes: unlisted (blank, or what it holds; amber and dashed when it is
-    /// the line's suggested place), drained, bounded, or a pool. Moves show only when something moves.
+    /// the line's suggested place), drained, bounded, or a pool. A listed cell always shows what it has
+    /// under its target chip, and its move beside that when something moves.
     /// Left-click lists an unlisted container as a pool or edits a listed one; right-click always edits.
     /// </summary>
     private void DrawMatrixCell(TransferWorkbenchRow row, CourierAllocation allocation, CourierCellView cell, CourierColumn column, MatrixLayout layout)
@@ -932,7 +1141,7 @@ internal sealed partial class TransferPlanWorkspace
         var small = ImGui.GetFontSize() * .85f;
         var lineHeight = layout.LineHeight;
         var center = origin.X + (width / 2f);
-        var twoLines = cell.Bottom.Length > 0;
+        var twoLines = cell.Bottom.Length > 0 || cell.Delta.Length > 0;
         var topY = twoLines ? origin.Y + (height * .30f) : origin.Y + (height / 2f);
         var bottomY = origin.Y + (height * .74f);
         void Centered(string text, float midY, Vector4 color, float size)
@@ -969,10 +1178,21 @@ internal sealed partial class TransferPlanWorkspace
                 Chip(cell.Top, QuartermasterPalette.Info with { W = .18f }, QuartermasterPalette.Info with { W = .6f }, QuartermasterPalette.Info);
                 break;
             case CourierCellKind.Pool:
-                Centered(cell.Top, topY, QuartermasterPalette.Info with { W = .8f }, small);
+                Chip(cell.Top, Vector4.Zero, QuartermasterPalette.Info with { W = .45f }, QuartermasterPalette.Info with { W = .85f });
                 break;
         }
-        if (twoLines)
+        if (cell.Delta.Length > 0)
+        {
+            // Has, then the move, centered together on the bottom line.
+            var ratio = small / ImGui.GetFontSize();
+            var hasSize = ImGui.CalcTextSize(cell.Bottom) * ratio;
+            var deltaSize = ImGui.CalcTextSize(cell.Delta) * ratio;
+            var left = center - ((hasSize.X + CellPairGap + deltaSize.X) / 2f);
+            drawList.AddText(font, small, new Vector2(left, bottomY - (hasSize.Y / 2f)), ImGui.GetColorU32(cell.BottomColor ?? dim), cell.Bottom);
+            drawList.AddText(font, small, new Vector2(left + hasSize.X + CellPairGap, bottomY - (deltaSize.Y / 2f)),
+                ImGui.GetColorU32(cell.DeltaColor ?? dim), cell.Delta);
+        }
+        else if (twoLines)
             Centered(cell.Bottom, bottomY, cell.BottomColor ?? dim, cell.Kind == CourierCellKind.Suggested ? small * .9f : small);
 
         if (hovered)

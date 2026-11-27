@@ -227,25 +227,27 @@ internal sealed partial class TransferPlanWorkspace
         : row.Distribution is { } distribution ? CourierSession.Outcome(distribution).Text
         : "In place";
 
-    private void DrawCourierMoves(TransferWorkbenchRow row)
+    /// <summary>
+    /// What a line's moves come to, as both views word it: paused, its own refusal, the solved outcome,
+    /// or in place. A refusal's detail is built only when <paramref name="withDetail"/>, as on hover.
+    /// </summary>
+    private (string Text, Vector4? Color, string? Detail) CourierVerdict(TransferWorkbenchRow row, bool withDetail)
     {
         if (!row.Rule.Enabled)
-            RightAligned("Paused", QuartermasterPalette.Dim);
-        else if (row.CourierRefusal is { } refusal && !CourierSession.IsPlanWide(refusal.Code))
-        {
-            RightAligned(CourierSession.RefusalLabel(refusal.Code), ErrorColor);
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip(courier.RefusalDetail(row.Runtime, refusal));
-        }
-        else if (row.Distribution is { } distribution)
-        {
-            var (text, color, detail) = CourierSession.Outcome(distribution);
-            RightAligned(text, color);
-            if (detail is not null && ImGui.IsItemHovered())
-                ImGui.SetTooltip(detail);
-        }
-        else
-            RightAligned("In place", QuartermasterPalette.Green);
+            return ("Paused", QuartermasterPalette.Dim, null);
+        if (row.CourierRefusal is { } refusal && !CourierSession.IsPlanWide(refusal.Code))
+            return (CourierSession.RefusalLabel(refusal.Code), ErrorColor, withDetail ? courier.RefusalDetail(row.Runtime, refusal) : null);
+        return row.Distribution is { } distribution
+            ? CourierSession.Outcome(distribution)
+            : ("In place", QuartermasterPalette.Green, null);
+    }
+
+    private void DrawCourierMoves(TransferWorkbenchRow row)
+    {
+        var (text, color, detail) = CourierVerdict(row, withDetail: false);
+        RightAligned(text, color);
+        if (ImGui.IsItemHovered() && (detail ?? CourierVerdict(row, withDetail: true).Detail) is { } hover)
+            ImGui.SetTooltip(hover);
     }
 
     private static void RightAligned(string text, Vector4? color)
@@ -548,23 +550,35 @@ internal sealed partial class TransferPlanWorkspace
         DrawPlacePicker(row, choices);
     }
 
+    /// <summary>The list's place picker: the chosen container joins the line as a pool.</summary>
+    private void DrawPlacePicker(TransferWorkbenchRow row, (OwnerScope Character, CourierContainer[] Containers)[] choices) =>
+        DrawContainerPicker(PlacePickerPopup, "quartermaster.courier.picker", choices, showHas: true,
+            (character, retainer) => MutateCourierLine(row, line => line.WithPlace(character, retainer)),
+            (character, name) => $"Add {character.CharacterName} · {name} to {row.Rule.ItemName}");
+
     /// <summary>
-    /// Picks a container to list: a character, then one of its containers with its free space and units
-    /// of the item, beside everything the highlighted container holds. It joins the line as a pool.
+    /// Picks a container: a character, then one of its containers with its free space (and units of the
+    /// item when <paramref name="showHas"/>), beside everything the highlighted container holds. Shared by
+    /// the list's place picker and the matrix's column and row pickers. Closes itself when nothing is left
+    /// to pick.
     /// </summary>
-    private void DrawPlacePicker(TransferWorkbenchRow row, (OwnerScope Character, CourierContainer[] Containers)[] choices)
+    private void DrawContainerPicker(
+        string popup,
+        string ids,
+        (OwnerScope Character, CourierContainer[] Containers)[] choices,
+        bool showHas,
+        Action<OwnerScope, ulong?> add,
+        Func<OwnerScope, string, string> addDescription)
     {
-        if (!DalamudOwnedPopup.BeginOpaquePopup(PlacePickerPopup))
+        if (!DalamudOwnedPopup.BeginOpaquePopup(popup))
             return;
-        const string ids = "quartermaster.courier.picker";
-        if (pickerClose)
+        if (pickerClose || choices.Length == 0)
         {
             pickerClose = false;
             ImGui.CloseCurrentPopup();
             ImGui.EndPopup();
             return;
         }
-        var rule = row.Rule;
         var scale = ImGuiHelpers.GlobalScale;
         var current = choices.FirstOrDefault(choice => pickerCharacter is { } chosen && choice.Character.Matches(chosen));
         if (current.Character is null)
@@ -582,7 +596,7 @@ internal sealed partial class TransferPlanWorkspace
         }
         void Add(OwnerScope character, ulong? retainer)
         {
-            MutateCourierLine(row, line => line.WithPlace(character, retainer));
+            add(character, retainer);
             pickerClose = true;
         }
 
@@ -615,12 +629,13 @@ internal sealed partial class TransferPlanWorkspace
                         $"Show the containers of {character.CharacterName}", true, picked, () => Choose(character), picked ? "Selected" : "Available");
                 }
             }
-            if (ImGui.BeginTable("##picker-container-table", 3,
+            if (ImGui.BeginTable("##picker-container-table", showHas ? 3 : 2,
                     ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.ScrollY))
             {
                 ImGui.TableSetupColumn("Container", ImGuiTableColumnFlags.WidthStretch);
                 ImGui.TableSetupColumn("Free slots", ImGuiTableColumnFlags.WidthFixed, 104f * scale);
-                ImGui.TableSetupColumn("Has", ImGuiTableColumnFlags.WidthFixed, 64f * scale);
+                if (showHas)
+                    ImGui.TableSetupColumn("Has", ImGuiTableColumnFlags.WidthFixed, 64f * scale);
                 ImGui.TableSetupScrollFreeze(0, 1);
                 ImGui.TableHeadersRow();
                 foreach (var container in current.Containers)
@@ -646,8 +661,11 @@ internal sealed partial class TransferPlanWorkspace
                         container.Free is { } free ? $"{free} free" : "Not observed");
                     ImGui.TableNextColumn();
                     FreeSlotsBar.Draw(container.Capacity, container.Free);
-                    ImGui.TableNextColumn();
-                    RightAlignedLine(container.Has is > 0 and var has ? has.ToString("N0") : "—", container.Has is > 0 ? null : QuartermasterPalette.Dim);
+                    if (showHas)
+                    {
+                        ImGui.TableNextColumn();
+                        RightAlignedLine(container.Has is > 0 and var has ? has.ToString("N0") : "—", container.Has is > 0 ? null : QuartermasterPalette.Dim);
+                    }
                 }
                 ImGui.EndTable();
             }
@@ -668,8 +686,7 @@ internal sealed partial class TransferPlanWorkspace
             var retainer = highlighted.Retainer;
             if (ImGui.Button(addLabel))
                 Add(character, retainer);
-            reviewRegistry.RegisterLastButton($"{ids}.add",
-                $"Add {character.CharacterName} · {highlighted.Name} to {rule.ItemName}", true,
+            reviewRegistry.RegisterLastButton($"{ids}.add", addDescription(character, highlighted.Name), true,
                 () => Add(character, retainer), $"{character.CharacterName} · {highlighted.Name}");
             ImGui.Separator();
             if (ImGui.BeginTable("##picker-content-table", 2, ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY))
