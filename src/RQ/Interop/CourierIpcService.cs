@@ -7,6 +7,9 @@ using RQ.UI;
 
 namespace RQ.Interop;
 
+/// <summary>A roster character's cached room: free bag slots and free retainer slots, each null while unobserved.</summary>
+public sealed record CourierHeadroom(int? FreeBagSlots, int? RetainerFreeSlots);
+
 /// <summary>
 /// The versioned courier IPC (<c>Quartermaster.v1.*Courier*</c>): status, direct carried transfers between
 /// roster characters (gil and bag-held items, across regions through the bridge), stop and resume.
@@ -16,6 +19,8 @@ public sealed class CourierIpcService
 {
     public const string StatusSchema = "gooseworks-quartermaster-courier-status/v1";
     public const string TransferSchema = "gooseworks-quartermaster-courier-transfer/v1";
+    /// <summary>Status feature: transfers accept <see cref="CourierTransferRequest.DepositToRetainers"/>.</summary>
+    public const string DepositToRetainersFeature = "depositToRetainers";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly string providerInstanceId;
@@ -27,14 +32,17 @@ public sealed class CourierIpcService
     private readonly Func<uint, string> worldName;
     private readonly Func<uint, ItemMetadata> metadata;
     private readonly Action<string> warn;
+    private readonly Func<OwnerScope, CourierHeadroom> headroom;
     private readonly object gate = new();
     private (string RequestId, Guid Run)? launched;
 
     /// <param name="localBags">The logged-in character's latest bags, observed on the framework thread.</param>
+    /// <param name="headroom">A roster character's cached bag and retainer room; absent reads as unobserved.</param>
     public CourierIpcService(string providerInstanceId, CourierSession session, Func<CourierSettings> settings,
         Func<InventoryView?> localBags, Func<MeetingBell?> bridge, Func<uint, uint> worldRegion, Func<uint, string> worldName,
-        Func<uint, ItemMetadata> metadata, Action<string> warn)
+        Func<uint, ItemMetadata> metadata, Action<string> warn, Func<OwnerScope, CourierHeadroom>? headroom = null)
     {
+        this.headroom = headroom ?? (_ => new(null, null));
         this.providerInstanceId = providerInstanceId;
         this.session = session;
         this.settings = settings;
@@ -91,6 +99,7 @@ public sealed class CourierIpcService
                 regionName = RegionName(worldRegion(live.Character.HomeWorldId ?? 0)),
                 carriedGil = live.Gil,
                 freeBagSlots = live.FreeSlots,
+                retainerFreeSlots = headroom(live.Character).RetainerFreeSlots,
                 hasMeetingBell = HomeBell(cfg, live.Character) != null,
                 meetingBellLabel = HomeBell(cfg, live.Character)?.Label,
                 isPairedWithCarrier = IsPaired(live.Character),
@@ -118,18 +127,25 @@ public sealed class CourierIpcService
                 territoryId = bridgeBell.Territory,
                 label = bridgeBell.Label,
             };
-            var roster = cfg.LocalRoster.Where(o => o.HasStableIdentity).Select(o => new
+            var roster = cfg.LocalRoster.Where(o => o.HasStableIdentity).Select(o =>
             {
-                localContentId = o.LocalContentId,
-                homeWorldId = o.HomeWorldId,
-                characterName = o.CharacterName,
-                homeWorldName = HomeWorldName(o),
-                regionId = worldRegion(o.HomeWorldId ?? 0),
-                regionName = RegionName(worldRegion(o.HomeWorldId ?? 0)),
-                hasMeetingBell = HomeBell(cfg, o) != null,
-                meetingBellLabel = HomeBell(cfg, o)?.Label,
-                isCarrier = CourierPlanner.Exact(o, cfg.Carrier),
-                isPairedWithCarrier = IsPaired(o),
+                // Cached room, as last observed; the logged-in character's live bags are under loggedIn.
+                var room = headroom(o);
+                return new
+                {
+                    localContentId = o.LocalContentId,
+                    homeWorldId = o.HomeWorldId,
+                    characterName = o.CharacterName,
+                    homeWorldName = HomeWorldName(o),
+                    regionId = worldRegion(o.HomeWorldId ?? 0),
+                    regionName = RegionName(worldRegion(o.HomeWorldId ?? 0)),
+                    hasMeetingBell = HomeBell(cfg, o) != null,
+                    meetingBellLabel = HomeBell(cfg, o)?.Label,
+                    isCarrier = CourierPlanner.Exact(o, cfg.Carrier),
+                    isPairedWithCarrier = IsPaired(o),
+                    freeBagSlots = room.FreeBagSlots,
+                    retainerFreeSlots = room.RetainerFreeSlots,
+                };
             }).ToArray();
             object? run = null;
             if (session.Conductor is { } conductor)
@@ -152,12 +168,19 @@ public sealed class CourierIpcService
                     canClear = snapshot.CanClear,
                     custodyUnits = journal.Custody.Where(s => !s.IsGil).Sum(s => (long)s.Units),
                     custodyGil = journal.Custody.Where(s => s.IsGil).Sum(s => (long)s.Units),
+                    // Present only for a transfer that asked to stow its delivery into the destination's retainers.
+                    deposit = journal.Plan.DepositToRetainers ? new
+                    {
+                        unstowedUnits = journal.Unstowed.Values.Sum(units => (long)units),
+                        code = CourierConductor.DepositShortfall(journal)?.Code,
+                    } : null,
                 };
             }
             return JsonSerializer.Serialize(new
             {
                 schema = StatusSchema,
                 providerInstanceId,
+                features = new[] { DepositToRetainersFeature },
                 loggedIn,
                 carrier,
                 bridge = bridgeView,
@@ -263,10 +286,16 @@ public sealed class CourierIpcService
                 $"{initiator.CharacterName} is not paired as an owner on {cfg.Carrier!.CharacterName}'s Quartermaster Courier settings.");
         var order = new CourierTransferOrder(source, destination, request.GilAmount,
             [.. (request.Items ?? []).Select(i => new CourierTransferItem(i.ItemId, i.ItemName, i.IsHq, i.Quantity))],
-            request.ReturnDestinationHome, requestId);
+            request.ReturnDestinationHome, requestId, request.DepositToRetainers);
         var (plan, refusal) = CourierTransferPlanner.Build(order, cfg, carrierPeer?.Bags, live, metadata, worldRegion, bridge());
         if (refusal != null || plan == null)
             return Ack(requestId, null, "rejected", refusal?.Code ?? "PlanningFailed", refusal?.Message ?? "No plan.");
+        // A stowing transfer whose destination is known to lack the room is refused whole, before anything
+        // leaves the source: otherwise the hand-in stops part-way with the rest held by the carrier.
+        if (plan.DepositToRetainers && headroom(destination) is { FreeBagSlots: { } bagRoom, RetainerFreeSlots: { } retainerRoom } &&
+            plan.Trips.SelectMany(t => t.Manifest).Count(s => !s.IsGil) is var needed && needed > (long)bagRoom + retainerRoom)
+            return Ack(requestId, null, "rejected", "DestinationFull",
+                $"{destination.CharacterName} has room for {(long)bagRoom + retainerRoom:N0} more stack(s) ({bagRoom:N0} in bags, {retainerRoom:N0} in retainers); the transfer carries {needed:N0}.");
         // A finished or zero-custody unresolved previous run is archived first; one holding custody was refused above.
         Guid? clear = journal.Run != Guid.Empty && (journal.State is "Completed" or "Refused" || unresolved) && journal.Custody.IsEmpty ? journal.Run : null;
         var run = Guid.NewGuid();

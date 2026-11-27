@@ -9,10 +9,11 @@ public sealed record CourierTransferItem(uint ItemId, string ItemName, bool IsHq
 
 /// <summary>
 /// A direct carried transfer between two roster characters: carried gil and bag-held items only, never a
-/// retainer. Source and Destination are the roster's own identities.
+/// retainer. Source and Destination are the roster's own identities. With DepositToRetainers the destination
+/// stows what it received into its own retainers after each hand-in (see <see cref="CourierPlan.DepositToRetainers"/>).
 /// </summary>
 public sealed record CourierTransferOrder(OwnerScope Source, OwnerScope Destination, int Gil,
-    ImmutableArray<CourierTransferItem> Items, bool ReturnDestinationHome, string RequestId);
+    ImmutableArray<CourierTransferItem> Items, bool ReturnDestinationHome, string RequestId, bool DepositToRetainers = false);
 
 /// <summary>A transfer the planner refused: a stable code and the plain reason.</summary>
 public sealed record CourierTransferRefusal(string Code, string Message);
@@ -92,7 +93,8 @@ public static class CourierTransferPlanner
             return Refuse("BagSlotLimit", $"{carrierScope.CharacterName} has no free bag slot.");
         var trips = CourierPlanner.Pack(stacks, Math.Max(1, carrier.FreeSlots), int.MaxValue)
             .Select(batch => new CourierTrip(source, destination, pickup!, dropoff!, batch)).ToImmutableArray();
-        return (new CourierPlan(Guid.NewGuid(), 0, trips, [], order.ReturnDestinationHome, order.RequestId), null);
+        return (new CourierPlan(Guid.NewGuid(), 0, trips, [], order.ReturnDestinationHome, order.RequestId)
+            { DepositToRetainers = order.DepositToRetainers }, null);
     }
 
     /// <summary>

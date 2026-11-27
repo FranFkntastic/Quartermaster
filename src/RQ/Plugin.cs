@@ -364,7 +364,8 @@ public sealed class Plugin : IDalamudPlugin
             () => state.ReadConfiguration(s => s.Courier), () => courierPeer.LocalBags, courierGame.Bridge,
             courierWorldRegion,
             worldId => dataManager.GetExcelSheet<Lumina.Excel.Sheets.World>()?.GetRowOrDefault(worldId)?.Name.ToString() ?? "",
-            scanner.ResolveItemMetadata, s => log.Warning(s)));
+            scanner.ResolveItemMetadata, s => log.Warning(s),
+            who => new(courier.CachedFreeBagSlots(who), Operations.CourierPlacementBatch.RetainerFreeSlots(cache.Snapshot(), who))));
         var marketHistory = new MarketRunHistoryWindow(marketRunStore.History, CurrentOwner, window.DrawTimings)
         {
             Size = new System.Numerics.Vector2(780, 650),

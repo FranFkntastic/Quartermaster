@@ -65,6 +65,13 @@ public sealed class CourierJournal
     /// </summary>
     public List<string> ConsolidationLimits { get; set; } = [];
     /// <summary>
+    /// Units per line a retainer-deposit transfer (<see cref="CourierPlan.DepositToRetainers"/>) delivered but
+    /// left in the destination's bags: no retainer could hold them, or the rendezvous was off the
+    /// destination's home world. Delivery still completes; the run then ends as DepositLimited or
+    /// DepositUnavailable with these in its detail.
+    /// </summary>
+    public Dictionary<Guid, int> Unstowed { get; set; } = [];
+    /// <summary>
     /// 0: a schedule written before batching (per-stack placement, carrier travels in CarrierToSource).
     /// 1: batched placement and trades, carrier travels to the pickup during EnsureSource.
     /// </summary>
@@ -187,6 +194,28 @@ public sealed class CourierConductor
     private static bool InTrip(CourierPhase phase) => phase < CourierPhase.ReturnOwner || phase == CourierPhase.Consolidate;
     /// <summary>Only an unsettled trade blocks clearing a stopped run; travel and local placement have no cross-account custody in limbo.</summary>
     private static bool HasPendingTrade(CourierJournal r) => r.Pending?.Action.Phase is CourierPhase.HandOut or CourierPhase.HandIn;
+    /// <summary>Credits a settled Deposit's shipment as delivered; one a retainer-deposit transfer left in the bags is also recorded as unstowed.</summary>
+    private static void Credit(CourierJournal r, Shipment shipped)
+    {
+        r.Delivered[shipped.Line] = checked(r.Delivered.GetValueOrDefault(shipped.Line) + shipped.Units);
+        if (r.Plan.DepositToRetainers && !shipped.IsGil && shipped.To == null)
+            r.Unstowed[shipped.Line] = checked(r.Unstowed.GetValueOrDefault(shipped.Line) + shipped.Units);
+    }
+    /// <summary>
+    /// What a retainer-deposit transfer left in the destination's bags, as an outcome code and its detail;
+    /// null when everything was stowed or the plan asked for no deposit.
+    /// </summary>
+    internal static (string Code, string Detail)? DepositShortfall(CourierJournal r)
+    {
+        if (!r.Plan.DepositToRetainers || r.Plan.Trips.IsEmpty || r.Unstowed.Values.All(units => units <= 0)) return null;
+        var left = string.Join(", ", r.Plan.Trips.SelectMany(t => t.Manifest).GroupBy(s => s.Line)
+            .Where(g => r.Unstowed.GetValueOrDefault(g.Key) > 0)
+            .Select(g => $"{g.First().Name}{(g.First().Hq ? " HQ" : "")} × {r.Unstowed[g.Key]:N0}"));
+        var destination = r.Plan.Trips[^1].Destination.CharacterName;
+        return r.Plan.Trips.All(CourierPlan.DropsAtHomeBell)
+            ? ("DepositLimited", $"No retainer of {destination} has known room; left in bags: {left}")
+            : ("DepositUnavailable", $"{destination} was met off its home world, away from its retainers; left in bags: {left}");
+    }
     public CourierSnapshot Snapshot()=>Project(store.Load());
     private CourierSnapshot Project(CourierJournal r)
     {
@@ -606,6 +635,19 @@ public sealed class CourierConductor
                     !CourierPlanner.Exact(owner.Character, t.Source) ||
                     s.Phase is CourierPhase.Deposit or CourierPhase.CarrierToDestination or CourierPhase.HandIn or CourierPhase.Consolidate &&
                     !CourierPlanner.Exact(owner.Character, t.Destination)) throw Fault("OwnerIdentityMismatch", owner.Character.CharacterName);
+                // A retainer-deposit transfer routes each delivered batch when it is stowed, from the destination's
+                // freshest retainer cache: what fits becomes retainer-bound, the rest stays bag-bound and is credited
+                // as delivered there. The routed batch is journaled before the step's intent, so an interrupted
+                // deposit settles against it; a re-run step is routed afresh.
+                if (s.Phase == CourierPhase.Deposit && r.Plan.DepositToRetainers && CourierPlan.DropsAtHomeBell(t))
+                {
+                    var routed = placement.RouteDeposit(owner.Character, [.. s.Batch.Select(x => x with { To = null })]);
+                    if (!routed.SequenceEqual(s.Batch))
+                    {
+                        steps = r.Schedule = steps.SetItem(r.Cursor, s with { Batch = routed });
+                        s = steps[r.Cursor]; store.Save(r);
+                    }
+                }
                 if (stop) throw new CourierFault(CourierOutcome.Cancelled,"StopRequested","Stopped before dispatch.");
                 // Placement needs no retainer baseline: a resume settles it from the journal and the bags.
                 var intent=r.Pending ?? new(Guid.NewGuid(),s,owner,carrier);
@@ -753,7 +795,7 @@ public sealed class CourierConductor
                         (await CarrierStatus()).Bags);
                 }
                 if(s.Phase==CourierPhase.Deposit)
-                    foreach(var shipped in s.Batch)r.Delivered[shipped.Line]=checked(r.Delivered.GetValueOrDefault(shipped.Line)+shipped.Units);
+                    foreach(var shipped in s.Batch)Credit(r,shipped);
                 r.Pending = null; r.Cursor++; store.Save(r);
                 // The trip's last hand-in frees the carrier (a bag-slot split leaves custody for the next one): it sets
                 // out for the next trip's pickup, or home, while the owner deposits, consolidates and returns.
@@ -779,6 +821,12 @@ public sealed class CourierConductor
             {
                 r.Detail += (r.Detail.Length == 0 ? "" : "; ") + string.Join("; ", r.ConsolidationLimits);
                 if (r.Code == "") r.Code = "ConsolidationLimited";
+            }
+            if (DepositShortfall(r) is { } unstowed)
+            {
+                r.Detail += (r.Detail.Length == 0 ? "" : "; ") + unstowed.Detail;
+                if (r.Code == "") r.Code = unstowed.Code;
+                warning($"{r.Run} {unstowed.Code}: {unstowed.Detail}");
             }
             if(r.Code=="")r.Code="Succeeded"; store.Save(r);
         }
@@ -901,8 +949,7 @@ public sealed class CourierConductor
         }
         if(moved.Count==0)return; // Nothing moved: the step runs again as scheduled.
         // Bag-only shipments need no retainer: a deposit that moved anything has settled them too.
-        if(deposit)foreach(var s in moved.Concat(batch.Where(s=>!Moves(s))))
-            r.Delivered[s.Line]=checked(r.Delivered.GetValueOrDefault(s.Line)+s.Units);
+        if(deposit)foreach(var s in moved.Concat(batch.Where(s=>!Moves(s))))Credit(r,s);
         if(rest.Count==0)r.Cursor++;
         else r.Schedule=r.Schedule.SetItem(r.Cursor,move.Action with {Batch=[..rest]});
     }

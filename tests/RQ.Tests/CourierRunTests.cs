@@ -222,6 +222,33 @@ public sealed class CourierRunTests : IDisposable
         Assert.Equal(5, owner.Quantities[source]); Assert.Equal(0, owner.Quantities[shopper]); Assert.Equal(10, mule.Units);
     }
 
+    // A retainer-deposit haul whose retainers take only part of the delivery, interrupted mid-deposit: the
+    // resumed run must stow the rest of what fits, credit every unit delivered exactly once, and report
+    // exactly what stayed in the bags. MarketMafioso reads that count to decide whether another shopping
+    // cycle may start; a count lost or doubled across the resume sends it back out against full retainers
+    // (items then strand on the carrier in another region) or ends a healthy run early.
+    [Fact]
+    public async Task RetainerDepositHaulInterruptedMidDepositReportsExactlyWhatStayedInBags()
+    {
+        cfg = cfg with { LocalRoster = [source, shopper] };
+        owner.Quantities[shopper] = 5; mule.Gil[carrier] = 100;
+        owner.RetainerRoom = 3; owner.FailPlacement = true;
+        var haul = Transfer(shopper, source, 0, false, new CourierTransferItem(Ore, "Titanium Ore", false, 5)) with { DepositToRetainers = true };
+        var interrupted = await engine.StartAsync(haul, cfg);
+        Assert.True(interrupted.State == "Indeterminate" && interrupted.CanResume, interrupted.Code + ":" + interrupted.Detail);
+        Assert.Empty(engine.Journal().Custody); Assert.Equal(1, owner.Deposited);
+
+        engine = Conductor();
+        var resumed = await engine.StartAsync(haul, cfg);
+        Assert.True(resumed.State == "Completed", resumed.Code + ":" + resumed.Detail);
+        Assert.Equal("DepositLimited", resumed.Code);
+        var journal = engine.Journal();
+        Assert.Empty(journal.Custody);
+        Assert.Equal(3, owner.Deposited); Assert.Equal(2, owner.Quantities[source]); Assert.Equal(0, owner.Quantities[shopper]);
+        Assert.Equal(5, journal.Delivered.Values.Sum()); Assert.Equal(2, journal.Unstowed.Values.Sum());
+        Assert.Equal(10, mule.Units);
+    }
+
     // An unsettled journaled consolidation (or one that left retrieved units in destination bags)
     // must not silently start a fresh moves-only pass that strands items in bags.
     [Theory]
@@ -381,12 +408,29 @@ public sealed class CourierRunTests : IDisposable
         public bool? FailPlacement;
         readonly Dictionary<string,(ImmutableArray<PlacementTally> Lines,string Status)> movements=[];
         public ImmutableArray<PlacementTally>? JournalUnits(string id,OwnerScope owner)=>movements.TryGetValue(id,out var m)?m.Lines:null;
+        // Units retainer 22 can still take; a retainer-deposit transfer routes what fits and leaves the rest bag-bound.
+        public int RetainerRoom = int.MaxValue;
+        public ImmutableArray<Shipment> RouteDeposit(OwnerScope owner,ImmutableArray<Shipment> batch)
+        {
+            var routed=new List<Shipment>();var room=RetainerRoom;
+            foreach(var s in batch)
+            {
+                var fits=s.IsGil?0:Math.Min(room,s.Units);room-=fits;
+                if(fits>0)routed.Add(s with {Units=fits,To=22});
+                if(fits<s.Units)routed.Add(s with {Units=s.Units-fits,To=null});
+            }
+            return [..routed];
+        }
         // A failing batch stops after one verified unit, journaled like the coordinator's lines.
         public Task<Result<bool>> MoveBatchAsync(StowagePlan plan,ImmutableArray<Shipment> batch,bool deposit,IDisposable lease,Func<bool> auth,Deadline d,Action<string> recordOperation)
         {
-            Assert.True(auth()); Assert.Equal(plan.Owner, who); Assert.All(batch,s=>Assert.Equal(deposit ? 22ul : 11ul, deposit ? s.To : s.From));
+            Assert.True(auth()); Assert.Equal(plan.Owner, who);
+            // Only a routed retainer-deposit batch carries bag-bound shipments; they never reach a retainer.
+            if(deposit && RetainerRoom!=int.MaxValue)batch=[..batch.Where(s=>s.To!=null)];
+            Assert.All(batch,s=>Assert.Equal(deposit ? 22ul : 11ul, deposit ? s.To : s.From));
             var id=Guid.NewGuid().ToString();recordOperation(id);
             bool fail=FailPlacement==deposit;int n=fail?1:batch.Sum(s=>s.Units),left=n;
+            if(deposit && RetainerRoom!=int.MaxValue)RetainerRoom-=n;
             var lines=deposit
                 ? CourierPlacementBatch.Deposits(batch).Select(r=>(r.Line,r.Item,r.Hq,Units:r.Shipments.Sum(s=>s.Units)))
                 : batch.GroupBy(s=>(s.Item,s.Hq)).Select(g=>(g.First().Line,g.Key.Item,g.Key.Hq,Units:g.Sum(s=>s.Units)));

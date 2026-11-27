@@ -51,6 +51,13 @@ public sealed record CourierTransferRequest
     public bool ReturnOwner { get; init; }
     public bool ReturnDestinationHome { get; init; }
     public bool ReturnCarrier { get; init; }
+    /// <summary>
+    /// Stow the delivered items into the destination's retainers at its home-world bell. What no retainer can
+    /// hold stays in the destination's bags and the run ends as DepositLimited; a destination met off its
+    /// home world keeps everything in its bags and the run ends as DepositUnavailable. Absent reads as false.
+    /// Providers that support it list "depositToRetainers" in the courier status features.
+    /// </summary>
+    public bool DepositToRetainers { get; init; }
 }
 
 /// <summary>Stop or resume a courier run; an empty RunId means the current run.</summary>

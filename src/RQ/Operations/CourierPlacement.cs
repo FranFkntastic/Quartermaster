@@ -24,6 +24,45 @@ public static class CourierPlacementBatch
     public static ImmutableArray<(Guid Line, uint Item, bool Hq, ulong To, ImmutableArray<Shipment> Shipments)> Deposits(ImmutableArray<Shipment> batch) =>
         [.. batch.Where(s => s.To != null).GroupBy(s => (s.Line, s.Item, s.Hq, To: s.To!.Value))
             .Select(g => (g.Key.Line, g.Key.Item, g.Key.Hq, g.Key.To, g.ToImmutableArray()))];
+    /// <summary>
+    /// Routes a delivered batch into the owner's retainers as an any-space stowage deposit would, from the
+    /// cached retainer inventories: each (line, item, quality) comes back as one shipment per retainer that
+    /// takes part of it, in routing order, followed by a bag-bound one (To null) for whatever no retainer can
+    /// hold. Gil is never routed. The deposit that follows routes the same requests against the same cache,
+    /// so everything routed here fits it whole.
+    /// </summary>
+    public static ImmutableArray<Shipment> RouteDeposit(ImmutableArray<Shipment> batch, IReadOnlyDictionary<ulong, CachedRetainer> cache,
+        OwnerScope owner, DateTime nowUtc)
+    {
+        var groups = batch.Where(s => !s.IsGil).GroupBy(s => (s.Line, s.Item, s.Hq)).ToArray();
+        if (groups.Length == 0) return batch;
+        var sizes = groups.GroupBy(g => g.Key.Item).ToDictionary(g => g.Key, g => Math.Max(1, g.Max(x => x.Max(s => s.StackSize))));
+        var built = StowageRouter.BuildBatch(groups.Select(g => new StowageDepositRequest(null, g.Key.Line, g.Key.Item, g.First().Name, g.Key.Hq,
+            g.Sum(s => s.Units), new() { AnySpace = true }, null, sizes[g.Key.Item])), cache, owner, item => sizes.GetValueOrDefault(item, 1), nowUtc);
+        var routed = batch.Where(s => s.IsGil).ToList();
+        for (var i = 0; i < groups.Length; i++)
+        {
+            var first = groups[i].First();
+            var left = groups[i].Sum(s => s.Units);
+            foreach (var allocation in built.Routes[i].Allocations)
+            {
+                routed.Add(first with { Units = allocation.Quantity, To = allocation.RetainerId });
+                left -= allocation.Quantity;
+            }
+            if (left > 0) routed.Add(first with { Units = left, To = null });
+        }
+        return [.. routed];
+    }
+    /// <summary>
+    /// Free inventory slots across the owner's usable retainers whose inventory is fully observed, or null
+    /// when none of them is.
+    /// </summary>
+    public static int? RetainerFreeSlots(IReadOnlyDictionary<ulong, CachedRetainer> cache, OwnerScope owner)
+    {
+        var free = cache.Values.Where(r => r.Owner.Matches(owner) && r.IsCurrentlyAssigned is not false && r.IsUiAccessible is not false)
+            .Select(StowageRouter.FreeInventorySlots).Where(slots => slots != null).Select(slots => slots!.Value).ToArray();
+        return free.Length == 0 ? null : free.Sum();
+    }
 }
 
 public interface ICourierPlacementPort
@@ -40,6 +79,11 @@ public interface ICourierPlacementPort
     /// </summary>
     Task<Result<bool>> MoveBatchAsync(StowagePlan plan, ImmutableArray<Shipment> batch, bool deposit, IDisposable lease,
         Func<bool> authorized, Deadline deadline, Action<string> recordOperation);
+    /// <summary>
+    /// Routes a delivered batch into the owner's retainers (<see cref="CourierPlacementBatch.RouteDeposit"/>):
+    /// nothing moves and nothing is journaled. Shipments no retainer can hold come back bag-bound.
+    /// </summary>
+    ImmutableArray<Shipment> RouteDeposit(OwnerScope owner, ImmutableArray<Shipment> batch);
     /// <summary>
     /// Gathers each line's stray stacks on the logged-in plan owner's retainers into the line's
     /// retainer, as Transfer Placement's Consolidate does. Succeeded: every move landed. Failed: it
@@ -58,6 +102,8 @@ public sealed partial class TransferCoordinator : ICourierPlacementPort
             : null;
     string? ICourierPlacementPort.OperationStatus(string id, OwnerScope owner) =>
         journal.Get(id) is { } record && CourierPlanner.Exact(record.Owner, owner) ? record.Status : null;
+    ImmutableArray<Shipment> ICourierPlacementPort.RouteDeposit(OwnerScope owner, ImmutableArray<Shipment> batch) =>
+        CourierPlacementBatch.RouteDeposit(batch, cache.Snapshot(), owner, utcNow());
     async Task<Result<bool>> ICourierPlacementPort.MoveBatchAsync(StowagePlan plan, ImmutableArray<Shipment> batch, bool deposit,
         IDisposable lease, Func<bool> authorized, Deadline deadline, Action<string> recordOperation)
     {

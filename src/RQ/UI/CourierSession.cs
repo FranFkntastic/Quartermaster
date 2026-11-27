@@ -661,6 +661,16 @@ public sealed class CourierSession
         return locations;
     }
 
+    /// <summary>A character's cached free bag slots, or null while any of its bags is unobserved.</summary>
+    internal int? CachedFreeBagSlots(OwnerScope who)
+    {
+        var capture = cachedBags(who);
+        if (!PlayerBagNames.All(name => capture.ObservedSources.Contains(name, StringComparer.Ordinal)))
+            return null;
+        return Math.Max(0, PlayerBagSlots - capture.Bags.Where(bag => PlayerBagNames.Contains(bag.BagName, StringComparer.Ordinal))
+            .SelectMany(bag => bag.Items).Count(item => item.ItemId > 0 && item.Quantity > 0));
+    }
+
     private (long Revision, Dictionary<(ulong?, ulong?, uint, ItemQualityPolicy), int?> Units)? available;
 
     /// <summary>
@@ -961,6 +971,8 @@ public sealed class CourierSession
         {
             "" or "Succeeded" => "Completed",
             "ConsolidationLimited" => "Delivered; consolidation incomplete",
+            "DepositLimited" => "Delivered; retainers could not take everything",
+            "DepositUnavailable" => "Delivered to bags; retainers out of reach",
             "StopRequested" or "StopBeforeBegin" or "StopBeforeTrade" or "StopBeforeLocalTrade" or "CancelledPreLock" => "Stopped",
             "PlanRefused" => "Some lines cannot be sent",
             "AutomationBusy" => "Another automation is running",

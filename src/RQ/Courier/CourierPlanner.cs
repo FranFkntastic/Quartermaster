@@ -230,6 +230,15 @@ public sealed record CourierPlan(Guid PlanId, long Revision, ImmutableArray<Cour
 {
     /// <summary>Absent in journals written before destination consolidation, which read as none.</summary>
     public ImmutableArray<CourierConsolidation> Consolidations { get; init; } = [];
+    /// <summary>
+    /// A direct transfer that stows what it delivers: each delivered batch is routed into the destination's
+    /// retainers when it is deposited at the destination's home-world bell, and whatever no retainer can hold
+    /// stays in its bags. Absent in journals written before it, which read as false.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool DepositToRetainers { get; init; }
+    /// <summary>Whether a trip drops off where its destination can reach its own retainers.</summary>
+    internal static bool DropsAtHomeBell(CourierTrip trip) => !trip.Dropoff.IsPlaza && trip.Dropoff.World == trip.Destination.HomeWorldId;
 }
 
 public static class CourierPlanner
