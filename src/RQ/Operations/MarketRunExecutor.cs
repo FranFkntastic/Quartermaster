@@ -46,6 +46,16 @@ public interface IMarketRunDriver
     Task<MarketMutationResult> PostAsync(DalamudInventoryStack source, int quantity, uint price, CancellationToken token);
     Task ReturnAsync(CancellationToken token);
     Task CloseListAsync(CancellationToken token);
+    /// <summary>
+    /// Leaves no summoning-bell session open when a run ends, however it ended: closes the list, backing out of
+    /// any retainer window first and reopening and re-closing the list from the bell once when the session will
+    /// not end. Returns the outcome instead of throwing for a session that is still open.
+    /// </summary>
+    async Task<RetainerAutomationResult> EndSessionAsync(CancellationToken token)
+    {
+        await CloseListAsync(token).ConfigureAwait(false);
+        return RetainerAutomationResult.Succeeded("RetainerSessionEnded", "Retainer list closed.");
+    }
     Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token, Action<MarketMutationReceipt>? receiptChanged = null);
     /// <summary>Stows (and with <paramref name="reorganizeRetainers"/> relocates) only the given plan-scoped placement items.</summary>
     Task<IReadOnlyList<string>> StowAsync(Guid planId, IReadOnlyList<ItemPlacementRule> planPlacements, IDisposable lease,
@@ -68,6 +78,9 @@ public sealed class MarketRunDeadline(TimeSpan timeout) : IMarketRunDeadline
     // worst case is about 60 s. 75 s leaves a margin, so this deadline never turns a pre-send
     // recovery into an Indeterminate timeout.
     public static readonly TimeSpan RepriceTimeout = TimeSpan.FromSeconds(75);
+    // Ending the bell session may back out of a retainer window, wait 2 s for a closing session, reopen the list
+    // from the bell (15 s budget) and close it twice (about 3 s each, longer at low frame rates).
+    public static readonly TimeSpan SessionEndTimeout = TimeSpan.FromSeconds(90);
     internal static readonly AsyncLocal<ConcurrentBag<Task>?> Calls = new();
     internal static bool HasUnsettled => Calls.Value?.Any(t => !t.IsCompleted) == true;
     public async Task<T> RunAsync<T>(Func<CancellationToken, Task<T>> action)
@@ -173,6 +186,7 @@ public sealed class MarketRunExecutor(
     // A caller-supplied deadline (tests) also governs reprices unless one is given for them.
     private readonly IMarketRunDeadline repriceDeadline = repriceDeadlines ?? deadlines ?? new MarketRunDeadline(MarketRunDeadline.RepriceTimeout);
     private readonly IMarketRunDeadline routeDeadline = routeDeadlines ?? new MarketRunDeadline(MarketRunDeadline.RetainerListTimeout);
+    private readonly IMarketRunDeadline sessionEndDeadline = deadlines ?? new MarketRunDeadline(MarketRunDeadline.SessionEndTimeout);
     private int running;
     private int cancelled;
     private bool driverUnsettled;
@@ -375,12 +389,8 @@ public sealed class MarketRunExecutor(
                     if (!stowageEntered)
                         StowSkipped(record, placements, record.State == "Cancelled" ? "MarketRunStowSkippedCancelled" :
                             record.NeedsCheck.Count > 0 ? "MarketRunStowSkippedNeedsCheck" : "MarketRunStowSkippedStopped", record.Reason);
-                    // Never overlap an abandoned call, touch a new character, or use an unloaded session.
-                    if (sessionStarted && CanCleanUp(record))
-                    {
-                        try { await Step(driver.CloseListAsync).ConfigureAwait(false); }
-                        catch (Exception e) { Add(record, $"Could not close retainer list: {e.Message}"); }
-                    }
+                    if (sessionStarted)
+                        await EndBellSessionAsync(record).ConfigureAwait(false);
                     record.ListingSummaryComplete = record.Assignments.Select(a => a.RetainerId).Distinct().All(scannedRetainers.Contains);
                     record.FinishedAtUtc = DateTime.UtcNow;
                     Status = record.State + (record.Reason.Length == 0 ? string.Empty : $": {record.Reason}");
@@ -1026,6 +1036,45 @@ public sealed class MarketRunExecutor(
     }
 
     private Task<bool> Step(Func<CancellationToken, Task> action) => deadline.RunAsync(async t => { await action(t).ConfigureAwait(false); return true; });
+
+    internal const string BellSessionNotEndedCode = "MarketRunBellSessionNotEnded";
+    internal const string BellSessionLeftOpenCode = "MarketRunBellSessionCleanupSkipped";
+
+    /// <summary>
+    /// The bell session never outlives the run: it is ended however the run ended (reopened and re-closed once
+    /// when it will not end), and a run whose session is still open is never reported Completed.
+    /// </summary>
+    private async Task EndBellSessionAsync(MarketRunRecord record)
+    {
+        // Never overlap an abandoned call, touch a new character, or use an unloaded session.
+        if (!CanCleanUp(record))
+        {
+            var reason = driverUnsettled || MarketRunDeadline.HasUnsettled
+                ? "a session call has not settled"
+                : "the run no longer holds session authority (automation lease, Listing Plan or character changed)";
+            var skipped = $"{BellSessionLeftOpenCode}: the summoning-bell session was not ended because {reason}.";
+            warning?.Invoke(skipped);
+            Add(record, skipped);
+            return;
+        }
+        RetainerAutomationResult ended;
+        try { ended = await sessionEndDeadline.RunAsync(driver.EndSessionAsync).ConfigureAwait(false); }
+        catch (Exception e) { ended = RetainerAutomationResult.Failed("RetainerSessionEndFaulted", $"{e.GetType().Name}: {e.Message}"); }
+        if (ended.Success)
+        {
+            if (ended.Code == "RetainerSessionEndedAfterReopen")
+                Add(record, $"MarketRunBellSessionRecovered: {ended.Message}");
+            return;
+        }
+        var message = $"{BellSessionNotEndedCode}: {ended.Code}: {ended.Message}";
+        warning?.Invoke(message);
+        Add(record, message);
+        if (record.State == "Completed")
+        {
+            record.State = "Stopped";
+            record.Reason = $"The summoning-bell session could not be closed ({ended.Code}).";
+        }
+    }
     private bool HasSessionAuthority(MarketRunRecord record) => !Volatile.Read(ref disposed) &&
         runLease is not null && automation.Owns(runLease) &&
         currentPlan(record.PlanId) is { Owner.HasStableIdentity: true } plan && plan.Owner.Matches(record.Owner);

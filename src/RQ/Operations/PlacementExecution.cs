@@ -396,8 +396,9 @@ public sealed partial class TransferCoordinator
         }
         finally
         {
-            // Legs leave the retainer list open so the next one does not race a bell reopen; close it once here.
-            try { await driver.CloseRetainerListAsync(CancellationToken.None).ConfigureAwait(false); }
+            // Legs leave the retainer list open so the next one does not race a bell reopen; end the session once
+            // here, reopening and re-closing it when it will not end. A failure is logged as RetainerSessionNotEnded.
+            try { await EndRetainerSessionAsync(lease, CancellationToken.None).ConfigureAwait(false); }
             catch (Exception) { }
         }
     }

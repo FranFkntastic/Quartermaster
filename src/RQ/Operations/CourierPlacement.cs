@@ -165,8 +165,10 @@ public sealed partial class TransferCoordinator : ICourierPlacementPort
         {
             if (listUsed)
             {
-                try { await driver.CloseRetainerListAsync(CancellationToken.None); }
-                catch (Exception) { /* A failed leg already released the session; nothing is in transit here. */ }
+                // A failed leg already ended the session (this then succeeds at once); otherwise end it here,
+                // reopening and re-closing it when it will not end. A failure is logged as RetainerSessionNotEnded.
+                try { await EndRetainerSessionAsync(lease, CancellationToken.None); }
+                catch (Exception) { /* Logged above; nothing is in transit here. */ }
             }
         }
     }

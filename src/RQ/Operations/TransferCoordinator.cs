@@ -45,6 +45,14 @@ public interface IRetainerTransferDriver
     Task<RetainerCrystalTransferResult> DepositCrystalAsync(DalamudInventoryStack stack, int quantity, CancellationToken cancellationToken);
     Task CloseRetainerAsync(CancellationToken cancellationToken);
     Task CloseRetainerListAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    /// <summary>
+    /// Leaves no summoning-bell session open after a finished, failed or cancelled leg, reopening
+    /// and re-closing a session that will not end; throws when it is still open. Nothing is done
+    /// once <paramref name="refusalReason"/> returns a reason. Drivers that keep the list open for
+    /// a caller (market-run legs) inherit the list-close default.
+    /// </summary>
+    Task EndRetainerSessionAsync(Func<string?> refusalReason, CancellationToken cancellationToken) =>
+        CloseRetainerListAsync(cancellationToken);
     void CancelActive();
 }
 
@@ -188,6 +196,8 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
         var token = linkedCancellation.Token;
         var retainerOpen = false;
         var retainerSessionOpen = false;
+        // Set before the bell is touched: a list request that fails or is cancelled halfway can still leave a session open.
+        var sessionRequested = false;
         var movementAttempted = false;
         var transferred = 0;
         try
@@ -341,6 +351,7 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                 {
                     try
                     {
+                        sessionRequested = true;
                         await driver.RequireRetainerListAsync(token).ConfigureAwait(false);
                         retainerSessionOpen = true;
                     }
@@ -468,7 +479,9 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                 if (inventoryFull || remaining.Values.All(quantity => quantity <= 0))
                     break;
             }
-            if (placement?.KeepListOpen != true) await driver.CloseRetainerListAsync(token).ConfigureAwait(false);
+            var sessionNote = placement?.KeepListOpen != true
+                ? await EndRetainerSessionAfterSuccessAsync(operationId, borrowedLease ?? lease, token).ConfigureAwait(false)
+                : string.Empty;
             retainerSessionOpen = false;
             var missing = remaining.Values.Where(quantity => quantity > 0).Sum();
             var bypassedRetainerLeg = retainerLegMessage is not null;
@@ -499,7 +512,7 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                     : bypassedRetainerLeg
                         ? $"Retainer retrieval could not start ({retainerLegMessage}); remaining units are left for vendor procurement."
                         : $"Retrieved {transferred:N0} units; {missing:N0} units remain missing.{unreachedAfter}");
-            return new(true, missing == 0 ? "Retrieval completed." : "Retrieval completed with missing units.");
+            return new(true, (missing == 0 ? "Retrieval completed." : "Retrieval completed with missing units.") + sessionNote);
         }
         catch (OperationCanceledException)
         {
@@ -509,11 +522,14 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                 try { await driver.CloseRetainerAsync(CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure = closeException; }
             }
-            if (retainerSessionOpen && !MarketRunDeadline.HasUnsettled)
+            // A cancel hides the retainer windows (CancelActive), so a session can be live with nothing left
+            // to close; ending it reopens and re-closes the list from the bell when needed.
+            if ((retainerSessionOpen || sessionRequested) && !MarketRunDeadline.HasUnsettled)
             {
-                try { await driver.CloseRetainerListAsync(CancellationToken.None).ConfigureAwait(false); }
+                try { await EndRetainerSessionAsync(borrowedLease ?? lease, CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure ??= closeException; }
             }
+            RecordSessionNotEnded(operationId, releaseFailure);
             if (borrowedLease is not null && !movementAttempted && journal.Get(operationId)?.Status == OperationStatuses.Running)
                 journal.Transition(operationId, OperationStatuses.Cancelled, "CancelledBeforeMovement", "Gather cancelled with no unresolved movement.");
             else MarkCancelled(operationId);
@@ -531,11 +547,12 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                 try { await driver.CloseRetainerAsync(CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure = closeException; }
             }
-            if (retainerSessionOpen && !MarketRunDeadline.HasUnsettled)
+            if ((retainerSessionOpen || sessionRequested) && !MarketRunDeadline.HasUnsettled)
             {
-                try { await driver.CloseRetainerListAsync(CancellationToken.None).ConfigureAwait(false); }
+                try { await EndRetainerSessionAsync(borrowedLease ?? lease, CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure ??= closeException; }
             }
+            RecordSessionNotEnded(operationId, releaseFailure);
             var failure = releaseFailure is null
                 ? exception.Message
                 : $"{exception.Message} Retainer session release also failed: {releaseFailure.Message}";
@@ -590,6 +607,8 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
         var token = linkedCancellation.Token;
         var retainerOpen = false;
         var retainerSessionOpen = false;
+        // Set before the bell is touched: a list request that fails or is cancelled halfway can still leave a session open.
+        var sessionRequested = false;
         var movementAttempted = false;
         var transferred = 0;
         string? lastZeroMovement = null;
@@ -611,6 +630,7 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
             var remaining = operation.Lines.ToDictionary(
                 OperationJournal.AuthorizationKey,
                 line => line.TargetQuantity);
+            sessionRequested = true;
             await driver.RequireRetainerListAsync(token).ConfigureAwait(false);
             retainerSessionOpen = true;
             token.ThrowIfCancellationRequested();
@@ -835,7 +855,9 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                 if (remaining.Values.All(quantity => quantity <= 0))
                     break;
             }
-            if (placement?.KeepListOpen != true) await driver.CloseRetainerListAsync(token).ConfigureAwait(false);
+            var sessionNote = placement?.KeepListOpen != true
+                ? await EndRetainerSessionAfterSuccessAsync(operationId, borrowedLease ?? lease, token).ConfigureAwait(false)
+                : string.Empty;
             retainerSessionOpen = false;
             var missing = remaining.Values.Where(quantity => quantity > 0).Sum();
             journal.Transition(operationId,
@@ -843,7 +865,7 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                 missing == 0 ? "DepositComplete" : "DepositPartial",
                 $"Stowed {transferred:N0} units; {missing:N0} remain on character." +
                 (missing > 0 && lastZeroMovement is not null ? $" {DepositZeroMovementCode}: {lastZeroMovement}" : string.Empty));
-            return new(true, missing == 0 ? "Deposit completed." : "Deposit completed with remaining units.");
+            return new(true, (missing == 0 ? "Deposit completed." : "Deposit completed with remaining units.") + sessionNote);
         }
         catch (OperationCanceledException)
         {
@@ -853,11 +875,12 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                 try { await driver.CloseRetainerAsync(CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure = closeException; }
             }
-            if (retainerSessionOpen)
+            if (retainerSessionOpen || sessionRequested)
             {
-                try { await driver.CloseRetainerListAsync(CancellationToken.None).ConfigureAwait(false); }
+                try { await EndRetainerSessionAsync(borrowedLease ?? lease, CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure ??= closeException; }
             }
+            RecordSessionNotEnded(operationId, releaseFailure);
             MarkCancelled(operationId);
             return new(
                 true,
@@ -873,11 +896,12 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
                 try { await driver.CloseRetainerAsync(CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure = closeException; }
             }
-            if (retainerSessionOpen)
+            if (retainerSessionOpen || sessionRequested)
             {
-                try { await driver.CloseRetainerListAsync(CancellationToken.None).ConfigureAwait(false); }
+                try { await EndRetainerSessionAsync(borrowedLease ?? lease, CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception closeException) { releaseFailure ??= closeException; }
             }
+            RecordSessionNotEnded(operationId, releaseFailure);
             var failure = releaseFailure is null
                 ? exception.Message
                 : $"{exception.Message} Retainer session release also failed: {releaseFailure.Message}";
@@ -899,6 +923,61 @@ public sealed partial class TransferCoordinator : IRetrievalOperationExecutor
             Volatile.Write(ref running, 0);
         }
         }
+    }
+
+    internal const string RetainerSessionNotEndedCode = "RetainerSessionNotEnded";
+
+    /// <summary>The summoning-bell session could not be ended; the message carries Franthropy's outcome code.</summary>
+    private sealed class RetainerSessionNotEndedException(string message, Exception inner) : Exception(message, inner);
+
+    private Func<string?> SessionRefusal(IDisposable? lease) =>
+        () => lease is not null && automation.Owns(lease) ? null : "this transfer no longer holds the automation lease.";
+
+    /// <summary>
+    /// Ends the bell session this transfer used. A failure is logged and rethrown as
+    /// <see cref="RetainerSessionNotEndedException"/>; cancellation passes through unchanged.
+    /// </summary>
+    private async Task EndRetainerSessionAsync(IDisposable? lease, CancellationToken token)
+    {
+        try { await driver.EndRetainerSessionAsync(SessionRefusal(lease), token).ConfigureAwait(false); }
+        catch (Exception exception) when (exception is not OperationCanceledException and not RetainerSessionNotEndedException)
+        {
+            var message = $"{RetainerSessionNotEndedCode}: {exception.Message}";
+            warning?.Invoke(message);
+            throw new RetainerSessionNotEndedException(message, exception);
+        }
+    }
+
+    /// <summary>
+    /// Ends the session after a leg whose movement is already verified. A session that will not end is
+    /// journaled as its own RetainerSessionNotEnded receipt and returned as a note; it does not change what
+    /// the operation moved (callers such as courier settlement read the status as movement evidence).
+    /// </summary>
+    private async Task<string> EndRetainerSessionAfterSuccessAsync(string operationId, IDisposable? lease, CancellationToken token)
+    {
+        try
+        {
+            await EndRetainerSessionAsync(lease, token).ConfigureAwait(false);
+            return string.Empty;
+        }
+        catch (RetainerSessionNotEndedException notEnded)
+        {
+            RecordSessionNotEnded(operationId, notEnded);
+            return $" {notEnded.Message}";
+        }
+    }
+
+    // Journals a session that could not be ended as its own receipt while the operation is still open.
+    private void RecordSessionNotEnded(string operationId, Exception? failure)
+    {
+        if (failure is not RetainerSessionNotEndedException)
+            return;
+        try
+        {
+            if (journal.Get(operationId) is { } operation && !OperationStatuses.IsTerminal(operation.Status))
+                journal.RecordWarning(operationId, RetainerSessionNotEndedCode, failure.Message);
+        }
+        catch (Exception exception) { warning?.Invoke($"{RetainerSessionNotEndedCode} could not be journaled for {operationId}: {exception.Message}"); }
     }
 
     private Dictionary<string, int> LiveCandidateCapacity(
