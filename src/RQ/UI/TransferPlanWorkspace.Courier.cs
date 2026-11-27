@@ -5,6 +5,7 @@ using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Utility;
 using Franthropy.Dalamud.AgentBridge;
+using Franthropy.Dalamud.UI.Layout;
 using Franthropy.Dalamud.UI.Tables;
 using Franthropy.Dalamud.UI.Windows;
 using RQ.Courier;
@@ -21,6 +22,8 @@ namespace RQ.UI;
 internal sealed partial class TransferPlanWorkspace
 {
     private const string PlacePickerPopup = "courier-place-picker";
+    /// <summary>The trailing column: the line menu's … and its always-visible ×.</summary>
+    private const float CourierMenuWidth = 60f;
     private float courierWhoWidth;
     private static readonly string ConfirmIcon = FontAwesomeIcon.Check.ToIconString();
     private static readonly string DismissIcon = FontAwesomeIcon.Times.ToIconString();
@@ -65,19 +68,19 @@ internal sealed partial class TransferPlanWorkspace
             Id: "after"),
         new(
             "Moves",
-            .55f,
+            168,
             CourierOutcome,
             row => row.Distribution?.Moving ?? 0,
-            ImGuiTableColumnFlags.WidthStretch,
+            ImGuiTableColumnFlags.WidthFixed,
             Draw: DrawCourierMoves,
             Id: "moves"),
         new(
             "##line-menu",
-            52,
+            CourierMenuWidth,
             _ => string.Empty,
             Flags: ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoSort | ImGuiTableColumnFlags.NoResize |
                    ImGuiTableColumnFlags.NoHeaderLabel | ImGuiTableColumnFlags.NoHide,
-            Draw: DrawLineMenu,
+            Draw: row => DrawLineMenu(row, alwaysShowRemove: true),
             Id: "line-menu"),
     ], DalamudTableSelection<TransferWorkbenchRow>.Multi(selection, row => row.Rule.Id));
 
@@ -172,7 +175,7 @@ internal sealed partial class TransferPlanWorkspace
             (targetHovered || !ImGui.IsAnyItemHovered()))
         {
             var mouse = ImGui.GetMousePos();
-            var menuLeft = ImGui.GetWindowPos().X + ImGui.GetWindowContentRegionMax().X - 56f;
+            var menuLeft = ImGui.GetWindowPos().X + ImGui.GetWindowContentRegionMax().X - CourierMenuWidth - 4f;
             if (mouse.X < menuLeft && mouse.Y >= rowTop && mouse.Y < rowTop + ImGui.GetFrameHeight() + (style.CellPadding.Y * 2f))
                 courierExpansion.Toggle(key);
         }
@@ -245,9 +248,15 @@ internal sealed partial class TransferPlanWorkspace
     private void DrawCourierMoves(TransferWorkbenchRow row)
     {
         var (text, color, detail) = CourierVerdict(row, withDetail: false);
-        RightAligned(text, color);
+        // A verdict wider than the column is elided; hovering shows it whole.
+        var shown = ImGui.CalcTextSize(text).X > ImGui.GetContentRegionAvail().X
+            ? DalamudUiLayout.ElideText(text, ImGui.GetContentRegionAvail().X)
+            : text;
+        RightAligned(shown, color);
         if (ImGui.IsItemHovered() && (detail ?? CourierVerdict(row, withDetail: true).Detail) is { } hover)
-            ImGui.SetTooltip(hover);
+            ImGui.SetTooltip(shown.Length < text.Length ? $"{text}\n{hover}" : hover);
+        else if (shown.Length < text.Length && ImGui.IsItemHovered())
+            ImGui.SetTooltip(text);
     }
 
     private static void RightAligned(string text, Vector4? color)
@@ -314,7 +323,6 @@ internal sealed partial class TransferPlanWorkspace
         var style = ImGui.GetStyle();
         ImGui.PushID(index);
         var start = BeginPlaceRow(row, layout);
-        var rowTop = ImGui.GetCursorScreenPos().Y - style.CellPadding.Y;
         ImGui.TextColored(suggested ? QuartermasterPalette.Dim : spot.Character.Matches(runtime.Owner) ? QuartermasterPalette.Info : QuartermasterPalette.Dim,
             CourierSession.CharacterLabel(spot.Character));
         ImGui.SameLine(start + layout.WhoWidth + style.ItemSpacing.X * 2f);
@@ -344,7 +352,7 @@ internal sealed partial class TransferPlanWorkspace
         if (suggested)
             DrawSuggestionChoice(row, spot);
         else
-            DrawRemovePlace(row, spot, rowTop, rowTop + ImGui.GetFrameHeight() + (style.CellPadding.Y * 2f));
+            DrawRemovePlace(row, spot);
         ImGui.PopID();
     }
 
@@ -456,12 +464,14 @@ internal sealed partial class TransferPlanWorkspace
         }
     }
 
-    private void DrawRemovePlace(TransferWorkbenchRow row, CourierSpot spot, float rowTop, float rowBottom)
+    private void DrawRemovePlace(TransferWorkbenchRow row, CourierSpot spot)
     {
         var rule = row.Rule;
         void Remove() => MutateCourierLine(row, line => line.Without(spot.Character, spot.Retainer));
-        if (DalamudRowRemoveButton.Draw("remove-place", DalamudRowRemoveButton.IsRowHovered(rowTop, rowBottom)))
+        if (DalamudRowRemoveButton.Draw("remove-place", rowHovered: true))
             Remove();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip($"Remove {PlaceLabel(row.Runtime, spot)}");
         reviewRegistry.RegisterLastButton(
             $"quartermaster.courier.place.remove.{PlaceKey(rule.Id, spot)}",
             $"Remove {PlaceLabel(row.Runtime, spot)} from {rule.ItemName}",
@@ -520,15 +530,47 @@ internal sealed partial class TransferPlanWorkspace
             .OrderByDescending(choice => choice.Containers.Sum(container => (long)(container.Has ?? 0)))
             .ToArray();
 
-    /// <summary>The row that adds a place, opening the place picker.</summary>
+    /// <summary>
+    /// The row that adds a place: a 1-click chip per unlisted container already holding the item (the
+    /// suggested place has its own row), then the place picker for any other container.
+    /// </summary>
     private void DrawAddPlace(TransferWorkbenchRow row, CourierAllocation allocation, PlaceLayout layout)
     {
         var choices = PlaceChoices(row, allocation);
-        if (choices.Length == 0)
+        var holders = allocation.Holders
+            .Where(holder => allocation.Suggestion is not { } offered ||
+                             offered.Retainer != holder.Retainer || !offered.Character.Matches(holder.Character))
+            .OrderByDescending(holder => holder.Has ?? 0)
+            .ToArray();
+        if (choices.Length == 0 && holders.Length == 0)
             return;
         var rule = row.Rule;
-        BeginPlaceRow(row, layout);
-        const string label = "+ Add place…";
+        var start = BeginPlaceRow(row, layout);
+        var first = true;
+        // Wraps under the first chip rather than the cell's edge, so the strip stays under the places.
+        void Next(float width)
+        {
+            if (first)
+            {
+                first = false;
+                return;
+            }
+            ImGui.SameLine();
+            if (ImGui.GetContentRegionAvail().X < width)
+            {
+                ImGui.NewLine();
+                ImGui.SetCursorPosX(start);
+            }
+        }
+        foreach (var holder in holders)
+        {
+            Next(HolderChipWidth(row.Runtime, holder));
+            DrawHolderChip(row, holder);
+        }
+        if (choices.Length == 0)
+            return;
+        var label = holders.Length > 0 ? "+ Other container…" : "+ Add container…";
+        Next(ImGui.CalcTextSize(label).X);
         ImGui.PushStyleColor(ImGuiCol.Text, QuartermasterPalette.Dim);
         var clicked = ImGui.Selectable($"{label}##add-place", false, ImGuiSelectableFlags.None, new Vector2(ImGui.CalcTextSize(label).X, 0));
         ImGui.PopStyleColor();
@@ -548,6 +590,61 @@ internal sealed partial class TransferPlanWorkspace
             ImGui.OpenPopup(PlacePickerPopup);
         }
         DrawPlacePicker(row, choices);
+    }
+
+    /// <summary>A holder chip's name part: "+ Banshee · Grungler-perfected".</summary>
+    private static string HolderChipName(QuartermasterRuntimeSnapshot runtime, CourierSpot holder)
+    {
+        var name = CourierSession.CharacterLabel(holder.Character);
+        var space = name.IndexOf(' ', StringComparison.Ordinal);
+        return $"+ {(space > 0 ? name[..space] : name)} · {CourierSession.ContainerLabel(runtime, holder.Retainer)}";
+    }
+
+    private static float HolderChipPadding => 6f * ImGuiHelpers.GlobalScale;
+
+    private static float HolderChipWidth(QuartermasterRuntimeSnapshot runtime, CourierSpot holder) =>
+        ImGui.CalcTextSize(HolderChipName(runtime, holder)).X + ImGui.GetStyle().ItemInnerSpacing.X +
+        ImGui.CalcTextSize((holder.Has ?? 0).ToString("N0")).X + (HolderChipPadding * 2f);
+
+    /// <summary>
+    /// A quiet bordered chip for a container that holds the item but is not listed: clicking it lists
+    /// the container as a pool. The name is muted and the count reads at full strength; hovering lights it.
+    /// </summary>
+    private void DrawHolderChip(TransferWorkbenchRow row, CourierSpot holder)
+    {
+        var runtime = row.Runtime;
+        var rule = row.Rule;
+        var name = HolderChipName(runtime, holder);
+        var count = (holder.Has ?? 0).ToString("N0");
+        var padding = HolderChipPadding;
+        var inner = ImGui.GetStyle().ItemInnerSpacing.X;
+        var nameSize = ImGui.CalcTextSize(name);
+        // Frame-tall, so its text lines up with the frame-aligned text beside it.
+        var size = new Vector2(nameSize.X + inner + ImGui.CalcTextSize(count).X + (padding * 2f), ImGui.GetFrameHeight());
+        var min = ImGui.GetCursorScreenPos();
+        var key = PlaceKey(rule.Id, holder);
+        var clicked = ImGui.InvisibleButton($"##holder:{key}", size);
+        var hovered = ImGui.IsItemHovered();
+        var max = min + size;
+        var draw = ImGui.GetWindowDrawList();
+        var rounding = 2f * ImGuiHelpers.GlobalScale;
+        if (hovered)
+            draw.AddRectFilled(min, max, ImGui.GetColorU32(ImGuiCol.FrameBgHovered), rounding);
+        draw.AddRect(min, max, ImGui.GetColorU32(hovered ? QuartermasterPalette.Info : ImGui.GetStyle().Colors[(int)ImGuiCol.Border]), rounding);
+        var text = new Vector2(min.X + padding, min.Y + ImGui.GetStyle().FramePadding.Y);
+        draw.AddText(text, ImGui.GetColorU32(hovered ? ImGui.GetStyle().Colors[(int)ImGuiCol.Text] : QuartermasterPalette.Dim), name);
+        draw.AddText(new Vector2(text.X + nameSize.X + inner, text.Y), ImGui.GetColorU32(ImGuiCol.Text), count);
+        void Add() => MutateCourierLine(row, line => line.WithPlace(holder.Character, holder.Retainer));
+        if (hovered)
+            ImGui.SetTooltip($"Add {PlaceLabel(runtime, holder)} ({(holder.Has ?? 0):N0}) as Pool");
+        reviewRegistry.RegisterLastButton(
+            $"quartermaster.courier.holder.add.{key}",
+            $"Add {PlaceLabel(runtime, holder)}, which holds {(holder.Has ?? 0):N0}, to {rule.ItemName} as a pool",
+            true,
+            Add,
+            PlaceLabel(runtime, holder));
+        if (clicked)
+            Add();
     }
 
     /// <summary>The list's place picker: the chosen container joins the line as a pool.</summary>
