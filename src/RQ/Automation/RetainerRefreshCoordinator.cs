@@ -300,22 +300,24 @@ public sealed class RetainerRefreshCoordinator : IDisposable
                 }
             }
 
-            await CloseRetainerListAsync(cancellationToken).ConfigureAwait(false);
+            var ended = await EndRetainerSessionAsync(cancellationToken).ConfigureAwait(false);
             if (pending.Count != 0)
             {
                 if (persistStandaloneRecovery)
                     PersistRecovery(runId, owner, pending, $"{pending.Count} retainer(s) need retry.");
-                Status = $"Retainer evidence refresh failed for {pending.Count} of {attempts.Length} retainers. Retry to try again.";
+                Status = $"Retainer evidence refresh failed for {pending.Count} of {attempts.Length} retainers. Retry to try again." +
+                    SessionNotEndedNote(ended);
                 CompleteRun(runId, false);
                 return;
             }
 
             if (persistStandaloneRecovery)
                 state.Mutate(StateChangeKind.Recovery, document => document.RetainerRefreshRecovery = null);
-            Status = inaccessible == 0
+            Status = (inaccessible == 0
                 ? $"Retainer refresh complete: {attempted}/{attempts.Length}."
-                : $"Retainer refresh complete: {attempted}/{attempts.Length}; {inaccessible} not accessible.";
-            CompleteRun(runId, true);
+                : $"Retainer refresh complete: {attempted}/{attempts.Length}; {inaccessible} not accessible.") + SessionNotEndedNote(ended);
+            // The evidence is in, but a run that leaves the bell session open did not finish cleanly.
+            CompleteRun(runId, ended.Success);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -323,7 +325,7 @@ public sealed class RetainerRefreshCoordinator : IDisposable
             if (persistStandaloneRecovery)
                 state.Mutate(StateChangeKind.Recovery, document => document.RetainerRefreshRecovery = null);
             CompleteRun(runId, false);
-            await TryCloseEverythingAsync().ConfigureAwait(false);
+            Status += SessionNotEndedNote(await EndRetainerSessionAsync(CancellationToken.None).ConfigureAwait(false));
         }
         catch (Exception exception)
         {
@@ -333,7 +335,7 @@ public sealed class RetainerRefreshCoordinator : IDisposable
                 PersistRecovery(runId, owner, requested, exception.Message);
             Status = $"Retainer refresh failed: {exception.Message}";
             CompleteRun(runId, false);
-            await TryCloseEverythingAsync().ConfigureAwait(false);
+            Status += SessionNotEndedNote(await EndRetainerSessionAsync(CancellationToken.None).ConfigureAwait(false));
         }
         finally
         {
@@ -439,18 +441,36 @@ public sealed class RetainerRefreshCoordinator : IDisposable
         return await session.EnsureRetainerListAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task CloseRetainerListAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Ends the refresh's summoning-bell session however the run ended: backs out of any retainer window, closes
+    /// the list, and reopens and re-closes it from the bell once when the session will not end. Hiding the windows
+    /// (CancelActive) is deliberately not used here: it leaves the session live with nothing left to close.
+    /// </summary>
+    private async Task<RetainerAutomationResult> EndRetainerSessionAsync(CancellationToken cancellationToken)
     {
-        var result = await session.CloseRetainerListAsync(cancellationToken).ConfigureAwait(false);
-        RequireSuccess(result);
+        RetainerAutomationResult result;
+        try
+        {
+            result = await session.EnsureRetainerSessionEndedAsync(
+                () => automationLease is not { } lease || !automation.Owns(lease)
+                    ? "the refresh no longer holds the automation lease."
+                    : autoRetainer.IsAvailable && autoRetainer.IsBusy ? "AutoRetainer is busy with the summoning bell." : null,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception exception)
+        {
+            result = RetainerAutomationResult.Failed("RetainerSessionEndFaulted", $"{exception.GetType().Name}: {exception.Message}");
+        }
+        if (!result.Success)
+            log.Warning("RetainerRefreshBellSessionNotEnded: {Code}: {Message}", result.Code, result.Message);
+        else if (result.Code == "RetainerSessionEndedAfterReopen")
+            log.Information("RetainerRefreshBellSessionRecovered: {Message}", result.Message);
+        return result;
     }
 
-    private Task TryCloseEverythingAsync()
-    {
-        try { session.CancelActive(); }
-        catch (Exception exception) { log.Warning(exception, "Unable to close retainer UI after refresh termination."); }
-        return Task.CompletedTask;
-    }
+    private static string SessionNotEndedNote(RetainerAutomationResult ended) =>
+        ended.Success ? string.Empty : $" The summoning-bell session could not be closed ({ended.Code}): {ended.Message}";
 
     private void PersistRecovery(string runId, OwnerScope owner, IReadOnlyCollection<ulong> pendingRetainerIds, string message) =>
         state.Mutate(StateChangeKind.Recovery, document => document.RetainerRefreshRecovery = new()

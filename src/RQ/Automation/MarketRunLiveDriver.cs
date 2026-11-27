@@ -186,6 +186,12 @@ internal sealed class MarketRunLiveDriver(
     { RequireSessionAuthority(); Require(await session.ReturnToRetainerListAsync(token).ConfigureAwait(false)); }
     public async Task CloseListAsync(CancellationToken token)
     { RequireSessionAuthority(); Require(await session.CloseRetainerListAsync(token).ConfigureAwait(false)); }
+    // The authority guard stays: recovery is refused before every game action once the run loses its lease,
+    // its plan or its character. AutoRetainer stays suppressed until the run's cleanup has finished.
+    public Task<RetainerAutomationResult> EndSessionAsync(CancellationToken token) =>
+        session.EnsureRetainerSessionEndedAsync(
+            () => HasSessionAuthority() ? null : "the market run lost its session authority (automation lease, Listing Plan or character changed).",
+            token);
 
     public async Task<IReadOnlyList<string>> GatherAsync(IReadOnlyList<MarketGatherTarget> targets, IDisposable lease, Action check, Func<bool> hasAuthority, CancellationToken token, Action<MarketMutationReceipt>? receiptChanged = null)
     {

@@ -197,6 +197,14 @@ public sealed class RetainerLiveDriver : IRetainerTransferDriver
     public async Task CloseRetainerListAsync(CancellationToken cancellationToken) =>
         RequireSuccess(await session.CloseRetainerListAsync(cancellationToken).ConfigureAwait(false));
 
+    public async Task EndRetainerSessionAsync(Func<string?> refusalReason, CancellationToken cancellationToken)
+    {
+        var result = await session.EnsureRetainerSessionEndedAsync(refusalReason, cancellationToken).ConfigureAwait(false);
+        if (result.Code == "RetainerSessionEndedAfterReopen")
+            warn?.Invoke($"[Quartermaster] {result.Code}: {result.Message}");
+        RequireSuccess(result);
+    }
+
     public void CancelActive()
     {
         bellRoute?.Cancel();
