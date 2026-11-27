@@ -664,7 +664,7 @@ internal sealed partial class TransferPlanWorkspace
         else
             DrawSummary(runtime, selected, projection);
         if (selected.Kind == StowagePlanKind.Courier)
-            DrawCourierControls(runtime, projection);
+            DrawCourierControls(projection);
         DrawUndoStrip(owner, selected);
         if (selected.Kind == StowagePlanKind.Courier && workbench.CourierMatrixView)
             DrawCourierMatrix(runtime, selected, projection);
@@ -1649,10 +1649,10 @@ internal sealed partial class TransferPlanWorkspace
             });
     }
 
-    private void DrawLineMenu(TransferWorkbenchRow row) => DrawLineMenu(row, hoverRemove: true);
+    private void DrawLineMenu(TransferWorkbenchRow row) => DrawLineMenu(row, alwaysShowRemove: false);
 
-    /// <param name="hoverRemove">Whether the row's hover × follows the menu button; a narrow column registers Remove on the button instead.</param>
-    private void DrawLineMenu(TransferWorkbenchRow row, bool hoverRemove)
+    /// <param name="alwaysShowRemove">Whether the × beside the menu button stays visible (the matrix) rather than appearing while the row is hovered.</param>
+    private void DrawLineMenu(TransferWorkbenchRow row, bool alwaysShowRemove)
     {
         var rule = row.Rule;
         if (ImGui.SmallButton("…##line-menu"))
@@ -1661,20 +1661,9 @@ internal sealed partial class TransferPlanWorkspace
             noteBuffer = rule.Notes;
             ImGui.OpenPopup("line-menu");
         }
-        if (hoverRemove)
-            DrawHoverRemove(row);
-        else
-        {
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip($"{rule.ItemName} options");
-            var (owner, planId, ruleId) = (row.Owner, row.PlanId, rule.Id);
-            reviewRegistry.RegisterLastButton(
-                $"quartermaster.transfer.line.remove.{ruleId:N}",
-                $"Remove {rule.ItemName} from the plan",
-                true,
-                () => RemoveRules(owner, planId, [ruleId]),
-                "Available");
-        }
+        if (alwaysShowRemove && ImGui.IsItemHovered())
+            ImGui.SetTooltip($"{rule.ItemName} options");
+        DrawLineRemove(row, alwaysShowRemove);
         if (!DalamudOwnedPopup.BeginOpaquePopup("line-menu"))
             return;
         Guid[] ids = [rule.Id];
@@ -1827,16 +1816,19 @@ internal sealed partial class TransferPlanWorkspace
     internal bool HasCourierDestinations(QuartermasterRuntimeSnapshot runtime, OwnerScope? source = null) =>
         courier.Destinations(runtime, source).Any();
 
-    private void DrawHoverRemove(TransferWorkbenchRow row)
+    /// <summary>The line's × after its menu button: shown while the row is hovered, or always when asked.</summary>
+    private void DrawLineRemove(TransferWorkbenchRow row, bool always)
     {
         // The line menu button was just drawn in this row; its rect is the row's vertical extent.
-        var rowHovered = DalamudRowRemoveButton.IsLastItemRowHovered();
+        var rowHovered = always || DalamudRowRemoveButton.IsLastItemRowHovered();
         ImGui.SameLine();
         var ruleId = row.Rule.Id;
         var owner = row.Owner;
         var planId = row.PlanId;
         if (DalamudRowRemoveButton.Draw("remove-line", rowHovered))
             RemoveRules(owner, planId, [ruleId]);
+        if (always && ImGui.IsItemHovered())
+            ImGui.SetTooltip($"Remove {row.Rule.ItemName}");
         reviewRegistry.RegisterLastButton(
             $"quartermaster.transfer.line.remove.{ruleId:N}",
             $"Remove {row.Rule.ItemName} from the plan",
