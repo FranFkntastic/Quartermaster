@@ -34,6 +34,13 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     Func<bool>? lifestreamBusy=null) : IDisposable
 {
     private readonly CourierStore<CarrierLedger> store = new(Path.Combine(directory, "courier-custody.json"), warning);
+    // What the ledger on disk held at its last successful load or save, for the idle paths (presence ticks, the pane)
+    // that only need to know no run is held. Taken under ledgerIo together with the IO, so a slow load can never
+    // overwrite a newer save's summary; any failed load or save forgets it, so the next caller reads the disk again.
+    // Disk stays the authority: a held run, and every command, always loads the full ledger.
+    private sealed record LedgerSummary(Guid? Run, bool Paused, ImmutableArray<Shipment> Units, Guid? Unconfirmed);
+    private readonly object ledgerIo = new();
+    private volatile LedgerSummary? summary;
     private readonly CourierCalls calls = new(warning);
     private readonly SemaphoreSlim gate = new(1);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<Action,byte> deferredReleases=new();
@@ -62,15 +69,37 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     // ledger: every send requires the bags to equal the last confirmed bags, so interference refuses, never loses units.
     internal void RestoreCustodyHold()
     {
-        var held=store.Load();
+        var held=LoadLedger();
         if(held.Run==null || held.Paused || held.Units.IsEmpty && held.Unconfirmed==null)return;
-        held.Paused=true;store.Save(held);
+        held.Paused=true;SaveLedger(held);
         warning($"{held.Run} CarrierRunPausedOnLoad: holding {held.Units.Sum(s=>(long)s.Units):N0} units{(held.Unconfirmed is {} u?$", hand-off {u} unconfirmed":"")}; " +
             "trade, automation and AutoRetainer locks stay released until the owner resumes.");
     }
+    private CarrierLedger LoadLedger()
+    {
+        lock (ledgerIo)
+        {
+            try { var ledger = store.Load(); summary = Summarize(ledger); return ledger; }
+            catch { summary = null; throw; }
+        }
+    }
+    private void SaveLedger(CarrierLedger ledger)
+    {
+        lock (ledgerIo)
+        {
+            try { store.Save(ledger); summary = Summarize(ledger); }
+            catch { summary = null; throw; }
+        }
+    }
+    private static LedgerSummary Summarize(CarrierLedger ledger) => new(ledger.Run, ledger.Paused, ledger.Units, ledger.Unconfirmed);
+    /// <summary>The last known ledger summary when it says no run is held; null when a run is held or the summary is unknown.</summary>
+    private LedgerSummary? IdleSummary() => summary is { Run: null } idle ? idle : null;
     public CarrierView View()
     {
-        var ledger = store.Load();
+        if (IdleSummary() is { } idle)
+            return new(null, idle.Units, idle.Paused, idle.Unconfirmed != null, active?.Command,
+                Volatile.Read(ref lease) != null || Volatile.Read(ref tradeHold) != null || Volatile.Read(ref suppress) != null);
+        var ledger = LoadLedger();
         return new(ledger.Run, ledger.Units, ledger.Paused, ledger.Unconfirmed != null, active?.Command,
             Volatile.Read(ref lease) != null || Volatile.Read(ref tradeHold) != null || Volatile.Read(ref suppress) != null);
     }
@@ -91,7 +120,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         bool Authorized(CourierSettings c, CarrierLedger held) => c.IsPaired(m.Owner) &&
             (CourierPlanner.Exact(m.Owner,peerOwner) || endpoint != null && held.Run == m.Run &&
                 (held.OwnerEndpoint == endpoint || held.RunKey is {Length:64} key && key==m.RunKey));
-        if (!Authorized(cfg,store.Load())) return Refuse("OwnerNotPaired");
+        if (!Authorized(cfg,LoadLedger())) return Refuse("OwnerNotPaired");
         if (!CourierPlanner.Exact(cfg.Carrier, m.Carrier) || m.Version != (m.Bell?.Ward != null ? 2 : 1) || m.Run == Guid.Empty || m.Step == Guid.Empty)
             return Refuse("EnvelopeMismatch");
         var remaining = deadline.Expires - DateTimeOffset.UtcNow;
@@ -104,15 +133,15 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         using var heartbeat = tradeStep && started != null
             ? new CourierTradeStartHeartbeat(reason => started!(new(m.Run, m.Step, CourierTradeStart.Preparing, reason))) : null;
         void Waiting(string reason) { if (heartbeat != null) heartbeat.Reason = reason; }
-        if (m.Command is CourierCommand.Stop or CourierCommand.Clear && store.Load().Run == m.Run) await StopLocalAsync(false);
+        if (m.Command is CourierCommand.Stop or CourierCommand.Clear && LoadLedger().Run == m.Run) await StopLocalAsync(false);
         if (!await gate.WaitAsync(remaining)) return Refuse("CommandQueueDeadline");
         active = m;
         try
         {
             cfg = settings();
-            if (disposed || !cfg.CarrierOptIn || !Authorized(cfg,store.Load()) || !CourierPlanner.Exact(cfg.Carrier, m.Carrier))
+            if (disposed || !cfg.CarrierOptIn || !Authorized(cfg,LoadLedger()) || !CourierPlanner.Exact(cfg.Carrier, m.Carrier))
                 return Refuse("PairingChanged");
-            var ledger = store.Load();
+            var ledger = LoadLedger();
             // The owner cleared the run: forget it whatever the ledger holds or awaits, with no lock, observation or identity check.
             if (m.Command == CourierCommand.Clear)
             {
@@ -167,7 +196,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                 ledger.NotDelivered.Add(fence);
                 if (ledger.Steps.TryGetValue(fence,out var abandoned))
                     ledger.Steps[fence]=abandoned with {Result=Result<CourierReceipt>.Fail("NotDelivered",deadline.Name)};
-                store.Save(ledger);
+                SaveLedger(ledger);
                 return Result<CourierReceipt>.Ok(new(m.Run,m.Step,fresh,Custody:ledger.Units));
             }
             if (ledger.Completed.Contains(m.Run)) return Refuse("RunClosed");
@@ -234,13 +263,13 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                 (!tradeStep || opened || DateTimeOffset.UtcNow < startBy);
             information?.Invoke($"{m.Run}/{m.Step} carrier {m.Command} ({deadline.Name}, expires {deadline.Expires:O})");
             var step = new CarrierStep(hash, m, null, m.Command is CourierCommand.Receive or CourierCommand.Send ? before : null);
-            if (m.Command is not (CourierCommand.Receive or CourierCommand.Send)) { ledger.Steps[m.Step]=step; store.Save(ledger); }
+            if (m.Command is not (CourierCommand.Receive or CourierCommand.Send)) { ledger.Steps[m.Step]=step; SaveLedger(ledger); }
             TradeEvidence? evidence = null;
             // A refused ledger-only command keeps its refusal as the step's receipt, so its intent never stays unsettled.
             Result<CourierReceipt> Recorded(string code)
             {
                 var refusal = Refuse(code);
-                ledger.Steps[m.Step] = step with { Result = refusal }; store.Save(ledger); return refusal;
+                ledger.Steps[m.Step] = step with { Result = refusal }; SaveLedger(ledger); return refusal;
             }
             switch (m.Command)
             {
@@ -267,7 +296,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                             ledger.LastConfirmedBags?.Count(g.Key.Item, g.Key.Hq) != before.Count(g.Key.Item, g.Key.Hq))))
                     {
                         var refusal = Refuse("CustodyInsufficient");
-                        ledger.Steps[m.Step] = step with { Result = refusal }; store.Save(ledger); return refusal;
+                        ledger.Steps[m.Step] = step with { Result = refusal }; SaveLedger(ledger); return refusal;
                     }
                     // Before the trade's intent is saved: running out of time here dispatched nothing.
                     Waiting("TradePartner");
@@ -277,7 +306,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                         return Refuse("CarrierTradeStartWindowElapsed", $"{CourierTradeStart.CarrierSeconds}s start budget spent before dispatch; last waiting on {heartbeat?.Reason ?? "unknown"}.");
                     Waiting("TradeOpening");
                     ledger.Unconfirmed = m.Step;
-                    ledger.Steps[m.Step]=step; store.Save(ledger);
+                    ledger.Steps[m.Step]=step; SaveLedger(ledger);
                     // The heartbeat stops before TradeStarted is reported, so no later beat replaces it.
                     CourierGame.TradeStarted.Value=()=>{opened=true;heartbeat?.Dispose();started?.Invoke(new(m.Run,m.Step,"TradeStarted"));};
                     try
@@ -290,7 +319,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                         if (!Custody.Matches(evidence, m.Carrier, m.Manifest, 0)) throw;
                         var cancelled = new Result<CourierReceipt>(CourierOutcome.Cancelled, "CancelledPreLock", fault.Message,
                             new(m.Run, m.Step, Evidence: evidence, Custody: ledger.Units));
-                        ledger.Unconfirmed = null; ledger.Steps[m.Step] = step with { Result = cancelled }; store.Save(ledger);
+                        ledger.Unconfirmed = null; ledger.Steps[m.Step] = step with { Result = cancelled }; SaveLedger(ledger);
                         refused = true; return cancelled;
                     }
                     catch (Exception fault)
@@ -300,7 +329,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                             (fault as CourierFault)?.Code ?? "CarrierTradeUnsettled", fault.Message,
                             new(m.Run, m.Step, Evidence: evidence, Custody: ledger.Units));
                         warning($"{m.Run}/{m.Step} {uncertain.Code}: {fault.Message}");
-                        ledger.Steps[m.Step] = step with { Result = uncertain }; store.Save(ledger);
+                        ledger.Steps[m.Step] = step with { Result = uncertain }; SaveLedger(ledger);
                         refused = true; return uncertain;
                     }
                     evidence = new(before, await Observe()); break;
@@ -441,7 +470,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             }
             var result = Result<CourierReceipt>.Ok(new(m.Run, m.Step, m.Command == CourierCommand.Stop ? null : before, evidence, ledger.Units));
             ledger.Steps[m.Step] = step with { Result = result };
-            store.Save(ledger);
+            SaveLedger(ledger);
             return result;
         }
         catch (Exception e)
@@ -458,7 +487,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             lastCommand = DateTimeOffset.UtcNow;
             try
             {
-                if(stopped && store.Load() is {Run:not null,Paused:false} held){held.Paused=true;store.Save(held);}
+                if(stopped && LoadLedger() is {Run:not null,Paused:false} held){held.Paused=true;SaveLedger(held);}
             }
             finally{try{if(refused || stopped || PausedRun())Release();DescribeLease();}finally{gate.Release();}}
         }
@@ -528,7 +557,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     public async Task StopLocalAsync(bool notifyOwner = true)
     {
         stopped = true; Interlocked.Increment(ref stops);
-        if (notifyOwner && store.Load().Run is { } run) StopRequested?.Invoke(run);
+        if (notifyOwner && LoadLedger().Run is { } run) StopRequested?.Invoke(run);
         await calls.Call("CarrierCancelPreLock", 10, trade.CancelPreLockAsync);
         if (notifyOwner)
         {
@@ -537,7 +566,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
                 warning("CarrierStopDrainDeadline: 15s elapsed; the active step retains ownership through settlement.");
                 return;
             }
-            try { var ledger=store.Load(); if(ledger.Run!=null){ledger.Paused=true;store.Save(ledger);} Release(); } finally { gate.Release(); }
+            try { var ledger=LoadLedger(); if(ledger.Run!=null){ledger.Paused=true;SaveLedger(ledger);} Release(); } finally { gate.Release(); }
         }
     }
     /// <summary>
@@ -553,7 +582,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         ledger.Run = null; ledger.RunKey = null; ledger.OwnerEndpoint = null; ledger.Start = null;
         ledger.Units = []; ledger.Unconfirmed = null; ledger.LastConfirmed = null; ledger.LastConfirmedBags = null;
         ledger.Paused = false; ledger.Steps.Clear(); ledger.NotDelivered.Clear(); ledger.Completed.Add(run);
-        store.Save(ledger);
+        SaveLedger(ledger);
         try { (trade as ICourierTradeForget)?.Forget(steps); }
         finally { ReleaseNow(); }
         var units = held.Where(s => !s.IsGil).Sum(s => (long)s.Units);
@@ -575,7 +604,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         Guid? forgotten = null;
         try
         {
-            var ledger = store.Load();
+            var ledger = LoadLedger();
             forgotten = ledger.Run;
             Forget(ledger, "cleared on this client");
             ReleaseNow();
@@ -586,7 +615,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         _ = Task.Run(async () =>
         {
             await gate.WaitAsync();
-            try { if (store.Load() is { Run: { } again } ledger && again == run) Forget(ledger, "cleared on this client (after the command in flight)"); }
+            try { if (LoadLedger() is { Run: { } again } ledger && again == run) Forget(ledger, "cleared on this client (after the command in flight)"); }
             catch (Exception e) { warning($"{run} CarrierClearRetryFailed: {e.Message}"); }
             finally { gate.Release(); }
         });
@@ -601,7 +630,9 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         if (disposed || active != null || DateTimeOffset.UtcNow - lastCommand < OrphanQuiet || !gate.Wait(0)) return;
         try
         {
-            var ledger = store.Load();
+            // No run held: nothing to forget, and no need to parse the whole ledger every presence tick.
+            if (IdleSummary() != null) return;
+            var ledger = LoadLedger();
             if (ledger.Run is not { } run) return;
             // The owner client is the endpoint that began the run; failing that (it restarted), the run owner logged in.
             var advertising = owners.Where(o => o.Peer.OwnerRun != null).ToArray();
@@ -628,7 +659,8 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         if (!gate.Wait(0)) return;
         try
         {
-            var ledger = store.Load();
+            if (IdleSummary() != null) return;
+            var ledger = LoadLedger();
             if (ledger.Run is not { } run || ledger.Paused || ledger.Units.IsEmpty && ledger.Unconfirmed == null) return;
             var now = DateTimeOffset.UtcNow;
             var linked = owners as IReadOnlyCollection<(Guid Instance, CourierPeer Peer)> ?? owners.ToArray();
@@ -644,7 +676,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
             if (heard == DateTimeOffset.MinValue) { lastCommand = now; return; }
             var silent = now - heard;
             if (silent < OwnerSilence) return;
-            ledger.Paused = true; store.Save(ledger);
+            ledger.Paused = true; SaveLedger(ledger);
             Release();
             warning($"{run} CarrierOwnerSilent: no command from {RunOwner(ledger)?.CharacterName ?? "the run's owner"} for {silent.TotalMinutes:N0} min " +
                 $"(limit {OwnerSilence.TotalMinutes:N0} min) while holding {Held(ledger)}{(ledger.Unconfirmed is { } u ? $", hand-off {u} unconfirmed" : "")}; " +
@@ -663,7 +695,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
         if (Volatile.Read(ref lease) is not { } held) return;
         try
         {
-            var ledger = store.Load();
+            var ledger = LoadLedger();
             automation.Describe(held, ledger.Run is { } run && (!ledger.Units.IsEmpty || ledger.Unconfirmed != null)
                 ? $"carrying {Held(ledger)} for courier run {run} from {RunOwner(ledger)?.CharacterName ?? "its owner"}; Clear on the Courier pane to keep them"
                 : null);
@@ -683,7 +715,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     private static bool SameOwnerClient(CarrierLedger ledger, OwnerScope owner, OwnerScope sender, Guid? endpoint) =>
         endpoint != null && endpoint == ledger.OwnerEndpoint ||
         RunOwner(ledger) is { } held && (CourierPlanner.Exact(held, owner) || CourierPlanner.Exact(held, sender));
-    private bool PausedRun(){try{return store.Load() is {Run:not null,Paused:true};}catch(Exception e){warning($"CarrierLedgerUnreadable: {e.Message}");return false;}}
+    private bool PausedRun(){try{return LoadLedger() is {Run:not null,Paused:true};}catch(Exception e){warning($"CarrierLedgerUnreadable: {e.Message}");return false;}}
     // Locks outlive a refused command only while a live (unpaused) run holds custody: the owner's next step needs them.
     // A paused or stopped run never keeps them; the ledger and the last confirmed bags still guard every unit, and the
     // owner's Begin or settlement re-takes them.
@@ -695,7 +727,7 @@ public sealed class CourierFollower(string directory, Func<CourierSettings> sett
     }
     private void Release(bool force=false, bool now=false)
     {
-        if (!force && store.Load() is {Paused:false} held && (!held.Units.IsEmpty || held.Unconfirmed!=null)) return;
+        if (!force && LoadLedger() is {Paused:false} held && (!held.Units.IsEmpty || held.Unconfirmed!=null)) return;
         var heldSuppression=Interlocked.Exchange(ref suppress,null);
         var heldLease=Interlocked.Exchange(ref lease,null);
         var heldTrade=Interlocked.Exchange(ref tradeHold,null);

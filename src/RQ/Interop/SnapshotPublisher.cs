@@ -130,6 +130,9 @@ public sealed class SnapshotPublisher
         {
             if (Interlocked.Exchange(ref snapshotDirty, 0) == 0)
                 return;
+            // The revision is read before the inputs and state: a refresh publishes its inputs before its revision,
+            // so the document is never labelled newer than what it was built from.
+            var snapshotRevision = Revision;
             if (Volatile.Read(ref latestInputs) is not { } inputs)
             {
                 Interlocked.Exchange(ref snapshotDirty, 1);
@@ -141,7 +144,7 @@ public sealed class SnapshotPublisher
                 state.FullSnapshot(),
                 inputs.Retainers,
                 inputs.Stowage,
-                Revision);
+                snapshotRevision);
         }
     }
 

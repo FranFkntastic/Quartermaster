@@ -18,6 +18,7 @@ public sealed class StateRepository
     private readonly QuartermasterStateStore store;
     private readonly OperationStateStore operationStore;
     private QuartermasterState state;
+    private (QuartermasterState Configuration, long OperationRevision, QuartermasterState Snapshot)? fullSnapshot;
 
     public StateRepository(QuartermasterStateStore store)
     {
@@ -50,10 +51,23 @@ public sealed class StateRepository
 
     public QuartermasterState OperationSnapshot() => operationStore.Snapshot();
 
+    /// <summary>
+    /// A deep copy of configuration and operation state combined. The same instance is returned until either
+    /// authority changes, so callers must treat it as read-only.
+    /// </summary>
     public QuartermasterState FullSnapshot()
     {
         lock (gate)
-            return Combine(Clone(state), operationStore.Snapshot());
+        {
+            // Configuration is copy-on-write (every mutation replaces state), and every operation mutation runs under
+            // this gate and bumps the operation store's revision, so the pair identifies the combined content exactly.
+            var operationRevision = operationStore.Revision;
+            if (fullSnapshot is { } cached && ReferenceEquals(cached.Configuration, state) && cached.OperationRevision == operationRevision)
+                return cached.Snapshot;
+            var snapshot = Combine(Clone(state), operationStore.Snapshot());
+            fullSnapshot = new(state, operationRevision, snapshot);
+            return snapshot;
+        }
     }
 
     internal T ReadConfiguration<T>(Func<QuartermasterState, T> read)
