@@ -637,7 +637,9 @@ public sealed class Plugin : IDalamudPlugin
                     .Distinct(StringComparer.Ordinal)
                     .ToArray());
         else
-            snapshots.Refresh(runtime);
+            // Operation documents stay current before the change notices below; the whole snapshot document is built
+            // when a consumer pulls it.
+            snapshots.Refresh(runtime, rebuildSnapshot: false);
         nextSnapshotAt = DateTime.UtcNow.Add(SnapshotRefreshInterval);
         updateTimings.Section("change notices");
         foreach (var notice in batch.Notices)

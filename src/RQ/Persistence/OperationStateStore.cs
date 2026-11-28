@@ -37,6 +37,16 @@ internal sealed class OperationStateStore
     public string DatabasePath { get; }
     public string JournalId { get; }
 
+    /// <summary>Bumped by every successful mutation and set by every reload.</summary>
+    public long Revision
+    {
+        get
+        {
+            lock (gate)
+                return revision;
+        }
+    }
+
     public T Read<T>(Func<QuartermasterState, T> read)
     {
         lock (gate)
